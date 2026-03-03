@@ -46,6 +46,36 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run CSV parsing benchmark");
     bench_step.dependOn(&bench_run.step);
 
+    // GROUP BY benchmark
+    const groupby_bench_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("bench/groupby_bench.zig"),
+    });
+    groupby_bench_mod.addImport("engine", b.createModule(.{
+        .root_source_file = b.path("src/engine.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    groupby_bench_mod.addImport("parser", b.createModule(.{
+        .root_source_file = b.path("src/parser.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    const groupby_bench_exe = b.addExecutable(.{
+        .name = "groupby_bench",
+        .root_module = groupby_bench_mod,
+    });
+    b.installArtifact(groupby_bench_exe);
+
+    const groupby_bench_run = b.addRunArtifact(groupby_bench_exe);
+    groupby_bench_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        groupby_bench_run.addArgs(args);
+    }
+    const groupby_bench_step = b.step("bench-groupby", "Run GROUP BY benchmark");
+    groupby_bench_step.dependOn(&groupby_bench_run.step);
+
     // Example executables for library users
     const csv_example = b.addExecutable(.{
         .name = "csv_reader_example",
