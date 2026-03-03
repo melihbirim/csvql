@@ -119,4 +119,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_fast_sort_tests = b.addRunArtifact(fast_sort_tests);
     test_step.dependOn(&run_fast_sort_tests.step);
+
+    // Engine tests (GROUP BY, aggregation integration)
+    const engine_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/engine.zig"),
+        }),
+    });
+    const run_engine_tests = b.addRunArtifact(engine_tests);
+    test_step.dependOn(&run_engine_tests.step);
 }
