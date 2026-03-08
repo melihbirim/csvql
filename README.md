@@ -511,9 +511,15 @@ This is a learning project and Zig port. Contributions welcome:
 - Feature implementations
 - Documentation improvements
 
-## License
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
-MIT
+## Licensing and Contributions
+
+csvq is licensed under the **MIT License** — see [LICENSE.md](LICENSE.md) for the full text.
+
+The MIT License keeps the project open, simple, and widely usable. Anyone is free to use, modify, and distribute csvq, including in commercial environments, in accordance with the MIT License.
+
+By contributing to this project (via pull requests, patches, or any form of contribution), you agree that your contribution will be licensed under the MIT License and may be incorporated into future versions of the project.
 
 ## Acknowledgments
 
@@ -536,4 +542,4 @@ MIT
 
 ---
 
-**Built with Zig** 🦎 • **Beating DuckDB, DataFusion & ClickHouse** 🏆 • **Open source** MIT
+**Built with Zig** 🦎 • **Beating DuckDB, DataFusion & ClickHouse** 🏆 • **Open source** [MIT](LICENSE.md)
