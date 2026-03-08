@@ -1,6 +1,6 @@
 # Architecture Deep Dive
 
-This document explains how csvq achieves **9x faster performance** than DuckDB (and beats DataFusion and ClickHouse) on real-world CSV queries over **1 million rows**. We cover seven key technologies: memory-mapped I/O, SIMD vectorization, lock-free parallelism, zero-copy design, ORDER BY optimization, hardware-aware radix sort, and top-K heap selection.
+This document explains how csvql achieves **9x faster performance** than DuckDB (and beats DataFusion and ClickHouse) on real-world CSV queries over **1 million rows**. We cover seven key technologies: memory-mapped I/O, SIMD vectorization, lock-free parallelism, zero-copy design, ORDER BY optimization, hardware-aware radix sort, and top-K heap selection.
 
 ---
 
@@ -22,7 +22,7 @@ This document explains how csvq achieves **9x faster performance** than DuckDB (
 
 ## Overview
 
-csvq is built on seven fundamental optimizations:
+csvql is built on seven fundamental optimizations:
 
 ```bash
 ┌──────────────────────────────────────────────────────────┐
@@ -92,7 +92,7 @@ Memory-mapped approach:
 - **Automatic prefetch**: OS detects sequential access and reads ahead
 - **Shared memory**: Multiple processes/threads can map the same file
 
-### csvq's Implementation
+### csvql's Implementation
 
 ```zig
 // src/parallel_mmap.zig
@@ -147,7 +147,7 @@ for (line, 0..) |byte, i| {
 // This requires 16 comparisons
 ```
 
-**SIMD approach (csvq):**
+**SIMD approach (csvql):**
 
 ```zig
 // Check 16 bytes at once
@@ -180,7 +180,7 @@ With SIMD (vectorized comparison):
 
 **Speed-up: ~5x faster** just for finding delimiters!
 
-### csvq's SIMD Implementation
+### csvql's SIMD Implementation
 
 ```zig
 // src/simd.zig
@@ -296,7 +296,7 @@ Thread 2: bytes 5,000,000-10,000,000
              "John,Doe,30,N" ← incomplete row
 ```
 
-**csvq's solution:**
+**csvql's solution:**
 
 ```zig
 // src/parallel_mmap.zig
@@ -408,7 +408,7 @@ With locks (traditional):
                ↑
                └─ Threads block each other constantly
 
-Without locks (csvq):
+Without locks (csvql):
   Thread 1: Parse → Parse → Parse → ... → (done) ──┐
   Thread 2: Parse → Parse → Parse → ... → (done) ──┤
   ...                                               ├─→ Sequential merge
@@ -420,9 +420,9 @@ Without locks (csvq):
 ### CPU Utilization
 
 ```bash
-$ time ./csvq large_test.csv "id,name,age" "age>30" 0
+$ time ./csvql large_test.csv "id,name,age" "age>30" 0
 
-./csvq large_test.csv "id,name,age" "age>30" 0  1.57s user 0.08s system 669% cpu 0.247 total
+./csvql large_test.csv "id,name,age" "age>30" 0  1.57s user 0.08s system 669% cpu 0.247 total
                                                                             ^^^^
                                                                             669% = 6.69 cores maxed out!
 ```
@@ -454,7 +454,7 @@ Most CSV parsers follow this pattern:
 Memory usage: Original line + struct + output = 3× the data
 ```
 
-### csvq's Zero-Copy Approach
+### csvql's Zero-Copy Approach
 
 Instead of copying, we use **slices** (pointer + length) into the memory-mapped file:
 
@@ -524,7 +524,7 @@ Traditional parser:
   - String allocations: ~50MB
   - Total: ~170MB
 
-csvq (zero-copy):
+csvql (zero-copy):
   - Slice metadata: 1M × 6 fields × 16 bytes/slice = 96MB
   - String allocations: 0 bytes (slices point to mmap'd file)
   - Total: ~96MB
@@ -691,7 +691,7 @@ CSV → Parse → Columnar Storage → Vectorized Execution → Result
 - ❌ Memory copies during ingestion
 - ❌ Cannot benefit from early termination on LIMIT without ORDER BY
 
-### csvq's Architecture (Streaming Query Engine)
+### csvql's Architecture (Streaming Query Engine)
 
 ```bash
 CSV (mmap'd) → SIMD Parse + Filter (parallel) → Sort → Result
@@ -719,7 +719,7 @@ CSV (mmap'd) → SIMD Parse + Filter (parallel) → Sort → Result
 
 `SELECT name, city, salary FROM data.csv WHERE age > 50 ORDER BY salary DESC LIMIT 10`
 
-| Metric | DuckDB | csvq | Advantage |
+| Metric | DuckDB | csvql | Advantage |
 |--------|--------|--------|-----------|
 | **Time** | 0.108s | **0.073s** | **1.5x faster** ⚡ |
 | **Memory** | 63.5MB | 1.8MB | **35x less** 💾 |
@@ -728,7 +728,7 @@ CSV (mmap'd) → SIMD Parse + Filter (parallel) → Sort → Result
 
 `SELECT name, city, salary FROM data.csv WHERE age > 50 LIMIT 10`
 
-| Metric | DuckDB | csvq | Advantage |
+| Metric | DuckDB | csvql | Advantage |
 |--------|--------|--------|-----------|
 | **Time** | 0.085s | **0.003s** | **28x faster** 🚀 |
 
@@ -736,13 +736,13 @@ CSV (mmap'd) → SIMD Parse + Filter (parallel) → Sort → Result
 
 `SELECT name, city, salary FROM data.csv ORDER BY salary DESC LIMIT 10`
 
-| Metric | DuckDB | csvq | Advantage |
+| Metric | DuckDB | csvql | Advantage |
 |--------|--------|--------|-----------|
 | **Time** | **0.108s** | 0.163s | DuckDB **1.5x faster** |
 
 ### Why The Speed Difference?
 
-**Where csvq wins (WHERE + ORDER BY, WHERE + LIMIT):**
+**Where csvql wins (WHERE + ORDER BY, WHERE + LIMIT):**
 
 1. Streaming WHERE filter reduces the sort dataset before sorting
 2. Zero-copy mmap means no data ingestion overhead
@@ -755,9 +755,9 @@ CSV (mmap'd) → SIMD Parse + Filter (parallel) → Sort → Result
 DuckDB's columnar storage gives it a fundamental advantage when sorting all rows:
 
 - **DuckDB**: After CSV import, stores each column as a contiguous array. For `ORDER BY salary`, reads only the salary column (a few MB) and sorts an index array.
-- **csvq**: Must parse every byte of every row in the CSV file to extract the sort column. Even with mmap and SIMD, touching all 35MB of row data is slower than reading a single contiguous column.
+- **csvql**: Must parse every byte of every row in the CSV file to extract the sort column. Even with mmap and SIMD, touching all 35MB of row data is slower than reading a single contiguous column.
 
-This is an inherent trade-off: csvq's row-oriented streaming model avoids format conversion overhead (which wins for WHERE queries), but loses the columnar data layout advantage on full-table sorts.
+This is an inherent trade-off: csvql's row-oriented streaming model avoids format conversion overhead (which wins for WHERE queries), but loses the columnar data layout advantage on full-table sorts.
 
 ---
 
@@ -766,7 +766,7 @@ This is an inherent trade-off: csvq's row-oriented streaming model avoids format
 Let's trace a query from start to finish:
 
 ```bash
-./csvq large.csv "id,name,age" "age>30" 0
+./csvql large.csv "id,name,age" "age>30" 0
 ```
 
 ### Step 1: Query Parsing (~0.1ms)
@@ -963,7 +963,7 @@ Further optimization potential:
 
 ## Summary
 
-csvq achieves industry-leading performance through seven key technologies:
+csvql achieves industry-leading performance through seven key technologies:
 
 1. **Memory-Mapped I/O**: Zero-copy file access with automatic OS optimization
 2. **SIMD Vectorization**: 5x faster delimiter finding by processing 16 bytes simultaneously
@@ -985,7 +985,7 @@ csvq achieves industry-leading performance through seven key technologies:
 
 The architecture prioritizes **simplicity and directness**: minimal abstractions, zero-copy operations, and embarrassingly parallel execution. This makes it ideal for streaming CSV queries where raw speed matters more than complex analytical features.
 
-For workloads requiring aggregations, joins, or complex query optimization, DuckDB and ClickHouse remain better choices. But for filtering, sorting, and outputting results from raw CSV files, csvq's focused architecture delivers unmatched performance across the board.
+For workloads requiring aggregations, joins, or complex query optimization, DuckDB and ClickHouse remain better choices. But for filtering, sorting, and outputting results from raw CSV files, csvql's focused architecture delivers unmatched performance across the board.
 
 ---
 

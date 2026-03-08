@@ -1,4 +1,4 @@
-# csvq
+# csvql
 
 **The world's fastest CSV query engine** 🚀
 
@@ -6,20 +6,20 @@ A high-performance SQL query engine for CSV files that **beats DuckDB, DataFusio
 
 ```bash
 # SQL mode: Query 1M rows with WHERE + ORDER BY in 0.020s (9x faster than DuckDB!)
-csvq "SELECT name, city, salary FROM 'data.csv' WHERE salary > 100000 ORDER BY salary DESC LIMIT 10"
+csvql "SELECT name, city, salary FROM 'data.csv' WHERE salary > 100000 ORDER BY salary DESC LIMIT 10"
 
 # Simple mode: Same query, shorter syntax
-csvq data.csv "name,city,salary" "salary>100000" 10 "salary:desc"
+csvql data.csv "name,city,salary" "salary>100000" 10 "salary:desc"
 
 # Full scan + sort 1M rows in 0.156s (7.8x faster than DuckDB!)
-csvq "SELECT name, city, salary FROM 'data.csv' ORDER BY salary DESC"
+csvql "SELECT name, city, salary FROM 'data.csv' ORDER BY salary DESC"
 ```
 
 ## 🏆 Performance (1M rows, 35MB CSV)
 
 Fair benchmarks — all tools forced to output all rows (no 40-row display tricks):
 
-| Query | csvq | DuckDB | DataFusion | ClickHouse |
+| Query | csvql | DuckDB | DataFusion | ClickHouse |
 |-------|--------|--------|------------|------------|
 | WHERE + ORDER BY LIMIT 10 | **0.020s** | 0.179s | 0.243s | 0.750s |
 | ORDER BY LIMIT 10 | **0.041s** | 0.165s | 0.143s | 0.761s |
@@ -93,13 +93,13 @@ cd csvq
 zig build -Doptimize=ReleaseFast
 ```
 
-The binary will be in `zig-out/bin/csvq`.
+The binary will be in `zig-out/bin/csvql`.
 
 ### Install
 
 ```bash
 # Copy to your PATH
-sudo cp zig-out/bin/csvq /usr/local/bin/
+sudo cp zig-out/bin/csvql /usr/local/bin/
 ```
 
 ## Quick Start
@@ -108,19 +108,19 @@ sudo cp zig-out/bin/csvq /usr/local/bin/
 
 ```bash
 # Show first 10 rows (default)
-csvq data.csv
+csvql data.csv
 
 # Select specific columns
-csvq data.csv "name,age,city"
+csvql data.csv "name,age,city"
 
 # Filter rows
-csvq data.csv "*" "age>30"
+csvql data.csv "*" "age>30"
 
 # Top 10 highest salaries
-csvq data.csv "name,salary" "salary>0" 10 "salary:desc"
+csvql data.csv "name,salary" "salary>0" 10 "salary:desc"
 
 # All rows, no limit, sorted by name
-csvq data.csv "*" "" 0 "name:asc"
+csvql data.csv "*" "" 0 "name:asc"
 ```
 
 See [SIMPLE_QUERY_LANGUAGE.md](SIMPLE_QUERY_LANGUAGE.md) for full syntax reference.
@@ -129,42 +129,42 @@ See [SIMPLE_QUERY_LANGUAGE.md](SIMPLE_QUERY_LANGUAGE.md) for full syntax referen
 
 ```bash
 # Select all columns
-csvq "SELECT * FROM 'data.csv' LIMIT 10"
+csvql "SELECT * FROM 'data.csv' LIMIT 10"
 
 # Select specific columns
-csvq "SELECT name, age FROM 'users.csv'"
+csvql "SELECT name, age FROM 'users.csv'"
 
 # Filter with WHERE clause
-csvq "SELECT * FROM 'sales.csv' WHERE amount > 100"
+csvql "SELECT * FROM 'sales.csv' WHERE amount > 100"
 
 # Filter, sort, and limit
-csvq "SELECT name, salary FROM 'data.csv' WHERE age > 30 ORDER BY salary DESC LIMIT 10"
+csvql "SELECT name, salary FROM 'data.csv' WHERE age > 30 ORDER BY salary DESC LIMIT 10"
 
 # Combine filtering and projection
-csvq "SELECT name, email FROM 'users.csv' WHERE age >= 18 LIMIT 100"
+csvql "SELECT name, email FROM 'users.csv' WHERE age >= 18 LIMIT 100"
 ```
 
 ### Unix Pipes
 
 ```bash
 # Read from stdin
-cat data.csv | csvq "SELECT name, age FROM '-' WHERE age > 25"
+cat data.csv | csvql "SELECT name, age FROM '-' WHERE age > 25"
 
 # Chain filters
-cat orders.csv | csvq "SELECT * FROM '-' WHERE country = 'US'" | csvq "SELECT total FROM '-' WHERE total > 1000"
+cat orders.csv | csvql "SELECT * FROM '-' WHERE country = 'US'" | csvql "SELECT total FROM '-' WHERE total > 1000"
 
 # Monitor live logs
-tail -f logs.csv | csvq "SELECT timestamp, message FROM '-' WHERE level = 'ERROR'"
+tail -f logs.csv | csvql "SELECT timestamp, message FROM '-' WHERE level = 'ERROR'"
 ```
 
 ### Output Redirection
 
 ```bash
 # Write to file
-csvq "SELECT * FROM 'data.csv' WHERE status = 'active'" > active_users.csv
+csvql "SELECT * FROM 'data.csv' WHERE status = 'active'" > active_users.csv
 
 # Pipe to other tools
-csvq "SELECT email FROM 'users.csv'" | wc -l
+csvql "SELECT email FROM 'users.csv'" | wc -l
 ```
 
 ## SQL Support
@@ -190,7 +190,7 @@ csvq "SELECT email FROM 'users.csv'" | wc -l
 
 ## Using the CSV Parser as a Library
 
-csvq includes a **world-class CSV parser** that you can use in your own Zig projects!
+csvql includes a **world-class CSV parser** that you can use in your own Zig projects!
 
 ### Why Use Our Parser?
 
@@ -449,7 +449,7 @@ All tools forced to output all rows — no 40-row display tricks.
 
 > **Important**: DuckDB and DataFusion CLIs default to displaying only 40 rows, making them appear much faster than they really are. These benchmarks use `-csv` mode (DuckDB) and `FORMAT CSV` (ClickHouse) to force full output materialization.
 
-| Query | csvq | DuckDB | DataFusion* | ClickHouse | csvq vs DuckDB |
+| Query | csvql | DuckDB | DataFusion* | ClickHouse | csvql vs DuckDB |
 |-------|--------|--------|-------------|------------|------------------|
 | **Q1:** WHERE + ORDER BY LIMIT 10 | **0.020s** | 0.179s | 0.243s | 0.750s | 🏆 **9x faster** |
 | **Q2:** ORDER BY LIMIT 10 | **0.041s** | 0.165s | 0.143s | 0.761s | 🏆 **4x faster** |
@@ -461,7 +461,7 @@ All tools forced to output all rows — no 40-row display tricks.
 
 **Memory efficiency**:
 
-- csvq: 1.8MB
+- csvql: 1.8MB
 - DuckDB: 63.5MB
 - **35x less memory!** 🎯
 
@@ -515,9 +515,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## Licensing and Contributions
 
-csvq is licensed under the **MIT License** — see [LICENSE.md](LICENSE.md) for the full text.
+csvql is licensed under the **MIT License** — see [LICENSE.md](LICENSE.md) for the full text.
 
-The MIT License keeps the project open, simple, and widely usable. Anyone is free to use, modify, and distribute csvq, including in commercial environments, in accordance with the MIT License.
+The MIT License keeps the project open, simple, and widely usable. Anyone is free to use, modify, and distribute csvql, including in commercial environments, in accordance with the MIT License.
 
 By contributing to this project (via pull requests, patches, or any form of contribution), you agree that your contribution will be licensed under the MIT License and may be incorporated into future versions of the project.
 

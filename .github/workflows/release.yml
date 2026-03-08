@@ -16,13 +16,13 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-linux
-            artifact: csvq-linux-x86_64
+            artifact: csvql-linux-x86_64
           - os: macos-latest
             target: x86_64-macos
-            artifact: csvq-macos-x86_64
+            artifact: csvql-macos-x86_64
           - os: macos-latest
             target: aarch64-macos
-            artifact: csvq-macos-aarch64
+            artifact: csvql-macos-aarch64
             
     runs-on: ${{ matrix.os }}
     
@@ -41,7 +41,7 @@ jobs:
     - name: Prepare artifact
       run: |
         mkdir -p release
-        cp zig-out/bin/csvq release/${{ matrix.artifact }}
+        cp zig-out/bin/csvql release/${{ matrix.artifact }}
         cd release
         tar -czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
         

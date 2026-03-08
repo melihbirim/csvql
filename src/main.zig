@@ -7,31 +7,31 @@ const Allocator = std.mem.Allocator;
 const version = "0.2.1";
 
 const help_text =
-    \\csvq — the world's fastest CSV query engine
+    \\csvql — the world's fastest CSV query engine
     \\
     \\USAGE:
-    \\  csvq <file> [columns] [where] [limit] [orderby]
-    \\  csvq "SELECT ... FROM 'file.csv' ..."
-    \\  cat file.csv | csvq "SELECT ... FROM '-' ..."
+    \\  csvql <file> [columns] [where] [limit] [orderby]
+    \\  csvql "SELECT ... FROM 'file.csv' ..."
+    \\  cat file.csv | csvql "SELECT ... FROM '-' ..."
     \\
     \\SQL MODE:
-    \\  csvq "SELECT name, age FROM 'data.csv'"
-    \\  csvq "SELECT * FROM 'data.csv' WHERE age > 30"
-    \\  csvq "SELECT name FROM 'data.csv' WHERE age > 30 ORDER BY name ASC"
-    \\  csvq "SELECT * FROM 'data.csv' ORDER BY salary DESC LIMIT 10"
-    \\  csvq "SELECT * FROM 'data.csv' WHERE age > 25 AND city = 'NYC'"
-    \\  csvq "SELECT * FROM 'data.csv' WHERE status = 'active' OR score >= 90"
+    \\  csvql "SELECT name, age FROM 'data.csv'"
+    \\  csvql "SELECT * FROM 'data.csv' WHERE age > 30"
+    \\  csvql "SELECT name FROM 'data.csv' WHERE age > 30 ORDER BY name ASC"
+    \\  csvql "SELECT * FROM 'data.csv' ORDER BY salary DESC LIMIT 10"
+    \\  csvql "SELECT * FROM 'data.csv' WHERE age > 25 AND city = 'NYC'"
+    \\  csvql "SELECT * FROM 'data.csv' WHERE status = 'active' OR score >= 90"
     \\
     \\SIMPLE MODE:
-    \\  csvq data.csv                                    # all columns, default limit 10
-    \\  csvq data.csv "name,age,city"                    # select columns
-    \\  csvq data.csv "*" "age>30"                       # WHERE filter
-    \\  csvq data.csv "name,salary" "salary>0" 10 "salary:desc"
-    \\  csvq data.csv "*" "" 0 "name:asc"               # 0 = no limit
+    \\  csvql data.csv                                    # all columns, default limit 10
+    \\  csvql data.csv "name,age,city"                    # select columns
+    \\  csvql data.csv "*" "age>30"                       # WHERE filter
+    \\  csvql data.csv "name,salary" "salary>0" 10 "salary:desc"
+    \\  csvql data.csv "*" "" 0 "name:asc"               # 0 = no limit
     \\
     \\PIPE MODE (use '-' as filename):
-    \\  cat data.csv | csvq "SELECT name FROM '-' WHERE age > 25"
-    \\  tail -f logs.csv | csvq "SELECT * FROM '-' WHERE level = 'ERROR'"
+    \\  cat data.csv | csvql "SELECT name FROM '-' WHERE age > 25"
+    \\  tail -f logs.csv | csvql "SELECT * FROM '-' WHERE level = 'ERROR'"
     \\
     \\SUPPORTED SQL:
     \\  SELECT   column list or *
@@ -54,9 +54,9 @@ const help_text =
     \\  -v, --version    Show version
     \\
     \\EXAMPLES:
-    \\  csvq "SELECT * FROM 'users.csv' WHERE age >= 18 LIMIT 100"
-    \\  csvq "SELECT * FROM 'data.csv' WHERE status = 'active'" > out.csv
-    \\  csvq "SELECT email FROM 'users.csv'" | wc -l
+    \\  csvql "SELECT * FROM 'users.csv' WHERE age >= 18 LIMIT 100"
+    \\  csvql "SELECT * FROM 'data.csv' WHERE status = 'active'" > out.csv
+    \\  csvql "SELECT email FROM 'users.csv'" | wc -l
     \\
 ;
 
@@ -75,7 +75,7 @@ pub fn main() !void {
     // Check for flags
     if (args.len >= 2) {
         if (std.mem.eql(u8, args[1], "--version") or std.mem.eql(u8, args[1], "-v")) {
-            try stderr_file.writeAll("csvq " ++ version ++ "\n");
+            try stderr_file.writeAll("csvql " ++ version ++ "\n");
             return;
         }
         if (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h")) {
@@ -86,21 +86,21 @@ pub fn main() !void {
 
     // Detect query mode: simple vs SQL
     var query = if (args.len > 1 and !isSQL(args[1])) blk: {
-        // Simple mode: csvq file.csv [columns] [where] [limit] [orderby]
+        // Simple mode: csvql file.csv [columns] [where] [limit] [orderby]
         const simple_args = args[1..];
         break :blk simple_parser.parseSimple(allocator, simple_args) catch |err| {
             std.debug.print("error: {}\n", .{err});
-            std.debug.print("\nRun 'csvq --help' for usage information.\n", .{});
+            std.debug.print("\nRun 'csvql --help' for usage information.\n", .{});
             std.process.exit(1);
         };
     } else blk: {
-        // SQL mode: csvq "SELECT ..."
+        // SQL mode: csvql "SELECT ..."
         const query_text = try getQueryFromArgsOrStdin(allocator, args);
         defer allocator.free(query_text);
 
         break :blk parser.parse(allocator, query_text) catch |err| {
             std.debug.print("SQL parse error: {}\n", .{err});
-            std.debug.print("\nRun 'csvq --help' for usage information.\n", .{});
+            std.debug.print("\nRun 'csvql --help' for usage information.\n", .{});
             std.process.exit(1);
         };
     };
@@ -145,7 +145,7 @@ fn getQueryFromArgsOrStdin(allocator: Allocator, args: [][:0]u8) ![]u8 {
 
     if (trimmed.len == 0) {
         const stderr = std.fs.File{ .handle = std.posix.STDERR_FILENO };
-        try stderr.writeAll("error: no query provided\n\nRun 'csvq --help' for usage information.\n");
+        try stderr.writeAll("error: no query provided\n\nRun 'csvql --help' for usage information.\n");
         std.process.exit(1);
     }
 
