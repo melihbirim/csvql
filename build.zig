@@ -46,6 +46,32 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run CSV parsing benchmark");
     bench_step.dependOn(&bench_run.step);
 
+    // GROUP BY benchmark — uses named modules so bench/ can reach src/
+    const engine_mod = b.createModule(.{
+        .root_source_file = b.path("src/engine.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const groupby_bench_root = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("bench/groupby_bench.zig"),
+    });
+    groupby_bench_root.addImport("engine", engine_mod);
+    const groupby_bench_exe = b.addExecutable(.{
+        .name = "groupby_bench",
+        .root_module = groupby_bench_root,
+    });
+    b.installArtifact(groupby_bench_exe);
+
+    const groupby_bench_run = b.addRunArtifact(groupby_bench_exe);
+    groupby_bench_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        groupby_bench_run.addArgs(args);
+    }
+    const groupby_bench_step = b.step("bench-groupby", "Run GROUP BY benchmark");
+    groupby_bench_step.dependOn(&groupby_bench_run.step);
+
     // Example executables for library users
     const csv_example = b.addExecutable(.{
         .name = "csv_reader_example",
@@ -119,4 +145,15 @@ pub fn build(b: *std.Build) void {
     });
     const run_fast_sort_tests = b.addRunArtifact(fast_sort_tests);
     test_step.dependOn(&run_fast_sort_tests.step);
+
+    // Engine tests (GROUP BY, aggregation integration)
+    const engine_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/engine.zig"),
+        }),
+    });
+    const run_engine_tests = b.addRunArtifact(engine_tests);
+    test_step.dependOn(&run_engine_tests.step);
 }
