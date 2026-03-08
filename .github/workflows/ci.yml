@@ -44,7 +44,7 @@ jobs:
       
     - name: Verify executable
       run: |
-        ./zig-out/bin/csvq --version
+        ./zig-out/bin/csvql --version
         
     - name: Generate test CSV
       if: matrix.os == 'ubuntu-latest'
@@ -56,7 +56,7 @@ jobs:
     - name: Test query execution
       if: matrix.os == 'ubuntu-latest'
       run: |
-        ./zig-out/bin/csvq "SELECT * FROM 'test_ci.csv'" | tee output.csv
+        ./zig-out/bin/csvql "SELECT * FROM 'test_ci.csv'" | tee output.csv
         [ $(wc -l < output.csv) -eq 3 ] && echo "✅ Query test passed"
 
   lint:

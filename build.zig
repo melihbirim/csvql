@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
 
     // Create the executable
     const exe = b.addExecutable(.{
-        .name = "csvq",
+        .name = "csvql",
         .root_module = b.createModule(.{
             .target = target,
             .optimize = optimize,

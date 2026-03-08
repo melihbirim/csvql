@@ -1,6 +1,6 @@
-# Contributing to csvq
+# Contributing to csvql
 
-Thank you for your interest in contributing to csvq! Contributions of all kinds are welcome — bug reports, performance improvements, feature implementations, and documentation fixes.
+Thank you for your interest in contributing to csvql! Contributions of all kinds are welcome — bug reports, performance improvements, feature implementations, and documentation fixes.
 
 ## How to Contribute
 
