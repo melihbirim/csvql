@@ -614,7 +614,7 @@ fn executeGroupBy(
     if (header_line.len > 0 and header_line[header_line.len - 1] == '\r')
         header_line = header_line[0 .. header_line.len - 1];
 
-    var header_list = std.ArrayList([]const u8){};
+    var header_list = std.ArrayListUnmanaged([]const u8){};
     defer header_list.deinit(allocator);
     {
         var it = std.mem.splitScalar(u8, header_line, ',');
@@ -647,16 +647,16 @@ fn executeGroupBy(
     }
 
     // -- Resolve SELECT columns into ColKind + AggSpec lists ---------------
-    var col_kinds = std.ArrayList(ColKind){};
+    var col_kinds = std.ArrayListUnmanaged(ColKind){};
     defer col_kinds.deinit(allocator);
 
-    var agg_specs = std.ArrayList(AggSpec){};
+    var agg_specs = std.ArrayListUnmanaged(AggSpec){};
     defer {
         for (agg_specs.items) |spec| allocator.free(spec.alias);
         agg_specs.deinit(allocator);
     }
 
-    var out_header_list = std.ArrayList([]const u8){};
+    var out_header_list = std.ArrayListUnmanaged([]const u8){};
     defer out_header_list.deinit(allocator);
 
     if (query.all_columns) {
@@ -722,11 +722,16 @@ fn executeGroupBy(
     const n_aggs = agg_specs.items.len;
 
     // Reusable key builder (grows once, then reused without allocation)
-    var key_buf = std.ArrayList(u8){};
+    var key_buf = std.ArrayListUnmanaged(u8){};
     defer key_buf.deinit(allocator);
 
     // Stack field buffer: zero heap allocation for field splitting per row
     var field_stk: [256][]const u8 = undefined;
+
+    // Fallback HashMap for complex WHERE expressions (AND/OR) — hoisted out of
+    // the hot loop so that only one allocation happens for the entire scan.
+    var fallback_row_map = std.StringHashMap([]const u8).init(allocator);
+    defer fallback_row_map.deinit();
 
     // -- Main scan loop (mmap sequential scan) ------------------------------
     var pos: usize = header_nl + 1;
@@ -767,12 +772,12 @@ fn executeGroupBy(
                 }
                 if (!matches) continue;
             } else {
-                var row_map = std.StringHashMap([]const u8).init(allocator);
-                defer row_map.deinit();
+                // Fallback map is allocated once before the loop and cleared here.
+                fallback_row_map.clearRetainingCapacity();
                 for (lower_header, 0..) |lh, i| {
-                    if (i < record.len) try row_map.put(lh, record[i]);
+                    if (i < record.len) try fallback_row_map.put(lh, record[i]);
                 }
-                if (!parser.evaluate(expr, row_map)) continue;
+                if (!parser.evaluate(expr, fallback_row_map)) continue;
             }
         }
 
@@ -833,18 +838,31 @@ fn executeGroupBy(
         }
     }
 
-    // -- Output phase -------------------------------------------------------
+    // -- Sorted output phase -----------------------------------------------
+    // Collect group keys and sort for deterministic output order.
+    var sorted_keys = try allocator.alloc([]const u8, group_map.count());
+    defer allocator.free(sorted_keys);
+    {
+        var kit = group_map.keyIterator();
+        var ki: usize = 0;
+        while (kit.next()) |k| : (ki += 1) sorted_keys[ki] = k.*;
+    }
+    std.mem.sort([]const u8, sorted_keys, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+
     var output_row = try allocator.alloc([]const u8, col_kinds.items.len);
     defer allocator.free(output_row);
 
     var rows_output: i32 = 0;
-    var group_it = group_map.iterator();
-    while (group_it.next()) |entry| {
+    for (sorted_keys) |key| {
         if (query.limit >= 0 and rows_output >= query.limit) break;
-        const accum = entry.value_ptr;
+        const accum = group_map.getPtr(key).?;
 
         // Format aggregate results (handful of groups, negligible cost)
-        var agg_allocs = std.ArrayList([]u8){};
+        var agg_allocs = std.ArrayListUnmanaged([]u8){};
         defer {
             for (agg_allocs.items) |s| allocator.free(s);
             agg_allocs.deinit(allocator);
@@ -901,29 +919,33 @@ fn executeGroupBy(
 }
 
 // --- Tests ---
+// Note: tests use std.testing.tmpDir so that parallel test runs don't race
+// on shared temp-file names.
 
 test "GROUP BY basic: unique values per group" {
     const allocator = std.testing.allocator;
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
     const csv_content = "name,department\nAlice,Engineering\nBob,Marketing\nCarol,Engineering\nDave,Marketing\nEve,Sales\n";
-    const in_path = "test_gb_basic_in.csv";
-    const out_path = "test_gb_basic_out.csv";
 
     {
-        const f = try std.fs.cwd().createFile(in_path, .{});
+        const f = try tmp.dir.createFile("input.csv", .{});
         defer f.close();
         try f.writeAll(csv_content);
     }
-    defer std.fs.cwd().deleteFile(in_path) catch {};
 
-    var query = try parser.parse(allocator, "SELECT department FROM '" ++ in_path ++ "' GROUP BY department");
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT department FROM '{s}' GROUP BY department", .{in_path});
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
     defer query.deinit();
 
-    const out_file = try std.fs.cwd().createFile(out_path, .{ .read = true });
-    defer {
-        out_file.close();
-        std.fs.cwd().deleteFile(out_path) catch {};
-    }
+    const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
+    defer out_file.close();
 
     try execute(allocator, query, out_file);
 
@@ -943,25 +965,27 @@ test "GROUP BY basic: unique values per group" {
 test "GROUP BY with COUNT(*)" {
     const allocator = std.testing.allocator;
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
     const csv_content = "name,department\nAlice,Engineering\nBob,Marketing\nCarol,Engineering\n";
-    const in_path = "test_gb_count_in.csv";
-    const out_path = "test_gb_count_out.csv";
 
     {
-        const f = try std.fs.cwd().createFile(in_path, .{});
+        const f = try tmp.dir.createFile("input.csv", .{});
         defer f.close();
         try f.writeAll(csv_content);
     }
-    defer std.fs.cwd().deleteFile(in_path) catch {};
 
-    var query = try parser.parse(allocator, "SELECT department, COUNT(*) FROM '" ++ in_path ++ "' GROUP BY department");
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT department, COUNT(*) FROM '{s}' GROUP BY department", .{in_path});
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
     defer query.deinit();
 
-    const out_file = try std.fs.cwd().createFile(out_path, .{ .read = true });
-    defer {
-        out_file.close();
-        std.fs.cwd().deleteFile(out_path) catch {};
-    }
+    const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
+    defer out_file.close();
 
     try execute(allocator, query, out_file);
 
@@ -976,33 +1000,36 @@ test "GROUP BY with COUNT(*)" {
     while (lines.next()) |_| line_count += 1;
     try std.testing.expectEqual(@as(usize, 3), line_count); // header + 2 groups
 
-    // Engineering appears twice so count should be 2; Marketing once so count is 1
-    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "2"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "1"));
+    // Engineering appears twice so count should be 2; Marketing once so count is 1.
+    // Output is sorted: Engineering row comes first (alphabetically).
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "Engineering,2"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "Marketing,1"));
 }
 
 test "GROUP BY with WHERE clause" {
     const allocator = std.testing.allocator;
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
     const csv_content = "name,age,department\nAlice,30,Engineering\nBob,22,Marketing\nCarol,35,Engineering\nDave,20,Marketing\n";
-    const in_path = "tgb_filtered_in.csv";
-    const out_path = "tgb_filtered_out.csv";
 
     {
-        const f = try std.fs.cwd().createFile(in_path, .{});
+        const f = try tmp.dir.createFile("input.csv", .{});
         defer f.close();
         try f.writeAll(csv_content);
     }
-    defer std.fs.cwd().deleteFile(in_path) catch {};
 
-    var query = try parser.parse(allocator, "SELECT department FROM '" ++ in_path ++ "' WHERE age > 25 GROUP BY department");
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT department FROM '{s}' WHERE age > 25 GROUP BY department", .{in_path});
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
     defer query.deinit();
 
-    const out_file = try std.fs.cwd().createFile(out_path, .{ .read = true });
-    defer {
-        out_file.close();
-        std.fs.cwd().deleteFile(out_path) catch {};
-    }
+    const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
+    defer out_file.close();
 
     try execute(allocator, query, out_file);
 
@@ -1018,25 +1045,27 @@ test "GROUP BY with WHERE clause" {
 test "GROUP BY with LIMIT" {
     const allocator = std.testing.allocator;
 
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
     const csv_content = "name,department\nAlice,Engineering\nBob,Marketing\nCarol,Sales\n";
-    const in_path = "tgb_capped_in.csv";
-    const out_path = "tgb_capped_out.csv";
 
     {
-        const f = try std.fs.cwd().createFile(in_path, .{});
+        const f = try tmp.dir.createFile("input.csv", .{});
         defer f.close();
         try f.writeAll(csv_content);
     }
-    defer std.fs.cwd().deleteFile(in_path) catch {};
 
-    var query = try parser.parse(allocator, "SELECT department FROM '" ++ in_path ++ "' GROUP BY department LIMIT 2");
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT department FROM '{s}' GROUP BY department LIMIT 2", .{in_path});
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
     defer query.deinit();
 
-    const out_file = try std.fs.cwd().createFile(out_path, .{ .read = true });
-    defer {
-        out_file.close();
-        std.fs.cwd().deleteFile(out_path) catch {};
-    }
+    const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
+    defer out_file.close();
 
     try execute(allocator, query, out_file);
 
@@ -1044,7 +1073,7 @@ test "GROUP BY with LIMIT" {
     const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(output);
 
-    // header + at most 2 groups
+    // header + at most 2 groups (sorted: Engineering, Marketing — Sales excluded by LIMIT)
     const trimmed = std.mem.trim(u8, output, "\n");
     var line_count: usize = 0;
     var lines = std.mem.splitScalar(u8, trimmed, '\n');
