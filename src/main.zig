@@ -2,6 +2,7 @@ const std = @import("std");
 const parser = @import("parser.zig");
 const simple_parser = @import("simple_parser.zig");
 const engine = @import("engine.zig");
+const options_mod = @import("options.zig");
 const Allocator = std.mem.Allocator;
 
 const version = "0.4.0";
@@ -50,8 +51,10 @@ const help_text =
     \\  aliases (AS), UNION, INSERT/UPDATE/DELETE
     \\
     \\OPTIONS:
-    \\  -h, --help       Show this help
-    \\  -v, --version    Show version
+    \\  -h, --help              Show this help
+    \\  -v, --version           Show version
+    \\  --no-header             Suppress header row in output
+    \\  -d, --delimiter <char>  Field delimiter (default: ',')  e.g. -d '\t' for TSV
     \\
     \\EXAMPLES:
     \\  csvql "SELECT * FROM 'users.csv' WHERE age >= 18 LIMIT 100"
@@ -72,7 +75,7 @@ pub fn main() !void {
     const stdout_file = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
     const stderr_file = std.fs.File{ .handle = std.posix.STDERR_FILENO };
 
-    // Check for flags
+    // Check for early-exit flags first (before any filtering)
     if (args.len >= 2) {
         if (std.mem.eql(u8, args[1], "--version") or std.mem.eql(u8, args[1], "-v")) {
             try stderr_file.writeAll("csvql " ++ version ++ "\n");
@@ -84,18 +87,40 @@ pub fn main() !void {
         }
     }
 
+    // Strip --no-header / -d / --delimiter flags; collect remainder for query parsing.
+    var opts = options_mod.Options{};
+    var clean_args = try std.ArrayList([]const u8).initCapacity(allocator, args.len);
+    defer clean_args.deinit(allocator);
+    try clean_args.append(allocator, args[0]); // keep program name at [0]
+
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--no-header")) {
+            opts.no_header = true;
+        } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--delimiter")) {
+            i += 1;
+            if (i >= args.len) {
+                try stderr_file.writeAll("error: --delimiter requires a character argument\n");
+                std.process.exit(1);
+            }
+            opts.delimiter = parseDelimiter(args[i]);
+        } else {
+            try clean_args.append(allocator, arg);
+        }
+    }
+
     // Detect query mode: simple vs SQL
-    var query = if (args.len > 1 and !isSQL(args[1])) blk: {
+    var query = if (clean_args.items.len > 1 and !isSQL(clean_args.items[1])) blk: {
         // Simple mode: csvql file.csv [columns] [where] [limit] [orderby]
-        const simple_args = args[1..];
-        break :blk simple_parser.parseSimple(allocator, simple_args) catch |err| {
+        break :blk simple_parser.parseSimple(allocator, clean_args.items[1..]) catch |err| {
             std.debug.print("error: {}\n", .{err});
             std.debug.print("\nRun 'csvql --help' for usage information.\n", .{});
             std.process.exit(1);
         };
     } else blk: {
         // SQL mode: csvql "SELECT ..."
-        const query_text = try getQueryFromArgsOrStdin(allocator, args);
+        const query_text = try getQueryFromArgs(allocator, clean_args.items);
         defer allocator.free(query_text);
 
         break :blk parser.parse(allocator, query_text) catch |err| {
@@ -107,7 +132,7 @@ pub fn main() !void {
     defer query.deinit();
 
     // Execute query
-    engine.execute(allocator, query, stdout_file) catch |err| {
+    engine.execute(allocator, query, stdout_file, opts) catch |err| {
         std.debug.print("execution error: {}\n", .{err});
         std.process.exit(1);
     };
@@ -124,23 +149,15 @@ fn isSQL(arg: []const u8) bool {
     return std.mem.eql(u8, upper, "SELECT");
 }
 
-fn getQueryFromArgsOrStdin(allocator: Allocator, args: [][:0]u8) ![]u8 {
-    // If query provided as argument
-    if (args.len > 1) {
-        // Join all args after program name
-        var query_parts = try std.ArrayList([]const u8).initCapacity(allocator, args.len - 1);
-        defer query_parts.deinit(allocator);
-
-        for (args[1..]) |arg| {
-            try query_parts.append(allocator, arg);
-        }
-
-        return try std.mem.join(allocator, " ", query_parts.items);
+/// Join clean_args[1..] into a single query string, or read from stdin.
+fn getQueryFromArgs(allocator: Allocator, clean_args: []const []const u8) ![]u8 {
+    if (clean_args.len > 1) {
+        return try std.mem.join(allocator, " ", clean_args[1..]);
     }
 
     // Read query from stdin
     const stdin = std.fs.File{ .handle = std.posix.STDIN_FILENO };
-    const query = try stdin.readToEndAlloc(allocator, 1024 * 1024); // Max 1MB query
+    const query = try stdin.readToEndAlloc(allocator, 1024 * 1024);
     const trimmed = std.mem.trim(u8, query, &std.ascii.whitespace);
 
     if (trimmed.len == 0) {
@@ -149,8 +166,25 @@ fn getQueryFromArgsOrStdin(allocator: Allocator, args: [][:0]u8) ![]u8 {
         std.process.exit(1);
     }
 
-    // Return a copy of the trimmed string
     const result = try allocator.dupe(u8, trimmed);
     allocator.free(query);
     return result;
+}
+
+/// Parse a delimiter argument, supporting \t, \n, \r escapes.
+fn parseDelimiter(arg: []const u8) u8 {
+    if (arg.len == 1) return arg[0];
+    // Handle 2-char escape sequences passed as literal strings (e.g. shell: -d '\t')
+    if (arg.len == 2 and arg[0] == '\\') {
+        return switch (arg[1]) {
+            't' => '\t',
+            'n' => '\n',
+            'r' => '\r',
+            '|' => '|',
+            ';' => ';',
+            else => arg[1],
+        };
+    }
+    // Fallback: use first byte
+    return arg[0];
 }

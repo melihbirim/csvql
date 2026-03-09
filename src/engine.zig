@@ -7,6 +7,7 @@ const parallel_mmap = @import("parallel_mmap.zig");
 const fast_sort = @import("fast_sort.zig");
 const aggregation = @import("aggregation.zig");
 const simd = @import("simd.zig");
+const options_mod = @import("options.zig");
 const Allocator = std.mem.Allocator;
 
 /// Result row for ORDER BY buffering — uses fast_sort SortKey
@@ -53,19 +54,19 @@ pub const parseQuery = parser.parse;
 pub const Query = parser.Query;
 
 /// Execute a SQL query on a CSV file
-pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.File) !void {
+pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.File, opts: options_mod.Options) !void {
     // Check if reading from stdin
     const is_stdin = std.mem.eql(u8, query.file_path, "-") or std.mem.eql(u8, query.file_path, "stdin");
 
     if (is_stdin) {
-        try executeFromStdin(allocator, query, output_file);
+        try executeFromStdin(allocator, query, output_file, opts);
         return;
     }
 
     // Scalar aggregate (no GROUP BY): SELECT COUNT(*)/SUM/AVG/MIN/MAX
     if (query.group_by.len == 0 and hasAggregates(query)) {
         if (hasRegularColumns(query)) return error.MixedAggregateAndNonAggregateSelect;
-        try executeScalarAgg(allocator, query, output_file);
+        try executeScalarAgg(allocator, query, output_file, opts);
         return;
     }
 
@@ -73,13 +74,13 @@ pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.Fi
     // SELECT DISTINCT c1,c2 ≡ SELECT c1,c2 GROUP BY c1,c2 — same O(unique rows)
     // memory and a single sequential mmap scan, just like our GROUP BY path.
     if (query.distinct and query.group_by.len == 0) {
-        try executeDistinct(allocator, query, output_file);
+        try executeDistinct(allocator, query, output_file, opts);
         return;
     }
 
     // Check for GROUP BY - requires sequential processing
     if (query.group_by.len > 0) {
-        try executeGroupBy(allocator, query, output_file);
+        try executeGroupBy(allocator, query, output_file, opts);
         return;
     }
 
@@ -94,19 +95,19 @@ pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.Fi
     if (file_stat.size > 10 * 1024 * 1024 and (query.limit < 0 or query.limit > 100000 or query.order_by != null)) {
         const num_cores = try std.Thread.getCpuCount();
         if (num_cores > 1) {
-            try parallel_mmap.executeParallelMapped(allocator, query, file, output_file);
+            try parallel_mmap.executeParallelMapped(allocator, query, file, output_file, opts);
             return;
         }
     }
 
     // Use memory-mapped I/O for medium-large files
     if (file_stat.size > 5 * 1024 * 1024) {
-        try mmap_engine.executeMapped(allocator, query, file, output_file);
+        try mmap_engine.executeMapped(allocator, query, file, output_file, opts);
         return;
     }
 
     // Sequential execution for smaller files
-    try executeSequential(allocator, query, file, output_file);
+    try executeSequential(allocator, query, file, output_file, opts);
 }
 
 /// Execute query sequentially
@@ -115,12 +116,15 @@ fn executeSequential(
     query: parser.Query,
     input_file: std.fs.File,
     output_file: std.fs.File,
+    opts: options_mod.Options,
 ) !void {
     // Use bulk CSV reader for much better performance
     var reader = try bulk_csv.BulkCsvReader.init(allocator, input_file);
     defer reader.deinit();
+    reader.delimiter = opts.delimiter;
 
     var writer = csv.CsvWriter.init(output_file);
+    writer.delimiter = opts.delimiter;
 
     // Read header
     const header = try reader.readRecord() orelse return error.EmptyFile;
@@ -172,7 +176,7 @@ fn executeSequential(
     }
 
     // Write output header
-    try writer.writeRecord(output_header.items);
+    if (!opts.no_header) try writer.writeRecord(output_header.items);
 
     // OPTIMIZATION: Find WHERE column index for fast lookup (avoid HashMap in hot path)
     var where_column_idx: ?usize = null;
@@ -398,10 +402,13 @@ fn executeFromStdin(
     allocator: Allocator,
     query: parser.Query,
     output_file: std.fs.File,
+    opts: options_mod.Options,
 ) !void {
     const stdin = std.fs.File{ .handle = std.posix.STDIN_FILENO };
     var reader = csv.CsvReader.init(allocator, stdin);
+    reader.delimiter = opts.delimiter;
     var writer = csv.CsvWriter.init(output_file);
+    writer.delimiter = opts.delimiter;
 
     // Read header
     const header = try reader.readRecord() orelse return error.EmptyFile;
@@ -452,7 +459,7 @@ fn executeFromStdin(
     }
 
     // Write output header
-    try writer.writeRecord(output_header.items);
+    if (!opts.no_header) try writer.writeRecord(output_header.items);
 
     // OPTIMIZATION: Find WHERE column index for fast lookup (avoid HashMap in hot path)
     var where_column_idx_stdin: ?usize = null;
@@ -639,9 +646,9 @@ inline fn parseNumericFast(s: []const u8) !f64 {
 
 /// Split a CSV line into fields using a pre-allocated stack buffer.
 /// Zero-copy: returned slices point into `line`.  Max 256 fields.
-inline fn splitLine(line: []const u8, buf: [][]const u8) []const []const u8 {
+inline fn splitLine(line: []const u8, buf: [][]const u8, delim: u8) []const []const u8 {
     var n: usize = 0;
-    var it = std.mem.splitScalar(u8, line, ',');
+    var it = std.mem.splitScalar(u8, line, delim);
     while (it.next()) |f| {
         if (n >= buf.len) break;
         buf[n] = f;
@@ -703,6 +710,7 @@ fn executeDistinct(
     allocator: Allocator,
     query: parser.Query,
     output_file: std.fs.File,
+    opts: options_mod.Options,
 ) !void {
     const file = try std.fs.cwd().openFile(query.file_path, .{});
     defer file.close();
@@ -722,6 +730,7 @@ fn executeDistinct(
     const data = mapped[0..file_size];
 
     var writer = csv.CsvWriter.init(output_file);
+    writer.delimiter = opts.delimiter;
 
     // Header
     const header_nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
@@ -732,7 +741,7 @@ fn executeDistinct(
     var header_list = std.ArrayListUnmanaged([]const u8){};
     defer header_list.deinit(allocator);
     {
-        var it = std.mem.splitScalar(u8, header_line, ',');
+        var it = std.mem.splitScalar(u8, header_line, opts.delimiter);
         while (it.next()) |col| try header_list.append(allocator, col);
     }
     const header = header_list.items;
@@ -773,7 +782,7 @@ fn executeDistinct(
             try out_header.append(allocator, header[idx]);
         }
     }
-    try writer.writeRecord(out_header.items);
+    if (!opts.no_header) try writer.writeRecord(out_header.items);
 
     // WHERE fast-path index
     var where_col_idx: ?usize = null;
@@ -835,7 +844,7 @@ fn executeDistinct(
         if (line_end > line_start and data[line_end - 1] == '\r') line_end -= 1;
         if (line_end <= line_start) continue;
 
-        const record = splitLine(data[line_start..line_end], &field_stk);
+        const record = splitLine(data[line_start..line_end], &field_stk, opts.delimiter);
 
         // WHERE filter
         if (query.where_expr) |expr| {
@@ -934,6 +943,7 @@ fn executeScalarAgg(
     allocator: Allocator,
     query: parser.Query,
     output_file: std.fs.File,
+    opts: options_mod.Options,
 ) !void {
     const file = try std.fs.cwd().openFile(query.file_path, .{});
     defer file.close();
@@ -953,6 +963,7 @@ fn executeScalarAgg(
     const data = mapped[0..file_size];
 
     var writer = csv.CsvWriter.init(output_file);
+    writer.delimiter = opts.delimiter;
 
     // -- Header --
     const header_nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
@@ -963,7 +974,7 @@ fn executeScalarAgg(
     var header_list = std.ArrayListUnmanaged([]const u8){};
     defer header_list.deinit(allocator);
     {
-        var it = std.mem.splitScalar(u8, header_line, ',');
+        var it = std.mem.splitScalar(u8, header_line, opts.delimiter);
         while (it.next()) |col| try header_list.append(allocator, col);
     }
     const header = header_list.items;
@@ -1023,7 +1034,7 @@ fn executeScalarAgg(
             try out_header_list.append(allocator, header[cidx]);
         }
     }
-    try writer.writeRecord(out_header_list.items);
+    if (!opts.no_header) try writer.writeRecord(out_header_list.items);
 
     // -- WHERE fast-path index --
     var where_col_idx: ?usize = null;
@@ -1059,7 +1070,7 @@ fn executeScalarAgg(
         if (line_end > line_start and data[line_end - 1] == '\r') line_end -= 1;
         if (line_end <= line_start) continue;
 
-        const record = splitLine(data[line_start..line_end], &field_stk);
+        const record = splitLine(data[line_start..line_end], &field_stk, opts.delimiter);
 
         // WHERE filter
         if (query.where_expr) |expr| {
@@ -1192,6 +1203,7 @@ fn executeGroupBy(
     allocator: Allocator,
     query: parser.Query,
     output_file: std.fs.File,
+    opts: options_mod.Options,
 ) !void {
     const file = try std.fs.cwd().openFile(query.file_path, .{});
     defer file.close();
@@ -1213,6 +1225,7 @@ fn executeGroupBy(
     const data = mapped[0..file_size];
 
     var writer = csv.CsvWriter.init(output_file);
+    writer.delimiter = opts.delimiter;
 
     // -- Header parsing -----------------------------------------------------
     const header_nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
@@ -1223,7 +1236,7 @@ fn executeGroupBy(
     var header_list = std.ArrayListUnmanaged([]const u8){};
     defer header_list.deinit(allocator);
     {
-        var it = std.mem.splitScalar(u8, header_line, ',');
+        var it = std.mem.splitScalar(u8, header_line, opts.delimiter);
         while (it.next()) |col| try header_list.append(allocator, col);
     }
     const header = header_list.items;
@@ -1303,7 +1316,7 @@ fn executeGroupBy(
             }
         }
     }
-    try writer.writeRecord(out_header_list.items);
+    if (!opts.no_header) try writer.writeRecord(out_header_list.items);
 
     // -- Precompute WHERE fast path -----------------------------------------
     var where_col_idx: ?usize = null;
@@ -1352,7 +1365,7 @@ fn executeGroupBy(
         if (line_end > line_start and data[line_end - 1] == '\r') line_end -= 1;
         if (line_end <= line_start) continue;
 
-        const record = splitLine(data[line_start..line_end], &field_stk);
+        const record = splitLine(data[line_start..line_end], &field_stk, opts.delimiter);
 
         // WHERE filter (fast single-comparison path with integer fast parse)
         if (query.where_expr) |expr| {
@@ -1582,7 +1595,7 @@ test "GROUP BY basic: unique values per group" {
     const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
     defer out_file.close();
 
-    try execute(allocator, query, out_file);
+    try execute(allocator, query, out_file, .{});
 
     try out_file.seekTo(0);
     const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
@@ -1622,7 +1635,7 @@ test "GROUP BY with COUNT(*)" {
     const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
     defer out_file.close();
 
-    try execute(allocator, query, out_file);
+    try execute(allocator, query, out_file, .{});
 
     try out_file.seekTo(0);
     const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
@@ -1666,7 +1679,7 @@ test "GROUP BY with WHERE clause" {
     const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
     defer out_file.close();
 
-    try execute(allocator, query, out_file);
+    try execute(allocator, query, out_file, .{});
 
     try out_file.seekTo(0);
     const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
@@ -1702,7 +1715,7 @@ test "GROUP BY with LIMIT" {
     const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
     defer out_file.close();
 
-    try execute(allocator, query, out_file);
+    try execute(allocator, query, out_file, .{});
 
     try out_file.seekTo(0);
     const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
@@ -1743,7 +1756,7 @@ test "DISTINCT basic: deduplicates repeated values" {
     const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
     defer out_file.close();
 
-    try execute(allocator, query, out_file);
+    try execute(allocator, query, out_file, .{});
 
     try out_file.seekTo(0);
     const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
@@ -1790,7 +1803,7 @@ test "DISTINCT with WHERE: deduplicates filtered rows" {
     const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
     defer out_file.close();
 
-    try execute(allocator, query, out_file);
+    try execute(allocator, query, out_file, .{});
 
     try out_file.seekTo(0);
     const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
@@ -1831,7 +1844,7 @@ test "DISTINCT star: deduplicates full rows" {
     const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
     defer out_file.close();
 
-    try execute(allocator, query, out_file);
+    try execute(allocator, query, out_file, .{});
 
     try out_file.seekTo(0);
     const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
@@ -1870,7 +1883,7 @@ test "DISTINCT with LIMIT: returns limited unique rows" {
     const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
     defer out_file.close();
 
-    try execute(allocator, query, out_file);
+    try execute(allocator, query, out_file, .{});
 
     try out_file.seekTo(0);
     const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
@@ -1908,7 +1921,7 @@ test "COUNT(*) with GROUP BY: counts per group" {
     const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
     defer out_file.close();
 
-    try execute(allocator, query, out_file);
+    try execute(allocator, query, out_file, .{});
 
     try out_file.seekTo(0);
     const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
@@ -1944,7 +1957,7 @@ test "COUNT(*) with WHERE and GROUP BY" {
     const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
     defer out_file.close();
 
-    try execute(allocator, query, out_file);
+    try execute(allocator, query, out_file, .{});
 
     try out_file.seekTo(0);
     const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
@@ -1980,7 +1993,7 @@ test "scalar COUNT(*): counts all rows" {
     const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
     defer out_file.close();
 
-    try execute(allocator, query, out_file);
+    try execute(allocator, query, out_file, .{});
 
     try out_file.seekTo(0);
     const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
@@ -2018,7 +2031,7 @@ test "scalar SUM/AVG/MIN/MAX: correct values" {
     const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
     defer out_file.close();
 
-    try execute(allocator, query, out_file);
+    try execute(allocator, query, out_file, .{});
 
     try out_file.seekTo(0);
     const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
@@ -2056,7 +2069,7 @@ test "scalar COUNT(*) with WHERE filter" {
     const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
     defer out_file.close();
 
-    try execute(allocator, query, out_file);
+    try execute(allocator, query, out_file, .{});
 
     try out_file.seekTo(0);
     const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
@@ -2096,7 +2109,7 @@ test "scalar aggregate with missing column returns ColumnNotFound" {
     const out_file = try tmp.dir.createFile("output.csv", .{});
     defer out_file.close();
 
-    try std.testing.expectError(error.ColumnNotFound, execute(allocator, query, out_file));
+    try std.testing.expectError(error.ColumnNotFound, execute(allocator, query, out_file, .{}));
 }
 
 test "mixed scalar aggregate and regular column requires GROUP BY" {
@@ -2123,7 +2136,7 @@ test "mixed scalar aggregate and regular column requires GROUP BY" {
     const out_file = try tmp.dir.createFile("output.csv", .{});
     defer out_file.close();
 
-    try std.testing.expectError(error.MixedAggregateAndNonAggregateSelect, execute(allocator, query, out_file));
+    try std.testing.expectError(error.MixedAggregateAndNonAggregateSelect, execute(allocator, query, out_file, .{}));
 }
 
 test "DISTINCT with scalar aggregate follows scalar path" {
@@ -2150,7 +2163,7 @@ test "DISTINCT with scalar aggregate follows scalar path" {
     const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
     defer out_file.close();
 
-    try execute(allocator, query, out_file);
+    try execute(allocator, query, out_file, .{});
 
     try out_file.seekTo(0);
     const output = try out_file.readToEndAlloc(allocator, 64 * 1024);

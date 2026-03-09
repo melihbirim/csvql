@@ -169,14 +169,14 @@ pub fn findNewlinesBatch(haystack: []const u8, positions: []usize, max_count: us
 /// SIMD-accelerated CSV field parser
 /// Finds all comma positions in a line to split into fields
 /// Returns slices pointing into the original line (zero-copy)
-pub fn parseCSVFields(line: []const u8, fields: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !void {
+pub fn parseCSVFields(line: []const u8, fields: *std.ArrayList([]const u8), allocator: std.mem.Allocator, delimiter: u8) !void {
     if (line.len == 0) return;
 
     // Fast path for small lines
     if (line.len < 32) {
         var start: usize = 0;
         for (line, 0..) |c, i| {
-            if (c == ',') {
+            if (c == delimiter) {
                 try fields.append(allocator, line[start..i]);
                 start = i + 1;
             }
@@ -185,14 +185,14 @@ pub fn parseCSVFields(line: []const u8, fields: *std.ArrayList([]const u8), allo
         return;
     }
 
-    // For larger lines, find all commas first, then slice
+    // For larger lines, find all delimiter positions first, then slice
     // This allows better prefetching and branch prediction
     var comma_positions_buf: [64]usize = undefined; // Max 64 fields
     var comma_count: usize = 0;
 
     var i: usize = 0;
     while (i < line.len and comma_count < 64) : (i += 1) {
-        if (line[i] == ',') {
+        if (line[i] == delimiter) {
             comma_positions_buf[comma_count] = i;
             comma_count += 1;
         }
