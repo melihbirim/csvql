@@ -83,13 +83,18 @@ sudo cp zig-out/bin/csvql /usr/local/bin/
 
 **1M rows, 35MB CSV, Apple M2** — all tools forced to output all rows (no display tricks):
 
-| Query                     | csvql      | DuckDB | ClickHouse | Speedup  |
-| ------------------------- | ---------- | ------ | ---------- | -------- |
-| WHERE + ORDER BY LIMIT 10 | **0.020s** | 0.179s | 0.750s     | **9x**   |
-| ORDER BY LIMIT 10         | **0.041s** | 0.165s | 0.761s     | **4x**   |
-| ORDER BY (all 1M rows)    | **0.156s** | 1.221s | 0.451s     | **7.8x** |
-| WHERE (full output)       | **0.141s** | 0.739s | 0.796s     | **5.2x** |
-| Full scan (all 1M rows)   | **0.196s** | 1.163s | 0.798s     | **5.9x** |
+| Query                             | csvql      | DuckDB | Speedup  |
+| --------------------------------- | ---------- | ------ | -------- |
+| WHERE + ORDER BY LIMIT 10         | **0.020s** | 0.179s | **9x**   |
+| ORDER BY LIMIT 10                 | **0.041s** | 0.165s | **4x**   |
+| ORDER BY (all 1M rows)            | **0.156s** | 1.221s | **7.8x** |
+| WHERE (full output)               | **0.141s** | 0.739s | **5.2x** |
+| Full scan (all 1M rows)           | **0.196s** | 1.163s | **5.9x** |
+| `COUNT(*) GROUP BY` (6 groups)    | **0.060s** | 0.110s | **1.8x** |
+| `SUM + AVG GROUP BY` (6 groups)   | **0.070s** | 0.110s | **1.6x** |
+| `SELECT DISTINCT city` (8 values) | **0.060s** | 0.110s | **1.8x** |
+| `SELECT COUNT(*)` scalar          | **0.050s** | 0.100s | **2x**   |
+| `SELECT SUM(salary)` scalar       | **0.050s** | 0.110s | **2.2x** |
 
 **35x less memory** than DuckDB (1.8MB vs 63.5MB).
 
@@ -121,13 +126,36 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 
 ### Supported
 
-| Feature      | Syntax                                                     |
-| ------------ | ---------------------------------------------------------- |
-| **SELECT**   | `SELECT col1, col2` or `SELECT *`                          |
-| **FROM**     | `FROM 'file.csv'` or `FROM -` (stdin)                      |
-| **WHERE**    | `=`, `!=`, `>`, `>=`, `<`, `<=` with auto numeric coercion |
-| **ORDER BY** | `ORDER BY col ASC/DESC`                                    |
-| **LIMIT**    | `LIMIT n`                                                  |
+| Feature          | Syntax                                                                  |
+| ---------------- | ----------------------------------------------------------------------- |
+| **SELECT**       | `SELECT col1, col2` or `SELECT *`                                       |
+| **DISTINCT**     | `SELECT DISTINCT col1, col2` — deduplicates output rows                 |
+| **FROM**         | `FROM 'file.csv'` or `FROM -` (stdin)                                   |
+| **WHERE**        | `=`, `!=`, `>`, `>=`, `<`, `<=` with auto numeric coercion              |
+| **GROUP BY**     | `GROUP BY col1` — groups rows for aggregation                           |
+| **COUNT**        | `COUNT(*)` or `COUNT(col)` — with or without `GROUP BY`                 |
+| **SUM**          | `SUM(col)` — with or without `GROUP BY`                                 |
+| **AVG**          | `AVG(col)` — full precision; with or without `GROUP BY`                 |
+| **MIN / MAX**    | `MIN(col)`, `MAX(col)` — with or without `GROUP BY`                     |
+| **ORDER BY**     | `ORDER BY col ASC/DESC`                                                 |
+| **LIMIT**        | `LIMIT n`                                                               |
+
+### Aggregate Examples
+
+```bash
+# Scalar aggregates (whole table)
+csvql "SELECT COUNT(*), SUM(salary), AVG(salary), MIN(age), MAX(age) FROM 'data.csv'"
+
+# Grouped aggregates
+csvql "SELECT department, COUNT(*), AVG(salary) FROM 'data.csv' GROUP BY department ORDER BY department"
+
+# DISTINCT
+csvql "SELECT DISTINCT city FROM 'data.csv' ORDER BY city"
+csvql "SELECT DISTINCT city, department FROM 'data.csv'"
+
+# DISTINCT with WHERE
+csvql "SELECT DISTINCT department FROM 'data.csv' WHERE salary > 100000"
+```
 
 ### Simple Mode
 
@@ -148,6 +176,14 @@ See [SIMPLE_QUERY_LANGUAGE.md](SIMPLE_QUERY_LANGUAGE.md) for the full reference.
 | [SIMPLE_QUERY_LANGUAGE.md](SIMPLE_QUERY_LANGUAGE.md) | Simple mode syntax reference                        |
 | [docs/LIBRARY.md](docs/LIBRARY.md)                   | Using the CSV parser as a Zig library               |
 | [CONTRIBUTING.md](CONTRIBUTING.md)                   | Contribution guidelines                             |
+
+## Roadmap
+
+| Feature | Issue | Status |
+| ------- | ----- | ------ |
+| `LIKE` operator in WHERE | [#13](https://github.com/melihbirim/csvql/issues/13) | planned |
+| `--no-header` / `--delimiter` flags | [#12](https://github.com/melihbirim/csvql/issues/12) | planned |
+| `--json` / `--jsonl` output format | [#14](https://github.com/melihbirim/csvql/issues/14) | planned |
 
 ## Contributing
 
