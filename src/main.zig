@@ -4,7 +4,7 @@ const simple_parser = @import("simple_parser.zig");
 const engine = @import("engine.zig");
 const Allocator = std.mem.Allocator;
 
-const version = "0.3.0";
+const version = "0.4.0";
 
 const help_text =
     \\csvql — the world's fastest CSV query engine
