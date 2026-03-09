@@ -252,6 +252,11 @@ pub fn executeParallelMapped(
         var output_row = try allocator.alloc([]const u8, output_indices.items.len);
         defer allocator.free(output_row);
 
+        var ob_distinct_arena = std.heap.ArenaAllocator.init(allocator);
+        defer ob_distinct_arena.deinit();
+        var ob_distinct_seen = std.StringHashMap(void).init(allocator);
+        defer ob_distinct_seen.deinit();
+
         var written: usize = 0;
         for (sorted) |entry| {
             if (query.limit >= 0 and written >= @as(usize, @intCast(query.limit))) break;
@@ -269,6 +274,25 @@ pub fn executeParallelMapped(
             for (output_indices.items, 0..) |idx, j| {
                 output_row[j] = if (idx < field_count) field_buf[idx] else "";
             }
+
+            // DISTINCT dedup on the projected output row
+            if (query.distinct) {
+                var key_buf: [8192]u8 = undefined;
+                var klen: usize = 0;
+                for (output_row, 0..) |field, fi| {
+                    if (fi > 0 and klen < key_buf.len) {
+                        key_buf[klen] = 0;
+                        klen += 1;
+                    }
+                    const n = @min(field.len, key_buf.len - klen);
+                    if (n > 0) @memcpy(key_buf[klen..][0..n], field[0..n]);
+                    klen += n;
+                }
+                const row_key = key_buf[0..klen];
+                if (ob_distinct_seen.contains(row_key)) continue;
+                try ob_distinct_seen.put(try ob_distinct_arena.allocator().dupe(u8, row_key), {});
+            }
+
             try writer.writeRecord(output_row);
             written += 1;
         }
@@ -299,12 +323,35 @@ pub fn executeParallelMapped(
 
         for (threads) |thread| thread.join();
 
+        // DISTINCT dedup (sequential: after all threads finish)
+        var distinct_arena = std.heap.ArenaAllocator.init(allocator);
+        defer distinct_arena.deinit();
+        var distinct_seen = std.StringHashMap(void).init(allocator);
+        defer distinct_seen.deinit();
+
         var total_written: usize = 0;
         for (contexts) |*ctx| {
             defer ctx.result.deinit(allocator);
 
             for (ctx.result.items) |row| {
                 defer allocator.free(row);
+
+                if (query.distinct) {
+                    var key_buf: [8192]u8 = undefined;
+                    var klen: usize = 0;
+                    for (row, 0..) |field, fi| {
+                        if (fi > 0 and klen < key_buf.len) {
+                            key_buf[klen] = 0;
+                            klen += 1;
+                        }
+                        const n = @min(field.len, key_buf.len - klen);
+                        if (n > 0) @memcpy(key_buf[klen..][0..n], field[0..n]);
+                        klen += n;
+                    }
+                    const row_key = key_buf[0..klen];
+                    if (distinct_seen.contains(row_key)) continue;
+                    try distinct_seen.put(try distinct_arena.allocator().dupe(u8, row_key), {});
+                }
 
                 try writer.writeRecord(row);
                 total_written += 1;

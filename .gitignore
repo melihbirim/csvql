@@ -25,3 +25,4 @@ csvq
 *.so
 *.dylib
 
+.bench_tmp/

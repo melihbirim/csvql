@@ -62,6 +62,21 @@ pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.Fi
         return;
     }
 
+    // Scalar aggregate (no GROUP BY): SELECT COUNT(*)/SUM/AVG/MIN/MAX
+    if (query.group_by.len == 0 and hasAggregates(query)) {
+        if (hasRegularColumns(query)) return error.MixedAggregateAndNonAggregateSelect;
+        try executeScalarAgg(allocator, query, output_file);
+        return;
+    }
+
+    // DISTINCT without GROUP BY: route through the hash-based GROUP BY engine.
+    // SELECT DISTINCT c1,c2 ≡ SELECT c1,c2 GROUP BY c1,c2 — same O(unique rows)
+    // memory and a single sequential mmap scan, just like our GROUP BY path.
+    if (query.distinct and query.group_by.len == 0) {
+        try executeDistinct(allocator, query, output_file);
+        return;
+    }
+
     // Check for GROUP BY - requires sequential processing
     if (query.group_by.len > 0) {
         try executeGroupBy(allocator, query, output_file);
@@ -208,6 +223,12 @@ fn executeSequential(
         }
     }
 
+    // DISTINCT dedup state (only used when query.distinct == true)
+    var distinct_arena = std.heap.ArenaAllocator.init(allocator);
+    defer distinct_arena.deinit();
+    var distinct_seen = std.StringHashMap(void).init(allocator);
+    defer distinct_seen.deinit();
+
     // Process rows
     var row_count: i32 = 0;
     var rows_written: i32 = 0;
@@ -286,6 +307,24 @@ fn executeSequential(
             output_row[i] = if (idx < record.len) record[idx] else "";
         }
 
+        // DISTINCT: skip duplicate rows
+        if (query.distinct) {
+            var key_buf: [8192]u8 = undefined;
+            var klen: usize = 0;
+            for (output_row, 0..) |field, fi| {
+                if (fi > 0 and klen < key_buf.len) {
+                    key_buf[klen] = 0;
+                    klen += 1;
+                }
+                const n = @min(field.len, key_buf.len - klen);
+                if (n > 0) @memcpy(key_buf[klen..][0..n], field[0..n]);
+                klen += n;
+            }
+            const row_key = key_buf[0..klen];
+            if (distinct_seen.contains(row_key)) continue;
+            try distinct_seen.put(try distinct_arena.allocator().dupe(u8, row_key), {});
+        }
+
         // Either buffer for ORDER BY or write directly
         if (sort_entries) |*entries| {
             // Build CSV line into arena and store sort key
@@ -334,8 +373,17 @@ fn executeSequential(
                 limit,
             );
 
-            // Write sorted rows
+            // Write sorted rows (with optional DISTINCT dedup on the output line)
+            var ob_distinct_arena = std.heap.ArenaAllocator.init(allocator);
+            defer ob_distinct_arena.deinit();
+            var ob_distinct_seen = std.StringHashMap(void).init(allocator);
+            defer ob_distinct_seen.deinit();
+
             for (sorted) |entry| {
+                if (query.distinct) {
+                    if (ob_distinct_seen.contains(entry.line)) continue;
+                    try ob_distinct_seen.put(try ob_distinct_arena.allocator().dupe(u8, entry.line), {});
+                }
                 try writer.writeToBuffer(entry.line);
                 try writer.writeToBuffer("\n");
             }
@@ -421,6 +469,12 @@ fn executeFromStdin(
         }
     }
 
+    // DISTINCT dedup state (only used when query.distinct == true)
+    var distinct_arena_stdin = std.heap.ArenaAllocator.init(allocator);
+    defer distinct_arena_stdin.deinit();
+    var distinct_seen_stdin = std.StringHashMap(void).init(allocator);
+    defer distinct_seen_stdin.deinit();
+
     // Process rows
     var rows_written: i32 = 0;
 
@@ -494,6 +548,24 @@ fn executeFromStdin(
 
         for (output_indices.items, 0..) |idx, i| {
             output_row[i] = if (idx < record.len) record[idx] else "";
+        }
+
+        // DISTINCT: skip duplicate rows
+        if (query.distinct) {
+            var key_buf: [8192]u8 = undefined;
+            var klen: usize = 0;
+            for (output_row, 0..) |field, fi| {
+                if (fi > 0 and klen < key_buf.len) {
+                    key_buf[klen] = 0;
+                    klen += 1;
+                }
+                const n = @min(field.len, key_buf.len - klen);
+                if (n > 0) @memcpy(key_buf[klen..][0..n], field[0..n]);
+                klen += n;
+            }
+            const row_key = key_buf[0..klen];
+            if (distinct_seen_stdin.contains(row_key)) continue;
+            try distinct_seen_stdin.put(try distinct_arena_stdin.allocator().dupe(u8, row_key), {});
         }
 
         try writer.writeRecord(output_row);
@@ -576,6 +648,540 @@ inline fn splitLine(line: []const u8, buf: [][]const u8) []const []const u8 {
         n += 1;
     }
     return buf[0..n];
+}
+
+/// Returns true if any SELECT column is an aggregate expression (no alloc).
+inline fn isAggregateExpr(col: []const u8) bool {
+    const paren = std.mem.indexOf(u8, col, "(") orelse return false;
+    const name_part = std.mem.trim(u8, col[0..paren], &std.ascii.whitespace);
+    if (name_part.len == 0 or name_part.len > 5) return false;
+    var buf: [5]u8 = undefined;
+    const lower = std.ascii.lowerString(buf[0..name_part.len], name_part);
+    return std.mem.eql(u8, lower, "count") or
+        std.mem.eql(u8, lower, "sum") or
+        std.mem.eql(u8, lower, "avg") or
+        std.mem.eql(u8, lower, "min") or
+        std.mem.eql(u8, lower, "max");
+}
+
+/// Returns true if any SELECT column is an aggregate expression (no alloc).
+fn hasAggregates(query: parser.Query) bool {
+    if (query.all_columns) return false;
+    for (query.columns) |col| {
+        if (isAggregateExpr(col)) return true;
+    }
+    return false;
+}
+
+/// Returns true if any SELECT column is a non-aggregate expression.
+fn hasRegularColumns(query: parser.Query) bool {
+    if (query.all_columns) return true;
+    for (query.columns) |col| {
+        if (!isAggregateExpr(col)) return true;
+    }
+    return false;
+}
+
+/// Format an f64 for aggregate output.
+/// Whole numbers print as integers; fractional values use Zig's shortest
+/// round-trip decimal representation (Ryu algorithm via `{d}`).
+inline fn formatF64(alloc: Allocator, val: f64) ![]u8 {
+    const as_int: i64 = @intFromFloat(val);
+    if (@as(f64, @floatFromInt(as_int)) == val) {
+        return std.fmt.allocPrint(alloc, "{d}", .{as_int});
+    }
+    return std.fmt.allocPrint(alloc, "{d}", .{val});
+}
+
+/// Execute SELECT DISTINCT query.
+///
+/// Routes through a single-pass mmap scan with a StringHashMap dedup set —
+/// same O(unique rows) memory and ~same throughput as the GROUP BY engine.
+/// This avoids sending 1M rows through the parallel engine only to dedup at
+/// the end, which is the bottleneck for low-cardinality DISTINCT columns.
+fn executeDistinct(
+    allocator: Allocator,
+    query: parser.Query,
+    output_file: std.fs.File,
+) !void {
+    const file = try std.fs.cwd().openFile(query.file_path, .{});
+    defer file.close();
+
+    const file_size = (try file.stat()).size;
+    if (file_size == 0) return error.EmptyFile;
+
+    const mapped = try std.posix.mmap(
+        null,
+        file_size,
+        std.posix.PROT.READ,
+        .{ .TYPE = .SHARED },
+        file.handle,
+        0,
+    );
+    defer std.posix.munmap(mapped);
+    const data = mapped[0..file_size];
+
+    var writer = csv.CsvWriter.init(output_file);
+
+    // Header
+    const header_nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
+    var header_line = data[0..header_nl];
+    if (header_line.len > 0 and header_line[header_line.len - 1] == '\r')
+        header_line = header_line[0 .. header_line.len - 1];
+
+    var header_list = std.ArrayListUnmanaged([]const u8){};
+    defer header_list.deinit(allocator);
+    {
+        var it = std.mem.splitScalar(u8, header_line, ',');
+        while (it.next()) |col| try header_list.append(allocator, col);
+    }
+    const header = header_list.items;
+
+    // Build lowercase column map
+    var lower_header = try allocator.alloc([]u8, header.len);
+    defer {
+        for (lower_header) |h| allocator.free(h);
+        allocator.free(lower_header);
+    }
+    var column_map = std.StringHashMap(usize).init(allocator);
+    defer column_map.deinit();
+    for (header, 0..) |col_name, idx| {
+        const lower = try allocator.alloc(u8, col_name.len);
+        _ = std.ascii.lowerString(lower, col_name);
+        lower_header[idx] = lower;
+        try column_map.put(lower, idx);
+    }
+
+    // Resolve output column indices
+    var out_indices = std.ArrayListUnmanaged(usize){};
+    defer out_indices.deinit(allocator);
+    var out_header = std.ArrayListUnmanaged([]const u8){};
+    defer out_header.deinit(allocator);
+
+    if (query.all_columns) {
+        for (0..header.len) |i| {
+            try out_indices.append(allocator, i);
+            try out_header.append(allocator, header[i]);
+        }
+    } else {
+        for (query.columns) |col| {
+            const lower = try allocator.alloc(u8, col.len);
+            defer allocator.free(lower);
+            _ = std.ascii.lowerString(lower, col);
+            const idx = column_map.get(lower) orelse return error.ColumnNotFound;
+            try out_indices.append(allocator, idx);
+            try out_header.append(allocator, header[idx]);
+        }
+    }
+    try writer.writeRecord(out_header.items);
+
+    // WHERE fast-path index
+    var where_col_idx: ?usize = null;
+    if (query.where_expr) |expr| {
+        if (expr == .comparison) {
+            for (lower_header, 0..) |lh, i| {
+                if (std.mem.eql(u8, lh, expr.comparison.column)) {
+                    where_col_idx = i;
+                    break;
+                }
+            }
+        }
+    }
+
+    // ORDER BY support: buffer unique rows then sort
+    var sort_entries: ?std.ArrayList(fast_sort.SortKey) = null;
+    var sort_arena: ?ArenaBuffer = null;
+    var order_by_out_pos: ?usize = null;
+    defer {
+        if (sort_entries) |*e| e.deinit(allocator);
+        if (sort_arena) |*a| a.deinit();
+    }
+    if (query.order_by) |ob| {
+        sort_entries = std.ArrayList(fast_sort.SortKey){};
+        sort_arena = try ArenaBuffer.init(allocator, 4 * 1024 * 1024);
+        for (out_indices.items, 0..) |oi, pos| {
+            if (oi < lower_header.len and std.mem.eql(u8, lower_header[oi], ob.column)) {
+                order_by_out_pos = pos;
+                break;
+            }
+        }
+        if (order_by_out_pos == null) return error.OrderByColumnNotFound;
+    }
+
+    // Dedup set + arena for key storage
+    var key_arena = std.heap.ArenaAllocator.init(allocator);
+    defer key_arena.deinit();
+    var seen = std.StringHashMap(void).init(allocator);
+    defer seen.deinit();
+    try seen.ensureTotalCapacity(256);
+
+    var fallback_row_map = std.StringHashMap([]const u8).init(allocator);
+    defer fallback_row_map.deinit();
+
+    var field_stk: [256][]const u8 = undefined;
+    var out_row = try allocator.alloc([]const u8, out_indices.items.len);
+    defer allocator.free(out_row);
+    var key_buf = std.ArrayListUnmanaged(u8){};
+    defer key_buf.deinit(allocator);
+
+    var rows_written: i32 = 0;
+    var pos: usize = header_nl + 1;
+
+    while (pos < data.len) {
+        const line_start = pos;
+        const nl = std.mem.indexOfScalarPos(u8, data, pos, '\n');
+        var line_end = nl orelse data.len;
+        pos = if (nl) |n| n + 1 else data.len;
+        if (line_end > line_start and data[line_end - 1] == '\r') line_end -= 1;
+        if (line_end <= line_start) continue;
+
+        const record = splitLine(data[line_start..line_end], &field_stk);
+
+        // WHERE filter
+        if (query.where_expr) |expr| {
+            if (expr == .comparison) {
+                const comp = expr.comparison;
+                const cidx = where_col_idx orelse continue;
+                if (cidx >= record.len) continue;
+                const fv = record[cidx];
+                var matches = false;
+                if (comp.numeric_value) |threshold| {
+                    const val = parseNumericFast(fv) catch continue;
+                    matches = switch (comp.operator) {
+                        .equal => val == threshold,
+                        .not_equal => val != threshold,
+                        .greater => val > threshold,
+                        .greater_equal => val >= threshold,
+                        .less => val < threshold,
+                        .less_equal => val <= threshold,
+                    };
+                } else {
+                    matches = switch (comp.operator) {
+                        .equal => std.mem.eql(u8, fv, comp.value),
+                        .not_equal => !std.mem.eql(u8, fv, comp.value),
+                        else => false,
+                    };
+                }
+                if (!matches) continue;
+            } else {
+                fallback_row_map.clearRetainingCapacity();
+                for (lower_header, 0..) |lh, i| {
+                    if (i < record.len) try fallback_row_map.put(lh, record[i]);
+                }
+                if (!parser.evaluate(expr, fallback_row_map)) continue;
+            }
+        }
+
+        // Project output columns
+        for (out_indices.items, 0..) |idx, i| {
+            out_row[i] = if (idx < record.len) record[idx] else "";
+        }
+
+        // Build NUL-separated dedup key (no alloc after warmup)
+        key_buf.clearRetainingCapacity();
+        for (out_row, 0..) |field, i| {
+            if (i > 0) try key_buf.append(allocator, 0);
+            try key_buf.appendSlice(allocator, field);
+        }
+
+        // Skip if already seen
+        if (seen.contains(key_buf.items)) continue;
+        try seen.put(try key_arena.allocator().dupe(u8, key_buf.items), {});
+
+        if (query.limit >= 0 and rows_written >= query.limit and sort_entries == null) break;
+
+        // Either buffer for ORDER BY or write directly
+        if (sort_entries) |*entries| {
+            const a = &(sort_arena.?);
+            const sort_key = try a.append(out_row[order_by_out_pos.?]);
+            const line_start_a = a.pos;
+            for (out_row, 0..) |field, i| {
+                if (i > 0) _ = try a.append(",");
+                _ = try a.append(field);
+            }
+            const line = a.data[line_start_a..a.pos];
+            try entries.append(allocator, fast_sort.makeSortKey(
+                std.fmt.parseFloat(f64, sort_key) catch std.math.nan(f64),
+                sort_key,
+                line,
+            ));
+        } else {
+            try writer.writeRecord(out_row);
+            rows_written += 1;
+        }
+    }
+
+    // Sort and emit if ORDER BY
+    if (sort_entries) |*entries| {
+        if (query.order_by) |ob| {
+            const limit: ?usize = if (query.limit >= 0) @intCast(query.limit) else null;
+            const sorted = try fast_sort.sortEntries(allocator, entries.items, ob.order == .desc, limit);
+            for (sorted) |entry| {
+                try writer.writeToBuffer(entry.line);
+                try writer.writeToBuffer("\n");
+            }
+        }
+    }
+
+    try writer.flush();
+}
+
+/// Execute a scalar aggregate query (aggregate functions without GROUP BY).
+/// Performs a single mmap scan accumulating one CompactAccum and emits
+/// exactly one result row.  Supports WHERE, all five aggregate functions,
+/// and mixed regular+aggregate SELECT lists.
+fn executeScalarAgg(
+    allocator: Allocator,
+    query: parser.Query,
+    output_file: std.fs.File,
+) !void {
+    const file = try std.fs.cwd().openFile(query.file_path, .{});
+    defer file.close();
+
+    const file_size = (try file.stat()).size;
+    if (file_size == 0) return error.EmptyFile;
+
+    const mapped = try std.posix.mmap(
+        null,
+        file_size,
+        std.posix.PROT.READ,
+        .{ .TYPE = .SHARED },
+        file.handle,
+        0,
+    );
+    defer std.posix.munmap(mapped);
+    const data = mapped[0..file_size];
+
+    var writer = csv.CsvWriter.init(output_file);
+
+    // -- Header --
+    const header_nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
+    var header_line = data[0..header_nl];
+    if (header_line.len > 0 and header_line[header_line.len - 1] == '\r')
+        header_line = header_line[0 .. header_line.len - 1];
+
+    var header_list = std.ArrayListUnmanaged([]const u8){};
+    defer header_list.deinit(allocator);
+    {
+        var it = std.mem.splitScalar(u8, header_line, ',');
+        while (it.next()) |col| try header_list.append(allocator, col);
+    }
+    const header = header_list.items;
+
+    var lower_header = try allocator.alloc([]u8, header.len);
+    defer {
+        for (lower_header) |h| allocator.free(h);
+        allocator.free(lower_header);
+    }
+    var column_map = std.StringHashMap(usize).init(allocator);
+    defer column_map.deinit();
+    for (header, 0..) |col_name, idx| {
+        const lower = try allocator.alloc(u8, col_name.len);
+        _ = std.ascii.lowerString(lower, col_name);
+        lower_header[idx] = lower;
+        try column_map.put(lower, idx);
+    }
+
+    // -- Resolve SELECT into ColKind + AggSpec lists --
+    var col_kinds = std.ArrayListUnmanaged(ColKind){};
+    defer col_kinds.deinit(allocator);
+    var agg_specs = std.ArrayListUnmanaged(AggSpec){};
+    defer {
+        for (agg_specs.items) |spec| allocator.free(spec.alias);
+        agg_specs.deinit(allocator);
+    }
+    var out_header_list = std.ArrayListUnmanaged([]const u8){};
+    defer out_header_list.deinit(allocator);
+
+    for (query.columns) |col| {
+        if (try aggregation.parseAggregateFunc(allocator, col)) |parsed_agg| {
+            var agg_func = parsed_agg;
+            errdefer agg_func.deinit(allocator);
+            const agg_idx = agg_specs.items.len;
+            var col_idx: ?usize = null;
+            if (agg_func.column) |agg_col| {
+                const lower = try allocator.alloc(u8, agg_col.len);
+                defer allocator.free(lower);
+                _ = std.ascii.lowerString(lower, agg_col);
+                col_idx = column_map.get(lower) orelse return error.ColumnNotFound;
+                allocator.free(agg_col);
+                agg_func.column = null;
+            }
+            try col_kinds.append(allocator, .{ .aggregate = agg_idx });
+            try out_header_list.append(allocator, agg_func.alias);
+            try agg_specs.append(allocator, AggSpec{
+                .func_type = agg_func.func_type,
+                .col_idx = col_idx,
+                .alias = agg_func.alias,
+            });
+        } else {
+            const lower = try allocator.alloc(u8, col.len);
+            defer allocator.free(lower);
+            _ = std.ascii.lowerString(lower, col);
+            const cidx = column_map.get(lower) orelse return error.ColumnNotFound;
+            try col_kinds.append(allocator, .{ .regular = cidx });
+            try out_header_list.append(allocator, header[cidx]);
+        }
+    }
+    try writer.writeRecord(out_header_list.items);
+
+    // -- WHERE fast-path index --
+    var where_col_idx: ?usize = null;
+    if (query.where_expr) |expr| {
+        if (expr == .comparison) {
+            for (lower_header, 0..) |lh, i| {
+                if (std.mem.eql(u8, lh, expr.comparison.column)) {
+                    where_col_idx = i;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Single global accumulator
+    var ka = std.heap.ArenaAllocator.init(allocator);
+    defer ka.deinit();
+    const n_aggs = agg_specs.items.len;
+    const empty_keys = try ka.allocator().alloc([]const u8, 0);
+    var accum = try CompactAccum.init(ka.allocator(), empty_keys, n_aggs);
+
+    var fallback_row_map = std.StringHashMap([]const u8).init(allocator);
+    defer fallback_row_map.deinit();
+    var field_stk: [256][]const u8 = undefined;
+
+    // -- Scan --
+    var scan_pos: usize = header_nl + 1;
+    while (scan_pos < data.len) {
+        const line_start = scan_pos;
+        const nl = std.mem.indexOfScalarPos(u8, data, scan_pos, '\n');
+        var line_end = nl orelse data.len;
+        scan_pos = if (nl) |n| n + 1 else data.len;
+        if (line_end > line_start and data[line_end - 1] == '\r') line_end -= 1;
+        if (line_end <= line_start) continue;
+
+        const record = splitLine(data[line_start..line_end], &field_stk);
+
+        // WHERE filter
+        if (query.where_expr) |expr| {
+            if (expr == .comparison) {
+                const comp = expr.comparison;
+                const cidx = where_col_idx orelse continue;
+                if (cidx >= record.len) continue;
+                const fv = record[cidx];
+                var matches = false;
+                if (comp.numeric_value) |threshold| {
+                    const val = parseNumericFast(fv) catch continue;
+                    matches = switch (comp.operator) {
+                        .equal => val == threshold,
+                        .not_equal => val != threshold,
+                        .greater => val > threshold,
+                        .greater_equal => val >= threshold,
+                        .less => val < threshold,
+                        .less_equal => val <= threshold,
+                    };
+                } else {
+                    matches = switch (comp.operator) {
+                        .equal => std.mem.eql(u8, fv, comp.value),
+                        .not_equal => !std.mem.eql(u8, fv, comp.value),
+                        else => false,
+                    };
+                }
+                if (!matches) continue;
+            } else {
+                fallback_row_map.clearRetainingCapacity();
+                for (lower_header, 0..) |lh, i| {
+                    if (i < record.len) try fallback_row_map.put(lh, record[i]);
+                }
+                if (!parser.evaluate(expr, fallback_row_map)) continue;
+            }
+        }
+
+        // Accumulate
+        accum.count += 1;
+        for (agg_specs.items, 0..) |spec, i| {
+            switch (spec.func_type) {
+                .count => {},
+                .sum, .avg => {
+                    if (spec.col_idx) |cidx| {
+                        if (cidx < record.len) {
+                            if (parseNumericFast(record[cidx])) |val| {
+                                accum.sums[i] += val;
+                                accum.sum_counts[i] += 1;
+                            } else |_| {}
+                        }
+                    }
+                },
+                .min => {
+                    if (spec.col_idx) |cidx| {
+                        if (cidx < record.len) {
+                            if (parseNumericFast(record[cidx])) |val| {
+                                if (val < accum.mins[i]) accum.mins[i] = val;
+                            } else |_| {}
+                        }
+                    }
+                },
+                .max => {
+                    if (spec.col_idx) |cidx| {
+                        if (cidx < record.len) {
+                            if (parseNumericFast(record[cidx])) |val| {
+                                if (val > accum.maxs[i]) accum.maxs[i] = val;
+                            } else |_| {}
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    // -- Emit one result row --
+    var agg_allocs = std.ArrayListUnmanaged([]u8){};
+    defer {
+        for (agg_allocs.items) |s| allocator.free(s);
+        agg_allocs.deinit(allocator);
+    }
+    var agg_results = try allocator.alloc([]const u8, n_aggs);
+    defer allocator.free(agg_results);
+
+    for (agg_specs.items, 0..) |spec, i| {
+        const s: []u8 = switch (spec.func_type) {
+            .count => try std.fmt.allocPrint(allocator, "{d}", .{accum.count}),
+            .sum => try formatF64(allocator, accum.sums[i]),
+            .avg => blk: {
+                const cnt = accum.sum_counts[i];
+                break :blk if (cnt > 0)
+                    try formatF64(allocator, accum.sums[i] / @as(f64, @floatFromInt(cnt)))
+                else
+                    try allocator.dupe(u8, "0");
+            },
+            .min => blk: {
+                const v = accum.mins[i];
+                break :blk if (v < std.math.inf(f64))
+                    try formatF64(allocator, v)
+                else
+                    try allocator.dupe(u8, "");
+            },
+            .max => blk: {
+                const v = accum.maxs[i];
+                break :blk if (v > -std.math.inf(f64))
+                    try formatF64(allocator, v)
+                else
+                    try allocator.dupe(u8, "");
+            },
+        };
+        try agg_allocs.append(allocator, s);
+        agg_results[i] = s;
+    }
+
+    var output_row = try allocator.alloc([]const u8, col_kinds.items.len);
+    defer allocator.free(output_row);
+    for (col_kinds.items, 0..) |kind, i| {
+        output_row[i] = switch (kind) {
+            .regular => "",
+            .aggregate => |agg_idx| agg_results[agg_idx],
+        };
+    }
+    try writer.writeRecord(output_row);
+    try writer.flush();
 }
 
 /// Execute GROUP BY query.
@@ -666,24 +1272,27 @@ fn executeGroupBy(
         }
     } else {
         for (query.columns) |col| {
-            if (try aggregation.parseAggregateFunc(allocator, col)) |agg_func| {
+            if (try aggregation.parseAggregateFunc(allocator, col)) |parsed_agg| {
+                var agg_func = parsed_agg;
+                errdefer agg_func.deinit(allocator);
                 const agg_idx = agg_specs.items.len;
                 var col_idx: ?usize = null;
                 if (agg_func.column) |agg_col| {
                     const lower = try allocator.alloc(u8, agg_col.len);
                     defer allocator.free(lower);
                     _ = std.ascii.lowerString(lower, agg_col);
-                    col_idx = column_map.get(lower);
-                    allocator.free(agg_func.column.?);
+                    col_idx = column_map.get(lower) orelse return error.ColumnNotFound;
+                    allocator.free(agg_col);
+                    agg_func.column = null;
                 }
+                try col_kinds.append(allocator, .{ .aggregate = agg_idx });
+                try out_header_list.append(allocator, agg_func.alias);
                 // alias ownership transfers to AggSpec
                 try agg_specs.append(allocator, AggSpec{
                     .func_type = agg_func.func_type,
                     .col_idx = col_idx,
                     .alias = agg_func.alias,
                 });
-                try col_kinds.append(allocator, .{ .aggregate = agg_idx });
-                try out_header_list.append(allocator, agg_specs.items[agg_idx].alias);
             } else {
                 const lower = try allocator.alloc(u8, col.len);
                 defer allocator.free(lower);
@@ -856,6 +1465,13 @@ fn executeGroupBy(
     var output_row = try allocator.alloc([]const u8, col_kinds.items.len);
     defer allocator.free(output_row);
 
+    // DISTINCT dedup for GROUP BY output (groups are unique by key but SELECT
+    // may project fewer columns making two groups map to the same output row)
+    var distinct_arena_gb = std.heap.ArenaAllocator.init(allocator);
+    defer distinct_arena_gb.deinit();
+    var distinct_seen_gb = std.StringHashMap(void).init(allocator);
+    defer distinct_seen_gb.deinit();
+
     var rows_output: i32 = 0;
     for (sorted_keys) |key| {
         if (query.limit >= 0 and rows_output >= query.limit) break;
@@ -873,25 +1489,25 @@ fn executeGroupBy(
         for (agg_specs.items, 0..) |spec, i| {
             const s: []u8 = switch (spec.func_type) {
                 .count => try std.fmt.allocPrint(allocator, "{d}", .{accum.count}),
-                .sum => try std.fmt.allocPrint(allocator, "{d:.2}", .{accum.sums[i]}),
+                .sum => try formatF64(allocator, accum.sums[i]),
                 .avg => blk: {
                     const cnt = accum.sum_counts[i];
                     break :blk if (cnt > 0)
-                        try std.fmt.allocPrint(allocator, "{d:.2}", .{accum.sums[i] / @as(f64, @floatFromInt(cnt))})
+                        try formatF64(allocator, accum.sums[i] / @as(f64, @floatFromInt(cnt)))
                     else
                         try allocator.dupe(u8, "0");
                 },
                 .min => blk: {
                     const v = accum.mins[i];
                     break :blk if (v < std.math.inf(f64))
-                        try std.fmt.allocPrint(allocator, "{d:.2}", .{v})
+                        try formatF64(allocator, v)
                     else
                         try allocator.dupe(u8, "");
                 },
                 .max => blk: {
                     const v = accum.maxs[i];
                     break :blk if (v > -std.math.inf(f64))
-                        try std.fmt.allocPrint(allocator, "{d:.2}", .{v})
+                        try formatF64(allocator, v)
                     else
                         try allocator.dupe(u8, "");
                 },
@@ -911,6 +1527,25 @@ fn executeGroupBy(
                 .aggregate => |agg_idx| agg_results[agg_idx],
             };
         }
+
+        // DISTINCT check for GROUP BY output
+        if (query.distinct) {
+            var distinct_key_buf: [8192]u8 = undefined;
+            var klen: usize = 0;
+            for (output_row, 0..) |field, fi| {
+                if (fi > 0 and klen < distinct_key_buf.len) {
+                    distinct_key_buf[klen] = 0;
+                    klen += 1;
+                }
+                const n = @min(field.len, distinct_key_buf.len - klen);
+                if (n > 0) @memcpy(distinct_key_buf[klen..][0..n], field[0..n]);
+                klen += n;
+            }
+            const row_key = distinct_key_buf[0..klen];
+            if (distinct_seen_gb.contains(row_key)) continue;
+            try distinct_seen_gb.put(try distinct_arena_gb.allocator().dupe(u8, row_key), {});
+        }
+
         try writer.writeRecord(output_row);
         rows_output += 1;
     }
@@ -1079,4 +1714,448 @@ test "GROUP BY with LIMIT" {
     var lines = std.mem.splitScalar(u8, trimmed, '\n');
     while (lines.next()) |_| line_count += 1;
     try std.testing.expectEqual(@as(usize, 3), line_count); // header + 2 groups (LIMIT 2)
+}
+
+test "DISTINCT basic: deduplicates repeated values" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const csv_content = "name,department\nAlice,Engineering\nBob,Marketing\nCarol,Engineering\nDave,Marketing\nEve,Sales\n";
+
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT DISTINCT department FROM '{s}'", .{in_path});
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    try std.testing.expect(query.distinct);
+
+    const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file);
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    // Should have header + 3 unique departments (Engineering, Marketing, Sales)
+    const trimmed_out = std.mem.trim(u8, output, "\n");
+    var lc: usize = 0;
+    var ls = std.mem.splitScalar(u8, trimmed_out, '\n');
+    while (ls.next()) |_| lc += 1;
+    try std.testing.expectEqual(@as(usize, 4), lc); // header + 3 unique values
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "Engineering"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "Marketing"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "Sales"));
+    // Each value should appear exactly once
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "Engineering"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "Marketing"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "Sales"));
+}
+
+test "DISTINCT with WHERE: deduplicates filtered rows" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const csv_content = "name,age,department\nAlice,30,Engineering\nBob,22,Marketing\nCarol,35,Engineering\nDave,20,Marketing\n";
+
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT DISTINCT department FROM '{s}' WHERE age > 25", .{in_path});
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file);
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    // age > 25: Alice(30)→Engineering, Carol(35)→Engineering → only 1 unique dept
+    const trimmed_out = std.mem.trim(u8, output, "\n");
+    var lc: usize = 0;
+    var ls = std.mem.splitScalar(u8, trimmed_out, '\n');
+    while (ls.next()) |_| lc += 1;
+    try std.testing.expectEqual(@as(usize, 2), lc); // header + 1 unique department
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, output, "Engineering"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, output, 1, "Marketing"));
+}
+
+test "DISTINCT star: deduplicates full rows" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const csv_content = "city,country\nParis,France\nBerlin,Germany\nParis,France\nTokyo,Japan\nBerlin,Germany\n";
+
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT DISTINCT * FROM '{s}'", .{in_path});
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file);
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    // 5 rows but only 3 unique (Paris/France ×2, Berlin/Germany ×2, Tokyo/Japan ×1)
+    const trimmed_out = std.mem.trim(u8, output, "\n");
+    var lc: usize = 0;
+    var ls = std.mem.splitScalar(u8, trimmed_out, '\n');
+    while (ls.next()) |_| lc += 1;
+    try std.testing.expectEqual(@as(usize, 4), lc); // header + 3 unique rows
+}
+
+test "DISTINCT with LIMIT: returns limited unique rows" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const csv_content = "name,department\nAlice,Engineering\nBob,Marketing\nCarol,Engineering\nDave,Sales\nEve,Marketing\n";
+
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT DISTINCT department FROM '{s}' LIMIT 2", .{in_path});
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file);
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    const trimmed_out = std.mem.trim(u8, output, "\n");
+    var lc: usize = 0;
+    var ls = std.mem.splitScalar(u8, trimmed_out, '\n');
+    while (ls.next()) |_| lc += 1;
+    try std.testing.expectEqual(@as(usize, 3), lc); // header + LIMIT(2) unique rows
+}
+
+test "COUNT(*) with GROUP BY: counts per group" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const csv_content = "name,department\nAlice,Engineering\nBob,Marketing\nCarol,Engineering\nDave,Marketing\nEve,Sales\n";
+
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT department, COUNT(*) FROM '{s}' GROUP BY department", .{in_path});
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file);
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "Engineering,2"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "Marketing,2"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "Sales,1"));
+}
+
+test "COUNT(*) with WHERE and GROUP BY" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const csv_content = "name,age,department\nAlice,30,Engineering\nBob,22,Marketing\nCarol,35,Engineering\nDave,20,Marketing\nEve,28,Sales\n";
+
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT department, COUNT(*) FROM '{s}' WHERE age > 25 GROUP BY department", .{in_path});
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file);
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    // age > 25: Alice(30)→Eng, Carol(35)→Eng, Eve(28)→Sales
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "Engineering,2"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "Sales,1"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, output, 1, "Marketing"));
+}
+
+test "scalar COUNT(*): counts all rows" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const csv_content = "name,age\nAlice,30\nBob,22\nCarol,35\n";
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM '{s}'", .{in_path});
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file);
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "COUNT(*)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "3"));
+}
+
+test "scalar SUM/AVG/MIN/MAX: correct values" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const csv_content = "name,salary,age\nAlice,60000,30\nBob,40000,22\nCarol,50000,35\n";
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT SUM(salary), MIN(age), MAX(age) FROM '{s}'",
+        .{in_path},
+    );
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file);
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    // SUM(salary) = 150000, MIN(age) = 22, MAX(age) = 35
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "150000"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "22"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "35"));
+    // Integer SUM should not have .00
+    try std.testing.expect(!std.mem.containsAtLeast(u8, output, 1, "150000."));
+}
+
+test "scalar COUNT(*) with WHERE filter" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const csv_content = "name,age\nAlice,30\nBob,22\nCarol,35\nDave,25\n";
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM '{s}' WHERE age > 25", .{in_path});
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file);
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    // age > 25: Alice(30), Carol(35) → 2 rows
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "2"));
+    // Should NOT count rows where age <= 25
+    const trimmed = std.mem.trim(u8, output, "\n");
+    var lines = std.mem.splitScalar(u8, trimmed, '\n');
+    _ = lines.next(); // skip header
+    const data_line = lines.next() orelse "";
+    try std.testing.expectEqualStrings("2", std.mem.trim(u8, data_line, "\r"));
+}
+
+test "scalar aggregate with missing column returns ColumnNotFound" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const csv_content = "name,age\nAlice,30\nBob,22\n";
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+    const sql = try std.fmt.allocPrint(allocator, "SELECT SUM(missing) FROM '{s}'", .{in_path});
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("output.csv", .{});
+    defer out_file.close();
+
+    try std.testing.expectError(error.ColumnNotFound, execute(allocator, query, out_file));
+}
+
+test "mixed scalar aggregate and regular column requires GROUP BY" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const csv_content = "name,age\nAlice,30\nBob,22\n";
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+    const sql = try std.fmt.allocPrint(allocator, "SELECT name, COUNT(*) FROM '{s}'", .{in_path});
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("output.csv", .{});
+    defer out_file.close();
+
+    try std.testing.expectError(error.MixedAggregateAndNonAggregateSelect, execute(allocator, query, out_file));
+}
+
+test "DISTINCT with scalar aggregate follows scalar path" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const csv_content = "name,age\nAlice,30\nBob,22\n";
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+    const sql = try std.fmt.allocPrint(allocator, "SELECT DISTINCT COUNT(*) FROM '{s}'", .{in_path});
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file);
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "COUNT(*)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "2"));
 }

@@ -137,6 +137,10 @@ pub const Aggregator = struct {
             },
             .sum => {
                 const sum = self.sums.get(index) orelse 0.0;
+                // Print as integer when the value has no fractional part
+                if (@abs(sum - @trunc(sum)) < 1e-9) {
+                    return try std.fmt.allocPrint(allocator, "{d:.0}", .{sum});
+                }
                 return try std.fmt.allocPrint(allocator, "{d:.2}", .{sum});
             },
             .avg => {
@@ -144,7 +148,8 @@ pub const Aggregator = struct {
                 const count = self.counts.get(index) orelse 0;
                 if (count > 0) {
                     const avg = sum / @as(f64, @floatFromInt(count));
-                    return try std.fmt.allocPrint(allocator, "{d:.2}", .{avg});
+                    // Use full precision (shortest round-trip representation)
+                    return try std.fmt.allocPrint(allocator, "{d}", .{avg});
                 }
                 return try allocator.dupe(u8, "0");
             },
@@ -152,6 +157,9 @@ pub const Aggregator = struct {
                 const has = self.has_min.get(index) orelse false;
                 if (has) {
                     const val = self.mins.get(index).?;
+                    if (@abs(val - @trunc(val)) < 1e-9) {
+                        return try std.fmt.allocPrint(allocator, "{d:.0}", .{val});
+                    }
                     return try std.fmt.allocPrint(allocator, "{d:.2}", .{val});
                 }
                 return try allocator.dupe(u8, "");
@@ -160,6 +168,9 @@ pub const Aggregator = struct {
                 const has = self.has_max.get(index) orelse false;
                 if (has) {
                     const val = self.maxs.get(index).?;
+                    if (@abs(val - @trunc(val)) < 1e-9) {
+                        return try std.fmt.allocPrint(allocator, "{d:.0}", .{val});
+                    }
                     return try std.fmt.allocPrint(allocator, "{d:.2}", .{val});
                 }
                 return try allocator.dupe(u8, "");

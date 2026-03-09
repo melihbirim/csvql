@@ -12,6 +12,7 @@ pub fn parseSimple(allocator: Allocator, args: []const []const u8) !parser.Query
     var query = parser.Query{
         .columns = undefined,
         .all_columns = false,
+        .distinct = false,
         .file_path = undefined,
         .where_expr = null,
         .group_by = undefined,

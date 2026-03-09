@@ -183,15 +183,24 @@ csvql "SELECT name FROM 'data.csv'"   # SQL mode
 
 Both syntaxes work simultaneously:
 
-- Simple mode: Fast, common operations
-- SQL mode: Complex queries (JOINs, GROUP BY, aggregates)
+- Simple mode: Fast, common operations with terse positional syntax
+- SQL mode: Full feature set — `GROUP BY`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), `DISTINCT`, complex WHERE expressions
+
+For aggregates and `DISTINCT`, use SQL mode directly:
+
+```bash
+# Aggregates require SQL mode
+csvql "SELECT department, COUNT(*), AVG(salary) FROM 'data.csv' GROUP BY department"
+csvql "SELECT COUNT(*), SUM(salary) FROM 'data.csv' WHERE age > 30"
+
+# DISTINCT requires SQL mode
+csvql "SELECT DISTINCT city FROM 'data.csv' ORDER BY city"
+```
 
 ## Future Extensions
 
-Possible additions (not in v1):
+Possible additions to simple mode syntax (not yet implemented):
 
 - Multiple sorts: `"age:desc,name:asc"`
 - LIKE operator: `"name~Alice%"`
 - IN operator: `"city IN (NYC,SF,LA)"`
-- Distinct: `--distinct` flag
-- Aggregates: Special columns like `COUNT(*)`, `SUM(score)`
