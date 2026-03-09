@@ -87,6 +87,7 @@ pub const OrderBy = struct {
 pub const Query = struct {
     columns: [][]u8,
     all_columns: bool,
+    distinct: bool,
     file_path: []u8,
     where_expr: ?Expression,
     group_by: [][]u8,
@@ -123,6 +124,7 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
     var query = Query{
         .columns = undefined,
         .all_columns = false,
+        .distinct = false,
         .file_path = undefined,
         .where_expr = null,
         .group_by = undefined,
@@ -140,7 +142,17 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
     const select_idx = std.ascii.indexOfIgnoreCase(trimmed, "SELECT") orelse return error.InvalidQuery;
     const from_idx = std.ascii.indexOfIgnoreCase(trimmed, "FROM") orelse return error.InvalidQuery;
 
-    const columns_part = std.mem.trim(u8, trimmed[select_idx + 6 .. from_idx], &std.ascii.whitespace);
+    var columns_part = std.mem.trim(u8, trimmed[select_idx + 6 .. from_idx], &std.ascii.whitespace);
+
+    // Detect DISTINCT keyword after SELECT
+    if (columns_part.len >= 8 and std.ascii.eqlIgnoreCase(columns_part[0..8], "DISTINCT")) {
+        const after = columns_part[8..];
+        // Must be followed by whitespace or end of string
+        if (after.len == 0 or std.ascii.isWhitespace(after[0])) {
+            query.distinct = true;
+            columns_part = std.mem.trim(u8, after, &std.ascii.whitespace);
+        }
+    }
 
     // Check for SELECT *
     if (std.mem.eql(u8, columns_part, "*")) {

@@ -1,4 +1,6 @@
-# csvql
+<p align="center">
+  <img src="logo.svg" alt="csvql" width="420"/>
+</p>
 
 [![CI](https://github.com/melihbirim/csvql/actions/workflows/ci.yml/badge.svg)](https://github.com/melihbirim/csvql/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.md)
