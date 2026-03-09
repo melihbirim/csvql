@@ -62,17 +62,18 @@ pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.Fi
         return;
     }
 
+    // Scalar aggregate (no GROUP BY): SELECT COUNT(*)/SUM/AVG/MIN/MAX
+    if (query.group_by.len == 0 and hasAggregates(query)) {
+        if (hasRegularColumns(query)) return error.MixedAggregateAndNonAggregateSelect;
+        try executeScalarAgg(allocator, query, output_file);
+        return;
+    }
+
     // DISTINCT without GROUP BY: route through the hash-based GROUP BY engine.
     // SELECT DISTINCT c1,c2 ≡ SELECT c1,c2 GROUP BY c1,c2 — same O(unique rows)
     // memory and a single sequential mmap scan, just like our GROUP BY path.
     if (query.distinct and query.group_by.len == 0) {
         try executeDistinct(allocator, query, output_file);
-        return;
-    }
-
-    // Scalar aggregate (no GROUP BY): SELECT COUNT(*)/SUM/AVG/MIN/MAX
-    if (query.group_by.len == 0 and hasAggregates(query)) {
-        try executeScalarAgg(allocator, query, output_file);
         return;
     }
 
@@ -650,19 +651,33 @@ inline fn splitLine(line: []const u8, buf: [][]const u8) []const []const u8 {
 }
 
 /// Returns true if any SELECT column is an aggregate expression (no alloc).
+inline fn isAggregateExpr(col: []const u8) bool {
+    const paren = std.mem.indexOf(u8, col, "(") orelse return false;
+    const name_part = std.mem.trim(u8, col[0..paren], &std.ascii.whitespace);
+    if (name_part.len == 0 or name_part.len > 5) return false;
+    var buf: [5]u8 = undefined;
+    const lower = std.ascii.lowerString(buf[0..name_part.len], name_part);
+    return std.mem.eql(u8, lower, "count") or
+        std.mem.eql(u8, lower, "sum") or
+        std.mem.eql(u8, lower, "avg") or
+        std.mem.eql(u8, lower, "min") or
+        std.mem.eql(u8, lower, "max");
+}
+
+/// Returns true if any SELECT column is an aggregate expression (no alloc).
 fn hasAggregates(query: parser.Query) bool {
     if (query.all_columns) return false;
     for (query.columns) |col| {
-        const paren = std.mem.indexOf(u8, col, "(") orelse continue;
-        const name_part = std.mem.trim(u8, col[0..paren], &std.ascii.whitespace);
-        if (name_part.len == 0 or name_part.len > 5) continue;
-        var buf: [5]u8 = undefined;
-        const lower = std.ascii.lowerString(buf[0..name_part.len], name_part);
-        if (std.mem.eql(u8, lower, "count") or
-            std.mem.eql(u8, lower, "sum") or
-            std.mem.eql(u8, lower, "avg") or
-            std.mem.eql(u8, lower, "min") or
-            std.mem.eql(u8, lower, "max")) return true;
+        if (isAggregateExpr(col)) return true;
+    }
+    return false;
+}
+
+/// Returns true if any SELECT column is a non-aggregate expression.
+fn hasRegularColumns(query: parser.Query) bool {
+    if (query.all_columns) return true;
+    for (query.columns) |col| {
+        if (!isAggregateExpr(col)) return true;
     }
     return false;
 }
@@ -873,7 +888,7 @@ fn executeDistinct(
         if (seen.contains(key_buf.items)) continue;
         try seen.put(try key_arena.allocator().dupe(u8, key_buf.items), {});
 
-        if (query.limit >= 0 and rows_written >= query.limit) continue;
+        if (query.limit >= 0 and rows_written >= query.limit and sort_entries == null) break;
 
         // Either buffer for ORDER BY or write directly
         if (sort_entries) |*entries| {
@@ -979,23 +994,26 @@ fn executeScalarAgg(
     defer out_header_list.deinit(allocator);
 
     for (query.columns) |col| {
-        if (try aggregation.parseAggregateFunc(allocator, col)) |agg_func| {
+        if (try aggregation.parseAggregateFunc(allocator, col)) |parsed_agg| {
+            var agg_func = parsed_agg;
+            errdefer agg_func.deinit(allocator);
             const agg_idx = agg_specs.items.len;
             var col_idx: ?usize = null;
             if (agg_func.column) |agg_col| {
                 const lower = try allocator.alloc(u8, agg_col.len);
                 defer allocator.free(lower);
                 _ = std.ascii.lowerString(lower, agg_col);
-                col_idx = column_map.get(lower);
-                allocator.free(agg_func.column.?);
+                col_idx = column_map.get(lower) orelse return error.ColumnNotFound;
+                allocator.free(agg_col);
+                agg_func.column = null;
             }
+            try col_kinds.append(allocator, .{ .aggregate = agg_idx });
+            try out_header_list.append(allocator, agg_func.alias);
             try agg_specs.append(allocator, AggSpec{
                 .func_type = agg_func.func_type,
                 .col_idx = col_idx,
                 .alias = agg_func.alias,
             });
-            try col_kinds.append(allocator, .{ .aggregate = agg_idx });
-            try out_header_list.append(allocator, agg_specs.items[agg_idx].alias);
         } else {
             const lower = try allocator.alloc(u8, col.len);
             defer allocator.free(lower);
@@ -1254,24 +1272,27 @@ fn executeGroupBy(
         }
     } else {
         for (query.columns) |col| {
-            if (try aggregation.parseAggregateFunc(allocator, col)) |agg_func| {
+            if (try aggregation.parseAggregateFunc(allocator, col)) |parsed_agg| {
+                var agg_func = parsed_agg;
+                errdefer agg_func.deinit(allocator);
                 const agg_idx = agg_specs.items.len;
                 var col_idx: ?usize = null;
                 if (agg_func.column) |agg_col| {
                     const lower = try allocator.alloc(u8, agg_col.len);
                     defer allocator.free(lower);
                     _ = std.ascii.lowerString(lower, agg_col);
-                    col_idx = column_map.get(lower);
-                    allocator.free(agg_func.column.?);
+                    col_idx = column_map.get(lower) orelse return error.ColumnNotFound;
+                    allocator.free(agg_col);
+                    agg_func.column = null;
                 }
+                try col_kinds.append(allocator, .{ .aggregate = agg_idx });
+                try out_header_list.append(allocator, agg_func.alias);
                 // alias ownership transfers to AggSpec
                 try agg_specs.append(allocator, AggSpec{
                     .func_type = agg_func.func_type,
                     .col_idx = col_idx,
                     .alias = agg_func.alias,
                 });
-                try col_kinds.append(allocator, .{ .aggregate = agg_idx });
-                try out_header_list.append(allocator, agg_specs.items[agg_idx].alias);
             } else {
                 const lower = try allocator.alloc(u8, col.len);
                 defer allocator.free(lower);
@@ -1824,6 +1845,44 @@ test "DISTINCT star: deduplicates full rows" {
     try std.testing.expectEqual(@as(usize, 4), lc); // header + 3 unique rows
 }
 
+test "DISTINCT with LIMIT: returns limited unique rows" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const csv_content = "name,department\nAlice,Engineering\nBob,Marketing\nCarol,Engineering\nDave,Sales\nEve,Marketing\n";
+
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT DISTINCT department FROM '{s}' LIMIT 2", .{in_path});
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file);
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    const trimmed_out = std.mem.trim(u8, output, "\n");
+    var lc: usize = 0;
+    var ls = std.mem.splitScalar(u8, trimmed_out, '\n');
+    while (ls.next()) |_| lc += 1;
+    try std.testing.expectEqual(@as(usize, 3), lc); // header + LIMIT(2) unique rows
+}
+
 test "COUNT(*) with GROUP BY: counts per group" {
     const allocator = std.testing.allocator;
 
@@ -2011,4 +2070,92 @@ test "scalar COUNT(*) with WHERE filter" {
     _ = lines.next(); // skip header
     const data_line = lines.next() orelse "";
     try std.testing.expectEqualStrings("2", std.mem.trim(u8, data_line, "\r"));
+}
+
+test "scalar aggregate with missing column returns ColumnNotFound" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const csv_content = "name,age\nAlice,30\nBob,22\n";
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+    const sql = try std.fmt.allocPrint(allocator, "SELECT SUM(missing) FROM '{s}'", .{in_path});
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("output.csv", .{});
+    defer out_file.close();
+
+    try std.testing.expectError(error.ColumnNotFound, execute(allocator, query, out_file));
+}
+
+test "mixed scalar aggregate and regular column requires GROUP BY" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const csv_content = "name,age\nAlice,30\nBob,22\n";
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+    const sql = try std.fmt.allocPrint(allocator, "SELECT name, COUNT(*) FROM '{s}'", .{in_path});
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("output.csv", .{});
+    defer out_file.close();
+
+    try std.testing.expectError(error.MixedAggregateAndNonAggregateSelect, execute(allocator, query, out_file));
+}
+
+test "DISTINCT with scalar aggregate follows scalar path" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const csv_content = "name,age\nAlice,30\nBob,22\n";
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+    const sql = try std.fmt.allocPrint(allocator, "SELECT DISTINCT COUNT(*) FROM '{s}'", .{in_path});
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file);
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "COUNT(*)"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "2"));
 }

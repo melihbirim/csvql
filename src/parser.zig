@@ -415,3 +415,16 @@ test "parse simple query" {
     try std.testing.expectEqualStrings("data.csv", query.file_path);
     try std.testing.expectEqual(@as(i32, 10), query.limit);
 }
+
+test "parse distinct aggregate query" {
+    const allocator = std.testing.allocator;
+
+    var query = try parse(allocator, "SELECT DISTINCT COUNT(*) FROM 'data.csv'");
+    defer query.deinit();
+
+    try std.testing.expect(query.distinct);
+    try std.testing.expect(!query.all_columns);
+    try std.testing.expectEqual(@as(usize, 1), query.columns.len);
+    try std.testing.expectEqualStrings("COUNT(*)", query.columns[0]);
+    try std.testing.expectEqualStrings("data.csv", query.file_path);
+}
