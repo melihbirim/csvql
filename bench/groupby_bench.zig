@@ -117,7 +117,7 @@ fn timeQuery(allocator: std.mem.Allocator, sql: []const u8) !u64 {
     defer sink.close();
 
     var timer = try std.time.Timer.start();
-    try engine.execute(allocator, q, sink);
+    try engine.execute(allocator, q, sink, .{});
     return timer.read();
 }
 

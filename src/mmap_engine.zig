@@ -2,6 +2,7 @@ const std = @import("std");
 const parser = @import("parser.zig");
 const csv = @import("csv.zig");
 const fast_sort = @import("fast_sort.zig");
+const options_mod = @import("options.zig");
 const Allocator = std.mem.Allocator;
 
 /// Sort entry for ORDER BY — uses fast_sort SortKey
@@ -46,6 +47,7 @@ pub fn executeMapped(
     query: parser.Query,
     input_file: std.fs.File,
     output_file: std.fs.File,
+    opts: options_mod.Options,
 ) !void {
     const file_size = (try input_file.stat()).size;
 
@@ -70,7 +72,7 @@ pub fn executeMapped(
     var header = std.ArrayList([]const u8){};
     defer header.deinit(allocator);
 
-    var header_iter = std.mem.splitScalar(u8, header_line, ',');
+    var header_iter = std.mem.splitScalar(u8, header_line, opts.delimiter);
     while (header_iter.next()) |col| {
         try header.append(allocator, col);
     }
@@ -114,13 +116,14 @@ pub fn executeMapped(
 
     // Write output header
     var writer = csv.CsvWriter.init(output_file);
+    writer.delimiter = opts.delimiter;
     var output_header = std.ArrayList([]const u8){};
     defer output_header.deinit(allocator);
 
     for (output_indices.items) |idx| {
         try output_header.append(allocator, header.items[idx]);
     }
-    try writer.writeRecord(output_header.items);
+    if (!opts.no_header) try writer.writeRecord(output_header.items);
 
     // OPTIMIZATION: Find WHERE column index for fast lookup
     var where_column_idx: ?usize = null;
@@ -191,7 +194,7 @@ pub fn executeMapped(
             // Parse fields as slices into mmap data (zero-copy)
             var field_buf: [256][]const u8 = undefined;
             var field_count: usize = 0;
-            var field_iter = std.mem.splitScalar(u8, line, ',');
+            var field_iter = std.mem.splitScalar(u8, line, opts.delimiter);
             while (field_iter.next()) |field| {
                 if (field_count >= field_buf.len) break;
                 field_buf[field_count] = field;
