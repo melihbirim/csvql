@@ -48,6 +48,26 @@ csvql "SELECT * FROM 'data.csv' WHERE status = 'active'" > output.csv
 csvql "SELECT email FROM 'users.csv'" | wc -l
 ```
 
+### Flags
+
+| Flag | Short | Description |
+| ---- | ----- | ----------- |
+| `--no-header` | | Suppress header row in output |
+| `--delimiter <char>` | `-d` | Field delimiter (default `,`). Use `\t` for TSV |
+| `--version` | `-v` | Show version |
+| `--help` | `-h` | Show help |
+
+```bash
+# TSV file
+csvql "SELECT name, salary FROM 'data.tsv'" -d $'\t'
+
+# Pipe into another tool that expects no header
+csvql "SELECT name, age FROM 'data.csv'" --no-header | awk -F, '{print $2}'
+
+# TSV input, no header in output
+cat data.tsv | csvql "SELECT * FROM '-'" -d $'\t' --no-header
+```
+
 ## Installation
 
 ### Prebuilt Binaries (recommended)
@@ -181,8 +201,8 @@ See [SIMPLE_QUERY_LANGUAGE.md](SIMPLE_QUERY_LANGUAGE.md) for the full reference.
 
 | Feature | Issue | Status |
 | ------- | ----- | ------ |
+| `--no-header` / `--delimiter` flags | [#12](https://github.com/melihbirim/csvql/issues/12) | ✅ shipped (v0.5.0) |
 | `LIKE` operator in WHERE | [#13](https://github.com/melihbirim/csvql/issues/13) | planned |
-| `--no-header` / `--delimiter` flags | [#12](https://github.com/melihbirim/csvql/issues/12) | planned |
 | `--json` / `--jsonl` output format | [#14](https://github.com/melihbirim/csvql/issues/14) | planned |
 
 ## Contributing
