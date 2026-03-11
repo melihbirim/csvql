@@ -373,6 +373,25 @@ EOF
     "JOIN larger right (${ROW_COUNT} × 50K): employees JOIN bonus table on id" \
     "SELECT e.name, e.salary, b.bonus_pct FROM '${CSV}' e INNER JOIN '${BONUS}' b ON e.id = b.emp_id" \
     "SELECT e.name, e.salary, b.bonus_pct FROM read_csv_auto('${CSV}') AS e JOIN read_csv_auto('${BONUS}') AS b ON e.id::TEXT = b.emp_id::TEXT"
+
+  # ── 3-table chained JOIN ───────────────────────────────────────
+  local REGIONS="${BENCH_DIR}/bench_regions.csv"
+  cat > "$REGIONS" <<'EOF'
+region_name,continent
+West,North America
+East,North America
+Central,North America
+EOF
+
+  run_query \
+    "3-table JOIN (${ROW_COUNT} × 6 × 3): employees → departments → regions" \
+    "SELECT e.name, e.salary, d.region, r.continent FROM '${CSV}' e INNER JOIN '${DEPTS}' d ON e.department = d.dept_name INNER JOIN '${REGIONS}' r ON d.region = r.region_name" \
+    "SELECT e.name, e.salary, d.region, r.continent FROM read_csv_auto('${CSV}') AS e JOIN read_csv_auto('${DEPTS}') AS d ON e.department = d.dept_name JOIN read_csv_auto('${REGIONS}') AS r ON d.region = r.region_name"
+
+  run_query \
+    "3-table JOIN + WHERE (${ROW_COUNT} × 6 × 3): WHERE r.continent = 'North America'" \
+    "SELECT e.name, e.salary, d.region FROM '${CSV}' e INNER JOIN '${DEPTS}' d ON e.department = d.dept_name INNER JOIN '${REGIONS}' r ON d.region = r.region_name WHERE r.continent = 'North America'" \
+    "SELECT e.name, e.salary, d.region FROM read_csv_auto('${CSV}') AS e JOIN read_csv_auto('${DEPTS}') AS d ON e.department = d.dept_name JOIN read_csv_auto('${REGIONS}') AS r ON d.region = r.region_name WHERE r.continent = 'North America'"
 }
 
 # ═════════════════════════════════════════════════════════════════

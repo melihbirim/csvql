@@ -638,8 +638,14 @@ fn executeJoin(
     // Step 3 – build a unified column map over the final merged schema.
     // -----------------------------------------------------------------------
     var col_map = std.StringHashMap(usize).init(aa);
+    // Count occurrences of each bare (unaliased) column name to detect ambiguity later.
+    var bare_count = std.StringHashMap(usize).init(aa);
     for (current_headers, 0..) |h, i| {
         try col_map.put(h, i);
+        const bare_h = if (std.mem.indexOf(u8, h, ".")) |d| h[d + 1 ..] else h;
+        const bc_gop = try bare_count.getOrPut(bare_h);
+        if (!bc_gop.found_existing) bc_gop.value_ptr.* = 0;
+        bc_gop.value_ptr.* += 1;
     }
     // Also register qualified alias.col names from all join clauses so that
     // SELECT a.name, b.dept, c.region style projections still work.
@@ -681,6 +687,10 @@ fn executeJoin(
                 _ = std.ascii.lowerString(tmp, col_raw);
                 break :blk tmp;
             };
+            // Reject unqualified (no-dot) column references that exist in more than one table.
+            if (std.mem.indexOfScalar(u8, col, '.') == null) {
+                if ((bare_count.get(col) orelse 0) > 1) return error.AmbiguousColumnReference;
+            }
             if (col_map.get(col)) |idx| {
                 try output_indices.append(aa, idx);
                 try output_header_names.append(aa, current_headers[idx]);
@@ -3102,4 +3112,43 @@ test "INNER JOIN chained: WHERE on third table" {
     defer allocator.free(output);
 
     try std.testing.expectEqualStrings("name\nAlice\nCarol\n", output);
+}
+
+test "INNER JOIN: ambiguous unqualified column returns AmbiguousColumnReference" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Both tables have a column named "id" — SELECT id (unqualified) must error.
+    {
+        const f = try tmp.dir.createFile("left.csv", .{});
+        defer f.close();
+        try f.writeAll("id,name\n1,Alice\n2,Bob\n");
+    }
+    {
+        const f = try tmp.dir.createFile("right.csv", .{});
+        defer f.close();
+        try f.writeAll("id,dept\n1,Engineering\n2,Marketing\n");
+    }
+
+    var left_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var right_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const left_path = try tmp.dir.realpath("left.csv", &left_buf);
+    const right_path = try tmp.dir.realpath("right.csv", &right_buf);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT id FROM '{s}' a JOIN '{s}' b ON a.id = b.id",
+        .{ left_path, right_path },
+    );
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("ambig_out.csv", .{});
+    defer out_file.close();
+
+    try std.testing.expectError(error.AmbiguousColumnReference, execute(allocator, query, out_file, .{}));
 }

@@ -298,3 +298,24 @@ test "parse chained JOIN with WHERE clause" {
     try std.testing.expectEqualStrings("c.name", comp.column);
     try std.testing.expectEqualStrings("West", comp.value);
 }
+
+test "unsupported join types return UnsupportedJoinType error" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(
+        error.UnsupportedJoinType,
+        parser.parse(allocator, "SELECT * FROM 'a.csv' a LEFT JOIN 'b.csv' b ON a.id = b.id"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedJoinType,
+        parser.parse(allocator, "SELECT * FROM 'a.csv' a RIGHT JOIN 'b.csv' b ON a.id = b.id"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedJoinType,
+        parser.parse(allocator, "SELECT * FROM 'a.csv' a FULL OUTER JOIN 'b.csv' b ON a.id = b.id"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedJoinType,
+        parser.parse(allocator, "SELECT * FROM 'a.csv' a CROSS JOIN 'b.csv' b ON a.id = b.id"),
+    );
+}

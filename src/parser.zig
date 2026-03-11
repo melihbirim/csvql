@@ -310,6 +310,13 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
     const from_rest = trimmed[from_idx + 4 ..];
     var rest: []const u8 = undefined;
 
+    // Reject unsupported JOIN types before they silently fall through to single-file mode.
+    inline for ([_][]const u8{ "LEFT JOIN", "RIGHT JOIN", "OUTER JOIN", "FULL JOIN", "FULL OUTER JOIN", "CROSS JOIN" }) |kw| {
+        if (std.ascii.indexOfIgnoreCase(from_rest, kw)) |_| {
+            return error.UnsupportedJoinType;
+        }
+    }
+
     // Collect all JOIN clauses into a temporary list.
     var joins_list = std.ArrayList(JoinClause){};
     // On error, free any already-collected JoinClause items.

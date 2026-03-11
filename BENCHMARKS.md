@@ -291,6 +291,8 @@ Key achievements:
 | **JOIN SELECT * (1M × 6)** | **csvql** 🏆 | **18.8x faster** | Streaming output vs DuckDB serialisation |
 | **JOIN cities (1M × 8)** | **csvql** 🏆 | **10.0x faster** | Hash-join, tiny build side |
 | **JOIN larger right (1M × 50K)** | **csvql** 🏆 | **2.7x faster** | String-key hash probe at scale |
+| **3-table JOIN (1M × 6 × 3)** | **csvql** 🏆 | **3.2x faster** | Iterative hash-join steps |
+| **3-table JOIN + WHERE** | **csvql** 🏆 | **2.8x faster** | WHERE fast-path on third table |
 | **Memory usage** | **csvql** 🏆 | **35x less** | Streaming architecture |
 
 ### csvql Optimization Journey 🚀
@@ -325,12 +327,15 @@ Tested on `large_test.csv` (1M rows, 35 MB). Right tables range from 6 to 50K ro
 | `JOIN SELECT * (1M × 6)` | **0.220s** | 4.130s | **18.8x** |
 | `employees JOIN cities (1M × 8)` | **0.146s** | 1.464s | **10.0x** |
 | `employees JOIN bonus_50k (1M × 50K)` | **0.104s** | 0.276s | **2.7x** |
+| `3-table JOIN: emp → dept → region (1M × 6 × 3)` | **0.600s** | 1.900s | **3.2x** |
+| `3-table JOIN + WHERE continent (1M × 6 × 3)` | **0.537s** | 1.517s | **2.8x** |
 
 ### Architecture
 
 csvql uses a **hash-join** strategy:
 - Right table fully loaded into `StringHashMap` (build side)
-- Left table streamed row-by-row (probe side)  
+- Left table streamed row-by-row (probe side)
+- Chained JOINs execute iteratively: each step materialises the intermediate result, then the next join uses it as the new probe side
 - WHERE clause resolved to a direct column index before the loop — zero per-row allocations for simple comparisons
 
 The large speedup on `SELECT *` queries is due to DuckDB's format serialisation overhead; csvql streams output incrementally.
