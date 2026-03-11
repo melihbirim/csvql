@@ -84,6 +84,12 @@ pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.Fi
         return;
     }
 
+    // JOIN query: load right table into hash map, probe with left table
+    if (query.join != null) {
+        try executeJoin(allocator, query, output_file, opts);
+        return;
+    }
+
     // Scalar aggregate (no GROUP BY): SELECT COUNT(*)/SUM/AVG/MIN/MAX
     if (query.group_by.len == 0 and hasAggregates(query)) {
         if (hasRegularColumns(query)) return error.MixedAggregateAndNonAggregateSelect;
@@ -428,6 +434,240 @@ fn executeSequential(
                 try writer.writeRawLine(entry.line);
             }
         }
+    }
+
+    try writer.finish();
+    try writer.flush();
+}
+
+/// Execute an INNER JOIN between two CSV files using a hash-join algorithm.
+/// The right table is fully loaded into a hash map (build side); the left table
+/// is streamed row-by-row (probe side).  This is memory-efficient when the right
+/// table fits in RAM, which is the common case for JOIN queries.
+fn executeJoin(
+    allocator: Allocator,
+    query: parser.Query,
+    output_file: std.fs.File,
+    opts: options_mod.Options,
+) !void {
+    const join = query.join.?;
+
+    // Arena for all temporary key/header allocations that live for the whole function
+    var tmp_arena = std.heap.ArenaAllocator.init(allocator);
+    defer tmp_arena.deinit();
+    const ta = tmp_arena.allocator();
+
+    // --- Open both CSV files ---
+    const left_file = try std.fs.cwd().openFile(query.file_path, .{});
+    defer left_file.close();
+    const right_file_h = try std.fs.cwd().openFile(join.right_file, .{});
+    defer right_file_h.close();
+
+    // --- Set up readers ---
+    var left_reader = try bulk_csv.BulkCsvReader.init(allocator, left_file);
+    defer left_reader.deinit();
+    left_reader.delimiter = opts.delimiter;
+
+    var right_reader = try bulk_csv.BulkCsvReader.init(allocator, right_file_h);
+    defer right_reader.deinit();
+    right_reader.delimiter = opts.delimiter;
+
+    // --- Read headers ---
+    const lh_raw = try left_reader.readRecord() orelse return error.EmptyFile;
+    defer left_reader.freeRecord(lh_raw);
+    const lw = lh_raw.len;
+
+    const rh_raw = try right_reader.readRecord() orelse return error.EmptyFile;
+    defer right_reader.freeRecord(rh_raw);
+    const rw = rh_raw.len;
+
+    // --- Build column maps (all keys live in tmp_arena) ---
+    // left_col_map:  "col" | "alias.col"  →  index in left row
+    // right_col_map: "col" | "alias.col"  →  index in right row
+    var left_col_map = std.StringHashMap(usize).init(ta);
+    var right_col_map = std.StringHashMap(usize).init(ta);
+
+    var left_lh = try ta.alloc([]u8, lw);
+    for (lh_raw, 0..) |col, i| {
+        const lower = try ta.alloc(u8, col.len);
+        _ = std.ascii.lowerString(lower, col);
+        left_lh[i] = lower;
+        try left_col_map.put(lower, i);
+        if (join.left_alias.len > 0) {
+            const qname = try std.fmt.allocPrint(ta, "{s}.{s}", .{ join.left_alias, lower });
+            try left_col_map.put(qname, i);
+        }
+    }
+
+    var right_lh = try ta.alloc([]u8, rw);
+    for (rh_raw, 0..) |col, i| {
+        const lower = try ta.alloc(u8, col.len);
+        _ = std.ascii.lowerString(lower, col);
+        right_lh[i] = lower;
+        try right_col_map.put(lower, i);
+        if (join.right_alias.len > 0) {
+            const qname = try std.fmt.allocPrint(ta, "{s}.{s}", .{ join.right_alias, lower });
+            try right_col_map.put(qname, i);
+        }
+    }
+
+    // --- Find join key column indices ---
+    const ljidx = left_col_map.get(join.left_col) orelse return error.JoinColumnNotFound;
+    const rjidx = right_col_map.get(join.right_col) orelse return error.JoinColumnNotFound;
+
+    // --- Load right table into hash map (build side) ---
+    // right_data_arena owns all copied row data; right_index ArrayList items use allocator
+    var right_data_arena = std.heap.ArenaAllocator.init(allocator);
+    defer right_data_arena.deinit();
+    const rda = right_data_arena.allocator();
+
+    var right_index = std.StringHashMap(std.ArrayList([][]const u8)).init(allocator);
+    defer {
+        var it = right_index.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
+        right_index.deinit();
+    }
+
+    while (try right_reader.readRecordSlices()) |rrow| {
+        if (rjidx >= rrow.len) continue;
+        const key = try rda.dupe(u8, rrow[rjidx]);
+        const gop = try right_index.getOrPut(key);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = std.ArrayList([][]const u8){};
+        }
+        // Copy all fields into the arena so they survive after the reader buffer is overwritten
+        const rcopy = try rda.alloc([]const u8, rrow.len);
+        for (rrow, 0..) |f, fi| rcopy[fi] = try rda.dupe(u8, f);
+        try gop.value_ptr.append(allocator, rcopy);
+    }
+
+    // --- Determine output columns and headers ---
+    var output_indices = std.ArrayList(usize){};
+    defer output_indices.deinit(allocator);
+    var output_header = std.ArrayList([]const u8){};
+    defer output_header.deinit(allocator);
+
+    if (query.all_columns) {
+        for (0..lw) |i| {
+            try output_indices.append(allocator, i);
+            try output_header.append(allocator, lh_raw[i]);
+        }
+        for (0..rw) |i| {
+            try output_indices.append(allocator, lw + i);
+            try output_header.append(allocator, rh_raw[i]);
+        }
+    } else {
+        for (query.columns) |col_raw| {
+            // Lowercase column reference for case-insensitive lookup
+            const col = blk: {
+                const tmp = try ta.alloc(u8, col_raw.len);
+                _ = std.ascii.lowerString(tmp, col_raw);
+                break :blk tmp;
+            };
+            // Qualified reference: "alias.colname" — look in the right table map
+            if (std.mem.indexOf(u8, col, ".")) |dot| {
+                const col_alias = col[0..dot];
+                const col_name = col[dot + 1 ..];
+                if (join.left_alias.len > 0 and std.mem.eql(u8, col_alias, join.left_alias)) {
+                    const idx = left_col_map.get(col_name) orelse return error.ColumnNotFound;
+                    try output_indices.append(allocator, idx);
+                    try output_header.append(allocator, lh_raw[idx]);
+                } else if (join.right_alias.len > 0 and std.mem.eql(u8, col_alias, join.right_alias)) {
+                    const idx = right_col_map.get(col_name) orelse return error.ColumnNotFound;
+                    try output_indices.append(allocator, lw + idx);
+                    try output_header.append(allocator, rh_raw[idx]);
+                } else {
+                    // Unknown alias — fall through to unqualified lookup
+                    if (left_col_map.get(col)) |idx| {
+                        try output_indices.append(allocator, idx);
+                        try output_header.append(allocator, lh_raw[idx]);
+                    } else if (right_col_map.get(col)) |idx| {
+                        try output_indices.append(allocator, lw + idx);
+                        try output_header.append(allocator, rh_raw[idx]);
+                    } else return error.ColumnNotFound;
+                }
+            } else {
+                // Unqualified reference — left table takes priority
+                if (left_col_map.get(col)) |idx| {
+                    try output_indices.append(allocator, idx);
+                    try output_header.append(allocator, lh_raw[idx]);
+                } else if (right_col_map.get(col)) |idx| {
+                    try output_indices.append(allocator, lw + idx);
+                    try output_header.append(allocator, rh_raw[idx]);
+                } else return error.ColumnNotFound;
+            }
+        }
+    }
+
+    // --- Set up writer and write header ---
+    var writer = csv.RecordWriter.init(output_file, opts);
+    defer writer.deinit();
+    try writer.writeHeader(output_header.items, opts.no_header);
+
+    // Merged row buffer: [left_col_0 .. left_col_{lw-1}, right_col_0 .. right_col_{rw-1}]
+    const merged_w = lw + rw;
+    var merged_row = try allocator.alloc([]const u8, merged_w);
+    defer allocator.free(merged_row);
+    var output_row = try allocator.alloc([]const u8, output_indices.items.len);
+    defer allocator.free(output_row);
+
+    // Per-row arena for WHERE evaluation maps (reset each iteration)
+    var row_arena = std.heap.ArenaAllocator.init(allocator);
+    defer row_arena.deinit();
+
+    var rows_written: i32 = 0;
+
+    // --- Stream left table and probe hash map ---
+    while (try left_reader.readRecordSlices()) |lrow| {
+        if (ljidx >= lrow.len) continue;
+        const lkey = lrow[ljidx];
+        const matches = right_index.get(lkey) orelse continue;
+
+        for (matches.items) |rrow| {
+            // Build merged row view (no copying — left slices from reader buffer,
+            // right slices from right_data_arena which lives for the whole function)
+            for (0..lw) |i| merged_row[i] = if (i < lrow.len) lrow[i] else "";
+            for (0..rw) |i| merged_row[lw + i] = if (i < rrow.len) rrow[i] else "";
+
+            // Apply WHERE clause if present
+            if (query.where_expr) |expr| {
+                _ = row_arena.reset(.retain_capacity);
+                const ra = row_arena.allocator();
+
+                var row_map = std.StringHashMap([]const u8).init(ra);
+                // Populate with left columns (qualified and unqualified)
+                for (left_lh, 0..) |lh, i| {
+                    const v = if (i < lrow.len) lrow[i] else "";
+                    try row_map.put(lh, v);
+                    if (join.left_alias.len > 0) {
+                        const qk = try std.fmt.allocPrint(ra, "{s}.{s}", .{ join.left_alias, lh });
+                        try row_map.put(qk, v);
+                    }
+                }
+                // Populate with right columns (qualified; unqualified only if not shadowed by left)
+                for (right_lh, 0..) |rh, i| {
+                    const v = if (i < rrow.len) rrow[i] else "";
+                    if (row_map.get(rh) == null) try row_map.put(rh, v);
+                    if (join.right_alias.len > 0) {
+                        const qk = try std.fmt.allocPrint(ra, "{s}.{s}", .{ join.right_alias, rh });
+                        try row_map.put(qk, v);
+                    }
+                }
+
+                if (!parser.evaluate(expr, row_map)) continue;
+            }
+
+            // Project output columns
+            for (output_indices.items, 0..) |midx, oi| {
+                output_row[oi] = if (midx < merged_row.len) merged_row[midx] else "";
+            }
+
+            try writer.writeRecord(output_row);
+            rows_written += 1;
+            if (query.limit >= 0 and rows_written >= query.limit) break;
+        }
+
+        if (query.limit >= 0 and rows_written >= query.limit) break;
     }
 
     try writer.finish();
@@ -2450,4 +2690,194 @@ test "JSON output: CSV mode still produces CSV-compatible output" {
     defer allocator.free(output);
 
     try std.testing.expectEqualStrings("name,age\nAlice,35\nBob,42\n", output);
+}
+
+// --- JOIN integration tests ---
+
+test "INNER JOIN: basic two-file join" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // left: employees
+    {
+        const f = try tmp.dir.createFile("emp.csv", .{});
+        defer f.close();
+        try f.writeAll("id,name,dept_id\n1,Alice,10\n2,Bob,20\n3,Carol,10\n");
+    }
+    // right: departments
+    {
+        const f = try tmp.dir.createFile("dept.csv", .{});
+        defer f.close();
+        try f.writeAll("id,dept_name\n10,Engineering\n20,Marketing\n");
+    }
+
+    var emp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dept_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const emp_path = try tmp.dir.realpath("emp.csv", &emp_buf);
+    const dept_path = try tmp.dir.realpath("dept.csv", &dept_buf);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT a.name, b.dept_name FROM '{s}' a INNER JOIN '{s}' b ON a.dept_id = b.id",
+        .{ emp_path, dept_path },
+    );
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("join_out.csv", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file, .{});
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    // Alice → Engineering, Bob → Marketing, Carol → Engineering (order matches left table)
+    try std.testing.expectEqualStrings(
+        "name,dept_name\nAlice,Engineering\nBob,Marketing\nCarol,Engineering\n",
+        output,
+    );
+}
+
+test "INNER JOIN with WHERE clause" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("emp.csv", .{});
+        defer f.close();
+        try f.writeAll("id,name,dept_id\n1,Alice,10\n2,Bob,20\n3,Carol,10\n");
+    }
+    {
+        const f = try tmp.dir.createFile("dept.csv", .{});
+        defer f.close();
+        try f.writeAll("id,dept_name\n10,Engineering\n20,Marketing\n");
+    }
+
+    var emp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dept_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const emp_path = try tmp.dir.realpath("emp.csv", &emp_buf);
+    const dept_path = try tmp.dir.realpath("dept.csv", &dept_buf);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT a.name, b.dept_name FROM '{s}' a JOIN '{s}' b ON a.dept_id = b.id WHERE b.dept_name = 'Engineering'",
+        .{ emp_path, dept_path },
+    );
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("join_where_out.csv", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file, .{});
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    try std.testing.expectEqualStrings(
+        "name,dept_name\nAlice,Engineering\nCarol,Engineering\n",
+        output,
+    );
+}
+
+test "INNER JOIN SELECT *: all columns from both tables" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("l.csv", .{});
+        defer f.close();
+        try f.writeAll("id,val\n1,aaa\n2,bbb\n");
+    }
+    {
+        const f = try tmp.dir.createFile("r.csv", .{});
+        defer f.close();
+        try f.writeAll("fk,extra\n1,xxx\n2,yyy\n");
+    }
+
+    var lb: [std.fs.max_path_bytes]u8 = undefined;
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const lp = try tmp.dir.realpath("l.csv", &lb);
+    const rp = try tmp.dir.realpath("r.csv", &rb);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT * FROM '{s}' l JOIN '{s}' r ON l.id = r.fk",
+        .{ lp, rp },
+    );
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("join_star_out.csv", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file, .{});
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    try std.testing.expectEqualStrings(
+        "id,val,fk,extra\n1,aaa,1,xxx\n2,bbb,2,yyy\n",
+        output,
+    );
+}
+
+test "INNER JOIN with LIMIT" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("emp.csv", .{});
+        defer f.close();
+        try f.writeAll("id,name,dept_id\n1,Alice,10\n2,Bob,20\n3,Carol,10\n");
+    }
+    {
+        const f = try tmp.dir.createFile("dept.csv", .{});
+        defer f.close();
+        try f.writeAll("id,dept_name\n10,Engineering\n20,Marketing\n");
+    }
+
+    var emp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dept_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const emp_path = try tmp.dir.realpath("emp.csv", &emp_buf);
+    const dept_path = try tmp.dir.realpath("dept.csv", &dept_buf);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT a.name FROM '{s}' a JOIN '{s}' b ON a.dept_id = b.id LIMIT 1",
+        .{ emp_path, dept_path },
+    );
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("join_limit_out.csv", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file, .{});
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    try std.testing.expectEqualStrings("name\nAlice\n", output);
 }

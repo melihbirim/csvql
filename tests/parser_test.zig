@@ -168,3 +168,86 @@ test "parse LIKE operator case-insensitive keyword" {
     try std.testing.expectEqual(parser.Operator.like, comp.operator);
     try std.testing.expectEqualStrings("John%", comp.value);
 }
+
+// --- JOIN parser tests ---
+
+test "parse INNER JOIN with aliases" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(
+        allocator,
+        "SELECT a.name, b.dept FROM 'employees.csv' a INNER JOIN 'departments.csv' b ON a.dept_id = b.id",
+    );
+    defer query.deinit();
+
+    try std.testing.expectEqualStrings("employees.csv", query.file_path);
+    try std.testing.expect(query.join != null);
+    const j = query.join.?;
+    try std.testing.expectEqualStrings("departments.csv", j.right_file);
+    try std.testing.expectEqualStrings("a", j.left_alias);
+    try std.testing.expectEqualStrings("b", j.right_alias);
+    try std.testing.expectEqualStrings("dept_id", j.left_col);
+    try std.testing.expectEqualStrings("id", j.right_col);
+    // Columns were requested as "a.name" and "b.dept"
+    try std.testing.expectEqual(@as(usize, 2), query.columns.len);
+}
+
+test "parse bare JOIN (no INNER keyword)" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(
+        allocator,
+        "SELECT * FROM 'left.csv' l JOIN 'right.csv' r ON l.id = r.fk",
+    );
+    defer query.deinit();
+
+    try std.testing.expectEqualStrings("left.csv", query.file_path);
+    try std.testing.expect(query.join != null);
+    const j = query.join.?;
+    try std.testing.expectEqualStrings("right.csv", j.right_file);
+    try std.testing.expectEqualStrings("l", j.left_alias);
+    try std.testing.expectEqualStrings("r", j.right_alias);
+    try std.testing.expectEqualStrings("id", j.left_col);
+    try std.testing.expectEqualStrings("fk", j.right_col);
+    try std.testing.expect(query.all_columns);
+}
+
+test "parse JOIN with WHERE clause" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(
+        allocator,
+        "SELECT a.name FROM 'emp.csv' a JOIN 'dept.csv' b ON a.dept_id = b.id WHERE b.name = 'Engineering'",
+    );
+    defer query.deinit();
+
+    try std.testing.expect(query.join != null);
+    try std.testing.expect(query.where_expr != null);
+    const comp = query.where_expr.?.comparison;
+    try std.testing.expectEqualStrings("b.name", comp.column);
+    try std.testing.expectEqualStrings("Engineering", comp.value);
+}
+
+test "parse JOIN with LIMIT" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(
+        allocator,
+        "SELECT * FROM 'a.csv' a JOIN 'b.csv' b ON a.id = b.id LIMIT 5",
+    );
+    defer query.deinit();
+
+    try std.testing.expect(query.join != null);
+    try std.testing.expectEqual(@as(i32, 5), query.limit);
+}
+
+test "single-file query still works after JOIN parser changes" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(allocator, "SELECT name, age FROM 'people.csv' WHERE age > 30");
+    defer query.deinit();
+
+    try std.testing.expect(query.join == null);
+    try std.testing.expectEqualStrings("people.csv", query.file_path);
+    try std.testing.expectEqual(@as(usize, 2), query.columns.len);
+}
