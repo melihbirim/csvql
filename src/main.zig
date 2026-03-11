@@ -55,6 +55,8 @@ const help_text =
     \\  -v, --version           Show version
     \\  --no-header             Suppress header row in output
     \\  -d, --delimiter <char>  Field delimiter (default: ',')  e.g. -d '\t' for TSV
+    \\  --json                  Output results as a JSON array of objects
+    \\  --jsonl                 Output results as newline-delimited JSON (NDJSON)
     \\
     \\EXAMPLES:
     \\  csvql "SELECT * FROM 'users.csv' WHERE age >= 18 LIMIT 100"
@@ -98,6 +100,10 @@ pub fn main() !void {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--no-header")) {
             opts.no_header = true;
+        } else if (std.mem.eql(u8, arg, "--json")) {
+            opts.format = .json;
+        } else if (std.mem.eql(u8, arg, "--jsonl")) {
+            opts.format = .jsonl;
         } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--delimiter")) {
             i += 1;
             if (i >= args.len) {

@@ -41,7 +41,23 @@ const ArenaBuffer = struct {
     }
 };
 
-/// Memory-mapped parallel CSV processing
+/// Append a JSON-escaped, double-quoted string to an ArenaBuffer.
+fn appendJsonStringToArena(arena: *ArenaBuffer, s: []const u8) !void {
+    _ = try arena.append("\"");
+    for (s) |c| {
+        switch (c) {
+            '"' => _ = try arena.append("\\\""),
+            '\\' => _ = try arena.append("\\\\"),
+            '\n' => _ = try arena.append("\\n"),
+            '\r' => _ = try arena.append("\\r"),
+            '\t' => _ = try arena.append("\\t"),
+            else => _ = try arena.append(&[_]u8{c}),
+        }
+    }
+    _ = try arena.append("\"");
+}
+
+
 pub fn executeMapped(
     allocator: Allocator,
     query: parser.Query,
@@ -115,15 +131,15 @@ pub fn executeMapped(
     }
 
     // Write output header
-    var writer = csv.CsvWriter.init(output_file);
-    writer.delimiter = opts.delimiter;
+    var writer = csv.RecordWriter.init(output_file, opts);
+
     var output_header = std.ArrayList([]const u8){};
     defer output_header.deinit(allocator);
 
     for (output_indices.items) |idx| {
         try output_header.append(allocator, header.items[idx]);
     }
-    if (!opts.no_header) try writer.writeRecord(output_header.items);
+    try writer.writeHeader(output_header.items, opts.no_header);
 
     // OPTIMIZATION: Find WHERE column index for fast lookup
     var where_column_idx: ?usize = null;
@@ -285,14 +301,28 @@ pub fn executeMapped(
             }
 
             if (sort_entries) |*entries| {
-                // Buffer for ORDER BY: store sort key + CSV line in arena
+                // Buffer for ORDER BY: store sort key + output line in arena
                 const a = &(arena.?);
                 const sort_key = try a.append(output_row[order_by_col_idx.?]);
                 const numeric_key = std.fmt.parseFloat(f64, sort_key) catch std.math.nan(f64);
                 const line_buf_start = a.pos;
-                for (output_row, 0..) |field, i| {
-                    if (i > 0) _ = try a.append(",");
-                    _ = try a.append(field);
+                switch (opts.format) {
+                    .csv => {
+                        for (output_row, 0..) |field, i| {
+                            if (i > 0) _ = try a.append(",");
+                            _ = try a.append(field);
+                        }
+                    },
+                    .json, .jsonl => {
+                        _ = try a.append("{");
+                        for (output_row, 0..) |field, i| {
+                            if (i > 0) _ = try a.append(",");
+                            try appendJsonStringToArena(a, output_header.items[i]);
+                            _ = try a.append(":");
+                            try appendJsonStringToArena(a, field);
+                        }
+                        _ = try a.append("}");
+                    },
                 }
                 const csv_line = a.data[line_buf_start..a.pos];
                 try entries.append(allocator, fast_sort.makeSortKey(
@@ -338,11 +368,11 @@ pub fn executeMapped(
                     if (ob_distinct_seen.contains(entry.line)) continue;
                     try ob_distinct_seen.put(try ob_distinct_arena.allocator().dupe(u8, entry.line), {});
                 }
-                try writer.writeToBuffer(entry.line);
-                try writer.writeToBuffer("\n");
+                try writer.writeRawLine(entry.line);
             }
         }
     }
 
+    try writer.finish();
     try writer.flush();
 }

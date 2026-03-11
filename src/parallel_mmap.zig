@@ -133,15 +133,15 @@ pub fn executeParallelMapped(
     }
 
     // Write output header
-    var writer = csv.CsvWriter.init(output_file);
-    writer.delimiter = opts.delimiter;
+    var writer = csv.RecordWriter.init(output_file, opts);
+
     var output_header = std.ArrayList([]const u8){};
     defer output_header.deinit(allocator);
 
     for (output_indices.items) |idx| {
         try output_header.append(allocator, header.items[idx]);
     }
-    if (!opts.no_header) try writer.writeRecord(output_header.items);
+    try writer.writeHeader(output_header.items, opts.no_header);
 
     // Find WHERE column index for fast lookup (avoid HashMap in hot path)
     var where_column_idx: ?usize = null;
@@ -370,6 +370,7 @@ pub fn executeParallelMapped(
         }
     }
 
+    try writer.finish();
     try writer.flush();
 }
 

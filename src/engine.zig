@@ -47,7 +47,24 @@ const ArenaBuffer = struct {
     }
 };
 
-/// Re-export parser.parse so callers (benchmarks, tests) don't need a
+/// Append a JSON-escaped, double-quoted string to an ArenaBuffer.
+/// Used by the ORDER BY path when building JSON objects for sorting.
+fn appendJsonStringToArena(arena: *ArenaBuffer, s: []const u8) !void {
+    _ = try arena.append("\"");
+    for (s) |c| {
+        switch (c) {
+            '"' => _ = try arena.append("\\\""),
+            '\\' => _ = try arena.append("\\\\"),
+            '\n' => _ = try arena.append("\\n"),
+            '\r' => _ = try arena.append("\\r"),
+            '\t' => _ = try arena.append("\\t"),
+            else => _ = try arena.append(&[_]u8{c}),
+        }
+    }
+    _ = try arena.append("\"");
+}
+
+
 /// separate parser import — avoiding Zig 0.15 module-duplication errors.
 pub const parseQuery = parser.parse;
 /// Re-export Query type for the same reason.
@@ -123,8 +140,8 @@ fn executeSequential(
     defer reader.deinit();
     reader.delimiter = opts.delimiter;
 
-    var writer = csv.CsvWriter.init(output_file);
-    writer.delimiter = opts.delimiter;
+    var writer = csv.RecordWriter.init(output_file, opts);
+
 
     // Read header
     const header = try reader.readRecord() orelse return error.EmptyFile;
@@ -176,7 +193,7 @@ fn executeSequential(
     }
 
     // Write output header
-    if (!opts.no_header) try writer.writeRecord(output_header.items);
+    try writer.writeHeader(output_header.items, opts.no_header);
 
     // OPTIMIZATION: Find WHERE column index for fast lookup (avoid HashMap in hot path)
     var where_column_idx: ?usize = null;
@@ -331,15 +348,29 @@ fn executeSequential(
 
         // Either buffer for ORDER BY or write directly
         if (sort_entries) |*entries| {
-            // Build CSV line into arena and store sort key
+            // Build output line into arena and store sort key
             const a = &(arena.?);
             const sort_key = try a.append(output_row[order_by_column_idx.?]);
 
-            // Build the CSV line: field1,field2,...
+            // Build the line representation: CSV or JSON depending on format
             const line_start = a.pos;
-            for (output_row, 0..) |field, i| {
-                if (i > 0) _ = try a.append(",");
-                _ = try a.append(field);
+            switch (opts.format) {
+                .csv => {
+                    for (output_row, 0..) |field, i| {
+                        if (i > 0) _ = try a.append(",");
+                        _ = try a.append(field);
+                    }
+                },
+                .json, .jsonl => {
+                    _ = try a.append("{");
+                    for (output_row, 0..) |field, i| {
+                        if (i > 0) _ = try a.append(",");
+                        try appendJsonStringToArena(a, output_header.items[i]);
+                        _ = try a.append(":");
+                        try appendJsonStringToArena(a, field);
+                    }
+                    _ = try a.append("}");
+                },
             }
             const line = a.data[line_start..a.pos];
 
@@ -388,12 +419,12 @@ fn executeSequential(
                     if (ob_distinct_seen.contains(entry.line)) continue;
                     try ob_distinct_seen.put(try ob_distinct_arena.allocator().dupe(u8, entry.line), {});
                 }
-                try writer.writeToBuffer(entry.line);
-                try writer.writeToBuffer("\n");
+                try writer.writeRawLine(entry.line);
             }
         }
     }
 
+    try writer.finish();
     try writer.flush();
 }
 
@@ -407,8 +438,8 @@ fn executeFromStdin(
     const stdin = std.fs.File{ .handle = std.posix.STDIN_FILENO };
     var reader = csv.CsvReader.init(allocator, stdin);
     reader.delimiter = opts.delimiter;
-    var writer = csv.CsvWriter.init(output_file);
-    writer.delimiter = opts.delimiter;
+    var writer = csv.RecordWriter.init(output_file, opts);
+
 
     // Read header
     const header = try reader.readRecord() orelse return error.EmptyFile;
@@ -459,7 +490,7 @@ fn executeFromStdin(
     }
 
     // Write output header
-    if (!opts.no_header) try writer.writeRecord(output_header.items);
+    try writer.writeHeader(output_header.items, opts.no_header);
 
     // OPTIMIZATION: Find WHERE column index for fast lookup (avoid HashMap in hot path)
     var where_column_idx_stdin: ?usize = null;
@@ -583,6 +614,7 @@ fn executeFromStdin(
         }
     }
 
+    try writer.finish();
     try writer.flush();
 }
 
@@ -729,8 +761,8 @@ fn executeDistinct(
     defer std.posix.munmap(mapped);
     const data = mapped[0..file_size];
 
-    var writer = csv.CsvWriter.init(output_file);
-    writer.delimiter = opts.delimiter;
+    var writer = csv.RecordWriter.init(output_file, opts);
+
 
     // Header
     const header_nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
@@ -782,7 +814,7 @@ fn executeDistinct(
             try out_header.append(allocator, header[idx]);
         }
     }
-    if (!opts.no_header) try writer.writeRecord(out_header.items);
+    try writer.writeHeader(out_header.items, opts.no_header);
 
     // WHERE fast-path index
     var where_col_idx: ?usize = null;
@@ -904,9 +936,23 @@ fn executeDistinct(
             const a = &(sort_arena.?);
             const sort_key = try a.append(out_row[order_by_out_pos.?]);
             const line_start_a = a.pos;
-            for (out_row, 0..) |field, i| {
-                if (i > 0) _ = try a.append(",");
-                _ = try a.append(field);
+            switch (opts.format) {
+                .csv => {
+                    for (out_row, 0..) |field, i| {
+                        if (i > 0) _ = try a.append(",");
+                        _ = try a.append(field);
+                    }
+                },
+                .json, .jsonl => {
+                    _ = try a.append("{");
+                    for (out_row, 0..) |field, i| {
+                        if (i > 0) _ = try a.append(",");
+                        try appendJsonStringToArena(a, out_header.items[i]);
+                        _ = try a.append(":");
+                        try appendJsonStringToArena(a, field);
+                    }
+                    _ = try a.append("}");
+                },
             }
             const line = a.data[line_start_a..a.pos];
             try entries.append(allocator, fast_sort.makeSortKey(
@@ -926,12 +972,12 @@ fn executeDistinct(
             const limit: ?usize = if (query.limit >= 0) @intCast(query.limit) else null;
             const sorted = try fast_sort.sortEntries(allocator, entries.items, ob.order == .desc, limit);
             for (sorted) |entry| {
-                try writer.writeToBuffer(entry.line);
-                try writer.writeToBuffer("\n");
+                try writer.writeRawLine(entry.line);
             }
         }
     }
 
+    try writer.finish();
     try writer.flush();
 }
 
@@ -962,8 +1008,8 @@ fn executeScalarAgg(
     defer std.posix.munmap(mapped);
     const data = mapped[0..file_size];
 
-    var writer = csv.CsvWriter.init(output_file);
-    writer.delimiter = opts.delimiter;
+    var writer = csv.RecordWriter.init(output_file, opts);
+
 
     // -- Header --
     const header_nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
@@ -1034,7 +1080,7 @@ fn executeScalarAgg(
             try out_header_list.append(allocator, header[cidx]);
         }
     }
-    if (!opts.no_header) try writer.writeRecord(out_header_list.items);
+    try writer.writeHeader(out_header_list.items, opts.no_header);
 
     // -- WHERE fast-path index --
     var where_col_idx: ?usize = null;
@@ -1192,6 +1238,7 @@ fn executeScalarAgg(
         };
     }
     try writer.writeRecord(output_row);
+    try writer.finish();
     try writer.flush();
 }
 
@@ -1224,8 +1271,8 @@ fn executeGroupBy(
     defer std.posix.munmap(mapped);
     const data = mapped[0..file_size];
 
-    var writer = csv.CsvWriter.init(output_file);
-    writer.delimiter = opts.delimiter;
+    var writer = csv.RecordWriter.init(output_file, opts);
+
 
     // -- Header parsing -----------------------------------------------------
     const header_nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
@@ -1316,7 +1363,7 @@ fn executeGroupBy(
             }
         }
     }
-    if (!opts.no_header) try writer.writeRecord(out_header_list.items);
+    try writer.writeHeader(out_header_list.items, opts.no_header);
 
     // -- Precompute WHERE fast path -----------------------------------------
     var where_col_idx: ?usize = null;
@@ -1563,6 +1610,7 @@ fn executeGroupBy(
         rows_output += 1;
     }
 
+    try writer.finish();
     try writer.flush();
 }
 
@@ -2171,4 +2219,188 @@ test "DISTINCT with scalar aggregate follows scalar path" {
 
     try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "COUNT(*)"));
     try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "2"));
+}
+
+test "JSON output: basic SELECT produces JSON array" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const csv_content = "name,age\nAlice,35\nBob,42\n";
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+    const sql = try std.fmt.allocPrint(allocator, "SELECT name, age FROM '{s}'", .{in_path});
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("output.json", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file, .{ .format = .json });
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    const expected =
+        \\[
+        \\{"name":"Alice","age":"35"},
+        \\{"name":"Bob","age":"42"}
+        \\]
+        \\
+    ;
+    try std.testing.expectEqualStrings(expected, output);
+}
+
+test "JSONL output: basic SELECT produces newline-delimited JSON" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const csv_content = "name,age\nAlice,35\nBob,42\n";
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+    const sql = try std.fmt.allocPrint(allocator, "SELECT name, age FROM '{s}'", .{in_path});
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("output.jsonl", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file, .{ .format = .jsonl });
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    const expected = "{\"name\":\"Alice\",\"age\":\"35\"}\n{\"name\":\"Bob\",\"age\":\"42\"}\n";
+    try std.testing.expectEqualStrings(expected, output);
+}
+
+test "JSON output: WHERE clause filters rows" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const csv_content = "name,age\nAlice,35\nBob,42\nCarol,28\n";
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+    const sql = try std.fmt.allocPrint(allocator, "SELECT name, age FROM '{s}' WHERE age > 30", .{in_path});
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("output_where.json", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file, .{ .format = .json });
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    // Only Alice (35) and Bob (42) match age > 30
+    const expected =
+        \\[
+        \\{"name":"Alice","age":"35"},
+        \\{"name":"Bob","age":"42"}
+        \\]
+        \\
+    ;
+    try std.testing.expectEqualStrings(expected, output);
+}
+
+test "JSON output: escapes special characters in field values" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // CSV field value contains a double-quote and a backslash
+    const csv_content = "id,note\n1,\"say \\\"hi\\\"\"\n";
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+    const sql = try std.fmt.allocPrint(allocator, "SELECT id, note FROM '{s}'", .{in_path});
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("output_escape.jsonl", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file, .{ .format = .jsonl });
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    // The note value `say "hi"` must be JSON-escaped to `say \"hi\"`
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "\\\"hi\\\""));
+}
+
+test "JSON output: CSV mode still produces CSV-compatible output" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const csv_content = "name,age\nAlice,35\nBob,42\n";
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+    const sql = try std.fmt.allocPrint(allocator, "SELECT name, age FROM '{s}'", .{in_path});
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("output_csv_compat.csv", .{ .read = true });
+    defer out_file.close();
+
+    // Default format is CSV - must produce identical output to old CsvWriter behaviour
+    try execute(allocator, query, out_file, .{});
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    try std.testing.expectEqualStrings("name,age\nAlice,35\nBob,42\n", output);
 }

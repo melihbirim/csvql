@@ -1,5 +1,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const options_mod = @import("options.zig");
+
+/// Re-export options so callers that only import csv can access Options/OutputFormat.
+pub const options = options_mod;
 
 /// RFC 4180 compliant CSV reader
 pub const CsvReader = struct {
@@ -291,6 +295,211 @@ pub const CsvWriter = struct {
         if (self.buffer_pos > 0) {
             try self.file.writeAll(self.buffer[0..self.buffer_pos]);
             self.buffer_pos = 0;
+        }
+    }
+};
+
+/// JSON output writer.  Produces either a JSON array (format == .json) or
+/// newline-delimited JSON (format == .jsonl) from structured record data.
+///
+/// Usage:
+///   1. Call setHeader() with column names before writing any records.
+///   2. Call writeRecord() for each row.
+///   3. Call finish() to emit the closing bracket for .json mode.
+///   4. Call flush() to drain the write buffer.
+pub const JsonWriter = struct {
+    file: std.fs.File,
+    mode: options_mod.OutputFormat, // .json or .jsonl
+    /// Column names — a borrowed slice valid for the writer's lifetime.
+    header: []const []const u8,
+    /// True until the first record is written (used to emit "[" prefix).
+    first_record: bool,
+    buffer: [1048576]u8, // 1 MB write buffer
+    buffer_pos: usize,
+
+    pub fn init(file: std.fs.File, mode: options_mod.OutputFormat) JsonWriter {
+        return JsonWriter{
+            .file = file,
+            .mode = mode,
+            .header = &[_][]const u8{},
+            .first_record = true,
+            .buffer = undefined,
+            .buffer_pos = 0,
+        };
+    }
+
+    /// Store column names (borrowed — must outlive the writer).
+    pub fn setHeader(self: *JsonWriter, fields: []const []const u8) void {
+        self.header = fields;
+    }
+
+    /// Write one data row as a JSON object.
+    pub fn writeRecord(self: *JsonWriter, fields: []const []const u8) !void {
+        if (self.mode == .json) {
+            if (self.first_record) {
+                try self.writeToBuffer("[\n");
+            } else {
+                try self.writeToBuffer(",\n");
+            }
+        }
+        self.first_record = false;
+
+        try self.writeToBuffer("{");
+        for (self.header, 0..) |key, i| {
+            if (i > 0) try self.writeToBuffer(",");
+            try self.writeJsonString(key);
+            try self.writeToBuffer(":");
+            if (i < fields.len) {
+                try self.writeJsonString(fields[i]);
+            } else {
+                try self.writeToBuffer("\"\"");
+            }
+        }
+        try self.writeToBuffer("}");
+        if (self.mode == .jsonl) try self.writeToBuffer("\n");
+    }
+
+    /// Write a pre-formatted JSON object line (used by ORDER BY sorted output).
+    /// `line` must already be a valid JSON object string without trailing newline.
+    pub fn writeRawLine(self: *JsonWriter, line: []const u8) !void {
+        if (self.mode == .json) {
+            if (self.first_record) {
+                try self.writeToBuffer("[\n");
+            } else {
+                try self.writeToBuffer(",\n");
+            }
+        }
+        self.first_record = false;
+        try self.writeToBuffer(line);
+        if (self.mode == .jsonl) try self.writeToBuffer("\n");
+    }
+
+    /// Finalise output: emit the closing `]` for .json mode.
+    pub fn finish(self: *JsonWriter) !void {
+        if (self.mode == .json) {
+            if (!self.first_record) {
+                try self.writeToBuffer("\n]");
+            } else {
+                try self.writeToBuffer("[]");
+            }
+            try self.writeToBuffer("\n");
+        }
+    }
+
+    pub fn flush(self: *JsonWriter) !void {
+        if (self.buffer_pos > 0) {
+            try self.file.writeAll(self.buffer[0..self.buffer_pos]);
+            self.buffer_pos = 0;
+        }
+    }
+
+    pub fn writeToBuffer(self: *JsonWriter, data: []const u8) !void {
+        var remaining = data;
+        while (remaining.len > 0) {
+            const space_left = self.buffer.len - self.buffer_pos;
+            if (space_left == 0) {
+                try self.flush();
+                continue;
+            }
+            const to_copy = @min(remaining.len, space_left);
+            @memcpy(self.buffer[self.buffer_pos..][0..to_copy], remaining[0..to_copy]);
+            self.buffer_pos += to_copy;
+            remaining = remaining[to_copy..];
+        }
+    }
+
+    fn writeJsonString(self: *JsonWriter, s: []const u8) !void {
+        try self.writeToBuffer("\"");
+        for (s) |c| {
+            switch (c) {
+                '"' => try self.writeToBuffer("\\\""),
+                '\\' => try self.writeToBuffer("\\\\"),
+                '\n' => try self.writeToBuffer("\\n"),
+                '\r' => try self.writeToBuffer("\\r"),
+                '\t' => try self.writeToBuffer("\\t"),
+                0x00...0x1F => {
+                    var buf: [6]u8 = undefined;
+                    const encoded = std.fmt.bufPrint(&buf, "\\u{X:0>4}", .{c}) catch unreachable;
+                    try self.writeToBuffer(encoded);
+                },
+                else => try self.writeToBuffer(&[_]u8{c}),
+            }
+        }
+        try self.writeToBuffer("\"");
+    }
+};
+
+/// Format-aware record writer that wraps either a CsvWriter or a JsonWriter.
+///
+/// This is the single output abstraction used by all engine paths.  Callers:
+///   1. var writer = RecordWriter.init(output_file, opts);
+///   2. try writer.writeHeader(header, opts.no_header);
+///   3. try writer.writeRecord(row);          // for each row
+///   4. try writer.finish();                  // finalise (closes JSON array etc.)
+///   5. try writer.flush();                   // drain write buffer
+pub const RecordWriter = union(enum) {
+    csv: CsvWriter,
+    json: JsonWriter,
+
+    /// Create a writer appropriate for the output format specified in `opts`.
+    pub fn init(file: std.fs.File, opts: options_mod.Options) RecordWriter {
+        return switch (opts.format) {
+            .csv => blk: {
+                var w = CsvWriter.init(file);
+                w.delimiter = opts.delimiter;
+                break :blk RecordWriter{ .csv = w };
+            },
+            .json => RecordWriter{ .json = JsonWriter.init(file, .json) },
+            .jsonl => RecordWriter{ .json = JsonWriter.init(file, .jsonl) },
+        };
+    }
+
+    /// Write the header row.
+    /// For CSV: writes the row unless `no_header` is true.
+    /// For JSON/JSONL: stores column names for use as object keys (ignores `no_header`).
+    pub fn writeHeader(self: *RecordWriter, fields: []const []const u8, no_header: bool) !void {
+        switch (self.*) {
+            .csv => |*w| {
+                if (!no_header) try w.writeRecord(fields);
+            },
+            .json => |*w| w.setHeader(fields),
+        }
+    }
+
+    /// Write a data row.
+    pub fn writeRecord(self: *RecordWriter, fields: []const []const u8) !void {
+        switch (self.*) {
+            .csv => |*w| try w.writeRecord(fields),
+            .json => |*w| try w.writeRecord(fields),
+        }
+    }
+
+    /// Write a pre-formatted line directly.
+    /// For CSV: `line` is written verbatim followed by "\n".
+    /// For JSON/JSONL: `line` must be a JSON object string (no trailing newline).
+    pub fn writeRawLine(self: *RecordWriter, line: []const u8) !void {
+        switch (self.*) {
+            .csv => |*w| {
+                try w.writeToBuffer(line);
+                try w.writeToBuffer("\n");
+            },
+            .json => |*w| try w.writeRawLine(line),
+        }
+    }
+
+    /// Finalise output (emits closing `]` for JSON mode).
+    pub fn finish(self: *RecordWriter) !void {
+        switch (self.*) {
+            .csv => {},
+            .json => |*w| try w.finish(),
+        }
+    }
+
+    /// Drain the internal write buffer.
+    pub fn flush(self: *RecordWriter) !void {
+        switch (self.*) {
+            .csv => |*w| try w.flush(),
+            .json => |*w| try w.flush(),
         }
     }
 };
