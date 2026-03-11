@@ -243,11 +243,13 @@ pub fn executeMapped(
                                     .greater_equal => val >= threshold,
                                     .less => val < threshold,
                                     .less_equal => val <= threshold,
+                                    .like => parser.matchLike(field_value, comp.value),
                                 };
                             } else {
                                 matches = switch (comp.operator) {
                                     .equal => std.mem.eql(u8, field_value, comp.value),
                                     .not_equal => !std.mem.eql(u8, field_value, comp.value),
+                                    .like => parser.matchLike(field_value, comp.value),
                                     else => false,
                                 };
                             }

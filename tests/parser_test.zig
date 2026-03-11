@@ -97,3 +97,74 @@ test "WHERE with mixed case column" {
     // Verify the query parses correctly with normalized column name
     try std.testing.expectEqualStrings("age", query.where_expr.?.comparison.column);
 }
+
+// LIKE operator: matchLike function tests
+test "matchLike: prefix wildcard %foo" {
+    try std.testing.expect(parser.matchLike("foo", "%foo"));
+    try std.testing.expect(parser.matchLike("barfoo", "%foo"));
+    try std.testing.expect(!parser.matchLike("foobar", "%foo"));
+}
+
+test "matchLike: suffix wildcard foo%" {
+    try std.testing.expect(parser.matchLike("foo", "foo%"));
+    try std.testing.expect(parser.matchLike("foobar", "foo%"));
+    try std.testing.expect(!parser.matchLike("barfoo", "foo%"));
+}
+
+test "matchLike: both ends %foo%" {
+    try std.testing.expect(parser.matchLike("foo", "%foo%"));
+    try std.testing.expect(parser.matchLike("xfoox", "%foo%"));
+    try std.testing.expect(parser.matchLike("foo_bar", "%foo%"));
+    try std.testing.expect(!parser.matchLike("bar", "%foo%"));
+}
+
+test "matchLike: single-char wildcard _" {
+    try std.testing.expect(parser.matchLike("abc", "a_c"));
+    try std.testing.expect(parser.matchLike("axc", "a_c"));
+    try std.testing.expect(!parser.matchLike("ac", "a_c"));
+    try std.testing.expect(!parser.matchLike("abbc", "a_c"));
+}
+
+test "matchLike: no wildcards (exact match)" {
+    try std.testing.expect(parser.matchLike("hello", "hello"));
+    try std.testing.expect(!parser.matchLike("hello", "world"));
+    try std.testing.expect(!parser.matchLike("hello!", "hello"));
+}
+
+test "matchLike: empty pattern and text" {
+    try std.testing.expect(parser.matchLike("", ""));
+    try std.testing.expect(parser.matchLike("", "%"));
+    try std.testing.expect(!parser.matchLike("a", ""));
+}
+
+test "matchLike: email pattern" {
+    try std.testing.expect(parser.matchLike("user@gmail.com", "%@gmail.com"));
+    try std.testing.expect(!parser.matchLike("user@yahoo.com", "%@gmail.com"));
+}
+
+// LIKE operator: parser parses LIKE keyword correctly
+test "parse LIKE operator" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(allocator, "SELECT * FROM 'users.csv' WHERE email LIKE '%@gmail.com'");
+    defer query.deinit();
+
+    try std.testing.expect(query.where_expr != null);
+    const comp = query.where_expr.?.comparison;
+    try std.testing.expectEqualStrings("email", comp.column);
+    try std.testing.expectEqual(parser.Operator.like, comp.operator);
+    try std.testing.expectEqualStrings("%@gmail.com", comp.value);
+    try std.testing.expect(comp.numeric_value == null);
+}
+
+test "parse LIKE operator case-insensitive keyword" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(allocator, "SELECT name FROM 'data.csv' WHERE name like 'John%'");
+    defer query.deinit();
+
+    try std.testing.expect(query.where_expr != null);
+    const comp = query.where_expr.?.comparison;
+    try std.testing.expectEqual(parser.Operator.like, comp.operator);
+    try std.testing.expectEqualStrings("John%", comp.value);
+}

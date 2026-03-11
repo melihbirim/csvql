@@ -495,6 +495,7 @@ fn processSortChunk(ctx: *SortWorkerContext) !void {
                                     .greater_equal => val >= threshold,
                                     .less => val < threshold,
                                     .less_equal => val <= threshold,
+                                    .like => parser.matchLike(field_value, comp.value),
                                 };
                                 if (!matches) {
                                     line_start += line_end + 1;
@@ -504,6 +505,7 @@ fn processSortChunk(ctx: *SortWorkerContext) !void {
                                 const matches = switch (comp.operator) {
                                     .equal => std.mem.eql(u8, field_value, comp.value),
                                     .not_equal => !std.mem.eql(u8, field_value, comp.value),
+                                    .like => parser.matchLike(field_value, comp.value),
                                     else => false,
                                 };
                                 if (!matches) {
@@ -596,6 +598,7 @@ fn processChunk(ctx: *WorkerContext) !void {
                                     .greater_equal => val >= threshold,
                                     .less => val < threshold,
                                     .less_equal => val <= threshold,
+                                    .like => parser.matchLike(field_value, comp.value),
                                 };
 
                                 if (!matches) {
@@ -607,6 +610,7 @@ fn processChunk(ctx: *WorkerContext) !void {
                                 const matches = switch (comp.operator) {
                                     .equal => std.mem.eql(u8, field_value, comp.value),
                                     .not_equal => !std.mem.eql(u8, field_value, comp.value),
+                                    .like => parser.matchLike(field_value, comp.value),
                                     else => blk: {
                                         const cmp = std.mem.order(u8, field_value, comp.value);
                                         break :blk switch (comp.operator) {
