@@ -62,7 +62,6 @@ fn appendJsonStringToArena(arena: *ArenaBuffer, s: []const u8) !void {
     _ = try arena.append("\"");
 }
 
-
 pub fn executeMapped(
     allocator: Allocator,
     query: parser.Query,
