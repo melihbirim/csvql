@@ -41,6 +41,12 @@ const WorkerContext = struct {
     output_indices: []const usize,
     where_column_idx: ?usize,
     result: std.ArrayList([][]const u8),
+    /// When true, workers serialize output directly into `output_buf` instead of collecting rows.
+    /// key_fragments holds pre-computed `"colname":` strings shared across workers (read-only).
+    use_parallel_output: bool,
+    output_buf: std.ArrayList(u8),
+    key_fragments: []const []const u8,
+    format: options_mod.OutputFormat,
     allocator: Allocator,
     mutex: *std.Thread.Mutex,
     delimiter: u8,
@@ -133,15 +139,16 @@ pub fn executeParallelMapped(
     }
 
     // Write output header
-    var writer = csv.CsvWriter.init(output_file);
-    writer.delimiter = opts.delimiter;
+    var writer = csv.RecordWriter.init(output_file, opts);
+    defer writer.deinit();
+
     var output_header = std.ArrayList([]const u8){};
     defer output_header.deinit(allocator);
 
     for (output_indices.items) |idx| {
         try output_header.append(allocator, header.items[idx]);
     }
-    if (!opts.no_header) try writer.writeRecord(output_header.items);
+    try writer.writeHeader(output_header.items, opts.no_header);
 
     // Find WHERE column index for fast lookup (avoid HashMap in hot path)
     var where_column_idx: ?usize = null;
@@ -303,7 +310,7 @@ pub fn executeParallelMapped(
             written += 1;
         }
     } else {
-        // ===== Non-ORDER BY path: original approach =====
+        // ===== Non-ORDER BY path =====
         var threads = try allocator.alloc(std.Thread, num_threads);
         defer allocator.free(threads);
 
@@ -311,6 +318,25 @@ pub fn executeParallelMapped(
         defer allocator.free(contexts);
 
         var mutex = std.Thread.Mutex{};
+
+        // For unlimited JSON/JSONL/CSV queries (no DISTINCT, no LIMIT): let workers
+        // serialize directly into per-thread byte buffers, eliminating the single-threaded
+        // serialization bottleneck.
+        const use_parallel_output = query.limit < 0 and !query.distinct;
+        var key_fragments: []const []const u8 = &[_][]const u8{};
+        defer {
+            if (key_fragments.len > 0) {
+                for (key_fragments) |frag| allocator.free(frag);
+                allocator.free(key_fragments);
+            }
+        }
+        if (use_parallel_output and opts.format != .csv) {
+            const frags = try allocator.alloc([]const u8, output_header.items.len);
+            for (output_header.items, 0..) |key, ki| {
+                frags[ki] = try csv.allocJsonKeyFragment(allocator, key);
+            }
+            key_fragments = frags;
+        }
 
         for (0..num_threads) |i| {
             contexts[i] = WorkerContext{
@@ -321,6 +347,10 @@ pub fn executeParallelMapped(
                 .output_indices = output_indices.items,
                 .where_column_idx = where_column_idx,
                 .result = std.ArrayList([][]const u8){},
+                .use_parallel_output = use_parallel_output,
+                .output_buf = std.ArrayList(u8){},
+                .key_fragments = key_fragments,
+                .format = opts.format,
                 .allocator = allocator,
                 .mutex = &mutex,
                 .delimiter = opts.delimiter,
@@ -330,7 +360,46 @@ pub fn executeParallelMapped(
 
         for (threads) |thread| thread.join();
 
-        // DISTINCT dedup (sequential: after all threads finish)
+        // Fast path: stitch per-thread output buffers directly to output_file.
+        // Workers serialized in parallel so we only need to concatenate here.
+        if (use_parallel_output) {
+            defer {
+                for (contexts) |*ctx| {
+                    ctx.result.deinit(allocator);
+                    ctx.output_buf.deinit(allocator);
+                }
+            }
+            // Flush the writer so any buffered header bytes reach the file first.
+            try writer.flush();
+            if (opts.format == .json) {
+                var first_non_empty = true;
+                for (contexts) |*ctx| {
+                    if (ctx.output_buf.items.len == 0) continue;
+                    if (first_non_empty) {
+                        try output_file.writeAll("[\n");
+                    } else {
+                        try output_file.writeAll(",\n");
+                    }
+                    try output_file.writeAll(ctx.output_buf.items);
+                    first_non_empty = false;
+                }
+                if (first_non_empty) {
+                    try output_file.writeAll("[]\n");
+                } else {
+                    try output_file.writeAll("\n]\n");
+                }
+            } else {
+                // JSONL or CSV: just concatenate chunks in order
+                for (contexts) |*ctx| {
+                    if (ctx.output_buf.items.len > 0) {
+                        try output_file.writeAll(ctx.output_buf.items);
+                    }
+                }
+            }
+            return;
+        }
+
+        // CSV mode (or JSON with finite LIMIT): use writer.writeRecord with DISTINCT + LIMIT
         var distinct_arena = std.heap.ArenaAllocator.init(allocator);
         defer distinct_arena.deinit();
         var distinct_seen = std.StringHashMap(void).init(allocator);
@@ -339,6 +408,7 @@ pub fn executeParallelMapped(
         var total_written: usize = 0;
         for (contexts) |*ctx| {
             defer ctx.result.deinit(allocator);
+            defer ctx.output_buf.deinit(allocator);
 
             for (ctx.result.items) |row| {
                 defer allocator.free(row);
@@ -370,6 +440,7 @@ pub fn executeParallelMapped(
         }
     }
 
+    try writer.finish();
     try writer.flush();
 }
 
@@ -585,13 +656,62 @@ fn processChunk(ctx: *WorkerContext) !void {
                 }
             }
 
-            // Build output row — zero-copy slices into mmap data (no field duplication)
-            var output_row = try ctx.allocator.alloc([]const u8, ctx.output_indices.len);
-            for (ctx.output_indices, 0..) |idx, j| {
-                output_row[j] = if (idx < fields.items.len) fields.items[idx] else "";
+            if (ctx.use_parallel_output) {
+                if (ctx.format == .csv) {
+                    // Fast parallel CSV serialization
+                    for (ctx.output_indices, 0..) |idx, j| {
+                        if (j > 0) try ctx.output_buf.append(ctx.allocator, ctx.delimiter);
+                        const value = if (idx < fields.items.len) fields.items[idx] else "";
+                        // Check if quoting is needed
+                        var needs_quote = false;
+                        for (value) |c| {
+                            if (c == ctx.delimiter or c == '"' or c == '\r' or c == '\n') {
+                                needs_quote = true;
+                                break;
+                            }
+                        }
+                        if (needs_quote) {
+                            try ctx.output_buf.append(ctx.allocator, '"');
+                            for (value) |c| {
+                                if (c == '"') try ctx.output_buf.append(ctx.allocator, '"');
+                                try ctx.output_buf.append(ctx.allocator, c);
+                            }
+                            try ctx.output_buf.append(ctx.allocator, '"');
+                        } else {
+                            try ctx.output_buf.appendSlice(ctx.allocator, value);
+                        }
+                    }
+                    try ctx.output_buf.append(ctx.allocator, '\n');
+                } else {
+                    // Serialize directly into the per-thread JSON buffer (no heap alloc per row)
+                    const is_jsonl = ctx.format == .jsonl;
+                    if (ctx.output_buf.items.len > 0 and !is_jsonl) {
+                        try ctx.output_buf.appendSlice(ctx.allocator, ",\n");
+                    }
+                    try ctx.output_buf.append(ctx.allocator, '{');
+                    for (ctx.output_indices, 0..) |idx, j| {
+                        if (j > 0) try ctx.output_buf.append(ctx.allocator, ',');
+                        try ctx.output_buf.appendSlice(ctx.allocator, ctx.key_fragments[j]);
+                        const value = if (idx < fields.items.len) fields.items[idx] else "";
+                        if (csv.isJsonNumber(value)) {
+                            try ctx.output_buf.appendSlice(ctx.allocator, value);
+                        } else {
+                            try ctx.output_buf.append(ctx.allocator, '"');
+                            try csv.appendJsonEscapedToList(&ctx.output_buf, ctx.allocator, value);
+                            try ctx.output_buf.append(ctx.allocator, '"');
+                        }
+                    }
+                    try ctx.output_buf.append(ctx.allocator, '}');
+                    if (is_jsonl) try ctx.output_buf.append(ctx.allocator, '\n');
+                }
+            } else {
+                // CSV mode (or JSON with LIMIT): build zero-copy output row slices into mmap data
+                var output_row = try ctx.allocator.alloc([]const u8, ctx.output_indices.len);
+                for (ctx.output_indices, 0..) |idx, j| {
+                    output_row[j] = if (idx < fields.items.len) fields.items[idx] else "";
+                }
+                try ctx.result.append(ctx.allocator, output_row);
             }
-
-            try ctx.result.append(ctx.allocator, output_row);
         }
 
         line_start += line_end + 1;
