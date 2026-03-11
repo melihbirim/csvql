@@ -299,6 +299,74 @@ pub const CsvWriter = struct {
     }
 };
 
+/// Returns true if `s` is a valid JSON number literal (integer or float).
+/// Used to write numeric CSV values unquoted in JSON output, matching DuckDB behaviour.
+pub fn isJsonNumber(s: []const u8) bool {
+    if (s.len == 0) return false;
+    var i: usize = 0;
+    if (s[i] == '-') {
+        i += 1;
+        if (i >= s.len) return false;
+    }
+    if (s[i] == '0') {
+        i += 1;
+    } else {
+        if (s[i] < '1' or s[i] > '9') return false;
+        i += 1;
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') i += 1;
+    }
+    if (i < s.len and s[i] == '.') {
+        i += 1;
+        if (i >= s.len or s[i] < '0' or s[i] > '9') return false;
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') i += 1;
+    }
+    if (i < s.len and (s[i] == 'e' or s[i] == 'E')) {
+        i += 1;
+        if (i < s.len and (s[i] == '+' or s[i] == '-')) i += 1;
+        if (i >= s.len or s[i] < '0' or s[i] > '9') return false;
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') i += 1;
+    }
+    return i == s.len;
+}
+
+/// Write a JSON-escaped version of `s` into `out` (without surrounding quotes).
+pub fn appendJsonEscapedToList(out: *std.ArrayList(u8), allocator: Allocator, s: []const u8) !void {
+    var segment_start: usize = 0;
+    for (s, 0..) |c, ci| {
+        var is_unicode_escape = false;
+        var escape_seq: []const u8 = undefined;
+        switch (c) {
+            '"' => escape_seq = "\\\"",
+            '\\' => escape_seq = "\\\\",
+            '\n' => escape_seq = "\\n",
+            '\r' => escape_seq = "\\r",
+            '\t' => escape_seq = "\\t",
+            0x00...0x08, 0x0B...0x0C, 0x0E...0x1F => is_unicode_escape = true,
+            else => continue,
+        }
+        if (ci > segment_start) try out.appendSlice(allocator, s[segment_start..ci]);
+        if (is_unicode_escape) {
+            var buf: [6]u8 = undefined;
+            const encoded = std.fmt.bufPrint(&buf, "\\u{X:0>4}", .{c}) catch unreachable;
+            try out.appendSlice(allocator, encoded);
+        } else {
+            try out.appendSlice(allocator, escape_seq);
+        }
+        segment_start = ci + 1;
+    }
+    if (segment_start < s.len) try out.appendSlice(allocator, s[segment_start..]);
+}
+
+/// Allocate a JSON key fragment like `"colname":` (caller must free with `allocator`).
+pub fn allocJsonKeyFragment(allocator: Allocator, key: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8){};
+    defer out.deinit(allocator);
+    try out.append(allocator, '"');
+    try appendJsonEscapedToList(&out, allocator, key);
+    try out.appendSlice(allocator, "\":");
+    return try out.toOwnedSlice(allocator);
+}
+
 /// JSON output writer.  Produces either a JSON array (format == .json) or
 /// newline-delimited JSON (format == .jsonl) from structured record data.
 ///
@@ -312,6 +380,8 @@ pub const JsonWriter = struct {
     mode: options_mod.OutputFormat, // .json or .jsonl
     /// Column names — a borrowed slice valid for the writer's lifetime.
     header: []const []const u8,
+    /// Pre-escaped key fragments like `"col":`, allocated once in setHeader().
+    header_key_fragments: []const []const u8,
     /// True until the first record is written (used to emit "[" prefix).
     first_record: bool,
     buffer: [1048576]u8, // 1 MB write buffer
@@ -322,15 +392,37 @@ pub const JsonWriter = struct {
             .file = file,
             .mode = mode,
             .header = &[_][]const u8{},
+            .header_key_fragments = &[_][]const u8{},
             .first_record = true,
             .buffer = undefined,
             .buffer_pos = 0,
         };
     }
 
+    pub fn deinit(self: *JsonWriter) void {
+        self.freeHeaderKeyFragments();
+    }
+
     /// Store column names (borrowed — must outlive the writer).
-    pub fn setHeader(self: *JsonWriter, fields: []const []const u8) void {
+    pub fn setHeader(self: *JsonWriter, fields: []const []const u8) !void {
+        self.freeHeaderKeyFragments();
         self.header = fields;
+        if (fields.len == 0) return;
+
+        const allocator = std.heap.page_allocator;
+        const fragments = try allocator.alloc([]const u8, fields.len);
+        errdefer allocator.free(fragments);
+
+        var built: usize = 0;
+        errdefer {
+            for (fragments[0..built]) |frag| allocator.free(frag);
+        }
+
+        for (fields, 0..) |key, i| {
+            fragments[i] = try allocJsonKeyFragment(allocator, key);
+            built += 1;
+        }
+        self.header_key_fragments = fragments;
     }
 
     /// Write one data row as a JSON object.
@@ -345,12 +437,11 @@ pub const JsonWriter = struct {
         self.first_record = false;
 
         try self.writeToBuffer("{");
-        for (self.header, 0..) |key, i| {
+        for (self.header_key_fragments, 0..) |key_fragment, i| {
             if (i > 0) try self.writeToBuffer(",");
-            try self.writeJsonString(key);
-            try self.writeToBuffer(":");
+            try self.writeToBuffer(key_fragment);
             if (i < fields.len) {
-                try self.writeJsonString(fields[i]);
+                try self.writeJsonValue(fields[i]);
             } else {
                 try self.writeToBuffer("\"\"");
             }
@@ -410,23 +501,57 @@ pub const JsonWriter = struct {
 
     fn writeJsonString(self: *JsonWriter, s: []const u8) !void {
         try self.writeToBuffer("\"");
-        for (s) |c| {
+        var segment_start: usize = 0;
+        for (s, 0..) |c, i| {
+            var is_unicode_escape = false;
+            var escape_seq: []const u8 = undefined;
+
             switch (c) {
-                '"' => try self.writeToBuffer("\\\""),
-                '\\' => try self.writeToBuffer("\\\\"),
-                '\n' => try self.writeToBuffer("\\n"),
-                '\r' => try self.writeToBuffer("\\r"),
-                '\t' => try self.writeToBuffer("\\t"),
-                0x00...0x1F => {
-                    // `\uXXXX` is exactly 6 bytes; bufPrint cannot fail with this buffer size.
-                    var buf: [6]u8 = undefined;
-                    const encoded = std.fmt.bufPrint(&buf, "\\u{X:0>4}", .{c}) catch unreachable;
-                    try self.writeToBuffer(encoded);
+                '"' => escape_seq = "\\\"",
+                '\\' => escape_seq = "\\\\",
+                '\n' => escape_seq = "\\n",
+                '\r' => escape_seq = "\\r",
+                '\t' => escape_seq = "\\t",
+                0x00...0x08, 0x0B...0x0C, 0x0E...0x1F => {
+                    is_unicode_escape = true;
                 },
-                else => try self.writeToBuffer(&[_]u8{c}),
+                else => continue,
             }
+
+            if (i > segment_start) {
+                try self.writeToBuffer(s[segment_start..i]);
+            }
+            if (is_unicode_escape) {
+                // `\uXXXX` is exactly 6 bytes; bufPrint cannot fail with this buffer size.
+                var buf: [6]u8 = undefined;
+                const encoded = std.fmt.bufPrint(&buf, "\\u{X:0>4}", .{c}) catch unreachable;
+                try self.writeToBuffer(encoded);
+            } else {
+                try self.writeToBuffer(escape_seq);
+            }
+            segment_start = i + 1;
+        }
+        if (segment_start < s.len) {
+            try self.writeToBuffer(s[segment_start..]);
         }
         try self.writeToBuffer("\"");
+    }
+
+    /// Write `s` as a JSON value: unquoted if it is a number, quoted+escaped otherwise.
+    fn writeJsonValue(self: *JsonWriter, s: []const u8) !void {
+        if (isJsonNumber(s)) {
+            try self.writeToBuffer(s);
+        } else {
+            try self.writeJsonString(s);
+        }
+    }
+
+    fn freeHeaderKeyFragments(self: *JsonWriter) void {
+        if (self.header_key_fragments.len == 0) return;
+        const allocator = std.heap.page_allocator;
+        for (self.header_key_fragments) |frag| allocator.free(frag);
+        allocator.free(self.header_key_fragments);
+        self.header_key_fragments = &[_][]const u8{};
     }
 };
 
@@ -455,6 +580,13 @@ pub const RecordWriter = union(enum) {
         };
     }
 
+    pub fn deinit(self: *RecordWriter) void {
+        switch (self.*) {
+            .csv => {},
+            .json => |*w| w.deinit(),
+        }
+    }
+
     /// Write the header row.
     /// For CSV: writes the row unless `no_header` is true.
     /// For JSON/JSONL: stores column names for use as object keys (ignores `no_header`).
@@ -463,7 +595,7 @@ pub const RecordWriter = union(enum) {
             .csv => |*w| {
                 if (!no_header) try w.writeRecord(fields);
             },
-            .json => |*w| w.setHeader(fields),
+            .json => |*w| try w.setHeader(fields),
         }
     }
 

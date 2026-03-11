@@ -51,6 +51,11 @@ fn appendJsonStringToArena(arena: *ArenaBuffer, s: []const u8) !void {
             '\n' => _ = try arena.append("\\n"),
             '\r' => _ = try arena.append("\\r"),
             '\t' => _ = try arena.append("\\t"),
+            0x00...0x08, 0x0B...0x0C, 0x0E...0x1F => {
+                var buf: [6]u8 = undefined;
+                const encoded = std.fmt.bufPrint(&buf, "\\u{X:0>4}", .{c}) catch unreachable;
+                _ = try arena.append(encoded);
+            },
             else => _ = try arena.append(&[_]u8{c}),
         }
     }
@@ -132,6 +137,7 @@ pub fn executeMapped(
 
     // Write output header
     var writer = csv.RecordWriter.init(output_file, opts);
+    defer writer.deinit();
 
     var output_header = std.ArrayList([]const u8){};
     defer output_header.deinit(allocator);

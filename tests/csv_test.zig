@@ -72,8 +72,9 @@ test "JsonWriter writeRecord outputs JSON array" {
     }
 
     var writer = csv.JsonWriter.init(tmp_file, .json);
+    defer writer.deinit();
     const header = &[_][]const u8{ "name", "age" };
-    writer.setHeader(header);
+    try writer.setHeader(header);
 
     try writer.writeRecord(&[_][]const u8{ "Alice", "35" });
     try writer.writeRecord(&[_][]const u8{ "Bob", "42" });
@@ -86,8 +87,8 @@ test "JsonWriter writeRecord outputs JSON array" {
 
     const expected =
         \\[
-        \\{"name":"Alice","age":"35"},
-        \\{"name":"Bob","age":"42"}
+        \\{"name":"Alice","age":35},
+        \\{"name":"Bob","age":42}
         \\]
         \\
     ;
@@ -105,8 +106,9 @@ test "JsonWriter writeRecord outputs JSONL" {
     }
 
     var writer = csv.JsonWriter.init(tmp_file, .jsonl);
+    defer writer.deinit();
     const header = &[_][]const u8{ "name", "age" };
-    writer.setHeader(header);
+    try writer.setHeader(header);
 
     try writer.writeRecord(&[_][]const u8{ "Alice", "35" });
     try writer.writeRecord(&[_][]const u8{ "Bob", "42" });
@@ -117,7 +119,7 @@ test "JsonWriter writeRecord outputs JSONL" {
     const content = try tmp_file.readToEndAlloc(allocator, 4096);
     defer allocator.free(content);
 
-    const expected = "{\"name\":\"Alice\",\"age\":\"35\"}\n{\"name\":\"Bob\",\"age\":\"42\"}\n";
+    const expected = "{\"name\":\"Alice\",\"age\":35}\n{\"name\":\"Bob\",\"age\":42}\n";
     try std.testing.expectEqualStrings(expected, content);
 }
 
@@ -132,8 +134,9 @@ test "JsonWriter escapes special characters" {
     }
 
     var writer = csv.JsonWriter.init(tmp_file, .jsonl);
+    defer writer.deinit();
     const header = &[_][]const u8{"value"};
-    writer.setHeader(header);
+    try writer.setHeader(header);
 
     // Value with quotes, backslash, tab, newline
     try writer.writeRecord(&[_][]const u8{"say \"hello\"\nworld\t\\"});
@@ -158,8 +161,9 @@ test "JsonWriter empty JSON array" {
     }
 
     var writer = csv.JsonWriter.init(tmp_file, .json);
+    defer writer.deinit();
     const header = &[_][]const u8{ "name", "age" };
-    writer.setHeader(header);
+    try writer.setHeader(header);
     try writer.finish();
     try writer.flush();
 
@@ -182,6 +186,7 @@ test "RecordWriter CSV mode matches CsvWriter output" {
 
     const opts = csv.options.Options{};
     var writer = csv.RecordWriter.init(tmp_file, opts);
+    defer writer.deinit();
     try writer.writeHeader(&[_][]const u8{ "id", "name" }, false);
     try writer.writeRecord(&[_][]const u8{ "1", "Alice" });
     try writer.writeRecord(&[_][]const u8{ "2", "Bob" });

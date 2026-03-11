@@ -58,12 +58,16 @@ fn appendJsonStringToArena(arena: *ArenaBuffer, s: []const u8) !void {
             '\n' => _ = try arena.append("\\n"),
             '\r' => _ = try arena.append("\\r"),
             '\t' => _ = try arena.append("\\t"),
+            0x00...0x08, 0x0B...0x0C, 0x0E...0x1F => {
+                var buf: [6]u8 = undefined;
+                const encoded = std.fmt.bufPrint(&buf, "\\u{X:0>4}", .{c}) catch unreachable;
+                _ = try arena.append(encoded);
+            },
             else => _ = try arena.append(&[_]u8{c}),
         }
     }
     _ = try arena.append("\"");
 }
-
 
 /// separate parser import — avoiding Zig 0.15 module-duplication errors.
 pub const parseQuery = parser.parse;
@@ -141,7 +145,7 @@ fn executeSequential(
     reader.delimiter = opts.delimiter;
 
     var writer = csv.RecordWriter.init(output_file, opts);
-
+    defer writer.deinit();
 
     // Read header
     const header = try reader.readRecord() orelse return error.EmptyFile;
@@ -439,7 +443,7 @@ fn executeFromStdin(
     var reader = csv.CsvReader.init(allocator, stdin);
     reader.delimiter = opts.delimiter;
     var writer = csv.RecordWriter.init(output_file, opts);
-
+    defer writer.deinit();
 
     // Read header
     const header = try reader.readRecord() orelse return error.EmptyFile;
@@ -762,7 +766,7 @@ fn executeDistinct(
     const data = mapped[0..file_size];
 
     var writer = csv.RecordWriter.init(output_file, opts);
-
+    defer writer.deinit();
 
     // Header
     const header_nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
@@ -1009,7 +1013,7 @@ fn executeScalarAgg(
     const data = mapped[0..file_size];
 
     var writer = csv.RecordWriter.init(output_file, opts);
-
+    defer writer.deinit();
 
     // -- Header --
     const header_nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
@@ -1272,7 +1276,7 @@ fn executeGroupBy(
     const data = mapped[0..file_size];
 
     var writer = csv.RecordWriter.init(output_file, opts);
-
+    defer writer.deinit();
 
     // -- Header parsing -----------------------------------------------------
     const header_nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
@@ -2253,8 +2257,8 @@ test "JSON output: basic SELECT produces JSON array" {
 
     const expected =
         \\[
-        \\{"name":"Alice","age":"35"},
-        \\{"name":"Bob","age":"42"}
+        \\{"name":"Alice","age":35},
+        \\{"name":"Bob","age":42}
         \\]
         \\
     ;
@@ -2291,7 +2295,7 @@ test "JSONL output: basic SELECT produces newline-delimited JSON" {
     const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(output);
 
-    const expected = "{\"name\":\"Alice\",\"age\":\"35\"}\n{\"name\":\"Bob\",\"age\":\"42\"}\n";
+    const expected = "{\"name\":\"Alice\",\"age\":35}\n{\"name\":\"Bob\",\"age\":42}\n";
     try std.testing.expectEqualStrings(expected, output);
 }
 
@@ -2328,8 +2332,8 @@ test "JSON output: WHERE clause filters rows" {
     // Only Alice (35) and Bob (42) match age > 30
     const expected =
         \\[
-        \\{"name":"Alice","age":"35"},
-        \\{"name":"Bob","age":"42"}
+        \\{"name":"Alice","age":35},
+        \\{"name":"Bob","age":42}
         \\]
         \\
     ;
@@ -2342,8 +2346,8 @@ test "JSON output: escapes special characters in field values" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    // CSV field value contains a double-quote and a backslash
-    const csv_content = "id,note\n1,\"say \\\"hi\\\"\"\n";
+    // CSV field value contains a literal double-quote via RFC 4180 escaping ("")
+    const csv_content = "id,note\n1,\"say \"\"hi\"\"\"\n";
     {
         const f = try tmp.dir.createFile("input.csv", .{});
         defer f.close();
@@ -2369,6 +2373,39 @@ test "JSON output: escapes special characters in field values" {
 
     // The note value `say "hi"` must be JSON-escaped to `say \"hi\"`
     try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "\\\"hi\\\""));
+}
+
+test "JSON output: ORDER BY path escapes control characters" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const csv_content = "id,note\n2,\"ok\"\n1,\"has\x0Cff\"\n";
+    {
+        const f = try tmp.dir.createFile("input_order_by_control.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input_order_by_control.csv", &in_path_buf);
+    const sql = try std.fmt.allocPrint(allocator, "SELECT id, note FROM '{s}' ORDER BY id ASC", .{in_path});
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("output_order_by_control.jsonl", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file, .{ .format = .jsonl });
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(output);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "\\u000C"));
 }
 
 test "JSON output: CSV mode still produces CSV-compatible output" {

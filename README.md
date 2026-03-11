@@ -54,6 +54,8 @@ csvql "SELECT email FROM 'users.csv'" | wc -l
 | ---- | ----- | ----------- |
 | `--no-header` | | Suppress header row in output |
 | `--delimiter <char>` | `-d` | Field delimiter (default `,`). Use `\t` for TSV |
+| `--json` | | Output as a JSON array (`[{...}, ...]`) |
+| `--jsonl` | | Output as JSONL / NDJSON (one JSON object per line) |
 | `--version` | `-v` | Show version |
 | `--help` | `-h` | Show help |
 
@@ -117,6 +119,18 @@ sudo cp zig-out/bin/csvql /usr/local/bin/
 | `SELECT SUM(salary)` scalar       | **0.050s** | 0.110s | **2.2x** |
 
 **35x less memory** than DuckDB (1.8MB vs 63.5MB).
+
+**5M rows, 173MB CSV, Apple M2** — output-format benchmark (full output, all rows matched, `> /dev/null`):
+
+| Output format | csvql | DuckDB | Speedup |
+| ------------- | ----- | ------ | ------- |
+| CSV | **0.100s** | 0.354s | **3.5x** |
+| JSON array (`--json`) | **0.164s** | 0.434s | **2.6x** |
+| JSONL / NDJSON (`--jsonl`) | **0.172s** | 0.422s | **2.5x** |
+
+Outputs are semantically/byte-identical to DuckDB (verified: CSV byte-for-byte diff; JSONL byte-for-byte diff; JSON array Python-parsed row comparison).
+
+Run the benchmark yourself: [`bench/bench_output_formats.sh`](bench/bench_output_formats.sh)
 
 <details>
 <summary><b>How is csvql so fast?</b></summary>
@@ -203,7 +217,7 @@ See [SIMPLE_QUERY_LANGUAGE.md](SIMPLE_QUERY_LANGUAGE.md) for the full reference.
 | ------- | ----- | ------ |
 | `--no-header` / `--delimiter` flags | [#12](https://github.com/melihbirim/csvql/issues/12) | ✅ shipped (v0.5.0) |
 | `LIKE` operator in WHERE | [#13](https://github.com/melihbirim/csvql/issues/13) | planned |
-| `--json` / `--jsonl` output format | [#14](https://github.com/melihbirim/csvql/issues/14) | planned |
+| `--json` / `--jsonl` output format | [#14](https://github.com/melihbirim/csvql/issues/14) | ✅ shipped |
 
 ## Contributing
 
