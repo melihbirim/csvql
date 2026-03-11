@@ -2,6 +2,12 @@ const std = @import("std");
 
 /// Benchmark: Pure CSV parsing (count rows and fields)
 /// Tests raw parsing performance without query overhead
+///
+/// Usage:
+///   csv_parse_bench <file.csv> [--include-naive]
+///
+/// The naive (byte-by-byte) benchmark is skipped by default because it takes
+/// several minutes on large files. Pass --include-naive to run it.
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -11,11 +17,15 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     if (args.len < 2) {
-        std.debug.print("Usage: csv_parse_bench <file.csv>\n", .{});
+        std.debug.print("Usage: csv_parse_bench <file.csv> [--include-naive]\n", .{});
         std.process.exit(1);
     }
 
     const file_path = args[1];
+    var include_naive = false;
+    for (args[2..]) |arg| {
+        if (std.mem.eql(u8, arg, "--include-naive")) include_naive = true;
+    }
 
     std.debug.print("Benchmarking CSV parsing on: {s}\n", .{file_path});
     std.debug.print("===========================================\n\n", .{});
@@ -23,8 +33,12 @@ pub fn main() !void {
     // Benchmark 1: Our buffered reader
     try benchmarkOurReader(allocator, file_path);
 
-    // Benchmark 2: Naive line-by-line
-    try benchmarkNaive(allocator, file_path);
+    // Benchmark 2: Naive line-by-line (skipped by default — very slow on large files)
+    if (include_naive) {
+        try benchmarkNaive(allocator, file_path);
+    } else {
+        std.debug.print("2. Naive (line-by-line): skipped (pass --include-naive to run)\n\n", .{});
+    }
 
     // Benchmark 3: Memory-mapped (our best approach)
     try benchmarkMmap(allocator, file_path);
