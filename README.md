@@ -130,7 +130,7 @@ sudo cp zig-out/bin/csvql /usr/local/bin/
 
 Outputs are semantically/byte-identical to DuckDB (verified: CSV byte-for-byte diff; JSONL byte-for-byte diff; JSON array Python-parsed row comparison).
 
-Run the benchmark yourself: [`bench/bench_output_formats.sh`](bench/bench_output_formats.sh)
+Run the benchmark yourself: [`bench/bench_all.sh --section formats`](bench/bench_all.sh)
 
 **5M rows, 173MB CSV, Apple M2** — LIKE operator benchmark (CSV output, `> /dev/null`):
 
@@ -142,7 +142,9 @@ Run the benchmark yourself: [`bench/bench_output_formats.sh`](bench/bench_output
 
 Row counts verified identical to DuckDB.
 
-Run the benchmark yourself: [`bench/bench_like.sh`](bench/bench_like.sh)
+Run the benchmark yourself: [`bench/bench_all.sh --section like`](bench/bench_all.sh)
+
+Run the full suite (all sections): [`bench/bench_all.sh`](bench/bench_all.sh)
 
 <details>
 <summary><b>How is csvql so fast?</b></summary>
