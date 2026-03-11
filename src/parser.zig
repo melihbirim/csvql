@@ -141,7 +141,8 @@ pub const Query = struct {
     group_by: [][]u8,
     limit: i32,
     order_by: ?OrderBy,
-    join: ?JoinClause,
+    /// All JOIN clauses in order (empty slice when there is no JOIN).
+    joins: []JoinClause,
     allocator: Allocator,
 
     pub fn deinit(self: *Query) void {
@@ -164,9 +165,10 @@ pub const Query = struct {
             ob.deinit(self.allocator);
         }
 
-        if (self.join) |*j| {
+        for (self.joins) |*j| {
             j.deinit(self.allocator);
         }
+        self.allocator.free(self.joins);
     }
 };
 
@@ -258,7 +260,7 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
         .group_by = undefined,
         .limit = -1,
         .order_by = null,
-        .join = null,
+        .joins = &.{},
         .allocator = allocator,
     };
 
@@ -303,87 +305,120 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
         query.columns = try col_list.toOwnedSlice(allocator);
     }
 
-    // Extract file path (and optional JOIN clause) from FROM clause
+    // Extract file path (and optional JOIN clauses) from FROM clause.
+    // Supports chained JOINs:  FROM a JOIN b ON ... JOIN c ON ... WHERE ...
     const from_rest = trimmed[from_idx + 4 ..];
     var rest: []const u8 = undefined;
 
-    // Detect INNER JOIN or bare JOIN keyword
-    const join_kw = detectJoinKeyword(from_rest);
-    if (join_kw) |jk| {
-        // Everything before the JOIN keyword is the left file + optional alias
-        const left_raw = std.mem.trim(u8, from_rest[0..jk.kw_start], &std.ascii.whitespace);
-        // Everything after JOIN keyword is: right_file [alias] ON cond [WHERE ...]
-        const after_join = std.mem.trimLeft(u8, from_rest[jk.kw_end..], &std.ascii.whitespace);
+    // Collect all JOIN clauses into a temporary list.
+    var joins_list = std.ArrayList(JoinClause){};
+    // On error, free any already-collected JoinClause items.
+    errdefer {
+        for (joins_list.items) |*jc| jc.deinit(allocator);
+        joins_list.deinit(allocator);
+    }
 
-        // Find ON keyword (requires a space on each side to avoid matching column names)
-        const on_pos = std.ascii.indexOfIgnoreCase(after_join, " ON ") orelse return error.InvalidJoinSyntax;
-        const right_raw = std.mem.trim(u8, after_join[0..on_pos], &std.ascii.whitespace);
-        // Tail after " ON " (4 chars)
-        const after_on = after_join[on_pos + 4 ..];
-
-        // Find end of ON condition (start of WHERE / GROUP BY / ORDER BY / LIMIT)
-        const on_where = std.ascii.indexOfIgnoreCase(after_on, "WHERE");
-        const on_group = std.ascii.indexOfIgnoreCase(after_on, "GROUP BY");
-        const on_order = std.ascii.indexOfIgnoreCase(after_on, "ORDER BY");
-        const on_limit = std.ascii.indexOfIgnoreCase(after_on, "LIMIT");
-        var on_end = after_on.len;
-        if (on_where) |i| on_end = @min(on_end, i);
-        if (on_group) |i| on_end = @min(on_end, i);
-        if (on_order) |i| on_end = @min(on_end, i);
-        if (on_limit) |i| on_end = @min(on_end, i);
-
-        const on_cond = std.mem.trim(u8, after_on[0..on_end], &std.ascii.whitespace);
-
-        // Parse left file + alias
-        const left_info = try extractFileAndAlias(allocator, left_raw);
+    if (detectJoinKeyword(from_rest)) |first_jk| {
+        // ---- There is at least one JOIN ----
+        // Left file + optional alias is everything before the first JOIN keyword.
+        const first_left_raw = std.mem.trim(u8, from_rest[0..first_jk.kw_start], &std.ascii.whitespace);
+        const first_left_info = try extractFileAndAlias(allocator, first_left_raw);
         errdefer {
-            allocator.free(left_info.file);
-            allocator.free(left_info.alias);
+            allocator.free(first_left_info.file);
+            allocator.free(first_left_info.alias);
         }
+        query.file_path = first_left_info.file;
 
-        // Parse right file + alias
-        const right_info = try extractFileAndAlias(allocator, right_raw);
-        errdefer {
-            allocator.free(right_info.file);
-            allocator.free(right_info.alias);
-        }
+        // Walk the remaining string, collecting one JoinClause per JOIN keyword.
+        // `cursor` always points into `from_rest` just after the last consumed JOIN keyword.
+        var cursor = std.mem.trimLeft(u8, from_rest[first_jk.kw_end..], &std.ascii.whitespace);
+        // left_alias for the *current* join step starts as the alias of the base left file.
+        var current_left_alias = first_left_info.alias;
+        // We'll re-assign current_left_alias at each iteration; ownership of the original
+        // string is transferred into the JoinClause we pushed in the *previous* iteration
+        // (or remains as first_left_info.alias for the very first clause), so no extra free.
 
-        // Parse ON condition: "left_alias.col = right_alias.col"
-        // Find '=' that is not part of '<=' or '>=' or '!='
-        const eq_pos = blk: {
-            var si: usize = 0;
-            while (si < on_cond.len) : (si += 1) {
-                if (on_cond[si] == '=' and
-                    (si == 0 or (on_cond[si - 1] != '<' and on_cond[si - 1] != '>' and on_cond[si - 1] != '!')))
-                {
-                    break :blk si;
-                }
+        while (true) {
+            // cursor = "right_file [alias] ON left.col = right.col [JOIN ...] [WHERE ...]"
+
+            // Find ON keyword for this join step.
+            const on_pos = std.ascii.indexOfIgnoreCase(cursor, " ON ") orelse return error.InvalidJoinSyntax;
+            const right_raw = std.mem.trim(u8, cursor[0..on_pos], &std.ascii.whitespace);
+            const after_on = cursor[on_pos + 4 ..]; // skip " ON "
+
+            // Find end of ON condition: stop at the next JOIN keyword OR at WHERE/GROUP/ORDER/LIMIT.
+            // We must stop at the *next* JOIN keyword before any clause keyword so that chained
+            // joins are parsed left–to–right rather than lumping everything into one condition.
+            const next_join_kw = detectJoinKeyword(after_on);
+            const on_where = std.ascii.indexOfIgnoreCase(after_on, "WHERE");
+            const on_group = std.ascii.indexOfIgnoreCase(after_on, "GROUP BY");
+            const on_order = std.ascii.indexOfIgnoreCase(after_on, "ORDER BY");
+            const on_limit = std.ascii.indexOfIgnoreCase(after_on, "LIMIT");
+            var on_end = after_on.len;
+            if (next_join_kw) |njk| on_end = @min(on_end, njk.kw_start);
+            if (on_where) |i| on_end = @min(on_end, i);
+            if (on_group) |i| on_end = @min(on_end, i);
+            if (on_order) |i| on_end = @min(on_end, i);
+            if (on_limit) |i| on_end = @min(on_end, i);
+
+            const on_cond = std.mem.trim(u8, after_on[0..on_end], &std.ascii.whitespace);
+
+            // Parse right file + alias.
+            const right_info = try extractFileAndAlias(allocator, right_raw);
+            errdefer {
+                allocator.free(right_info.file);
+                allocator.free(right_info.alias);
             }
-            return error.InvalidJoinSyntax;
-        };
-        const on_left_expr = std.mem.trim(u8, on_cond[0..eq_pos], &std.ascii.whitespace);
-        const on_right_expr = std.mem.trim(u8, on_cond[eq_pos + 1 ..], &std.ascii.whitespace);
 
-        // Strip alias prefix from join column names (e.g. "a.id" → "id")
-        const lj_col = if (std.mem.indexOf(u8, on_left_expr, ".")) |d| on_left_expr[d + 1 ..] else on_left_expr;
-        const rj_col = if (std.mem.indexOf(u8, on_right_expr, ".")) |d| on_right_expr[d + 1 ..] else on_right_expr;
+            // Parse ON condition: "left_alias.col = right_alias.col"
+            const eq_pos = blk: {
+                var si: usize = 0;
+                while (si < on_cond.len) : (si += 1) {
+                    if (on_cond[si] == '=' and
+                        (si == 0 or (on_cond[si - 1] != '<' and on_cond[si - 1] != '>' and on_cond[si - 1] != '!')))
+                    {
+                        break :blk si;
+                    }
+                }
+                return error.InvalidJoinSyntax;
+            };
+            const on_left_expr = std.mem.trim(u8, on_cond[0..eq_pos], &std.ascii.whitespace);
+            const on_right_expr = std.mem.trim(u8, on_cond[eq_pos + 1 ..], &std.ascii.whitespace);
 
-        const ljc = try allocator.alloc(u8, lj_col.len);
-        _ = std.ascii.lowerString(ljc, lj_col);
-        const rjc = try allocator.alloc(u8, rj_col.len);
-        _ = std.ascii.lowerString(rjc, rj_col);
+            // Strip alias prefix from join column names (e.g. "a.id" → "id")
+            const lj_col = if (std.mem.indexOf(u8, on_left_expr, ".")) |d| on_left_expr[d + 1 ..] else on_left_expr;
+            const rj_col = if (std.mem.indexOf(u8, on_right_expr, ".")) |d| on_right_expr[d + 1 ..] else on_right_expr;
 
-        query.file_path = left_info.file;
-        query.join = JoinClause{
-            .right_file = right_info.file,
-            .left_alias = left_info.alias,
-            .right_alias = right_info.alias,
-            .left_col = ljc,
-            .right_col = rjc,
-        };
+            const ljc = try allocator.alloc(u8, lj_col.len);
+            _ = std.ascii.lowerString(ljc, lj_col);
+            const rjc = try allocator.alloc(u8, rj_col.len);
+            _ = std.ascii.lowerString(rjc, rj_col);
 
-        // Rest = tail after ON condition (starts with WHERE / GROUP BY / etc. or empty)
-        rest = after_on[on_end..];
+            try joins_list.append(allocator, JoinClause{
+                .right_file = right_info.file,
+                .left_alias = current_left_alias,
+                .right_alias = right_info.alias,
+                .left_col = ljc,
+                .right_col = rjc,
+            });
+
+            // The right alias of this step becomes the left alias of the *next* step
+            // so that the ON condition in the next join can reference columns from the
+            // accumulated result.  We hand off ownership of right_info.alias into the
+            // JoinClause we just appended; we need a fresh copy for the next iteration.
+            if (next_join_kw) |njk| {
+                // Alias ownership already transferred above.  Derive new current_left_alias
+                // from right_info.alias (already stored in the clause, so dupe it).
+                current_left_alias = try allocator.dupe(u8, right_info.alias);
+                cursor = std.mem.trimLeft(u8, after_on[njk.kw_end..], &std.ascii.whitespace);
+            } else {
+                // current_left_alias was transferred into the JoinClause; we're done.
+                rest = after_on[on_end..];
+                break;
+            }
+        }
+
+        query.joins = try joins_list.toOwnedSlice(allocator);
     } else {
         // No JOIN: single-file query — extract file path from between FROM and first clause keyword
         const where_idx_pre = std.ascii.indexOfIgnoreCase(from_rest, "WHERE");
@@ -399,7 +434,7 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
 
         const fp = std.mem.trim(u8, from_rest[0..fend], &std.ascii.whitespace);
         query.file_path = try allocator.dupe(u8, trimQuotes(fp));
-        query.join = null;
+        query.joins = try allocator.alloc(JoinClause, 0);
         rest = from_rest;
     }
 
