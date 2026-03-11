@@ -291,12 +291,14 @@ fn executeSequential(
                                 .greater_equal => val >= threshold,
                                 .less => val < threshold,
                                 .less_equal => val <= threshold,
+                                .like => parser.matchLike(field_value, comp.value),
                             };
                         } else {
                             // String comparison
                             matches = switch (comp.operator) {
                                 .equal => std.mem.eql(u8, field_value, comp.value),
                                 .not_equal => !std.mem.eql(u8, field_value, comp.value),
+                                .like => parser.matchLike(field_value, comp.value),
                                 else => false, // String doesn't support < > comparisons
                             };
                         }
@@ -548,12 +550,14 @@ fn executeFromStdin(
                                 .greater_equal => val >= threshold,
                                 .less => val < threshold,
                                 .less_equal => val <= threshold,
+                                .like => parser.matchLike(field_value, comp.value),
                             };
                         } else {
                             // String comparison
                             matches = switch (comp.operator) {
                                 .equal => std.mem.eql(u8, field_value, comp.value),
                                 .not_equal => !std.mem.eql(u8, field_value, comp.value),
+                                .like => parser.matchLike(field_value, comp.value),
                                 else => false, // String doesn't support < > comparisons
                             };
                         }
@@ -899,11 +903,13 @@ fn executeDistinct(
                         .greater_equal => val >= threshold,
                         .less => val < threshold,
                         .less_equal => val <= threshold,
+                        .like => parser.matchLike(fv, comp.value),
                     };
                 } else {
                     matches = switch (comp.operator) {
                         .equal => std.mem.eql(u8, fv, comp.value),
                         .not_equal => !std.mem.eql(u8, fv, comp.value),
+                        .like => parser.matchLike(fv, comp.value),
                         else => false,
                     };
                 }
@@ -1139,11 +1145,13 @@ fn executeScalarAgg(
                         .greater_equal => val >= threshold,
                         .less => val < threshold,
                         .less_equal => val <= threshold,
+                        .like => parser.matchLike(fv, comp.value),
                     };
                 } else {
                     matches = switch (comp.operator) {
                         .equal => std.mem.eql(u8, fv, comp.value),
                         .not_equal => !std.mem.eql(u8, fv, comp.value),
+                        .like => parser.matchLike(fv, comp.value),
                         else => false,
                     };
                 }
@@ -1435,11 +1443,13 @@ fn executeGroupBy(
                         .greater_equal => val >= threshold,
                         .less => val < threshold,
                         .less_equal => val <= threshold,
+                        .like => parser.matchLike(fv, comp.value),
                     };
                 } else {
                     matches = switch (comp.operator) {
                         .equal => std.mem.eql(u8, fv, comp.value),
                         .not_equal => !std.mem.eql(u8, fv, comp.value),
+                        .like => parser.matchLike(fv, comp.value),
                         else => false,
                     };
                 }

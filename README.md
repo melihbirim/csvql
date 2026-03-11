@@ -132,6 +132,18 @@ Outputs are semantically/byte-identical to DuckDB (verified: CSV byte-for-byte d
 
 Run the benchmark yourself: [`bench/bench_output_formats.sh`](bench/bench_output_formats.sh)
 
+**5M rows, 173MB CSV, Apple M2** — LIKE operator benchmark (CSV output, `> /dev/null`):
+
+| Pattern | Description | csvql | DuckDB | Speedup |
+| ------- | ----------- | ----- | ------ | ------- |
+| `WHERE name LIKE 'A%'` | Prefix wildcard | **0.06s** | 2.17s | **~36x** |
+| `WHERE city LIKE '%on'` | Suffix wildcard | **0.06s** | 1.12s | **~19x** |
+| `WHERE department LIKE '%ing'` | Suffix, high selectivity | **0.07s** | 2.54s | **~36x** |
+
+Row counts verified identical to DuckDB.
+
+Run the benchmark yourself: [`bench/bench_like.sh`](bench/bench_like.sh)
+
 <details>
 <summary><b>How is csvql so fast?</b></summary>
 
@@ -166,6 +178,7 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 | **DISTINCT**     | `SELECT DISTINCT col1, col2` — deduplicates output rows                 |
 | **FROM**         | `FROM 'file.csv'` or `FROM -` (stdin)                                   |
 | **WHERE**        | `=`, `!=`, `>`, `>=`, `<`, `<=` with auto numeric coercion              |
+| **LIKE**         | `WHERE col LIKE 'pattern'` — `%` any sequence, `_` any single character |
 | **GROUP BY**     | `GROUP BY col1` — groups rows for aggregation                           |
 | **COUNT**        | `COUNT(*)` or `COUNT(col)` — with or without `GROUP BY`                 |
 | **SUM**          | `SUM(col)` — with or without `GROUP BY`                                 |
@@ -216,7 +229,7 @@ See [SIMPLE_QUERY_LANGUAGE.md](SIMPLE_QUERY_LANGUAGE.md) for the full reference.
 | Feature | Issue | Status |
 | ------- | ----- | ------ |
 | `--no-header` / `--delimiter` flags | [#12](https://github.com/melihbirim/csvql/issues/12) | ✅ shipped (v0.5.0) |
-| `LIKE` operator in WHERE | [#13](https://github.com/melihbirim/csvql/issues/13) | planned |
+| `LIKE` operator in WHERE | [#13](https://github.com/melihbirim/csvql/issues/13) | ✅ shipped |
 | `--json` / `--jsonl` output format | [#14](https://github.com/melihbirim/csvql/issues/14) | ✅ shipped |
 
 ## Contributing
