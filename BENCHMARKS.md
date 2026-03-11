@@ -286,13 +286,14 @@ Key achievements:
 | **ORDER BY (1M rows)** | **csvql** 🏆 | **7.8x faster** | Radix sort + pass-skipping |
 | **WHERE (full output)** | **csvql** 🏆 | **5.2x faster** | Zero-copy + lock-free parallel |
 | **Full scan (1M rows)** | **csvql** 🏆 | **5.9x faster** | mmap + SIMD + parallel output |
-| **JOIN lookup (1M × 6)** | **csvql** 🏆 | **10.7x faster** | Hash-join, right table in memory |
-| **JOIN + WHERE (1M × 6)** | **csvql** 🏆 | **5.9x faster** | Fast-path direct column index |
-| **JOIN SELECT * (1M × 6)** | **csvql** 🏆 | **18.8x faster** | Streaming output vs DuckDB serialisation |
-| **JOIN cities (1M × 8)** | **csvql** 🏆 | **10.0x faster** | Hash-join, tiny build side |
-| **JOIN larger right (1M × 50K)** | **csvql** 🏆 | **2.7x faster** | String-key hash probe at scale |
-| **3-table JOIN (1M × 6 × 3)** | **csvql** 🏆 | **3.2x faster** | Iterative hash-join steps |
-| **3-table JOIN + WHERE** | **csvql** 🏆 | **2.8x faster** | WHERE fast-path on third table |
+| **JOIN lookup (1M × 6)** | **csvql** 🏆 | **3.5x faster** | Hash-join, right table in memory |
+| **JOIN + WHERE (1M × 6)** | **csvql** 🏆 | **1.5x faster** | Fast-path direct column index |
+| **JOIN SELECT * (1M × 6)** | **csvql** 🏆 | **8.3x faster** | Streaming output vs DuckDB serialisation |
+| **JOIN cities (1M × 8)** | **csvql** 🏆 | **3.6x faster** | Hash-join, tiny build side |
+| **JOIN larger right (1M × 50K)** | **csvql** 🏆 | **1.0x (tied)** | String-key hash probe at scale |
+| **3-table JOIN (1M × 6 × 3)** | **csvql** 🏆 | **3.8x faster** | Iterative hash-join, 2 JOIN ops |
+| **3-table JOIN + WHERE** | **csvql** 🏆 | **3.0x faster** | WHERE fast-path on third table |
+| **4-table JOIN (1M × 6 × 3 × 6)** | **csvql** 🏆 | **3.2x faster** | 3 chained JOIN ops, N-table support |
 | **Memory usage** | **csvql** 🏆 | **35x less** | Streaming architecture |
 
 ### csvql Optimization Journey 🚀
@@ -322,13 +323,14 @@ Tested on `large_test.csv` (1M rows, 35 MB). Right tables range from 6 to 50K ro
 
 | Query | csvql | DuckDB | Speedup |
 |-------|-------|--------|---------|
-| `employees JOIN departments (1M × 6)` | **0.140s** | 1.492s | **10.7x** |
-| `JOIN + WHERE d.region = 'West' (1M × 6)` | **0.102s** | 0.600s | **5.9x** |
-| `JOIN SELECT * (1M × 6)` | **0.220s** | 4.130s | **18.8x** |
-| `employees JOIN cities (1M × 8)` | **0.146s** | 1.464s | **10.0x** |
-| `employees JOIN bonus_50k (1M × 50K)` | **0.104s** | 0.276s | **2.7x** |
-| `3-table JOIN: emp → dept → region (1M × 6 × 3)` | **0.600s** | 1.900s | **3.2x** |
-| `3-table JOIN + WHERE continent (1M × 6 × 3)` | **0.537s** | 1.517s | **2.8x** |
+| `employees JOIN departments (1M × 6)` | **0.433s** | 1.497s | **3.5x** |
+| `JOIN + WHERE d.region = 'West' (1M × 6)` | **0.403s** | 0.597s | **1.5x** |
+| `JOIN SELECT * (1M × 6)` | **0.513s** | 4.277s | **8.3x** |
+| `employees JOIN cities (1M × 8)` | **0.417s** | 1.503s | **3.6x** |
+| `employees JOIN bonus_50k (1M × 50K)` | **0.280s** | 0.283s | **~1.0x** |
+| `3-table: emp → dept → region (2 JOINs, 1M × 6 × 3)` | **0.490s** | 1.883s | **3.8x** |
+| `3-table + WHERE continent (2 JOINs, 1M × 6 × 3)` | **0.503s** | 1.533s | **3.0x** |
+| `4-table: emp → dept → region → continent (3 JOINs)` | **0.683s** | 2.183s | **3.2x** |
 
 ### Architecture
 

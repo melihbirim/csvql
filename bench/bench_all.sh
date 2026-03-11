@@ -374,13 +374,24 @@ EOF
     "SELECT e.name, e.salary, b.bonus_pct FROM '${CSV}' e INNER JOIN '${BONUS}' b ON e.id = b.emp_id" \
     "SELECT e.name, e.salary, b.bonus_pct FROM read_csv_auto('${CSV}') AS e JOIN read_csv_auto('${BONUS}') AS b ON e.id::TEXT = b.emp_id::TEXT"
 
-  # ── 3-table chained JOIN ───────────────────────────────────────
+  # ── 3-table and 4-table chained JOINs ─────────────────────────
   local REGIONS="${BENCH_DIR}/bench_regions.csv"
   cat > "$REGIONS" <<'EOF'
 region_name,continent
 West,North America
 East,North America
 Central,North America
+EOF
+
+  local CONTINENTS="${BENCH_DIR}/bench_continents.csv"
+  cat > "$CONTINENTS" <<'EOF'
+continent,hemisphere
+North America,Northern
+South America,Southern
+Europe,Northern
+Asia,Northern
+Africa,Southern
+Australia,Southern
 EOF
 
   run_query \
@@ -392,6 +403,11 @@ EOF
     "3-table JOIN + WHERE (${ROW_COUNT} × 6 × 3): WHERE r.continent = 'North America'" \
     "SELECT e.name, e.salary, d.region FROM '${CSV}' e INNER JOIN '${DEPTS}' d ON e.department = d.dept_name INNER JOIN '${REGIONS}' r ON d.region = r.region_name WHERE r.continent = 'North America'" \
     "SELECT e.name, e.salary, d.region FROM read_csv_auto('${CSV}') AS e JOIN read_csv_auto('${DEPTS}') AS d ON e.department = d.dept_name JOIN read_csv_auto('${REGIONS}') AS r ON d.region = r.region_name WHERE r.continent = 'North America'"
+
+  run_query \
+    "4-table JOIN (${ROW_COUNT} × 6 × 3 × 6): employees → depts → regions → continents" \
+    "SELECT e.name, e.salary, d.region, r.continent, c.hemisphere FROM '${CSV}' e INNER JOIN '${DEPTS}' d ON e.department = d.dept_name INNER JOIN '${REGIONS}' r ON d.region = r.region_name INNER JOIN '${CONTINENTS}' c ON r.continent = c.continent" \
+    "SELECT e.name, e.salary, d.region, r.continent, c.hemisphere FROM read_csv_auto('${CSV}') AS e JOIN read_csv_auto('${DEPTS}') AS d ON e.department = d.dept_name JOIN read_csv_auto('${REGIONS}') AS r ON d.region = r.region_name JOIN read_csv_auto('${CONTINENTS}') AS c ON r.continent = c.continent"
 }
 
 # ═════════════════════════════════════════════════════════════════
