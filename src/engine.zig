@@ -617,6 +617,33 @@ fn executeJoin(
 
     var rows_written: i32 = 0;
 
+    // --- Pre-compute WHERE column index in merged_row for fast-path evaluation ---
+    // merged_row layout: [left_col_0 .. left_col_{lw-1}, right_col_0 .. right_col_{rw-1}]
+    var where_merged_idx: ?usize = null;
+    if (query.where_expr) |expr| {
+        if (expr == .comparison) {
+            const col = expr.comparison.column; // already lowercased by parser
+            // Try qualified alias.col lookup first
+            if (std.mem.indexOf(u8, col, ".")) |dot| {
+                const col_alias = col[0..dot];
+                const col_name = col[dot + 1 ..];
+                if (join.left_alias.len > 0 and std.mem.eql(u8, col_alias, join.left_alias)) {
+                    if (left_col_map.get(col_name)) |idx| where_merged_idx = idx;
+                } else if (join.right_alias.len > 0 and std.mem.eql(u8, col_alias, join.right_alias)) {
+                    if (right_col_map.get(col_name)) |idx| where_merged_idx = lw + idx;
+                }
+            }
+            // Fall back to unqualified: left table first, then right
+            if (where_merged_idx == null) {
+                if (left_col_map.get(col)) |idx| {
+                    where_merged_idx = idx;
+                } else if (right_col_map.get(col)) |idx| {
+                    where_merged_idx = lw + idx;
+                }
+            }
+        }
+    }
+
     // --- Stream left table and probe hash map ---
     while (try left_reader.readRecordSlices()) |lrow| {
         if (ljidx >= lrow.len) continue;
@@ -631,30 +658,61 @@ fn executeJoin(
 
             // Apply WHERE clause if present
             if (query.where_expr) |expr| {
-                _ = row_arena.reset(.retain_capacity);
-                const ra = row_arena.allocator();
-
-                var row_map = std.StringHashMap([]const u8).init(ra);
-                // Populate with left columns (qualified and unqualified)
-                for (left_lh, 0..) |lh, i| {
-                    const v = if (i < lrow.len) lrow[i] else "";
-                    try row_map.put(lh, v);
-                    if (join.left_alias.len > 0) {
-                        const qk = try std.fmt.allocPrint(ra, "{s}.{s}", .{ join.left_alias, lh });
-                        try row_map.put(qk, v);
+                if (expr == .comparison) {
+                    const comp = expr.comparison;
+                    // Fast path: direct index lookup in merged row
+                    if (where_merged_idx) |midx| {
+                        const field_value = merged_row[midx];
+                        var matches_where = false;
+                        if (comp.numeric_value) |threshold| {
+                            const val = std.fmt.parseFloat(f64, field_value) catch {
+                                continue;
+                            };
+                            matches_where = switch (comp.operator) {
+                                .equal => val == threshold,
+                                .not_equal => val != threshold,
+                                .greater => val > threshold,
+                                .greater_equal => val >= threshold,
+                                .less => val < threshold,
+                                .less_equal => val <= threshold,
+                                .like => parser.matchLike(field_value, comp.value),
+                            };
+                        } else {
+                            matches_where = switch (comp.operator) {
+                                .equal => std.mem.eql(u8, field_value, comp.value),
+                                .not_equal => !std.mem.eql(u8, field_value, comp.value),
+                                .like => parser.matchLike(field_value, comp.value),
+                                else => false,
+                            };
+                        }
+                        if (!matches_where) continue;
+                    } else {
+                        continue; // Column not found — skip all rows
                     }
-                }
-                // Populate with right columns (qualified; unqualified only if not shadowed by left)
-                for (right_lh, 0..) |rh, i| {
-                    const v = if (i < rrow.len) rrow[i] else "";
-                    if (row_map.get(rh) == null) try row_map.put(rh, v);
-                    if (join.right_alias.len > 0) {
-                        const qk = try std.fmt.allocPrint(ra, "{s}.{s}", .{ join.right_alias, rh });
-                        try row_map.put(qk, v);
-                    }
-                }
+                } else {
+                    // Complex expressions (AND/OR/NOT) — build HashMap fallback
+                    _ = row_arena.reset(.retain_capacity);
+                    const ra = row_arena.allocator();
 
-                if (!parser.evaluate(expr, row_map)) continue;
+                    var row_map = std.StringHashMap([]const u8).init(ra);
+                    for (left_lh, 0..) |lh, i| {
+                        const v = if (i < lrow.len) lrow[i] else "";
+                        try row_map.put(lh, v);
+                        if (join.left_alias.len > 0) {
+                            const qk = try std.fmt.allocPrint(ra, "{s}.{s}", .{ join.left_alias, lh });
+                            try row_map.put(qk, v);
+                        }
+                    }
+                    for (right_lh, 0..) |rh, i| {
+                        const v = if (i < rrow.len) rrow[i] else "";
+                        if (row_map.get(rh) == null) try row_map.put(rh, v);
+                        if (join.right_alias.len > 0) {
+                            const qk = try std.fmt.allocPrint(ra, "{s}.{s}", .{ join.right_alias, rh });
+                            try row_map.put(qk, v);
+                        }
+                    }
+                    if (!parser.evaluate(expr, row_map)) continue;
+                }
             }
 
             // Project output columns

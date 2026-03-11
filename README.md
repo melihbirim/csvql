@@ -144,6 +144,18 @@ Row counts verified identical to DuckDB.
 
 Run the benchmark yourself: [`bench/bench_all.sh --section like`](bench/bench_all.sh)
 
+**1M rows, 35MB CSV, Apple M2** — JOIN benchmark (hash-join, CSV output, `> /dev/null`):
+
+| Query                                          | csvql      | DuckDB | Speedup   |
+| ---------------------------------------------- | ---------- | ------ | --------- |
+| `JOIN departments` (1M × 6 rows)               | **0.140s** | 1.492s | **10.7x** |
+| `JOIN + WHERE d.region = 'West'` (1M × 6)      | **0.102s** | 0.600s | **5.9x**  |
+| `JOIN SELECT *` (1M × 6, all cols)             | **0.220s** | 4.130s | **18.8x** |
+| `JOIN cities` (1M × 8 rows)                    | **0.146s** | 1.464s | **10.0x** |
+| `JOIN bonus_50k` (1M × 50K rows, numeric key)  | **0.104s** | 0.276s | **2.7x**  |
+
+Run the benchmark yourself: [`bench/bench_all.sh --section join`](bench/bench_all.sh)
+
 Run the full suite (all sections): [`bench/bench_all.sh`](bench/bench_all.sh)
 
 <details>

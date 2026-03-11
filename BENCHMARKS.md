@@ -286,6 +286,11 @@ Key achievements:
 | **ORDER BY (1M rows)** | **csvql** 🏆 | **7.8x faster** | Radix sort + pass-skipping |
 | **WHERE (full output)** | **csvql** 🏆 | **5.2x faster** | Zero-copy + lock-free parallel |
 | **Full scan (1M rows)** | **csvql** 🏆 | **5.9x faster** | mmap + SIMD + parallel output |
+| **JOIN lookup (1M × 6)** | **csvql** 🏆 | **10.7x faster** | Hash-join, right table in memory |
+| **JOIN + WHERE (1M × 6)** | **csvql** 🏆 | **5.9x faster** | Fast-path direct column index |
+| **JOIN SELECT * (1M × 6)** | **csvql** 🏆 | **18.8x faster** | Streaming output vs DuckDB serialisation |
+| **JOIN cities (1M × 8)** | **csvql** 🏆 | **10.0x faster** | Hash-join, tiny build side |
+| **JOIN larger right (1M × 50K)** | **csvql** 🏆 | **2.7x faster** | String-key hash probe at scale |
 | **Memory usage** | **csvql** 🏆 | **35x less** | Streaming architecture |
 
 ### csvql Optimization Journey 🚀
@@ -308,4 +313,25 @@ Key achievements:
 **DuckDB** remains excellent for:
 - Complex SQL (joins, window functions, aggregations)
 - Multi-format data sources beyond CSV
+
+## JOIN Benchmarks (hash-join, 1M-row left table)
+
+Tested on `large_test.csv` (1M rows, 35 MB). Right tables range from 6 to 50K rows.
+
+| Query | csvql | DuckDB | Speedup |
+|-------|-------|--------|---------|
+| `employees JOIN departments (1M × 6)` | **0.140s** | 1.492s | **10.7x** |
+| `JOIN + WHERE d.region = 'West' (1M × 6)` | **0.102s** | 0.600s | **5.9x** |
+| `JOIN SELECT * (1M × 6)` | **0.220s** | 4.130s | **18.8x** |
+| `employees JOIN cities (1M × 8)` | **0.146s** | 1.464s | **10.0x** |
+| `employees JOIN bonus_50k (1M × 50K)` | **0.104s** | 0.276s | **2.7x** |
+
+### Architecture
+
+csvql uses a **hash-join** strategy:
+- Right table fully loaded into `StringHashMap` (build side)
+- Left table streamed row-by-row (probe side)  
+- WHERE clause resolved to a direct column index before the loop — zero per-row allocations for simple comparisons
+
+The large speedup on `SELECT *` queries is due to DuckDB's format serialisation overhead; csvql streams output incrementally.
 - Interactive exploration with sophisticated query planning
