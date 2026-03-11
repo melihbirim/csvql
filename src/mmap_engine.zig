@@ -324,11 +324,11 @@ pub fn executeMapped(
                         _ = try a.append("}");
                     },
                 }
-                const csv_line = a.data[line_buf_start..a.pos];
+                const output_line = a.data[line_buf_start..a.pos];
                 try entries.append(allocator, fast_sort.makeSortKey(
                     numeric_key,
                     sort_key,
-                    csv_line,
+                    output_line,
                 ));
                 rows_written += 1;
             } else {

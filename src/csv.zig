@@ -418,6 +418,7 @@ pub const JsonWriter = struct {
                 '\r' => try self.writeToBuffer("\\r"),
                 '\t' => try self.writeToBuffer("\\t"),
                 0x00...0x1F => {
+                    // `\uXXXX` is exactly 6 bytes; bufPrint cannot fail with this buffer size.
                     var buf: [6]u8 = undefined;
                     const encoded = std.fmt.bufPrint(&buf, "\\u{X:0>4}", .{c}) catch unreachable;
                     try self.writeToBuffer(encoded);
