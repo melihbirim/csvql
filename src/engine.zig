@@ -810,8 +810,10 @@ fn executeJoin(
                 try output_indices.append(aa, idx);
                 try output_header_names.append(aa, final_headers[idx]);
             } else {
-                const bare = if (std.mem.indexOf(u8, col, ".")) |d| col[d + 1 ..] else col;
-                const idx = col_map.get(bare) orelse return error.ColumnNotFound;
+                // Qualified reference (alias.col) that missed col_map means the alias is
+                // unknown — never silently fall back to bare name.
+                if (std.mem.indexOf(u8, col, ".") != null) return error.ColumnNotFound;
+                const idx = col_map.get(col) orelse return error.ColumnNotFound;
                 try output_indices.append(aa, idx);
                 try output_header_names.append(aa, final_headers[idx]);
             }
@@ -824,8 +826,10 @@ fn executeJoin(
             const col = expr.comparison.column;
             if (col_map.get(col)) |idx| {
                 where_merged_idx = idx;
-            } else if (std.mem.indexOf(u8, col, ".")) |dot| {
-                where_merged_idx = col_map.get(col[dot + 1 ..]);
+            } else if (std.mem.indexOf(u8, col, ".") != null) {
+                // Qualified reference (alias.col) that col_map didn't find means unknown
+                // alias — never silently fall back to bare name.
+                return error.ColumnNotFound;
             }
         }
     }
@@ -3344,4 +3348,82 @@ test "INNER JOIN chained: ON clause uses correct table for join key when column 
     // If Bug 2 exists: engine probes c using b.id (100,200) instead of a.id (1,2) → 0 rows.
     // Correct:  Alice → West, Bob → East.
     try std.testing.expectEqualStrings("name,region\nAlice,West\nBob,East\n", output);
+}
+
+// Regression: unknown qualified alias in SELECT must return ColumnNotFound, not silently
+// fall back to bare-name lookup (e.g. SELECT z.id must not resolve as SELECT id).
+test "INNER JOIN: unknown alias in SELECT returns ColumnNotFound" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("left.csv", .{});
+        defer f.close();
+        try f.writeAll("id,name\n1,Alice\n2,Bob\n");
+    }
+    {
+        const f = try tmp.dir.createFile("right.csv", .{});
+        defer f.close();
+        try f.writeAll("id,dept\n1,Eng\n2,Mkt\n");
+    }
+
+    var lb: [std.fs.max_path_bytes]u8 = undefined;
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const lp = try tmp.dir.realpath("left.csv", &lb);
+    const rp = try tmp.dir.realpath("right.csv", &rb);
+
+    // 'z' is not a registered alias — must error, not silently return a.id rows.
+    const sql = try std.fmt.allocPrint(allocator,
+        "SELECT z.id FROM '{s}' a JOIN '{s}' b ON a.id = b.id",
+        .{ lp, rp });
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("unk_sel_out.csv", .{});
+    defer out_file.close();
+
+    try std.testing.expectError(error.ColumnNotFound, execute(allocator, query, out_file, .{}));
+}
+
+// Regression: unknown qualified alias in WHERE must return ColumnNotFound, not silently
+// filter by the bare column (e.g. WHERE z.id = 1 must not behave as WHERE id = 1).
+test "INNER JOIN: unknown alias in WHERE returns ColumnNotFound" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("left.csv", .{});
+        defer f.close();
+        try f.writeAll("id,name\n1,Alice\n2,Bob\n");
+    }
+    {
+        const f = try tmp.dir.createFile("right.csv", .{});
+        defer f.close();
+        try f.writeAll("id,dept\n1,Eng\n2,Mkt\n");
+    }
+
+    var lb: [std.fs.max_path_bytes]u8 = undefined;
+    var rb: [std.fs.max_path_bytes]u8 = undefined;
+    const lp = try tmp.dir.realpath("left.csv", &lb);
+    const rp = try tmp.dir.realpath("right.csv", &rb);
+
+    // 'z' is not a registered alias — must error, not filter by bare 'id'.
+    const sql = try std.fmt.allocPrint(allocator,
+        "SELECT a.name FROM '{s}' a JOIN '{s}' b ON a.id = b.id WHERE z.id = 1",
+        .{ lp, rp });
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("unk_whr_out.csv", .{});
+    defer out_file.close();
+
+    try std.testing.expectError(error.ColumnNotFound, execute(allocator, query, out_file, .{}));
 }
