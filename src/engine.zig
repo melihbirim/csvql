@@ -3375,9 +3375,7 @@ test "INNER JOIN: unknown alias in SELECT returns ColumnNotFound" {
     const rp = try tmp.dir.realpath("right.csv", &rb);
 
     // 'z' is not a registered alias — must error, not silently return a.id rows.
-    const sql = try std.fmt.allocPrint(allocator,
-        "SELECT z.id FROM '{s}' a JOIN '{s}' b ON a.id = b.id",
-        .{ lp, rp });
+    const sql = try std.fmt.allocPrint(allocator, "SELECT z.id FROM '{s}' a JOIN '{s}' b ON a.id = b.id", .{ lp, rp });
     defer allocator.free(sql);
 
     var query = try parser.parse(allocator, sql);
@@ -3414,9 +3412,7 @@ test "INNER JOIN: unknown alias in WHERE returns ColumnNotFound" {
     const rp = try tmp.dir.realpath("right.csv", &rb);
 
     // 'z' is not a registered alias — must error, not filter by bare 'id'.
-    const sql = try std.fmt.allocPrint(allocator,
-        "SELECT a.name FROM '{s}' a JOIN '{s}' b ON a.id = b.id WHERE z.id = 1",
-        .{ lp, rp });
+    const sql = try std.fmt.allocPrint(allocator, "SELECT a.name FROM '{s}' a JOIN '{s}' b ON a.id = b.id WHERE z.id = 1", .{ lp, rp });
     defer allocator.free(sql);
 
     var query = try parser.parse(allocator, sql);
