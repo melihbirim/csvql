@@ -115,6 +115,23 @@ pub const OrderBy = struct {
     }
 };
 
+/// Describes a JOIN between two CSV files
+pub const JoinClause = struct {
+    right_file: []u8,
+    left_alias: []u8,
+    right_alias: []u8,
+    left_col: []u8,
+    right_col: []u8,
+
+    pub fn deinit(self: *JoinClause, allocator: Allocator) void {
+        allocator.free(self.right_file);
+        allocator.free(self.left_alias);
+        allocator.free(self.right_alias);
+        allocator.free(self.left_col);
+        allocator.free(self.right_col);
+    }
+};
+
 pub const Query = struct {
     columns: [][]u8,
     all_columns: bool,
@@ -124,6 +141,8 @@ pub const Query = struct {
     group_by: [][]u8,
     limit: i32,
     order_by: ?OrderBy,
+    /// All JOIN clauses in order (empty slice when there is no JOIN).
+    joins: []JoinClause,
     allocator: Allocator,
 
     pub fn deinit(self: *Query) void {
@@ -145,8 +164,108 @@ pub const Query = struct {
         if (self.order_by) |*ob| {
             ob.deinit(self.allocator);
         }
+
+        for (self.joins) |*j| {
+            j.deinit(self.allocator);
+        }
+        self.allocator.free(self.joins);
     }
 };
+
+/// Describes the position of a JOIN keyword within the FROM clause string
+const JoinKeyword = struct {
+    /// Index in the source string where the JOIN keyword (or INNER JOIN) begins
+    kw_start: usize,
+    /// Index in the source string just after the JOIN keyword (points into right-file part)
+    kw_end: usize,
+};
+
+/// Returns true if `needle` appears case-insensitively in `s` at a position that is NOT
+/// enclosed in single-quotes (so that filenames like '/tmp/left join.csv' are ignored).
+fn containsKeywordOutsideQuotes(s: []const u8, needle: []const u8) bool {
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '\'') {
+            // Skip everything inside the quoted string.
+            i += 1;
+            while (i < s.len and s[i] != '\'') : (i += 1) {}
+            if (i < s.len) i += 1; // skip closing quote
+            continue;
+        }
+        if (i + needle.len <= s.len and std.ascii.eqlIgnoreCase(s[i..][0..needle.len], needle)) {
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+/// Returns the position of an INNER JOIN or bare JOIN keyword in `s`, or null if not found.
+/// Requires the keyword to be preceded by whitespace (or start of string) and followed by a space
+/// so that "join" inside a file name (e.g. 'data_join.csv') is not mistaken for the keyword.
+fn detectJoinKeyword(s: []const u8) ?JoinKeyword {
+    // Prefer "INNER JOIN " over bare "JOIN " to get the right kw_start
+    if (std.ascii.indexOfIgnoreCase(s, "INNER JOIN ")) |idx| {
+        // Verify it's preceded by whitespace or at position 0
+        if (idx == 0 or std.ascii.isWhitespace(s[idx - 1])) {
+            return JoinKeyword{ .kw_start = idx, .kw_end = idx + 10 }; // "INNER JOIN".len = 10
+        }
+    }
+    // Search for " JOIN " (with leading space) to avoid matching inside identifiers
+    var i: usize = 1;
+    while (i + 5 <= s.len) : (i += 1) {
+        if (std.ascii.isWhitespace(s[i - 1]) and
+            std.ascii.eqlIgnoreCase(s[i .. i + 4], "JOIN") and
+            std.ascii.isWhitespace(s[i + 4]))
+        {
+            return JoinKeyword{ .kw_start = i, .kw_end = i + 4 }; // "JOIN".len = 4
+        }
+    }
+    return null;
+}
+
+const FileAlias = struct { file: []u8, alias: []u8 };
+
+/// Extract a file path and optional alias from a string like:
+///   'path/to/file.csv' alias
+///   'path/to/file.csv'
+///   path/to/file.csv alias
+///   path/to/file.csv
+/// The alias is lowercased for case-insensitive matching later.
+fn extractFileAndAlias(allocator: Allocator, input: []const u8) !FileAlias {
+    const s = std.mem.trim(u8, input, &std.ascii.whitespace);
+    if (s.len == 0) return error.InvalidQuery;
+
+    if (s[0] == '\'') {
+        // Quoted path: find closing single-quote
+        const end_q = std.mem.indexOfScalar(u8, s[1..], '\'') orelse return error.InvalidQuery;
+        const file_raw = s[1 .. end_q + 1]; // inside the quotes
+        const after = std.mem.trim(u8, s[end_q + 2 ..], &std.ascii.whitespace);
+        const alias_buf = try allocator.alloc(u8, after.len);
+        _ = std.ascii.lowerString(alias_buf, after);
+        return FileAlias{
+            .file = try allocator.dupe(u8, file_raw),
+            .alias = alias_buf,
+        };
+    } else {
+        // Unquoted path: split on first whitespace
+        if (std.mem.indexOfAny(u8, s, &std.ascii.whitespace)) |sp| {
+            const file_raw = s[0..sp];
+            const after = std.mem.trim(u8, s[sp + 1 ..], &std.ascii.whitespace);
+            const alias_buf = try allocator.alloc(u8, after.len);
+            _ = std.ascii.lowerString(alias_buf, after);
+            return FileAlias{
+                .file = try allocator.dupe(u8, file_raw),
+                .alias = alias_buf,
+            };
+        } else {
+            return FileAlias{
+                .file = try allocator.dupe(u8, s),
+                .alias = try allocator.dupe(u8, ""),
+            };
+        }
+    }
+}
 
 /// Parse a SQL query string
 pub fn parse(allocator: Allocator, input: []const u8) !Query {
@@ -161,6 +280,7 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
         .group_by = undefined,
         .limit = -1,
         .order_by = null,
+        .joins = &.{},
         .allocator = allocator,
     };
 
@@ -204,22 +324,157 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
         }
         query.columns = try col_list.toOwnedSlice(allocator);
     }
+    // Ensure query.columns is freed on any error path from here on.
+    errdefer {
+        for (query.columns) |col| allocator.free(col);
+        allocator.free(query.columns);
+    }
 
-    // Extract file path from FROM clause
-    var rest = trimmed[from_idx + 4 ..];
+    // Extract file path (and optional JOIN clauses) from FROM clause.
+    // Supports chained JOINs:  FROM a JOIN b ON ... JOIN c ON ... WHERE ...
+    const from_rest = trimmed[from_idx + 4 ..];
+    var rest: []const u8 = undefined;
+
+    // Reject unsupported JOIN types before they silently fall through to single-file mode.
+    // Use the quote-aware scanner so that filenames like '/tmp/left join.csv' are not flagged.
+    inline for ([_][]const u8{ "LEFT JOIN", "RIGHT JOIN", "OUTER JOIN", "FULL JOIN", "FULL OUTER JOIN", "CROSS JOIN" }) |kw| {
+        if (containsKeywordOutsideQuotes(from_rest, kw)) {
+            return error.UnsupportedJoinType;
+        }
+    }
+
+    // Collect all JOIN clauses into a temporary list.
+    var joins_list = std.ArrayList(JoinClause){};
+    // On error, free any already-collected JoinClause items.
+    errdefer {
+        for (joins_list.items) |*jc| jc.deinit(allocator);
+        joins_list.deinit(allocator);
+    }
+
+    if (detectJoinKeyword(from_rest)) |first_jk| {
+        // ---- There is at least one JOIN ----
+        // Left file + optional alias is everything before the first JOIN keyword.
+        const first_left_raw = std.mem.trim(u8, from_rest[0..first_jk.kw_start], &std.ascii.whitespace);
+        const first_left_info = try extractFileAndAlias(allocator, first_left_raw);
+        errdefer {
+            allocator.free(first_left_info.file);
+            allocator.free(first_left_info.alias);
+        }
+        query.file_path = first_left_info.file;
+
+        // Walk the remaining string, collecting one JoinClause per JOIN keyword.
+        // `cursor` always points into `from_rest` just after the last consumed JOIN keyword.
+        var cursor = std.mem.trimLeft(u8, from_rest[first_jk.kw_end..], &std.ascii.whitespace);
+        // left_alias for the *current* join step starts as the alias of the base left file.
+        var current_left_alias = first_left_info.alias;
+        // We'll re-assign current_left_alias at each iteration; ownership of the original
+        // string is transferred into the JoinClause we pushed in the *previous* iteration
+        // (or remains as first_left_info.alias for the very first clause), so no extra free.
+
+        while (true) {
+            // cursor = "right_file [alias] ON left.col = right.col [JOIN ...] [WHERE ...]"
+
+            // Find ON keyword for this join step.
+            const on_pos = std.ascii.indexOfIgnoreCase(cursor, " ON ") orelse return error.InvalidJoinSyntax;
+            const right_raw = std.mem.trim(u8, cursor[0..on_pos], &std.ascii.whitespace);
+            const after_on = cursor[on_pos + 4 ..]; // skip " ON "
+
+            // Find end of ON condition: stop at the next JOIN keyword OR at WHERE/GROUP/ORDER/LIMIT.
+            // We must stop at the *next* JOIN keyword before any clause keyword so that chained
+            // joins are parsed left–to–right rather than lumping everything into one condition.
+            const next_join_kw = detectJoinKeyword(after_on);
+            const on_where = std.ascii.indexOfIgnoreCase(after_on, "WHERE");
+            const on_group = std.ascii.indexOfIgnoreCase(after_on, "GROUP BY");
+            const on_order = std.ascii.indexOfIgnoreCase(after_on, "ORDER BY");
+            const on_limit = std.ascii.indexOfIgnoreCase(after_on, "LIMIT");
+            var on_end = after_on.len;
+            if (next_join_kw) |njk| on_end = @min(on_end, njk.kw_start);
+            if (on_where) |i| on_end = @min(on_end, i);
+            if (on_group) |i| on_end = @min(on_end, i);
+            if (on_order) |i| on_end = @min(on_end, i);
+            if (on_limit) |i| on_end = @min(on_end, i);
+
+            const on_cond = std.mem.trim(u8, after_on[0..on_end], &std.ascii.whitespace);
+
+            // Parse right file + alias.
+            const right_info = try extractFileAndAlias(allocator, right_raw);
+            errdefer {
+                allocator.free(right_info.file);
+                allocator.free(right_info.alias);
+            }
+
+            // Parse ON condition: "left_alias.col = right_alias.col"
+            const eq_pos = blk: {
+                var si: usize = 0;
+                while (si < on_cond.len) : (si += 1) {
+                    if (on_cond[si] == '=' and
+                        (si == 0 or (on_cond[si - 1] != '<' and on_cond[si - 1] != '>' and on_cond[si - 1] != '!')))
+                    {
+                        break :blk si;
+                    }
+                }
+                return error.InvalidJoinSyntax;
+            };
+            const on_left_expr = std.mem.trim(u8, on_cond[0..eq_pos], &std.ascii.whitespace);
+            const on_right_expr = std.mem.trim(u8, on_cond[eq_pos + 1 ..], &std.ascii.whitespace);
+
+            // Preserve the full ON operand (including alias prefix if present).
+            // e.g. "a.dept_id" stays "a.dept_id", not stripped to "dept_id".
+            // The engine resolves qualified names against alias-range-precise maps.
+            const ljc = try allocator.alloc(u8, on_left_expr.len);
+            _ = std.ascii.lowerString(ljc, on_left_expr);
+            const rjc = try allocator.alloc(u8, on_right_expr.len);
+            _ = std.ascii.lowerString(rjc, on_right_expr);
+
+            try joins_list.append(allocator, JoinClause{
+                .right_file = right_info.file,
+                .left_alias = current_left_alias,
+                .right_alias = right_info.alias,
+                .left_col = ljc,
+                .right_col = rjc,
+            });
+
+            // The right alias of this step becomes the left alias of the *next* step
+            // so that the ON condition in the next join can reference columns from the
+            // accumulated result.  We hand off ownership of right_info.alias into the
+            // JoinClause we just appended; we need a fresh copy for the next iteration.
+            if (next_join_kw) |njk| {
+                // Alias ownership already transferred above.  Derive new current_left_alias
+                // from right_info.alias (already stored in the clause, so dupe it).
+                current_left_alias = try allocator.dupe(u8, right_info.alias);
+                cursor = std.mem.trimLeft(u8, after_on[njk.kw_end..], &std.ascii.whitespace);
+            } else {
+                // current_left_alias was transferred into the JoinClause; we're done.
+                rest = after_on[on_end..];
+                break;
+            }
+        }
+
+        query.joins = try joins_list.toOwnedSlice(allocator);
+    } else {
+        // No JOIN: single-file query — extract file path from between FROM and first clause keyword
+        const where_idx_pre = std.ascii.indexOfIgnoreCase(from_rest, "WHERE");
+        const group_by_idx_pre = std.ascii.indexOfIgnoreCase(from_rest, "GROUP BY");
+        const order_by_idx_pre = std.ascii.indexOfIgnoreCase(from_rest, "ORDER BY");
+        const limit_idx_pre = std.ascii.indexOfIgnoreCase(from_rest, "LIMIT");
+
+        var fend = from_rest.len;
+        if (where_idx_pre) |i| fend = @min(fend, i);
+        if (group_by_idx_pre) |i| fend = @min(fend, i);
+        if (order_by_idx_pre) |i| fend = @min(fend, i);
+        if (limit_idx_pre) |i| fend = @min(fend, i);
+
+        const fp = std.mem.trim(u8, from_rest[0..fend], &std.ascii.whitespace);
+        query.file_path = try allocator.dupe(u8, trimQuotes(fp));
+        query.joins = try allocator.alloc(JoinClause, 0);
+        rest = from_rest;
+    }
+
+    // Parse the clause keywords (WHERE / GROUP BY / ORDER BY / LIMIT) from `rest`
     const where_idx = std.ascii.indexOfIgnoreCase(rest, "WHERE");
     const group_by_idx = std.ascii.indexOfIgnoreCase(rest, "GROUP BY");
     const order_by_idx = std.ascii.indexOfIgnoreCase(rest, "ORDER BY");
     const limit_idx = std.ascii.indexOfIgnoreCase(rest, "LIMIT");
-
-    var file_end = rest.len;
-    if (where_idx) |idx| file_end = @min(file_end, idx);
-    if (group_by_idx) |idx| file_end = @min(file_end, idx);
-    if (order_by_idx) |idx| file_end = @min(file_end, idx);
-    if (limit_idx) |idx| file_end = @min(file_end, idx);
-
-    const file_part = std.mem.trim(u8, rest[0..file_end], &std.ascii.whitespace);
-    query.file_path = try allocator.dupe(u8, trimQuotes(file_part));
 
     // Parse WHERE clause if present
     if (where_idx) |idx| {

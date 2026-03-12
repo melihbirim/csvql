@@ -50,14 +50,14 @@ csvql "SELECT email FROM 'users.csv'" | wc -l
 
 ### Flags
 
-| Flag | Short | Description |
-| ---- | ----- | ----------- |
-| `--no-header` | | Suppress header row in output |
-| `--delimiter <char>` | `-d` | Field delimiter (default `,`). Use `\t` for TSV |
-| `--json` | | Output as a JSON array (`[{...}, ...]`) |
-| `--jsonl` | | Output as JSONL / NDJSON (one JSON object per line) |
-| `--version` | `-v` | Show version |
-| `--help` | `-h` | Show help |
+| Flag                 | Short | Description                                         |
+| -------------------- | ----- | --------------------------------------------------- |
+| `--no-header`        |       | Suppress header row in output                       |
+| `--delimiter <char>` | `-d`  | Field delimiter (default `,`). Use `\t` for TSV     |
+| `--json`             |       | Output as a JSON array (`[{...}, ...]`)             |
+| `--jsonl`            |       | Output as JSONL / NDJSON (one JSON object per line) |
+| `--version`          | `-v`  | Show version                                        |
+| `--help`             | `-h`  | Show help                                           |
 
 ```bash
 # TSV file
@@ -122,10 +122,10 @@ sudo cp zig-out/bin/csvql /usr/local/bin/
 
 **5M rows, 173MB CSV, Apple M2** — output-format benchmark (full output, all rows matched, `> /dev/null`):
 
-| Output format | csvql | DuckDB | Speedup |
-| ------------- | ----- | ------ | ------- |
-| CSV | **0.100s** | 0.354s | **3.5x** |
-| JSON array (`--json`) | **0.164s** | 0.434s | **2.6x** |
+| Output format              | csvql      | DuckDB | Speedup  |
+| -------------------------- | ---------- | ------ | -------- |
+| CSV                        | **0.100s** | 0.354s | **3.5x** |
+| JSON array (`--json`)      | **0.164s** | 0.434s | **2.6x** |
 | JSONL / NDJSON (`--jsonl`) | **0.172s** | 0.422s | **2.5x** |
 
 Outputs are semantically/byte-identical to DuckDB (verified: CSV byte-for-byte diff; JSONL byte-for-byte diff; JSON array Python-parsed row comparison).
@@ -134,15 +134,27 @@ Run the benchmark yourself: [`bench/bench_all.sh --section formats`](bench/bench
 
 **5M rows, 173MB CSV, Apple M2** — LIKE operator benchmark (CSV output, `> /dev/null`):
 
-| Pattern | Description | csvql | DuckDB | Speedup |
-| ------- | ----------- | ----- | ------ | ------- |
-| `WHERE name LIKE 'A%'` | Prefix wildcard | **0.06s** | 2.17s | **~36x** |
-| `WHERE city LIKE '%on'` | Suffix wildcard | **0.06s** | 1.12s | **~19x** |
-| `WHERE department LIKE '%ing'` | Suffix, high selectivity | **0.07s** | 2.54s | **~36x** |
+| Pattern                        | Description              | csvql     | DuckDB | Speedup  |
+| ------------------------------ | ------------------------ | --------- | ------ | -------- |
+| `WHERE name LIKE 'A%'`         | Prefix wildcard          | **0.06s** | 2.17s  | **~36x** |
+| `WHERE city LIKE '%on'`        | Suffix wildcard          | **0.06s** | 1.12s  | **~19x** |
+| `WHERE department LIKE '%ing'` | Suffix, high selectivity | **0.07s** | 2.54s  | **~36x** |
 
 Row counts verified identical to DuckDB.
 
 Run the benchmark yourself: [`bench/bench_all.sh --section like`](bench/bench_all.sh)
+
+**1M rows, 35MB CSV, Apple M2** — JOIN benchmark (hash-join, CSV output, `> /dev/null`):
+
+| Query                                          | csvql      | DuckDB | Speedup   |
+| ---------------------------------------------- | ---------- | ------ | --------- |
+| `JOIN departments` (1M × 6 rows)               | **0.140s** | 1.492s | **10.7x** |
+| `JOIN + WHERE d.region = 'West'` (1M × 6)      | **0.102s** | 0.600s | **5.9x**  |
+| `JOIN SELECT *` (1M × 6, all cols)             | **0.220s** | 4.130s | **18.8x** |
+| `JOIN cities` (1M × 8 rows)                    | **0.146s** | 1.464s | **10.0x** |
+| `JOIN bonus_50k` (1M × 50K rows, numeric key)  | **0.104s** | 0.276s | **2.7x**  |
+
+Run the benchmark yourself: [`bench/bench_all.sh --section join`](bench/bench_all.sh)
 
 Run the full suite (all sections): [`bench/bench_all.sh`](bench/bench_all.sh)
 
@@ -174,20 +186,21 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 
 ### Supported
 
-| Feature          | Syntax                                                                  |
-| ---------------- | ----------------------------------------------------------------------- |
-| **SELECT**       | `SELECT col1, col2` or `SELECT *`                                       |
-| **DISTINCT**     | `SELECT DISTINCT col1, col2` — deduplicates output rows                 |
-| **FROM**         | `FROM 'file.csv'` or `FROM -` (stdin)                                   |
-| **WHERE**        | `=`, `!=`, `>`, `>=`, `<`, `<=` with auto numeric coercion              |
-| **LIKE**         | `WHERE col LIKE 'pattern'` — `%` any sequence, `_` any single character |
-| **GROUP BY**     | `GROUP BY col1` — groups rows for aggregation                           |
-| **COUNT**        | `COUNT(*)` or `COUNT(col)` — with or without `GROUP BY`                 |
-| **SUM**          | `SUM(col)` — with or without `GROUP BY`                                 |
-| **AVG**          | `AVG(col)` — full precision; with or without `GROUP BY`                 |
-| **MIN / MAX**    | `MIN(col)`, `MAX(col)` — with or without `GROUP BY`                     |
-| **ORDER BY**     | `ORDER BY col ASC/DESC`                                                 |
-| **LIMIT**        | `LIMIT n`                                                               |
+| Feature       | Syntax                                                                  |
+| ------------- | ----------------------------------------------------------------------- |
+| **SELECT**    | `SELECT col1, col2` or `SELECT *`                                       |
+| **DISTINCT**  | `SELECT DISTINCT col1, col2` — deduplicates output rows                 |
+| **FROM**      | `FROM 'file.csv'` or `FROM -` (stdin)                                   |
+| **WHERE**     | `=`, `!=`, `>`, `>=`, `<`, `<=` with auto numeric coercion              |
+| **LIKE**      | `WHERE col LIKE 'pattern'` — `%` any sequence, `_` any single character |
+| **JOIN**      | `FROM 'a.csv' a [INNER] JOIN 'b.csv' b ON a.key = b.key`               |
+| **GROUP BY**  | `GROUP BY col1` — groups rows for aggregation                           |
+| **COUNT**     | `COUNT(*)` or `COUNT(col)` — with or without `GROUP BY`                 |
+| **SUM**       | `SUM(col)` — with or without `GROUP BY`                                 |
+| **AVG**       | `AVG(col)` — full precision; with or without `GROUP BY`                 |
+| **MIN / MAX** | `MIN(col)`, `MAX(col)` — with or without `GROUP BY`                     |
+| **ORDER BY**  | `ORDER BY col ASC/DESC`                                                 |
+| **LIMIT**     | `LIMIT n`                                                               |
 
 ### Aggregate Examples
 
@@ -205,6 +218,30 @@ csvql "SELECT DISTINCT city, department FROM 'data.csv'"
 # DISTINCT with WHERE
 csvql "SELECT DISTINCT department FROM 'data.csv' WHERE salary > 100000"
 ```
+
+### JOIN Examples
+
+```bash
+# Basic INNER JOIN — select columns from both tables using aliases
+csvql "SELECT e.name, d.dept_name FROM 'employees.csv' e INNER JOIN 'departments.csv' d ON e.dept_id = d.id"
+
+# Bare JOIN (INNER is optional)
+csvql "SELECT e.name, d.dept_name FROM 'employees.csv' e JOIN 'departments.csv' d ON e.dept_id = d.id"
+
+# JOIN with WHERE — filter on joined columns
+csvql "SELECT e.name, d.dept_name FROM 'employees.csv' e JOIN 'departments.csv' d ON e.dept_id = d.id WHERE d.dept_name = 'Engineering'"
+
+# SELECT * on join returns all columns from both tables
+csvql "SELECT * FROM 'orders.csv' o JOIN 'customers.csv' c ON o.customer_id = c.id"
+
+# JOIN with LIMIT
+csvql "SELECT e.name, d.dept_name FROM 'employees.csv' e JOIN 'departments.csv' d ON e.dept_id = d.id LIMIT 10"
+```
+
+**Notes:**
+- Table aliases are required when using qualified column references (`alias.col`)
+- Unqualified column names are resolved from the left table first, then the right
+- The right table is fully loaded into memory (build side); the left table is streamed (probe side)
 
 ### Simple Mode
 
@@ -228,11 +265,11 @@ See [SIMPLE_QUERY_LANGUAGE.md](SIMPLE_QUERY_LANGUAGE.md) for the full reference.
 
 ## Roadmap
 
-| Feature | Issue | Status |
-| ------- | ----- | ------ |
+| Feature                             | Issue                                                | Status              |
+| ----------------------------------- | ---------------------------------------------------- | ------------------- |
 | `--no-header` / `--delimiter` flags | [#12](https://github.com/melihbirim/csvql/issues/12) | ✅ shipped (v0.5.0) |
-| `LIKE` operator in WHERE | [#13](https://github.com/melihbirim/csvql/issues/13) | ✅ shipped |
-| `--json` / `--jsonl` output format | [#14](https://github.com/melihbirim/csvql/issues/14) | ✅ shipped |
+| `LIKE` operator in WHERE            | [#13](https://github.com/melihbirim/csvql/issues/13) | ✅ shipped          |
+| `--json` / `--jsonl` output format  | [#14](https://github.com/melihbirim/csvql/issues/14) | ✅ shipped          |
 
 ## Contributing
 

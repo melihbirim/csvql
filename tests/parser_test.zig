@@ -168,3 +168,168 @@ test "parse LIKE operator case-insensitive keyword" {
     try std.testing.expectEqual(parser.Operator.like, comp.operator);
     try std.testing.expectEqualStrings("John%", comp.value);
 }
+
+// --- JOIN parser tests ---
+
+test "parse INNER JOIN with aliases" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(
+        allocator,
+        "SELECT a.name, b.dept FROM 'employees.csv' a INNER JOIN 'departments.csv' b ON a.dept_id = b.id",
+    );
+    defer query.deinit();
+
+    try std.testing.expectEqualStrings("employees.csv", query.file_path);
+    try std.testing.expectEqual(@as(usize, 1), query.joins.len);
+    const j = query.joins[0];
+    try std.testing.expectEqualStrings("departments.csv", j.right_file);
+    try std.testing.expectEqualStrings("a", j.left_alias);
+    try std.testing.expectEqualStrings("b", j.right_alias);
+    try std.testing.expectEqualStrings("a.dept_id", j.left_col);
+    try std.testing.expectEqualStrings("b.id", j.right_col);
+    // Columns were requested as "a.name" and "b.dept"
+    try std.testing.expectEqual(@as(usize, 2), query.columns.len);
+}
+
+test "parse bare JOIN (no INNER keyword)" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(
+        allocator,
+        "SELECT * FROM 'left.csv' l JOIN 'right.csv' r ON l.id = r.fk",
+    );
+    defer query.deinit();
+
+    try std.testing.expectEqualStrings("left.csv", query.file_path);
+    try std.testing.expectEqual(@as(usize, 1), query.joins.len);
+    const j = query.joins[0];
+    try std.testing.expectEqualStrings("right.csv", j.right_file);
+    try std.testing.expectEqualStrings("l", j.left_alias);
+    try std.testing.expectEqualStrings("r", j.right_alias);
+    try std.testing.expectEqualStrings("l.id", j.left_col);
+    try std.testing.expectEqualStrings("r.fk", j.right_col);
+    try std.testing.expect(query.all_columns);
+}
+
+test "parse JOIN with WHERE clause" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(
+        allocator,
+        "SELECT a.name FROM 'emp.csv' a JOIN 'dept.csv' b ON a.dept_id = b.id WHERE b.name = 'Engineering'",
+    );
+    defer query.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), query.joins.len);
+    try std.testing.expect(query.where_expr != null);
+    const comp = query.where_expr.?.comparison;
+    try std.testing.expectEqualStrings("b.name", comp.column);
+    try std.testing.expectEqualStrings("Engineering", comp.value);
+}
+
+test "parse JOIN with LIMIT" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(
+        allocator,
+        "SELECT * FROM 'a.csv' a JOIN 'b.csv' b ON a.id = b.id LIMIT 5",
+    );
+    defer query.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), query.joins.len);
+    try std.testing.expectEqual(@as(i32, 5), query.limit);
+}
+
+test "single-file query still works after JOIN parser changes" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(allocator, "SELECT name, age FROM 'people.csv' WHERE age > 30");
+    defer query.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), query.joins.len);
+    try std.testing.expectEqualStrings("people.csv", query.file_path);
+    try std.testing.expectEqual(@as(usize, 2), query.columns.len);
+}
+
+test "parse chained JOIN: three tables" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(
+        allocator,
+        "SELECT a.name, b.dept_name, c.region FROM 'emp.csv' a " ++
+            "JOIN 'dept.csv' b ON a.dept_id = b.id " ++
+            "JOIN 'region.csv' c ON b.region_id = c.id",
+    );
+    defer query.deinit();
+
+    try std.testing.expectEqualStrings("emp.csv", query.file_path);
+    try std.testing.expectEqual(@as(usize, 2), query.joins.len);
+
+    const j1 = query.joins[0];
+    try std.testing.expectEqualStrings("dept.csv", j1.right_file);
+    try std.testing.expectEqualStrings("a", j1.left_alias);
+    try std.testing.expectEqualStrings("b", j1.right_alias);
+    try std.testing.expectEqualStrings("a.dept_id", j1.left_col);
+    try std.testing.expectEqualStrings("b.id", j1.right_col);
+
+    const j2 = query.joins[1];
+    try std.testing.expectEqualStrings("region.csv", j2.right_file);
+    try std.testing.expectEqualStrings("b", j2.left_alias);
+    try std.testing.expectEqualStrings("c", j2.right_alias);
+    try std.testing.expectEqualStrings("b.region_id", j2.left_col);
+    try std.testing.expectEqualStrings("c.id", j2.right_col);
+}
+
+test "parse chained JOIN with WHERE clause" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(
+        allocator,
+        "SELECT a.name FROM 'emp.csv' a " ++
+            "JOIN 'dept.csv' b ON a.dept_id = b.id " ++
+            "JOIN 'reg.csv' c ON b.region_id = c.id WHERE c.name = 'West'",
+    );
+    defer query.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), query.joins.len);
+    try std.testing.expect(query.where_expr != null);
+    const comp = query.where_expr.?.comparison;
+    try std.testing.expectEqualStrings("c.name", comp.column);
+    try std.testing.expectEqualStrings("West", comp.value);
+}
+
+test "unsupported join types return UnsupportedJoinType error" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(
+        error.UnsupportedJoinType,
+        parser.parse(allocator, "SELECT * FROM 'a.csv' a LEFT JOIN 'b.csv' b ON a.id = b.id"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedJoinType,
+        parser.parse(allocator, "SELECT * FROM 'a.csv' a RIGHT JOIN 'b.csv' b ON a.id = b.id"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedJoinType,
+        parser.parse(allocator, "SELECT * FROM 'a.csv' a FULL OUTER JOIN 'b.csv' b ON a.id = b.id"),
+    );
+    try std.testing.expectError(
+        error.UnsupportedJoinType,
+        parser.parse(allocator, "SELECT * FROM 'a.csv' a CROSS JOIN 'b.csv' b ON a.id = b.id"),
+    );
+}
+
+test "quoted filename containing join keyword is not flagged as UnsupportedJoinType" {
+    const allocator = std.testing.allocator;
+
+    // '/tmp/left join.csv' contains "left join" inside quotes — must NOT trigger error.
+    var query = try parser.parse(
+        allocator,
+        "SELECT a.id FROM '/tmp/left join.csv' a INNER JOIN 'right.csv' b ON a.id = b.id",
+    );
+    defer query.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), query.joins.len);
+    try std.testing.expectEqualStrings("/tmp/left join.csv", query.file_path);
+}

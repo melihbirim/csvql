@@ -286,6 +286,14 @@ Key achievements:
 | **ORDER BY (1M rows)** | **csvql** 🏆 | **7.8x faster** | Radix sort + pass-skipping |
 | **WHERE (full output)** | **csvql** 🏆 | **5.2x faster** | Zero-copy + lock-free parallel |
 | **Full scan (1M rows)** | **csvql** 🏆 | **5.9x faster** | mmap + SIMD + parallel output |
+| **JOIN lookup (1M × 6)** | **csvql** 🏆 | **10.9x faster** | Pipelined hash-join, zero left-side allocs |
+| **JOIN + WHERE (1M × 6)** | **csvql** 🏆 | **4.3x faster** | WHERE applied in streaming probe |
+| **JOIN SELECT * (1M × 6)** | **csvql** 🏆 | **18.7x faster** | Streaming output vs DuckDB serialisation |
+| **JOIN cities (1M × 8)** | **csvql** 🏆 | **10.0x faster** | Pipelined hash-join |
+| **JOIN larger right (1M × 50K)** | **csvql** 🏆 | **2.5x faster** | String-key hash probe at scale |
+| **3-table JOIN (1M × 6 × 3)** | **csvql** 🏆 | **11.0x faster** | Pipelined, 2 JOIN ops, no intermediates |
+| **3-table JOIN + WHERE** | **csvql** 🏆 | **7.5x faster** | WHERE evaluated at leaf, all joins pipelined |
+| **4-table JOIN (1M × 6 × 3 × 6)** | **csvql** 🏆 | **10.9x faster** | 3 chained JOINs, same cost as 2-table |
 | **Memory usage** | **csvql** 🏆 | **35x less** | Streaming architecture |
 
 ### csvql Optimization Journey 🚀
@@ -308,4 +316,30 @@ Key achievements:
 **DuckDB** remains excellent for:
 - Complex SQL (joins, window functions, aggregations)
 - Multi-format data sources beyond CSV
+
+## JOIN Benchmarks (hash-join, 1M-row left table)
+
+Tested on `large_test.csv` (1M rows, 35 MB). Right tables range from 6 to 50K rows.
+
+| Query | csvql | DuckDB | Speedup |
+|-------|-------|--------|---------|
+| `employees JOIN departments (1M × 6)` | **0.137s** | 1.490s | **10.9x** |
+| `JOIN + WHERE d.region = 'West' (1M × 6)` | **0.140s** | 0.600s | **4.3x** |
+| `JOIN SELECT * (1M × 6)` | **0.223s** | 4.173s | **18.7x** |
+| `employees JOIN cities (1M × 8)` | **0.150s** | 1.500s | **10.0x** |
+| `employees JOIN bonus_50k (1M × 50K)` | **0.113s** | 0.280s | **2.5x** |
+| `3-table: emp → dept → region (2 JOINs, 1M × 6 × 3)` | **0.170s** | 1.867s | **11.0x** |
+| `3-table + WHERE continent (2 JOINs, 1M × 6 × 3)` | **0.200s** | 1.503s | **7.5x** |
+| `4-table: emp → dept → region → continent (3 JOINs)` | **0.200s** | 2.187s | **10.9x** |
+
+### Architecture
+
+csvql uses a **pipelined hash-join** strategy:
+- All right-side tables are loaded into `StringHashMap`s upfront (build phase)
+- The left (base) table is streamed row-by-row using zero-copy reader slices (probe phase)
+- For N joined tables, a single pre-allocated `merged_row[]` buffer is filled in-place via recursive expansion through all N hash maps — no materialisation of the left or any intermediate result
+- WHERE evaluation and output projection happen at the leaf of the recursion, immediately before writing
+- For chained JOINs (3-, 4-table), each additional join step adds negligible overhead (~0.03s) since all data lives in the same buffer
+
+The large speedup on `SELECT *` queries is due to DuckDB's format serialisation overhead; csvql streams output incrementally.
 - Interactive exploration with sophisticated query planning

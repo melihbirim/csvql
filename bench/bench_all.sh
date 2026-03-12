@@ -7,6 +7,7 @@
 #   formats   — Output format throughput (CSV, JSON array, JSONL)
 #   parse     — Raw CSV parsing throughput (buffered / naive / mmap)
 #   groupby   — GROUP BY query shapes via internal Zig engine
+#   join      — INNER JOIN hash-join performance (csvql vs DuckDB)
 #
 # Usage:
 #   ./bench/bench_all.sh [--section queries|like|formats|parse|groupby] [csv_file]
@@ -310,6 +311,106 @@ run_section_groupby() {
 }
 
 # ═════════════════════════════════════════════════════════════════
+# SECTION 6: JOIN queries (hash-join) — csvql vs DuckDB
+# ═════════════════════════════════════════════════════════════════
+run_section_join() {
+  section_header "SECTION 6 — JOIN queries (hash-join, csvql vs DuckDB)"
+
+  # ── Create tiny lookup tables ──────────────────────────────────
+  local DEPTS="${BENCH_DIR}/bench_depts.csv"
+  cat > "$DEPTS" <<'EOF'
+dept_name,region,budget_code
+Engineering,West,ENG-001
+Finance,East,FIN-002
+HR,Central,HR-003
+Marketing,East,MKT-004
+Operations,West,OPS-005
+Sales,Central,SAL-006
+EOF
+
+  local CITIES="${BENCH_DIR}/bench_cities.csv"
+  cat > "$CITIES" <<'EOF'
+city,state,timezone
+Austin,TX,CDT
+Boston,MA,EDT
+Chicago,IL,CDT
+Denver,CO,MDT
+LA,CA,PDT
+NYC,NY,EDT
+SF,CA,PDT
+Seattle,WA,PDT
+EOF
+
+  # ── 50K-row right table: id + bonus_pct (join on numeric id) ──
+  local BONUS="${BENCH_DIR}/bench_bonus_50k.csv"
+  printf "Generating 50K-row bonus lookup table… "
+  awk -F, 'NR==1{print "emp_id,bonus_pct"} NR>1&&NR<=50001{printf "%s,%.2f\n",$1,($5*0.1)}' "$CSV" > "$BONUS"
+  echo "done"
+  echo ""
+
+  # ── Benchmark cases ────────────────────────────────────────────
+  run_query \
+    "JOIN lookup (${ROW_COUNT} × 6): employees JOIN departments" \
+    "SELECT e.name, e.salary, d.region FROM '${CSV}' e INNER JOIN '${DEPTS}' d ON e.department = d.dept_name" \
+    "SELECT e.name, e.salary, d.region FROM read_csv_auto('${CSV}') AS e JOIN read_csv_auto('${DEPTS}') AS d ON e.department = d.dept_name"
+
+  run_query \
+    "JOIN lookup + WHERE (${ROW_COUNT} × 6): WHERE d.region = 'West'" \
+    "SELECT e.name, e.salary, d.region FROM '${CSV}' e INNER JOIN '${DEPTS}' d ON e.department = d.dept_name WHERE d.region = 'West'" \
+    "SELECT e.name, e.salary, d.region FROM read_csv_auto('${CSV}') AS e JOIN read_csv_auto('${DEPTS}') AS d ON e.department = d.dept_name WHERE d.region = 'West'"
+
+  run_query \
+    "JOIN SELECT * (${ROW_COUNT} × 6): all columns from both tables" \
+    "SELECT * FROM '${CSV}' e INNER JOIN '${DEPTS}' d ON e.department = d.dept_name" \
+    "SELECT * FROM read_csv_auto('${CSV}') AS e JOIN read_csv_auto('${DEPTS}') AS d ON e.department = d.dept_name"
+
+  run_query \
+    "JOIN cities lookup (${ROW_COUNT} × 8): employees JOIN cities" \
+    "SELECT e.name, e.city, c.state, c.timezone FROM '${CSV}' e INNER JOIN '${CITIES}' c ON e.city = c.city" \
+    "SELECT e.name, e.city, c.state, c.timezone FROM read_csv_auto('${CSV}') AS e JOIN read_csv_auto('${CITIES}') AS c ON e.city = c.city"
+
+  run_query \
+    "JOIN larger right (${ROW_COUNT} × 50K): employees JOIN bonus table on id" \
+    "SELECT e.name, e.salary, b.bonus_pct FROM '${CSV}' e INNER JOIN '${BONUS}' b ON e.id = b.emp_id" \
+    "SELECT e.name, e.salary, b.bonus_pct FROM read_csv_auto('${CSV}') AS e JOIN read_csv_auto('${BONUS}') AS b ON e.id::TEXT = b.emp_id::TEXT"
+
+  # ── 3-table and 4-table chained JOINs ─────────────────────────
+  local REGIONS="${BENCH_DIR}/bench_regions.csv"
+  cat > "$REGIONS" <<'EOF'
+region_name,continent
+West,North America
+East,North America
+Central,North America
+EOF
+
+  local CONTINENTS="${BENCH_DIR}/bench_continents.csv"
+  cat > "$CONTINENTS" <<'EOF'
+continent,hemisphere
+North America,Northern
+South America,Southern
+Europe,Northern
+Asia,Northern
+Africa,Southern
+Australia,Southern
+EOF
+
+  run_query \
+    "3-table JOIN (${ROW_COUNT} × 6 × 3): employees → departments → regions" \
+    "SELECT e.name, e.salary, d.region, r.continent FROM '${CSV}' e INNER JOIN '${DEPTS}' d ON e.department = d.dept_name INNER JOIN '${REGIONS}' r ON d.region = r.region_name" \
+    "SELECT e.name, e.salary, d.region, r.continent FROM read_csv_auto('${CSV}') AS e JOIN read_csv_auto('${DEPTS}') AS d ON e.department = d.dept_name JOIN read_csv_auto('${REGIONS}') AS r ON d.region = r.region_name"
+
+  run_query \
+    "3-table JOIN + WHERE (${ROW_COUNT} × 6 × 3): WHERE r.continent = 'North America'" \
+    "SELECT e.name, e.salary, d.region FROM '${CSV}' e INNER JOIN '${DEPTS}' d ON e.department = d.dept_name INNER JOIN '${REGIONS}' r ON d.region = r.region_name WHERE r.continent = 'North America'" \
+    "SELECT e.name, e.salary, d.region FROM read_csv_auto('${CSV}') AS e JOIN read_csv_auto('${DEPTS}') AS d ON e.department = d.dept_name JOIN read_csv_auto('${REGIONS}') AS r ON d.region = r.region_name WHERE r.continent = 'North America'"
+
+  run_query \
+    "4-table JOIN (${ROW_COUNT} × 6 × 3 × 6): employees → depts → regions → continents" \
+    "SELECT e.name, e.salary, d.region, r.continent, c.hemisphere FROM '${CSV}' e INNER JOIN '${DEPTS}' d ON e.department = d.dept_name INNER JOIN '${REGIONS}' r ON d.region = r.region_name INNER JOIN '${CONTINENTS}' c ON r.continent = c.continent" \
+    "SELECT e.name, e.salary, d.region, r.continent, c.hemisphere FROM read_csv_auto('${CSV}') AS e JOIN read_csv_auto('${DEPTS}') AS d ON e.department = d.dept_name JOIN read_csv_auto('${REGIONS}') AS r ON d.region = r.region_name JOIN read_csv_auto('${CONTINENTS}') AS c ON r.continent = c.continent"
+}
+
+# ═════════════════════════════════════════════════════════════════
 # Entry point
 # ═════════════════════════════════════════════════════════════════
 check_deps
@@ -335,6 +436,7 @@ case "$SECTION" in
     run_section_formats
     run_section_parse
     run_section_groupby
+    run_section_join
     ;;
   queries)
     run_section_queries
@@ -351,9 +453,12 @@ case "$SECTION" in
   groupby)
     run_section_groupby
     ;;
+  join)
+    run_section_join
+    ;;
   *)
     echo "Unknown section: $SECTION"
-    echo "Valid values: all | queries | like | formats | parse | groupby"
+    echo "Valid values: all | queries | like | formats | parse | groupby | join"
     exit 1
     ;;
 esac
