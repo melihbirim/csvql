@@ -186,8 +186,8 @@ test "parse INNER JOIN with aliases" {
     try std.testing.expectEqualStrings("departments.csv", j.right_file);
     try std.testing.expectEqualStrings("a", j.left_alias);
     try std.testing.expectEqualStrings("b", j.right_alias);
-    try std.testing.expectEqualStrings("dept_id", j.left_col);
-    try std.testing.expectEqualStrings("id", j.right_col);
+    try std.testing.expectEqualStrings("a.dept_id", j.left_col);
+    try std.testing.expectEqualStrings("b.id", j.right_col);
     // Columns were requested as "a.name" and "b.dept"
     try std.testing.expectEqual(@as(usize, 2), query.columns.len);
 }
@@ -207,8 +207,8 @@ test "parse bare JOIN (no INNER keyword)" {
     try std.testing.expectEqualStrings("right.csv", j.right_file);
     try std.testing.expectEqualStrings("l", j.left_alias);
     try std.testing.expectEqualStrings("r", j.right_alias);
-    try std.testing.expectEqualStrings("id", j.left_col);
-    try std.testing.expectEqualStrings("fk", j.right_col);
+    try std.testing.expectEqualStrings("l.id", j.left_col);
+    try std.testing.expectEqualStrings("r.fk", j.right_col);
     try std.testing.expect(query.all_columns);
 }
 
@@ -270,15 +270,15 @@ test "parse chained JOIN: three tables" {
     try std.testing.expectEqualStrings("dept.csv", j1.right_file);
     try std.testing.expectEqualStrings("a", j1.left_alias);
     try std.testing.expectEqualStrings("b", j1.right_alias);
-    try std.testing.expectEqualStrings("dept_id", j1.left_col);
-    try std.testing.expectEqualStrings("id", j1.right_col);
+    try std.testing.expectEqualStrings("a.dept_id", j1.left_col);
+    try std.testing.expectEqualStrings("b.id", j1.right_col);
 
     const j2 = query.joins[1];
     try std.testing.expectEqualStrings("region.csv", j2.right_file);
     try std.testing.expectEqualStrings("b", j2.left_alias);
     try std.testing.expectEqualStrings("c", j2.right_alias);
-    try std.testing.expectEqualStrings("region_id", j2.left_col);
-    try std.testing.expectEqualStrings("id", j2.right_col);
+    try std.testing.expectEqualStrings("b.region_id", j2.left_col);
+    try std.testing.expectEqualStrings("c.id", j2.right_col);
 }
 
 test "parse chained JOIN with WHERE clause" {
@@ -318,4 +318,18 @@ test "unsupported join types return UnsupportedJoinType error" {
         error.UnsupportedJoinType,
         parser.parse(allocator, "SELECT * FROM 'a.csv' a CROSS JOIN 'b.csv' b ON a.id = b.id"),
     );
+}
+
+test "quoted filename containing join keyword is not flagged as UnsupportedJoinType" {
+    const allocator = std.testing.allocator;
+
+    // '/tmp/left join.csv' contains "left join" inside quotes — must NOT trigger error.
+    var query = try parser.parse(
+        allocator,
+        "SELECT a.id FROM '/tmp/left join.csv' a INNER JOIN 'right.csv' b ON a.id = b.id",
+    );
+    defer query.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), query.joins.len);
+    try std.testing.expectEqualStrings("/tmp/left join.csv", query.file_path);
 }

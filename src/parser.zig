@@ -180,6 +180,26 @@ const JoinKeyword = struct {
     kw_end: usize,
 };
 
+/// Returns true if `needle` appears case-insensitively in `s` at a position that is NOT
+/// enclosed in single-quotes (so that filenames like '/tmp/left join.csv' are ignored).
+fn containsKeywordOutsideQuotes(s: []const u8, needle: []const u8) bool {
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '\'') {
+            // Skip everything inside the quoted string.
+            i += 1;
+            while (i < s.len and s[i] != '\'') : (i += 1) {}
+            if (i < s.len) i += 1; // skip closing quote
+            continue;
+        }
+        if (i + needle.len <= s.len and std.ascii.eqlIgnoreCase(s[i..][0..needle.len], needle)) {
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
 /// Returns the position of an INNER JOIN or bare JOIN keyword in `s`, or null if not found.
 /// Requires the keyword to be preceded by whitespace (or start of string) and followed by a space
 /// so that "join" inside a file name (e.g. 'data_join.csv') is not mistaken for the keyword.
@@ -304,6 +324,11 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
         }
         query.columns = try col_list.toOwnedSlice(allocator);
     }
+    // Ensure query.columns is freed on any error path from here on.
+    errdefer {
+        for (query.columns) |col| allocator.free(col);
+        allocator.free(query.columns);
+    }
 
     // Extract file path (and optional JOIN clauses) from FROM clause.
     // Supports chained JOINs:  FROM a JOIN b ON ... JOIN c ON ... WHERE ...
@@ -311,8 +336,9 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
     var rest: []const u8 = undefined;
 
     // Reject unsupported JOIN types before they silently fall through to single-file mode.
+    // Use the quote-aware scanner so that filenames like '/tmp/left join.csv' are not flagged.
     inline for ([_][]const u8{ "LEFT JOIN", "RIGHT JOIN", "OUTER JOIN", "FULL JOIN", "FULL OUTER JOIN", "CROSS JOIN" }) |kw| {
-        if (std.ascii.indexOfIgnoreCase(from_rest, kw)) |_| {
+        if (containsKeywordOutsideQuotes(from_rest, kw)) {
             return error.UnsupportedJoinType;
         }
     }
@@ -392,14 +418,13 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
             const on_left_expr = std.mem.trim(u8, on_cond[0..eq_pos], &std.ascii.whitespace);
             const on_right_expr = std.mem.trim(u8, on_cond[eq_pos + 1 ..], &std.ascii.whitespace);
 
-            // Strip alias prefix from join column names (e.g. "a.id" → "id")
-            const lj_col = if (std.mem.indexOf(u8, on_left_expr, ".")) |d| on_left_expr[d + 1 ..] else on_left_expr;
-            const rj_col = if (std.mem.indexOf(u8, on_right_expr, ".")) |d| on_right_expr[d + 1 ..] else on_right_expr;
-
-            const ljc = try allocator.alloc(u8, lj_col.len);
-            _ = std.ascii.lowerString(ljc, lj_col);
-            const rjc = try allocator.alloc(u8, rj_col.len);
-            _ = std.ascii.lowerString(rjc, rj_col);
+            // Preserve the full ON operand (including alias prefix if present).
+            // e.g. "a.dept_id" stays "a.dept_id", not stripped to "dept_id".
+            // The engine resolves qualified names against alias-range-precise maps.
+            const ljc = try allocator.alloc(u8, on_left_expr.len);
+            _ = std.ascii.lowerString(ljc, on_left_expr);
+            const rjc = try allocator.alloc(u8, on_right_expr.len);
+            _ = std.ascii.lowerString(rjc, on_right_expr);
 
             try joins_list.append(allocator, JoinClause{
                 .right_file = right_info.file,

@@ -558,29 +558,104 @@ fn joinOneStep(
     };
 }
 
-/// Execute an INNER JOIN between two or more CSV files using a hash-join algorithm.
-/// For a single JOIN it streams the left file directly; for chained JOINs each
-/// intermediate result is materialised in an arena before the next step.
+/// Pipelined context threaded through the recursive expand-and-emit helper.
+const JoinCtx = struct {
+    right_maps: []const std.StringHashMap(std.ArrayList([][]const u8)),
+    left_key_idxs: []const usize,
+    right_ws: []const usize,
+    n_steps: usize,
+    final_headers: []const []const u8,
+    output_indices: []const usize,
+    output_row: [][]const u8,
+    where_merged_idx: ?usize,
+    where_expr: ?parser.Expression,
+    writer: *csv.RecordWriter,
+    rows_written: i32,
+    limit: i32,
+    allocator: Allocator, // for complex WHERE row_map only
+};
+
+/// Recursively fill `merged[filled_w..]` from right-table matches for `step_idx`,
+/// then emit the fully-merged row when all steps are satisfied.
+/// Base-row slices in `merged[0..base_w]` are zero-copy (valid for this base row's
+/// expansion) and right-table slices are arena-duped (valid for the whole query).
+fn expandAndEmit(merged: [][]const u8, filled_w: usize, step_idx: usize, ctx: *JoinCtx) !void {
+    if (step_idx == ctx.n_steps) {
+        // All join steps satisfied — apply WHERE then project and write.
+        if (ctx.where_expr) |expr| {
+            if (expr == .comparison) {
+                const comp = expr.comparison;
+                const wi = ctx.where_merged_idx orelse return; // col not resolved → skip
+                const fv = merged[wi];
+                const ok = if (comp.numeric_value) |thr| blk: {
+                    const v = std.fmt.parseFloat(f64, fv) catch return;
+                    break :blk switch (comp.operator) {
+                        .equal => v == thr,
+                        .not_equal => v != thr,
+                        .greater => v > thr,
+                        .greater_equal => v >= thr,
+                        .less => v < thr,
+                        .less_equal => v <= thr,
+                        .like => parser.matchLike(fv, comp.value),
+                    };
+                } else switch (comp.operator) {
+                    .equal => std.mem.eql(u8, fv, comp.value),
+                    .not_equal => !std.mem.eql(u8, fv, comp.value),
+                    .like => parser.matchLike(fv, comp.value),
+                    else => false,
+                };
+                if (!ok) return;
+            } else {
+                // Complex WHERE (AND/OR/NOT): build a temporary row map.
+                var row_map = std.StringHashMap([]const u8).init(ctx.allocator);
+                defer row_map.deinit();
+                for (ctx.final_headers, 0..) |h, ci| try row_map.put(h, merged[ci]);
+                if (!parser.evaluate(expr, row_map)) return;
+            }
+        }
+        for (ctx.output_indices, 0..) |midx, oi| ctx.output_row[oi] = merged[midx];
+        try ctx.writer.writeRecord(ctx.output_row);
+        ctx.rows_written += 1;
+        if (ctx.limit >= 0 and ctx.rows_written >= ctx.limit) return error.LimitReached;
+        return;
+    }
+
+    // Probe the right hash map for this step using the left key from the merged row.
+    const lkey = merged[ctx.left_key_idxs[step_idx]];
+    const matches = ctx.right_maps[step_idx].get(lkey) orelse return; // INNER: no match → discard
+    const rw = ctx.right_ws[step_idx];
+    for (matches.items) |rrow| {
+        // Fill right fields in-place; the next recursion level handles the next step.
+        for (0..rw) |ci| merged[filled_w + ci] = if (ci < rrow.len) rrow[ci] else "";
+        try expandAndEmit(merged, filled_w + rw, step_idx + 1, ctx);
+    }
+}
+
+/// Execute an INNER JOIN between two or more CSV files using a pipelined hash-join.
+///
+/// All right-side tables are loaded into hash maps upfront (they are typically small
+/// lookup tables).  The left (base) table is then streamed row-by-row using the
+/// zero-copy BulkCsvReader slices.  For each base row, expandAndEmit() recursively
+/// fills a single pre-allocated merged_row[] buffer through all join probes and
+/// writes matching rows directly to output.
+///
+/// No materialisation of the left or any intermediate result; no per-row allocations
+/// in the hot loop — only a pointer-copy into the stack-like merged_row[] buffer.
 fn executeJoin(
     allocator: Allocator,
     query: parser.Query,
     output_file: std.fs.File,
     opts: options_mod.Options,
 ) !void {
-    // Arena owns all intermediate strings and row copies for the whole function.
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const aa = arena.allocator();
-
     const joins = query.joins;
     std.debug.assert(joins.len > 0);
 
-    // -----------------------------------------------------------------------
-    // Step 1 – produce the initial left table by streaming the base CSV file.
-    // -----------------------------------------------------------------------
+    // ── Step 1: Read base schema (header only; rows are streamed in Step 4) ──
     const base_file = try std.fs.cwd().openFile(query.file_path, .{});
     defer base_file.close();
-
     var base_reader = try bulk_csv.BulkCsvReader.init(allocator, base_file);
     defer base_reader.deinit();
     base_reader.delimiter = opts.delimiter;
@@ -588,8 +663,6 @@ fn executeJoin(
     const base_hdr_raw = try base_reader.readRecord() orelse return error.EmptyFile;
     defer base_reader.freeRecord(base_hdr_raw);
     const base_w = base_hdr_raw.len;
-
-    // Copy base headers, lowercased, into arena.
     var base_headers = try aa.alloc([]const u8, base_w);
     for (base_hdr_raw, 0..) |col, i| {
         const lower = try aa.alloc(u8, col.len);
@@ -597,88 +670,131 @@ fn executeJoin(
         base_headers[i] = lower;
     }
 
-    // Read all base rows into a flat slice (lw fields per row).
-    var base_rows_list = std.ArrayList([]const u8){};
-    defer base_rows_list.deinit(allocator);
+    // ── Step 2: Load all right hash maps; pre-resolve join key indices ────────
+    // right_maps[ji] : right join col value → list of right rows (arena strings)
+    // left_key_idxs[ji]: index of the left join key in the accumulated schema at step ji
+    // right_ws[ji]   : column count for right table ji
+    //
+    // alias_ranges[0] = base table; alias_ranges[1..] = right tables in join order.
+    // Each entry records which contiguous slice of acc_hdrs belongs to that alias,
+    // enabling precise alias.col → index lookups without first-hit collisions.
+    const AliasRange = struct { name: []const u8, start: usize, width: usize };
+    var right_maps = try aa.alloc(std.StringHashMap(std.ArrayList([][]const u8)), joins.len);
+    var left_key_idxs = try aa.alloc(usize, joins.len);
+    var right_ws = try aa.alloc(usize, joins.len);
+    var alias_ranges = try aa.alloc(AliasRange, joins.len + 1);
+    alias_ranges[0] = .{ .name = joins[0].left_alias, .start = 0, .width = base_w };
+    var acc_offset: usize = base_w;
 
-    while (try base_reader.readRecordSlices()) |row| {
-        for (0..base_w) |ci| {
-            const field = if (ci < row.len) row[ci] else "";
-            try base_rows_list.append(allocator, try aa.dupe(u8, field));
+    var acc_hdrs = std.ArrayList([]const u8){};
+    for (base_headers) |h| try acc_hdrs.append(aa, h);
+
+    for (joins, 0..) |join, ji| {
+        // Resolve left join key using alias-range-precise lmap.
+        // For each table already in acc_hdrs, register both bare (first-seen wins)
+        // and alias-qualified (precise, always-correct) names.
+        var lmap = std.StringHashMap(usize).init(aa);
+        for (alias_ranges[0..ji + 1]) |ar| {
+            for (0..ar.width) |ci| {
+                const idx = ar.start + ci;
+                const bare_col = acc_hdrs.items[idx];
+                // bare: first-seen wins (unambiguous bare refs still work)
+                const bgop = try lmap.getOrPut(bare_col);
+                if (!bgop.found_existing) bgop.value_ptr.* = idx;
+                // qualified alias.col: always set the correct value for this alias
+                if (ar.name.len > 0) {
+                    const qname = try std.fmt.allocPrint(aa, "{s}.{s}", .{ ar.name, bare_col });
+                    try lmap.put(qname, idx);
+                }
+            }
         }
-    }
-    // Copy into arena so the flat slice stays alive independent of base_rows_list.
-    const base_rows = try aa.dupe([]const u8, base_rows_list.items);
+        left_key_idxs[ji] = lmap.get(join.left_col) orelse return error.JoinColumnNotFound;
 
-    // -----------------------------------------------------------------------
-    // Step 2 – apply each JOIN in sequence.
-    // -----------------------------------------------------------------------
-    var current_headers: []const []const u8 = base_headers;
-    // cur_rows is a flat slice: cur_w fields per logical row.
-    var cur_rows: []const []const u8 = base_rows;
-    var cur_w: usize = base_w;
+        // Open right table, build hash map.
+        const rf = try std.fs.cwd().openFile(join.right_file, .{});
+        defer rf.close();
+        var rr = try bulk_csv.BulkCsvReader.init(allocator, rf);
+        defer rr.deinit();
+        rr.delimiter = opts.delimiter;
 
-    for (joins) |join| {
-        var step_table = try joinOneStep(allocator, aa, current_headers, cur_rows, join, opts.delimiter);
-        // joinOneStep appends to step_table.rows using `allocator`; items are arena-owned.
-        // We want cur_rows as a flat slice; flatten step_table.rows.
-        const new_w = step_table.headers.len;
-        const n_rows = step_table.rows.items.len;
-        var flat = try aa.alloc([]const u8, n_rows * new_w);
-        for (step_table.rows.items, 0..) |row, ri| {
-            for (0..new_w) |ci| flat[ri * new_w + ci] = row[ci];
+        const rh_raw = try rr.readRecord() orelse return error.EmptyFile;
+        defer rr.freeRecord(rh_raw);
+        const rw = rh_raw.len;
+        right_ws[ji] = rw;
+        // Record alias range for this right table before extending acc_hdrs.
+        alias_ranges[ji + 1] = .{ .name = join.right_alias, .start = acc_offset, .width = rw };
+        acc_offset += rw;
+
+        var right_lh = try aa.alloc([]const u8, rw);
+        var right_col_map = std.StringHashMap(usize).init(aa);
+        for (rh_raw, 0..) |col, i| {
+            const lower = try aa.alloc(u8, col.len);
+            _ = std.ascii.lowerString(lower, col);
+            right_lh[i] = lower;
+            try right_col_map.put(lower, i);
+            if (join.right_alias.len > 0) {
+                const qname = try std.fmt.allocPrint(aa, "{s}.{s}", .{ join.right_alias, lower });
+                try right_col_map.put(qname, i);
+            }
         }
-        step_table.rows.deinit(allocator);
-        current_headers = step_table.headers;
-        cur_rows = flat;
-        cur_w = new_w;
+        const rjidx = right_col_map.get(join.right_col) orelse return error.JoinColumnNotFound;
+
+        var rmap = std.StringHashMap(std.ArrayList([][]const u8)).init(allocator);
+        while (try rr.readRecordSlices()) |rrow| {
+            if (rjidx >= rrow.len) continue;
+            const key = try aa.dupe(u8, rrow[rjidx]);
+            const gop = try rmap.getOrPut(key);
+            if (!gop.found_existing) gop.value_ptr.* = std.ArrayList([][]const u8){};
+            const rcopy = try aa.alloc([]const u8, rrow.len);
+            for (rrow, 0..) |f, fi| rcopy[fi] = try aa.dupe(u8, f);
+            try gop.value_ptr.append(allocator, rcopy);
+        }
+        right_maps[ji] = rmap;
+
+        // Extend accumulated schema with this right table's headers.
+        for (right_lh) |h| try acc_hdrs.append(aa, h);
     }
 
-    // -----------------------------------------------------------------------
-    // Step 3 – build a unified column map over the final merged schema.
-    // -----------------------------------------------------------------------
+    // Free ArrayList.items in right hash maps on exit (strings live in arena).
+    defer for (right_maps) |*rmap| {
+        var it = rmap.iterator();
+        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
+        rmap.deinit();
+    };
+
+    const final_headers = acc_hdrs.items;
+    const total_w = final_headers.len;
+
+    // ── Step 3: col_map, ambiguity counts, output indices, WHERE index ────────
     var col_map = std.StringHashMap(usize).init(aa);
-    // Count occurrences of each bare (unaliased) column name to detect ambiguity later.
     var bare_count = std.StringHashMap(usize).init(aa);
-    for (current_headers, 0..) |h, i| {
-        try col_map.put(h, i);
+    for (final_headers, 0..) |h, i| {
+        // bare name: first-seen wins (col_map lookup for unqualified columns)
+        const bgop = try col_map.getOrPut(h);
+        if (!bgop.found_existing) bgop.value_ptr.* = i;
         const bare_h = if (std.mem.indexOf(u8, h, ".")) |d| h[d + 1 ..] else h;
         const bc_gop = try bare_count.getOrPut(bare_h);
         if (!bc_gop.found_existing) bc_gop.value_ptr.* = 0;
         bc_gop.value_ptr.* += 1;
     }
-    // Also register qualified alias.col names from all join clauses so that
-    // SELECT a.name, b.dept, c.region style projections still work.
-    for (joins) |join| {
-        // right alias
-        if (join.right_alias.len > 0) {
-            for (current_headers, 0..) |h, i| {
-                const bare = if (std.mem.indexOf(u8, h, ".")) |d| h[d + 1 ..] else h;
-                const qname = try std.fmt.allocPrint(aa, "{s}.{s}", .{ join.right_alias, bare });
-                const gop = try col_map.getOrPut(qname);
-                if (!gop.found_existing) gop.value_ptr.* = i;
-            }
-        }
-    }
-    // Register left (base file) alias from the first join.
-    if (joins[0].left_alias.len > 0) {
-        for (base_headers, 0..) |h, i| {
-            const qname = try std.fmt.allocPrint(aa, "{s}.{s}", .{ joins[0].left_alias, h });
-            const gop = try col_map.getOrPut(qname);
-            if (!gop.found_existing) gop.value_ptr.* = i;
+    // Register alias.col → precise index using alias_ranges.
+    // This replaces the old first-hit getOrPut loops that could map b.id → a.id.
+    for (alias_ranges) |ar| {
+        if (ar.name.len == 0) continue;
+        for (0..ar.width) |ci| {
+            const idx = ar.start + ci;
+            const qname = try std.fmt.allocPrint(aa, "{s}.{s}", .{ ar.name, final_headers[idx] });
+            try col_map.put(qname, idx); // always correct: no first-hit collision
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Step 4 – determine output columns.
-    // -----------------------------------------------------------------------
     var output_indices = std.ArrayList(usize){};
     var output_header_names = std.ArrayList([]const u8){};
 
     if (query.all_columns) {
-        for (0..cur_w) |i| {
+        for (0..total_w) |i| {
             try output_indices.append(aa, i);
-            try output_header_names.append(aa, current_headers[i]);
+            try output_header_names.append(aa, final_headers[i]);
         }
     } else {
         for (query.columns) |col_raw| {
@@ -687,26 +803,21 @@ fn executeJoin(
                 _ = std.ascii.lowerString(tmp, col_raw);
                 break :blk tmp;
             };
-            // Reject unqualified (no-dot) column references that exist in more than one table.
             if (std.mem.indexOfScalar(u8, col, '.') == null) {
                 if ((bare_count.get(col) orelse 0) > 1) return error.AmbiguousColumnReference;
             }
             if (col_map.get(col)) |idx| {
                 try output_indices.append(aa, idx);
-                try output_header_names.append(aa, current_headers[idx]);
+                try output_header_names.append(aa, final_headers[idx]);
             } else {
-                // Try stripping alias prefix for dot-qualified references
                 const bare = if (std.mem.indexOf(u8, col, ".")) |d| col[d + 1 ..] else col;
                 const idx = col_map.get(bare) orelse return error.ColumnNotFound;
                 try output_indices.append(aa, idx);
-                try output_header_names.append(aa, current_headers[idx]);
+                try output_header_names.append(aa, final_headers[idx]);
             }
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Step 5 – pre-compute WHERE column index in merged row (fast path).
-    // -----------------------------------------------------------------------
     var where_merged_idx: ?usize = null;
     if (query.where_expr) |expr| {
         if (expr == .comparison) {
@@ -714,76 +825,45 @@ fn executeJoin(
             if (col_map.get(col)) |idx| {
                 where_merged_idx = idx;
             } else if (std.mem.indexOf(u8, col, ".")) |dot| {
-                const bare = col[dot + 1 ..];
-                where_merged_idx = col_map.get(bare);
+                where_merged_idx = col_map.get(col[dot + 1 ..]);
             }
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Step 6 – write output rows.
-    // -----------------------------------------------------------------------
+    // ── Step 4: Stream base rows → expand through hash maps → emit ───────────
+    // merged_row[] is allocated once and reused as a workspace for every base row.
+    // Slots [0..base_w] are filled from zero-copy BulkCsvReader slices (valid until
+    // the next readRecordSlices call).  Deeper slots are filled by expandAndEmit()
+    // from arena-duped right-table strings (valid for the whole query).
     var writer = csv.RecordWriter.init(output_file, opts);
     defer writer.deinit();
     try writer.writeHeader(output_header_names.items, opts.no_header);
 
-    var output_row = try aa.alloc([]const u8, output_indices.items.len);
-    var row_arena = std.heap.ArenaAllocator.init(allocator);
-    defer row_arena.deinit();
-    var rows_written: i32 = 0;
+    var merged_row = try aa.alloc([]const u8, total_w);
+    const output_row = try aa.alloc([]const u8, output_indices.items.len);
 
-    const n_rows = cur_rows.len / cur_w;
-    var ri: usize = 0;
-    while (ri < n_rows) : (ri += 1) {
-        const merged_row = cur_rows[ri * cur_w .. ri * cur_w + cur_w];
+    var ctx = JoinCtx{
+        .right_maps = right_maps,
+        .left_key_idxs = left_key_idxs,
+        .right_ws = right_ws,
+        .n_steps = joins.len,
+        .final_headers = final_headers,
+        .output_indices = output_indices.items,
+        .output_row = output_row,
+        .where_merged_idx = where_merged_idx,
+        .where_expr = query.where_expr,
+        .writer = &writer,
+        .rows_written = 0,
+        .limit = query.limit,
+        .allocator = allocator,
+    };
 
-        // Apply WHERE clause
-        if (query.where_expr) |expr| {
-            if (expr == .comparison) {
-                const comp = expr.comparison;
-                if (where_merged_idx) |midx| {
-                    const field_value = merged_row[midx];
-                    var matches_where = false;
-                    if (comp.numeric_value) |threshold| {
-                        const val = std.fmt.parseFloat(f64, field_value) catch continue;
-                        matches_where = switch (comp.operator) {
-                            .equal => val == threshold,
-                            .not_equal => val != threshold,
-                            .greater => val > threshold,
-                            .greater_equal => val >= threshold,
-                            .less => val < threshold,
-                            .less_equal => val <= threshold,
-                            .like => parser.matchLike(field_value, comp.value),
-                        };
-                    } else {
-                        matches_where = switch (comp.operator) {
-                            .equal => std.mem.eql(u8, field_value, comp.value),
-                            .not_equal => !std.mem.eql(u8, field_value, comp.value),
-                            .like => parser.matchLike(field_value, comp.value),
-                            else => false,
-                        };
-                    }
-                    if (!matches_where) continue;
-                } else {
-                    continue;
-                }
-            } else {
-                _ = row_arena.reset(.retain_capacity);
-                const ra = row_arena.allocator();
-                var row_map = std.StringHashMap([]const u8).init(ra);
-                for (current_headers, 0..) |h, ci| {
-                    try row_map.put(h, merged_row[ci]);
-                }
-                if (!parser.evaluate(expr, row_map)) continue;
-            }
-        }
-
-        for (output_indices.items, 0..) |midx, oi| {
-            output_row[oi] = if (midx < merged_row.len) merged_row[midx] else "";
-        }
-        try writer.writeRecord(output_row);
-        rows_written += 1;
-        if (query.limit >= 0 and rows_written >= query.limit) break;
+    while (try base_reader.readRecordSlices()) |base_row| {
+        for (0..base_w) |ci| merged_row[ci] = if (ci < base_row.len) base_row[ci] else "";
+        expandAndEmit(merged_row, base_w, 0, &ctx) catch |err| switch (err) {
+            error.LimitReached => break,
+            else => return err,
+        };
     }
 
     try writer.finish();
@@ -3151,4 +3231,117 @@ test "INNER JOIN: ambiguous unqualified column returns AmbiguousColumnReference"
     defer out_file.close();
 
     try std.testing.expectError(error.AmbiguousColumnReference, execute(allocator, query, out_file, .{}));
+}
+
+// Regression test: Bug 1 — SELECT b.id must return b's values, not a's.
+// When both tables share a bare column name ("id"), the old first-hit getOrPut in col_map
+// mapped b.id → a's column index.  alias_ranges-based registration fixes this.
+test "INNER JOIN: qualified SELECT on shared column name returns correct table's values" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // a: id,link   – id = 1,2
+    {
+        const f = try tmp.dir.createFile("a.csv", .{});
+        defer f.close();
+        try f.writeAll("id,link\n1,X\n2,Y\n");
+    }
+    // b: link,id   – id = 10,20  (both tables have "id")
+    {
+        const f = try tmp.dir.createFile("b.csv", .{});
+        defer f.close();
+        try f.writeAll("link,id\nX,10\nY,20\n");
+    }
+
+    var a_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var b_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const a_path = try tmp.dir.realpath("a.csv", &a_buf);
+    const b_path = try tmp.dir.realpath("b.csv", &b_buf);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT b.id FROM '{s}' a JOIN '{s}' b ON a.link = b.link",
+        .{ a_path, b_path },
+    );
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("bug1_out.csv", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file, .{});
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 4096);
+    defer allocator.free(output);
+
+    // Must return b's id values (10, 20), NOT a's id values (1, 2).
+    try std.testing.expectEqualStrings("id\n10\n20\n", output);
+}
+
+// Regression test: Bug 2 — ON a.id = c.id must probe using a's column index, not b's.
+// The old parser stripped alias prefixes (a.id → id) and the engine lmap used put()
+// (overwrite), so the last-appended table's bare "id" won.  Preserving full qualified
+// names in the parser and building lmap from alias_ranges fixes this.
+test "INNER JOIN chained: ON clause uses correct table for join key when column names clash" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // a: id,name
+    {
+        const f = try tmp.dir.createFile("a.csv", .{});
+        defer f.close();
+        try f.writeAll("id,name\n1,Alice\n2,Bob\n");
+    }
+    // b: a_id,id,dept  – b.id = 100,200 (different from a.id = 1,2)
+    {
+        const f = try tmp.dir.createFile("b.csv", .{});
+        defer f.close();
+        try f.writeAll("a_id,id,dept\n1,100,Eng\n2,200,Mkt\n");
+    }
+    // c: id,region  – c.id = 1,2 (matches a.id, NOT b.id)
+    {
+        const f = try tmp.dir.createFile("c.csv", .{});
+        defer f.close();
+        try f.writeAll("id,region\n1,West\n2,East\n");
+    }
+
+    var a_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var b_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var c_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const a_path = try tmp.dir.realpath("a.csv", &a_buf);
+    const b_path = try tmp.dir.realpath("b.csv", &b_buf);
+    const c_path = try tmp.dir.realpath("c.csv", &c_buf);
+
+    // Second join: ON a.id = c.id — must use a's id (1,2), not b's id (100,200).
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT a.name, c.region FROM '{s}' a " ++
+            "JOIN '{s}' b ON a.id = b.a_id " ++
+            "JOIN '{s}' c ON a.id = c.id",
+        .{ a_path, b_path, c_path },
+    );
+    defer allocator.free(sql);
+
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("bug2_out.csv", .{ .read = true });
+    defer out_file.close();
+
+    try execute(allocator, query, out_file, .{});
+
+    try out_file.seekTo(0);
+    const output = try out_file.readToEndAlloc(allocator, 4096);
+    defer allocator.free(output);
+
+    // If Bug 2 exists: engine probes c using b.id (100,200) instead of a.id (1,2) → 0 rows.
+    // Correct:  Alice → West, Bob → East.
+    try std.testing.expectEqualStrings("name,region\nAlice,West\nBob,East\n", output);
 }
