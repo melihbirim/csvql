@@ -694,7 +694,7 @@ fn executeJoin(
         // For each table already in acc_hdrs, register both bare (first-seen wins)
         // and alias-qualified (precise, always-correct) names.
         var lmap = std.StringHashMap(usize).init(aa);
-        for (alias_ranges[0..ji + 1]) |ar| {
+        for (alias_ranges[0 .. ji + 1]) |ar| {
             for (0..ar.width) |ci| {
                 const idx = ar.start + ci;
                 const bare_col = acc_hdrs.items[idx];
