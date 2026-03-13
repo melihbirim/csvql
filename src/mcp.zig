@@ -419,5 +419,3 @@ fn writeJsonValue(v: std.json.Value, buf: *ManagedList) !void {
         .array, .object => try buf.appendSlice("null"),
     }
 }
-
-
