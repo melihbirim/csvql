@@ -115,6 +115,7 @@ sudo cp zig-out/bin/csvql /usr/local/bin/
 | Full scan (all 1M rows)           | **0.196s** | 1.163s | **5.9x** |
 | `COUNT(*) GROUP BY` (6 groups)    | **0.060s** | 0.110s | **1.8x** |
 | `SUM + AVG GROUP BY` (6 groups)   | **0.070s** | 0.110s | **1.6x** |
+| `SUM(CASE WHEN) GROUP BY`         | **0.016s** | 0.114s | **7.1x** |
 | `SELECT DISTINCT city` (8 values) | **0.060s** | 0.110s | **1.8x** |
 | `SELECT COUNT(*)` scalar          | **0.050s** | 0.100s | **2x**   |
 | `SELECT SUM(salary)` scalar       | **0.050s** | 0.110s | **2.2x** |
