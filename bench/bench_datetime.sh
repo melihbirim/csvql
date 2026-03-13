@@ -254,11 +254,9 @@ bench_and_check "DATEDIFF seconds" \
     "SELECT order_id, DATEDIFF('second', ordered_at, picked_at) AS pick_secs FROM '$DUCK_ISO' WHERE picked_at != ''" \
     "SELECT order_id, CAST(epoch(strptime(picked_at, '%Y-%m-%d %H:%M:%S') - strptime(ordered_at, '%Y-%m-%d %H:%M:%S')) AS BIGINT) AS pick_secs FROM read_csv_auto('$DUCK_ISO', ALL_VARCHAR=TRUE) WHERE picked_at != ''"
 
-# Note: DATEDIFF in WHERE clause is not yet supported in csvql (scalar functions in WHERE
-# are evaluated at SELECT time, not filter time). Skipping this comparison.
-echo
-echo -e "  ${YELLOW}⊘${NC} DATEDIFF in WHERE clause (not yet supported — skip)"
-((skipped++)) || true
+bench_and_check "DATEDIFF in WHERE clause" \
+    "SELECT order_id FROM '$DUCK_ISO' WHERE shipped_at != '' AND delivered_at != '' AND DATEDIFF('day', shipped_at, delivered_at) > 1" \
+    "SELECT order_id FROM read_csv_auto('$DUCK_ISO', ALL_VARCHAR=TRUE) WHERE shipped_at != '' AND delivered_at != '' AND epoch(strptime(delivered_at, '%Y-%m-%d %H:%M:%S') - strptime(shipped_at, '%Y-%m-%d %H:%M:%S')) / 86400.0 > 1"
 
 bench_and_check "DATEDIFF with ORDER BY" \
     "SELECT order_id, DATEDIFF('minute', ordered_at, picked_at) AS pick_min FROM '$DUCK_ISO' WHERE picked_at != '' ORDER BY pick_min DESC" \

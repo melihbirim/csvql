@@ -60,6 +60,32 @@ const ArenaBuffer = struct {
     }
 };
 
+/// Append a CSV-escaped field to an ArenaBuffer.
+/// Fields containing the delimiter, `"`, `\r`, or `\n` are wrapped in
+/// double-quotes with any internal `"` doubled (RFC 4180).
+fn appendCsvFieldToArena(arena: *ArenaBuffer, field: []const u8, delimiter: u8) !void {
+    var needs_quotes = false;
+    for (field) |c| {
+        if (c == '"' or c == '\r' or c == '\n' or c == delimiter) {
+            needs_quotes = true;
+            break;
+        }
+    }
+    if (needs_quotes) {
+        _ = try arena.append("\"");
+        for (field) |c| {
+            if (c == '"') {
+                _ = try arena.append("\"\"");
+            } else {
+                _ = try arena.append(&[_]u8{c});
+            }
+        }
+        _ = try arena.append("\"");
+    } else {
+        _ = try arena.append(field);
+    }
+}
+
 /// Append a JSON-escaped, double-quoted string to an ArenaBuffer.
 /// Used by the ORDER BY path when building JSON objects for sorting.
 fn appendJsonStringToArena(arena: *ArenaBuffer, s: []const u8) !void {
@@ -470,8 +496,8 @@ fn executeSequential(
             switch (opts.format) {
                 .csv => {
                     for (output_row, 0..) |field, i| {
-                        if (i > 0) _ = try a.append(",");
-                        _ = try a.append(field);
+                        if (i > 0) _ = try a.append(&[_]u8{opts.delimiter});
+                        try appendCsvFieldToArena(a, field, opts.delimiter);
                     }
                 },
                 .json, .jsonl => {
@@ -2478,7 +2504,15 @@ fn executeScalarAgg(
             accum.count += 1;
             for (agg_specs.items, 0..) |spec, i| {
                 switch (spec.func_type) {
-                    .count => {},
+                    .count => {
+                        // COUNT(col): only count rows where the column is non-empty.
+                        // COUNT(*) (col_idx == null) relies on accum.count above.
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len and record[cidx].len > 0) {
+                                accum.sum_counts[i] += 1;
+                            }
+                        }
+                    },
                     .count_distinct => {
                         if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
@@ -2538,7 +2572,12 @@ fn executeScalarAgg(
 
     for (agg_specs.items, 0..) |spec, i| {
         const s: []u8 = switch (spec.func_type) {
-            .count => try std.fmt.allocPrint(allocator, "{d}", .{accum.count}),
+            .count => if (spec.col_idx != null)
+                // COUNT(col): only non-empty values were counted into sum_counts[i]
+                try std.fmt.allocPrint(allocator, "{d}", .{accum.sum_counts[i]})
+            else
+                // COUNT(*): all rows
+                try std.fmt.allocPrint(allocator, "{d}", .{accum.count}),
             .count_distinct => blk: {
                 const cnt: u32 = if (accum.distinct_sets[i]) |ds| ds.count() else 0;
                 break :blk try std.fmt.allocPrint(allocator, "{d}", .{cnt});
@@ -3570,7 +3609,15 @@ fn executeGroupBy(
             accum.count += 1;
             for (agg_specs.items, 0..) |spec, i| {
                 switch (spec.func_type) {
-                    .count => {},
+                    .count => {
+                        // COUNT(col): only count rows where the column is non-empty.
+                        // COUNT(*) (col_idx == null) relies on accum.count above.
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len and record[cidx].len > 0) {
+                                accum.sum_counts[i] += 1;
+                            }
+                        }
+                    },
                     .count_distinct => {
                         if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
@@ -3664,7 +3711,12 @@ fn executeGroupBy(
 
         for (agg_specs.items, 0..) |spec, i| {
             const s: []u8 = switch (spec.func_type) {
-                .count => try std.fmt.allocPrint(allocator, "{d}", .{accum.count}),
+                .count => if (spec.col_idx != null)
+                    // COUNT(col): only non-empty values were counted into sum_counts[i]
+                    try std.fmt.allocPrint(allocator, "{d}", .{accum.sum_counts[i]})
+                else
+                    // COUNT(*): all rows
+                    try std.fmt.allocPrint(allocator, "{d}", .{accum.count}),
                 .count_distinct => blk: {
                     const cnt: u32 = if (accum.distinct_sets[i]) |ds| ds.count() else 0;
                     break :blk try std.fmt.allocPrint(allocator, "{d}", .{cnt});
@@ -6028,4 +6080,121 @@ test "ROUND: rounds to specified decimal places" {
     try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "1.2"));
     try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "2.5"));
     try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "6.0"));
+}
+
+test "DATEDIFF in WHERE: filters rows by time difference greater than threshold" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("orders.csv", .{});
+        defer f.close();
+        // order 1: 2 days (keep), order 2: 0.5 days (drop), order 3: 3 days (keep)
+        try f.writeAll("order_id,shipped_at,delivered_at\n" ++
+            "1001,2026-01-15 08:00:00,2026-01-17 08:00:00\n" ++
+            "1002,2026-01-15 08:00:00,2026-01-15 20:00:00\n" ++
+            "1003,2026-01-15 08:00:00,2026-01-18 08:00:00\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("orders.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT order_id FROM '{s}' WHERE DATEDIFF('day', shipped_at, delivered_at) > 1",
+        .{p},
+    );
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out_dd_where.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "1001")); // 2 days > 1
+    try std.testing.expect(!std.mem.containsAtLeast(u8, data, 1, "1002")); // 0.5 days, excluded
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "1003")); // 3 days > 1
+}
+
+test "DATEDIFF in WHERE: combined with AND condition" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("orders.csv", .{});
+        defer f.close();
+        // status=delivered: order 1 (75 mins, keep), order 3 (120 mins, keep)
+        // status=pending: order 2 (60 mins, excluded by status filter)
+        try f.writeAll("order_id,status,ordered_at,picked_at\n" ++
+            "1001,delivered,2026-01-15 09:00:00,2026-01-15 10:15:00\n" ++
+            "1002,pending,2026-01-15 09:00:00,2026-01-15 10:00:00\n" ++
+            "1003,delivered,2026-01-15 09:00:00,2026-01-15 11:00:00\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("orders.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT order_id FROM '{s}' WHERE status = 'delivered' AND DATEDIFF('minute', ordered_at, picked_at) > 60",
+        .{p},
+    );
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out_dd_and.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "1001")); // delivered + 75 min
+    try std.testing.expect(!std.mem.containsAtLeast(u8, data, 1, "1002")); // pending, excluded
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "1003")); // delivered + 120 min
+}
+
+test "EXTRACT in WHERE: filters rows by year" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("events.csv", .{});
+        defer f.close();
+        try f.writeAll("id,event_date\n" ++
+            "1,2025-06-15 09:00:00\n" ++
+            "2,2026-01-10 14:00:00\n" ++
+            "3,2026-03-20 08:00:00\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("events.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT id FROM '{s}' WHERE EXTRACT(year FROM event_date) = 2026",
+        .{p},
+    );
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out_ext_where.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(!std.mem.containsAtLeast(u8, data, 1, "1,")); // 2025, excluded
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "2")); // 2026
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "3")); // 2026
 }

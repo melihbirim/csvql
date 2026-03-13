@@ -133,9 +133,14 @@ pub fn executeParallelMapped(
         }
     } else {
         for (query.columns) |col| {
-            const lower_col = try allocator.alloc(u8, col.len);
+            // Strip AS alias: "name AS n" → look up "name", output as "n"
+            const expr_part = if (std.ascii.indexOfIgnoreCase(col, " as ")) |as_idx|
+                std.mem.trim(u8, col[0..as_idx], &std.ascii.whitespace)
+            else
+                col;
+            const lower_col = try allocator.alloc(u8, expr_part.len);
             defer allocator.free(lower_col);
-            _ = std.ascii.lowerString(lower_col, col);
+            _ = std.ascii.lowerString(lower_col, expr_part);
             const idx = column_map.get(lower_col) orelse return error.ColumnNotFound;
             try output_indices.append(allocator, idx);
         }
@@ -148,8 +153,19 @@ pub fn executeParallelMapped(
     var output_header = std.ArrayList([]const u8){};
     defer output_header.deinit(allocator);
 
-    for (output_indices.items) |idx| {
-        try output_header.append(allocator, header.items[idx]);
+    if (query.all_columns) {
+        for (output_indices.items) |idx| {
+            try output_header.append(allocator, header.items[idx]);
+        }
+    } else {
+        for (query.columns) |col| {
+            // Use alias as the output column name when present
+            const out_name = if (std.ascii.indexOfIgnoreCase(col, " as ")) |as_idx|
+                std.mem.trim(u8, col[as_idx + 4 ..], &std.ascii.whitespace)
+            else
+                col;
+            try output_header.append(allocator, out_name);
+        }
     }
     try writer.writeHeader(output_header.items, opts.no_header);
 
@@ -202,12 +218,35 @@ pub fn executeParallelMapped(
     if (query.order_by) |order_by| {
         // ===== ORDER BY path: lightweight SortLine entries (zero per-row allocs) =====
 
-        // Find ORDER BY column index in raw CSV header
+        // Find ORDER BY column index in raw CSV header.
+        // Supports positional ("ORDER BY 1") and alias-aware matching.
         var order_by_raw_idx: ?usize = null;
-        for (lower_header, 0..) |name, idx| {
-            if (std.mem.eql(u8, name, order_by.column)) {
-                order_by_raw_idx = idx;
-                break;
+
+        // Positional ORDER BY: "ORDER BY 1" → first output column (raw index)
+        const pos_num = std.fmt.parseInt(usize, order_by.column, 10) catch 0;
+        if (pos_num >= 1 and pos_num <= output_indices.items.len) {
+            order_by_raw_idx = output_indices.items[pos_num - 1];
+        }
+
+        if (order_by_raw_idx == null) {
+            // Match against output header (supports AS aliases)
+            for (output_header.items, 0..) |hdr, pos| {
+                const lower_hdr = try allocator.alloc(u8, hdr.len);
+                defer allocator.free(lower_hdr);
+                _ = std.ascii.lowerString(lower_hdr, hdr);
+                if (std.mem.eql(u8, lower_hdr, order_by.column)) {
+                    order_by_raw_idx = output_indices.items[pos];
+                    break;
+                }
+            }
+        }
+
+        if (order_by_raw_idx == null) {
+            for (lower_header, 0..) |name, idx| {
+                if (std.mem.eql(u8, name, order_by.column)) {
+                    order_by_raw_idx = idx;
+                    break;
+                }
             }
         }
         if (order_by_raw_idx == null) return error.OrderByColumnNotFound;
