@@ -694,7 +694,7 @@ pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
             .operator = .is_not_null,
             .value = try allocator.dupe(u8, ""),
             .numeric_value = null,
-        }};
+        } };
     }
     if (std.ascii.indexOfIgnoreCase(trimmed, " IS NULL")) |idx| {
         const col_part = std.mem.trim(u8, trimmed[0..idx], &std.ascii.whitespace);
@@ -705,7 +705,7 @@ pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
             .operator = .is_null,
             .value = try allocator.dupe(u8, ""),
             .numeric_value = null,
-        }};
+        } };
     }
 
     // BETWEEN must be detected BEFORE the AND/OR split because
@@ -794,7 +794,7 @@ fn parseBetween(allocator: Allocator, input: []const u8, between_idx: usize) !Ex
         .numeric_value = std.fmt.parseFloat(f64, low_clean) catch null,
         .between_high = try allocator.dupe(u8, high_clean),
         .between_high_num = std.fmt.parseFloat(f64, high_clean) catch null,
-    }};
+    } };
 }
 
 fn parseInComparison(allocator: Allocator, input: []const u8, in_idx: usize) !Expression {

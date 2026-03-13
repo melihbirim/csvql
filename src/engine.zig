@@ -2463,7 +2463,7 @@ fn executeScalarAgg(
                             .less_equal => val <= threshold,
                             .like => parser.matchLike(fv, comp.value),
                             .ilike => parser.matchILike(fv, comp.value),
-                        .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
+                            .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
                         };
                     } else {
                         matches = parser.compareValues(comp, fv);
@@ -2670,7 +2670,7 @@ fn gbProcessRecord(
                     .less_equal => val <= threshold,
                     .like => parser.matchLike(fv, comp.value),
                     .ilike => parser.matchILike(fv, comp.value),
-                        .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
+                    .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
                 };
                 if (!matches) return;
             } else {
@@ -2924,7 +2924,7 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                             .less_equal => val <= threshold,
                             .like => parser.matchLike(fv, comp.value),
                             .ilike => parser.matchILike(fv, comp.value),
-                        .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
+                            .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
                         };
                     } else {
                         matches = parser.compareValues(comp, fv);
@@ -3008,7 +3008,7 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                             .less_equal => val <= threshold,
                             .like => parser.matchLike(fv, comp.value),
                             .ilike => parser.matchILike(fv, comp.value),
-                        .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
+                            .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
                         };
                         if (!matches) break :row;
                     } else {
@@ -3511,7 +3511,7 @@ fn executeGroupBy(
                             .less_equal => val <= threshold,
                             .like => parser.matchLike(fv, comp.value),
                             .ilike => parser.matchILike(fv, comp.value),
-                        .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
+                            .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
                         };
                     } else {
                         matches = parser.compareValues(comp, fv);
