@@ -2655,7 +2655,41 @@ fn executeGroupBy(
             const lower = try allocator.alloc(u8, col.len);
             defer allocator.free(lower);
             _ = std.ascii.lowerString(lower, col);
-            group_specs[i] = .{ .column = column_map.get(lower) orelse return error.ColumnNotFound };
+            if (column_map.get(lower)) |cidx| {
+                group_specs[i] = .{ .column = cidx };
+            } else {
+                // Try to resolve as a SELECT alias (e.g. GROUP BY month where SELECT STRFTIME(...) AS month)
+                const resolved: ?[]const u8 = blk: {
+                    if (!query.all_columns) {
+                        for (query.columns) |qcol| {
+                            const sa = splitAlias(qcol);
+                            if (sa.alias) |alias| {
+                                const lower_alias = try allocator.alloc(u8, alias.len);
+                                defer allocator.free(lower_alias);
+                                _ = std.ascii.lowerString(lower_alias, alias);
+                                if (std.mem.eql(u8, lower_alias, lower)) {
+                                    break :blk sa.expr;
+                                }
+                            }
+                        }
+                    }
+                    break :blk null;
+                };
+                if (resolved) |expr| {
+                    if (try parseStrftimeRaw(allocator, expr, column_map)) |sf| {
+                        group_specs[i] = .{ .strftime = sf };
+                    } else if (try parseSubstrRaw(allocator, expr, column_map)) |ss| {
+                        group_specs[i] = .{ .substr = ss };
+                    } else {
+                        const lower2 = try allocator.alloc(u8, expr.len);
+                        defer allocator.free(lower2);
+                        _ = std.ascii.lowerString(lower2, expr);
+                        group_specs[i] = .{ .column = column_map.get(lower2) orelse return error.ColumnNotFound };
+                    }
+                } else {
+                    return error.ColumnNotFound;
+                }
+            }
         }
         n_specs_init += 1;
     }
