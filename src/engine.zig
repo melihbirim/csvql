@@ -8,6 +8,7 @@ const fast_sort = @import("fast_sort.zig");
 const aggregation = @import("aggregation.zig");
 const simd = @import("simd.zig");
 const options_mod = @import("options.zig");
+const scalar = @import("scalar.zig");
 const Allocator = std.mem.Allocator;
 
 /// Result row for ORDER BY buffering — uses fast_sort SortKey
@@ -86,6 +87,36 @@ pub const parseQuery = parser.parse;
 /// Re-export Query type for the same reason.
 pub const Query = parser.Query;
 
+/// Return true when any SELECT column is a scalar function that needs per-row
+/// evaluation (UPPER, LOWER, TRIM, LENGTH, SUBSTR, ABS, CEIL, FLOOR, MOD,
+/// COALESCE, CAST).  Aggregate functions, STRFTIME, SUBSTR-as-GROUP-BY-key,
+/// and CASE WHEN are handled by their own dedicated paths and are excluded.
+fn hasScalarSelectFunctions(query: parser.Query) bool {
+    if (query.all_columns) return false;
+    for (query.columns) |col| {
+        const sa = splitAlias(col);
+        const e = std.mem.trim(u8, sa.expr, &std.ascii.whitespace);
+        const open = std.mem.indexOf(u8, e, "(") orelse continue;
+        const fn_raw = std.mem.trim(u8, e[0..open], &std.ascii.whitespace);
+        // Skip empty (would be a syntax error anyway)
+        if (fn_raw.len == 0) continue;
+        // Aggregate + special functions handled elsewhere
+        if (std.ascii.eqlIgnoreCase(fn_raw, "count") or
+            std.ascii.eqlIgnoreCase(fn_raw, "sum") or
+            std.ascii.eqlIgnoreCase(fn_raw, "avg") or
+            std.ascii.eqlIgnoreCase(fn_raw, "min") or
+            std.ascii.eqlIgnoreCase(fn_raw, "max") or
+            std.ascii.eqlIgnoreCase(fn_raw, "count_distinct") or
+            std.ascii.eqlIgnoreCase(fn_raw, "strftime") or
+            std.ascii.eqlIgnoreCase(fn_raw, "substr") or
+            std.ascii.eqlIgnoreCase(fn_raw, "substring") or
+            std.ascii.eqlIgnoreCase(fn_raw, "round") or
+            std.ascii.startsWithIgnoreCase(fn_raw, "case")) continue;
+        return true;
+    }
+    return false;
+}
+
 /// Execute a SQL query on a CSV file
 pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.File, opts: options_mod.Options) !void {
     // Check if reading from stdin
@@ -120,6 +151,18 @@ pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.Fi
     // Check for GROUP BY - requires sequential processing
     if (query.group_by.len > 0) {
         try executeGroupBy(allocator, query, output_file, opts);
+        return;
+    }
+
+    // Scalar SELECT functions (UPPER, LOWER, TRIM, etc.) need per-row eval;
+    // route to executeSequential which now supports OutputColSpec projection.
+    // This check runs BEFORE opening the file so large-file routing is bypassed —
+    // acceptable since scalar SELECT on multi-GB files is uncommon and the
+    // BulkCsvReader path is still fast (no mmap overhead, just seq reads).
+    if (hasScalarSelectFunctions(query)) {
+        const file_s = try std.fs.cwd().openFile(query.file_path, .{});
+        defer file_s.close();
+        try executeSequential(allocator, query, file_s, output_file, opts);
         return;
     }
 
@@ -191,27 +234,36 @@ fn executeSequential(
     }
 
     // Determine output columns
-    var output_indices = std.ArrayList(usize){};
-    defer output_indices.deinit(allocator);
+    var output_specs = std.ArrayListUnmanaged(scalar.OutputColSpec){};
+    defer output_specs.deinit(allocator);
 
     var output_header = std.ArrayList([]const u8){};
     defer output_header.deinit(allocator);
 
     if (query.all_columns) {
         for (header, 0..) |col_name, idx| {
-            try output_indices.append(allocator, idx);
+            try output_specs.append(allocator, .{ .column = idx });
             try output_header.append(allocator, col_name);
         }
     } else {
         for (query.columns) |col| {
             const sa = splitAlias(col);
             const expr = sa.expr;
+
+            // Try scalar function first (UPPER, LOWER, TRIM, etc.)
+            if (try scalar.tryParseScalar(expr, column_map, allocator)) |sc_spec| {
+                try output_specs.append(allocator, .{ .scalar = sc_spec });
+                try output_header.append(allocator, if (sa.alias) |a| a else expr);
+                continue;
+            }
+
+            // Fall back to plain column lookup
             const lower_col = try allocator.alloc(u8, expr.len);
             defer allocator.free(lower_col);
             _ = std.ascii.lowerString(lower_col, expr);
 
             const idx = column_map.get(lower_col) orelse return error.ColumnNotFound;
-            try output_indices.append(allocator, idx);
+            try output_specs.append(allocator, .{ .column = idx });
             try output_header.append(allocator, if (sa.alias) |a| a else header[idx]);
         }
     }
@@ -267,12 +319,18 @@ fn executeSequential(
         }
         // Fall back to raw column name match
         if (order_by_column_idx == null) {
-            for (output_indices.items, 0..) |out_idx, pos| {
-                if (out_idx < lower_header.len and
-                    std.mem.eql(u8, lower_header[out_idx], order_by.column))
-                {
-                    order_by_column_idx = pos;
-                    break;
+            for (output_specs.items, 0..) |spec, pos| {
+                const raw_idx: ?usize = switch (spec) {
+                    .column => |i| i,
+                    .scalar => null,
+                };
+                if (raw_idx) |i| {
+                    if (i < lower_header.len and
+                        std.mem.eql(u8, lower_header[i], order_by.column))
+                    {
+                        order_by_column_idx = pos;
+                        break;
+                    }
                 }
             }
         }
@@ -292,8 +350,13 @@ fn executeSequential(
     var rows_written: i32 = 0;
 
     // Pre-allocate output row buffer (reused across all rows)
-    var output_row = try allocator.alloc([]const u8, output_indices.items.len);
+    var output_row = try allocator.alloc([]const u8, output_specs.items.len);
     defer allocator.free(output_row);
+
+    // Arena for per-row scalar function allocations (UPPER/LOWER/numeric formatting).
+    // Retained capacity after each reset so warmup cost is amortised.
+    var scalar_arena = std.heap.ArenaAllocator.init(allocator);
+    defer scalar_arena.deinit();
 
     while (try reader.readRecordSlices()) |record| {
         // Zero-copy: record slices point into reader buffer, no freeRecord needed
@@ -325,6 +388,7 @@ fn executeSequential(
                                 .less => val < threshold,
                                 .less_equal => val <= threshold,
                                 .like => parser.matchLike(field_value, comp.value),
+                                .ilike => parser.matchILike(field_value, comp.value),
                                 .between, .is_null, .is_not_null => parser.compareValues(comp, field_value),
                             };
                         } else {
@@ -358,9 +422,10 @@ fn executeSequential(
             }
         }
 
-        // Project selected columns (reuse pre-allocated output_row)
-        for (output_indices.items, 0..) |idx, i| {
-            output_row[i] = if (idx < record.len) record[idx] else "";
+        // Project selected columns using scalar specs (no alloc for plain columns)
+        _ = scalar_arena.reset(.retain_capacity);
+        for (output_specs.items, 0..) |spec, i| {
+            output_row[i] = scalar.evalOutputCol(spec, record, scalar_arena.allocator());
         }
 
         // DISTINCT: skip duplicate rows
@@ -640,6 +705,7 @@ fn expandAndEmit(merged: [][]const u8, filled_w: usize, step_idx: usize, ctx: *J
                         .less => v < thr,
                         .less_equal => v <= thr,
                         .like => parser.matchLike(fv, comp.value),
+                        .ilike => parser.matchILike(fv, comp.value),
                         .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
                     };
                 } else parser.compareValues(comp, fv);
@@ -951,27 +1017,36 @@ fn executeFromStdin(
     }
 
     // Determine output columns
-    var output_indices = std.ArrayList(usize){};
-    defer output_indices.deinit(allocator);
+    var output_specs = std.ArrayListUnmanaged(scalar.OutputColSpec){};
+    defer output_specs.deinit(allocator);
 
     var output_header = std.ArrayList([]const u8){};
     defer output_header.deinit(allocator);
 
     if (query.all_columns) {
         for (header, 0..) |col_name, idx| {
-            try output_indices.append(allocator, idx);
+            try output_specs.append(allocator, .{ .column = idx });
             try output_header.append(allocator, col_name);
         }
     } else {
         for (query.columns) |col| {
             const sa = splitAlias(col);
             const expr = sa.expr;
+
+            // Try scalar function first (UPPER, LOWER, TRIM, etc.)
+            if (try scalar.tryParseScalar(expr, column_map, allocator)) |sc_spec| {
+                try output_specs.append(allocator, .{ .scalar = sc_spec });
+                try output_header.append(allocator, if (sa.alias) |a| a else expr);
+                continue;
+            }
+
+            // Fall back to plain column lookup
             const lower_col = try allocator.alloc(u8, expr.len);
             defer allocator.free(lower_col);
             _ = std.ascii.lowerString(lower_col, expr);
 
             const idx = column_map.get(lower_col) orelse return error.ColumnNotFound;
-            try output_indices.append(allocator, idx);
+            try output_specs.append(allocator, .{ .column = idx });
             try output_header.append(allocator, if (sa.alias) |a| a else header[idx]);
         }
     }
@@ -999,6 +1074,10 @@ fn executeFromStdin(
     defer distinct_arena_stdin.deinit();
     var distinct_seen_stdin = std.StringHashMap(void).init(allocator);
     defer distinct_seen_stdin.deinit();
+
+    // Arena for per-row scalar function allocations (UPPER/LOWER/numeric formatting).
+    var scalar_stdin_arena = std.heap.ArenaAllocator.init(allocator);
+    defer scalar_stdin_arena.deinit();
 
     // Process rows
     var rows_written: i32 = 0;
@@ -1032,6 +1111,7 @@ fn executeFromStdin(
                                 .less => val < threshold,
                                 .less_equal => val <= threshold,
                                 .like => parser.matchLike(field_value, comp.value),
+                                .ilike => parser.matchILike(field_value, comp.value),
                                 .between, .is_null, .is_not_null => parser.compareValues(comp, field_value),
                             };
                         } else {
@@ -1065,12 +1145,13 @@ fn executeFromStdin(
             }
         }
 
-        // Project selected columns
-        var output_row = try allocator.alloc([]const u8, output_indices.items.len);
+        // Project selected columns using scalar specs
+        var output_row = try allocator.alloc([]const u8, output_specs.items.len);
         defer allocator.free(output_row);
 
-        for (output_indices.items, 0..) |idx, i| {
-            output_row[i] = if (idx < record.len) record[idx] else "";
+        _ = scalar_stdin_arena.reset(.retain_capacity);
+        for (output_specs.items, 0..) |spec, i| {
+            output_row[i] = scalar.evalOutputCol(spec, record, scalar_stdin_arena.allocator());
         }
 
         // DISTINCT: skip duplicate rows
@@ -1108,6 +1189,9 @@ const ColKind = union(enum) {
     regular: usize, // direct CSV column index
     group_key: usize, // key_values slot gi (used for STRFTIME group expressions)
     aggregate: usize, // index into AggSpec list
+    /// scalar function applied to a group key at output time
+    /// (e.g. SELECT UPPER(city), COUNT(*) FROM x GROUP BY city)
+    group_key_scalar: struct { gi: usize, spec: scalar.ScalarSpec },
 };
 
 /// Describes a STRFTIME('%Y-%m', col) GROUP BY / SELECT expression.
@@ -1761,6 +1845,7 @@ fn executeDistinct(
                         .less => val < threshold,
                         .less_equal => val <= threshold,
                         .like => parser.matchLike(fv, comp.value),
+                        .ilike => parser.matchILike(fv, comp.value),
                         .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
                     };
                 } else {
@@ -2118,6 +2203,7 @@ fn executeScalarAgg(
                             .less => val < threshold,
                             .less_equal => val <= threshold,
                             .like => parser.matchLike(fv, comp.value),
+                            .ilike => parser.matchILike(fv, comp.value),
                         .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
                         };
                     } else {
@@ -2235,6 +2321,7 @@ fn executeScalarAgg(
         output_row[i] = switch (kind) {
             .regular => "",
             .group_key => "",
+            .group_key_scalar => "",
             .aggregate => |agg_idx| agg_results[agg_idx],
         };
     }
@@ -2328,6 +2415,7 @@ fn gbProcessRecord(
                     .less => val < threshold,
                     .less_equal => val <= threshold,
                     .like => parser.matchLike(fv, comp.value),
+                    .ilike => parser.matchILike(fv, comp.value),
                         .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
                 };
                 if (!matches) return;
@@ -2587,6 +2675,7 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                             .less => val < threshold,
                             .less_equal => val <= threshold,
                             .like => parser.matchLike(fv, comp.value),
+                            .ilike => parser.matchILike(fv, comp.value),
                         .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
                         };
                     } else {
@@ -2674,6 +2763,7 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                             .less => val < threshold,
                             .less_equal => val <= threshold,
                             .like => parser.matchLike(fv, comp.value),
+                            .ilike => parser.matchILike(fv, comp.value),
                         .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
                         };
                         if (!matches) break :row;
@@ -2987,7 +3077,27 @@ fn executeGroupBy(
                         try col_kinds.append(allocator, .{ .group_key = gi });
                         try out_header_list.append(allocator, if (sa.alias) |a| a else fn_hdr);
                     } else {
-                        return error.ColumnNotFound;
+                        // Try scalar function applied to a plain GROUP BY column
+                        // e.g. SELECT UPPER(city), COUNT(*) FROM x GROUP BY city
+                        if (try scalar.tryParseScalar(effective_col, column_map, allocator)) |sc_spec| {
+                            // Find which group_spec slot contains this column
+                            const sc_col_idx = sc_spec.colIdx();
+                            var sc_gi: ?usize = null;
+                            for (group_specs, 0..) |spec, gi| {
+                                if (spec == .column and spec.column == sc_col_idx) {
+                                    sc_gi = gi;
+                                    break;
+                                }
+                            }
+                            if (sc_gi) |gi| {
+                                try col_kinds.append(allocator, .{ .group_key_scalar = .{ .gi = gi, .spec = sc_spec } });
+                                try out_header_list.append(allocator, if (sa.alias) |a| a else effective_col);
+                            } else {
+                                return error.ColumnNotFound;
+                            }
+                        } else {
+                            return error.ColumnNotFound;
+                        }
                     }
                 }
             }
@@ -3165,6 +3275,7 @@ fn executeGroupBy(
                             .less => val < threshold,
                             .less_equal => val <= threshold,
                             .like => parser.matchLike(fv, comp.value),
+                            .ilike => parser.matchILike(fv, comp.value),
                         .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
                         };
                     } else {
@@ -3295,6 +3406,10 @@ fn executeGroupBy(
     var output_row = try allocator.alloc([]const u8, col_kinds.items.len);
     defer allocator.free(output_row);
 
+    // Arena for scalar function eval per output row (UPPER/LOWER/etc.)
+    var gb_scalar_arena = std.heap.ArenaAllocator.init(allocator);
+    defer gb_scalar_arena.deinit();
+
     // DISTINCT dedup for GROUP BY output (groups are unique by key but SELECT
     // may project fewer columns making two groups map to the same output row)
     var distinct_arena_gb = std.heap.ArenaAllocator.init(allocator);
@@ -3350,6 +3465,7 @@ fn executeGroupBy(
             agg_results[i] = s;
         }
 
+        _ = gb_scalar_arena.reset(.retain_capacity);
         for (col_kinds.items, 0..) |kind, i| {
             output_row[i] = switch (kind) {
                 .regular => |cidx| blk: {
@@ -3363,6 +3479,30 @@ fn executeGroupBy(
                 },
                 .group_key => |gi| accum.key_values[gi],
                 .aggregate => |agg_idx| agg_results[agg_idx],
+                .group_key_scalar => |gks| blk: {
+                    // Apply scalar function to the group key value at output time
+                    const key_val: []const u8 = if (gks.gi < accum.key_values.len) accum.key_values[gks.gi] else "";
+                    // Wrap into a single-element slice for scalar.eval
+                    const rec: [1][]const u8 = .{key_val};
+                    // Build a spec with col_idx=0 pointing into our single-element record
+                    var adj_spec = gks.spec;
+                    switch (adj_spec) {
+                        .upper => |*ci| ci.* = 0,
+                        .lower => |*ci| ci.* = 0,
+                        .trim => |*ci| ci.* = 0,
+                        .length => |*ci| ci.* = 0,
+                        .abs => |*ci| ci.* = 0,
+                        .ceil => |*ci| ci.* = 0,
+                        .floor => |*ci| ci.* = 0,
+                        .cast_int => |*ci| ci.* = 0,
+                        .cast_float => |*ci| ci.* = 0,
+                        .cast_text => |*ci| ci.* = 0,
+                        .substr => |*a| a.col_idx = 0,
+                        .mod_op => |*a| a.col_idx = 0,
+                        .coalesce => |*a| a.col_idx = 0,
+                    }
+                    break :blk scalar.eval(adj_spec, &rec, gb_scalar_arena.allocator());
+                },
             };
         }
 

@@ -247,6 +247,7 @@ pub fn executeMapped(
                                     .less => val < threshold,
                                     .less_equal => val <= threshold,
                                     .like => parser.matchLike(field_value, comp.value),
+                                    .ilike => parser.matchILike(field_value, comp.value),
                                     .between, .is_null, .is_not_null => parser.compareValues(comp, field_value),
                                 };
                             } else {
@@ -254,6 +255,7 @@ pub fn executeMapped(
                                     .equal => std.mem.eql(u8, field_value, comp.value),
                                     .not_equal => !std.mem.eql(u8, field_value, comp.value),
                                     .like => parser.matchLike(field_value, comp.value),
+                                    .ilike => parser.matchILike(field_value, comp.value),
                                     .between, .is_null, .is_not_null => parser.compareValues(comp, field_value),
                                     else => false,
                                 };

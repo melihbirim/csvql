@@ -11,6 +11,7 @@ pub const Operator = enum {
     less,
     less_equal,
     like,
+    ilike,
     between,
     is_null,
     is_not_null,
@@ -23,6 +24,7 @@ pub const Operator = enum {
         if (std.mem.eql(u8, s, "<")) return .less;
         if (std.mem.eql(u8, s, "<=")) return .less_equal;
         if (std.ascii.eqlIgnoreCase(s, "LIKE")) return .like;
+        if (std.ascii.eqlIgnoreCase(s, "ILIKE")) return .ilike;
         return null;
     }
 };
@@ -52,6 +54,34 @@ pub fn matchLike(text: []const u8, pattern: []const u8) bool {
         }
     }
     // Consume trailing %
+    while (p < pattern.len and pattern[p] == '%') p += 1;
+    return p == pattern.len;
+}
+
+/// Match text against a SQL ILIKE pattern (case-insensitive variant of LIKE).
+/// `%` matches any sequence, `_` matches exactly one character.
+pub fn matchILike(text: []const u8, pattern: []const u8) bool {
+    var t: usize = 0;
+    var p: usize = 0;
+    var star_p: usize = std.math.maxInt(usize);
+    var star_t: usize = 0;
+    while (t < text.len) {
+        const tc = std.ascii.toLower(text[t]);
+        if (p < pattern.len and (pattern[p] == '_' or std.ascii.toLower(pattern[p]) == tc)) {
+            t += 1;
+            p += 1;
+        } else if (p < pattern.len and pattern[p] == '%') {
+            star_p = p;
+            star_t = t;
+            p += 1;
+        } else if (star_p != std.math.maxInt(usize)) {
+            star_t += 1;
+            t = star_t;
+            p = star_p + 1;
+        } else {
+            return false;
+        }
+    }
     while (p < pattern.len and pattern[p] == '%') p += 1;
     return p == pattern.len;
 }
@@ -703,7 +733,10 @@ pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
         return Expression{ .binary = bin };
     }
 
-    // Check for LIKE operator before symbol operators (LIKE patterns may contain = > <)
+    // Check for ILIKE before LIKE (both before symbol operators since patterns may contain = > <)
+    if (std.ascii.indexOfIgnoreCase(trimmed, " ILIKE ")) |idx| {
+        return parseILikeComparison(allocator, trimmed, idx);
+    }
     if (std.ascii.indexOfIgnoreCase(trimmed, " LIKE ")) |idx| {
         return parseLikeComparison(allocator, trimmed, idx);
     }
@@ -819,6 +852,25 @@ fn parseLikeComparison(allocator: Allocator, input: []const u8, like_idx: usize)
     };
 }
 
+fn parseILikeComparison(allocator: Allocator, input: []const u8, ilike_idx: usize) !Expression {
+    const column_part = std.mem.trim(u8, input[0..ilike_idx], &std.ascii.whitespace);
+    // " ILIKE " is 7 bytes: space + I + L + I + K + E + space
+    const value_part = std.mem.trim(u8, input[ilike_idx + 7 ..], &std.ascii.whitespace);
+    const value_clean = trimQuotes(value_part);
+
+    const column_lower = try allocator.alloc(u8, column_part.len);
+    _ = std.ascii.lowerString(column_lower, column_part);
+
+    return Expression{
+        .comparison = Comparison{
+            .column = column_lower,
+            .operator = .ilike,
+            .value = try allocator.dupe(u8, value_clean),
+            .numeric_value = null, // ILIKE is always a string pattern match
+        },
+    };
+}
+
 fn parseComparison(allocator: Allocator, input: []const u8, op_str: []const u8, op_idx: usize) !Expression {
     const column_part = std.mem.trim(u8, input[0..op_idx], &std.ascii.whitespace);
     const value_part = std.mem.trim(u8, input[op_idx + op_str.len ..], &std.ascii.whitespace);
@@ -900,8 +952,9 @@ pub fn compareValues(comp: Comparison, candidate: []const u8) bool {
         }
     }
 
-    // LIKE is always a string pattern match — skip numeric path entirely
+    // LIKE / ILIKE are always string pattern matches — skip numeric path entirely
     if (comp.operator == .like) return matchLike(candidate, comp.value);
+    if (comp.operator == .ilike) return matchILike(candidate, comp.value);
 
     if (comp.numeric_value) |expected| {
         // Try SIMD fast integer parsing first
@@ -914,7 +967,7 @@ pub fn compareValues(comp: Comparison, candidate: []const u8) bool {
                 .greater_equal => candidate_num >= expected,
                 .less => candidate_num < expected,
                 .less_equal => candidate_num <= expected,
-                .like, .between, .is_null, .is_not_null => unreachable, // handled above
+                .like, .ilike, .between, .is_null, .is_not_null => unreachable, // handled above
             };
         } else |_| {
             // Fall back to standard float parsing for decimals or parse errors
@@ -926,7 +979,7 @@ pub fn compareValues(comp: Comparison, candidate: []const u8) bool {
                 .greater_equal => candidate_num >= expected,
                 .less => candidate_num < expected,
                 .less_equal => candidate_num <= expected,
-                .like, .between, .is_null, .is_not_null => unreachable, // handled above
+                .like, .ilike, .between, .is_null, .is_not_null => unreachable, // handled above
             };
         }
     }
@@ -948,6 +1001,7 @@ pub fn compareValues(comp: Comparison, candidate: []const u8) bool {
         .less => cmp == .lt,
         .less_equal => cmp == .lt or cmp == .eq,
         .like => matchLike(candidate, comp.value),
+        .ilike => matchILike(candidate, comp.value),
         .between, .is_null, .is_not_null => unreachable, // handled above
     };
 }
