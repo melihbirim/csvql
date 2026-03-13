@@ -13,6 +13,18 @@ const Allocator = std.mem.Allocator;
 /// Result row for ORDER BY buffering — uses fast_sort SortKey
 const SortEntry = fast_sort.SortKey;
 
+/// Stores arena-relative offsets for an ORDER BY row during buffering.
+/// Converted to real slices (SortEntry) AFTER the arena stops growing.
+/// This avoids the dangling-pointer bug where ArenaBuffer.append() can
+/// reallocate a.data, invalidating all previously returned slices.
+const SortRowOffsets = struct {
+    numeric_key: f64,
+    sort_key_start: usize,
+    sort_key_len: usize,
+    line_start: usize,
+    line_len: usize,
+};
+
 /// Arena buffer for ORDER BY — single large allocation instead of per-field allocs
 const ArenaBuffer = struct {
     data: []u8,
@@ -192,13 +204,15 @@ fn executeSequential(
         }
     } else {
         for (query.columns) |col| {
-            const lower_col = try allocator.alloc(u8, col.len);
+            const sa = splitAlias(col);
+            const expr = sa.expr;
+            const lower_col = try allocator.alloc(u8, expr.len);
             defer allocator.free(lower_col);
-            _ = std.ascii.lowerString(lower_col, col);
+            _ = std.ascii.lowerString(lower_col, expr);
 
             const idx = column_map.get(lower_col) orelse return error.ColumnNotFound;
             try output_indices.append(allocator, idx);
-            try output_header.append(allocator, header[idx]);
+            try output_header.append(allocator, if (sa.alias) |a| a else header[idx]);
         }
     }
 
@@ -220,31 +234,44 @@ fn executeSequential(
         }
     }
 
-    // Buffer for ORDER BY support
-    var sort_entries: ?std.ArrayList(SortEntry) = null;
+    // Buffer for ORDER BY support (offset-based to avoid dangling slices on arena growth)
+    var sort_offsets: ?std.ArrayList(SortRowOffsets) = null;
     var arena: ?ArenaBuffer = null;
     var order_by_column_idx: ?usize = null;
     defer {
-        if (sort_entries) |*entries| entries.deinit(allocator);
+        if (sort_offsets) |*offsets| offsets.deinit(allocator);
         if (arena) |*a| a.deinit();
     }
 
     // If ORDER BY is specified, prepare buffer and find column index
     if (query.order_by) |order_by| {
-        sort_entries = std.ArrayList(SortEntry){};
+        sort_offsets = std.ArrayList(SortRowOffsets){};
         arena = try ArenaBuffer.init(allocator, 1024 * 1024); // 1MB initial
-        // Find the ORDER BY column index in output columns
-        // order_by.column is already lowercase from parser
-        for (output_indices.items) |out_idx| {
-            if (out_idx < lower_header.len) {
-                if (std.mem.eql(u8, lower_header[out_idx], order_by.column)) {
-                    // Find position in output columns
-                    for (output_indices.items, 0..) |idx, pos| {
-                        if (idx == out_idx) {
-                            order_by_column_idx = pos;
-                            break;
-                        }
-                    }
+        // Positional ORDER BY: "ORDER BY 1" uses the 1-based column position.
+        const pos_num = std.fmt.parseInt(usize, order_by.column, 10) catch 0;
+        if (pos_num >= 1 and pos_num <= output_header.items.len) {
+            order_by_column_idx = pos_num - 1;
+        }
+        if (order_by_column_idx == null) {
+            // Match against output header first (supports AS aliases), then raw header.
+            // order_by.column is already lowercase from parser.
+            for (output_header.items, 0..) |hdr, pos| {
+                const lower_hdr = try allocator.alloc(u8, hdr.len);
+                defer allocator.free(lower_hdr);
+                _ = std.ascii.lowerString(lower_hdr, hdr);
+                if (std.mem.eql(u8, lower_hdr, order_by.column)) {
+                    order_by_column_idx = pos;
+                    break;
+                }
+            }
+        }
+        // Fall back to raw column name match
+        if (order_by_column_idx == null) {
+            for (output_indices.items, 0..) |out_idx, pos| {
+                if (out_idx < lower_header.len and
+                    std.mem.eql(u8, lower_header[out_idx], order_by.column))
+                {
+                    order_by_column_idx = pos;
                     break;
                 }
             }
@@ -298,6 +325,7 @@ fn executeSequential(
                                 .less => val < threshold,
                                 .less_equal => val <= threshold,
                                 .like => parser.matchLike(field_value, comp.value),
+                                .between, .is_null, .is_not_null => parser.compareValues(comp, field_value),
                             };
                         } else {
                             // String comparison
@@ -354,10 +382,16 @@ fn executeSequential(
         }
 
         // Either buffer for ORDER BY or write directly
-        if (sort_entries) |*entries| {
-            // Build output line into arena and store sort key
+        if (sort_offsets) |*offsets| {
+            // Parse numeric key NOW from the source slice (stable, from record).
+            // Then store offsets into the arena — NOT slices — because arena can
+            // reallocate and invalidate pointers during later rows.
+            const sort_val = output_row[order_by_column_idx.?];
+            const numeric_key = std.fmt.parseFloat(f64, sort_val) catch std.math.nan(f64);
             const a = &(arena.?);
-            const sort_key = try a.append(output_row[order_by_column_idx.?]);
+            const sort_key_start = a.pos;
+            _ = try a.append(sort_val);
+            const sort_key_len = a.pos - sort_key_start;
 
             // Build the line representation: CSV or JSON depending on format
             const line_start = a.pos;
@@ -379,13 +413,15 @@ fn executeSequential(
                     _ = try a.append("}");
                 },
             }
-            const line = a.data[line_start..a.pos];
+            const line_len = a.pos - line_start;
 
-            try entries.append(allocator, fast_sort.makeSortKey(
-                std.fmt.parseFloat(f64, sort_key) catch std.math.nan(f64),
-                sort_key,
-                line,
-            ));
+            try offsets.append(allocator, .{
+                .numeric_key = numeric_key,
+                .sort_key_start = sort_key_start,
+                .sort_key_len = sort_key_len,
+                .line_start = line_start,
+                .line_len = line_len,
+            });
             rows_written += 1;
         } else {
             // Write directly (no ORDER BY)
@@ -405,8 +441,20 @@ fn executeSequential(
     }
 
     // Sort and write buffered rows if ORDER BY is specified
-    if (sort_entries) |*entries| {
+    if (sort_offsets) |*offsets| {
         if (query.order_by) |order_by| {
+            // Arena is done growing — now safe to materialise real slices from offsets.
+            const a = &(arena.?);
+            var entries = std.ArrayList(SortEntry){};
+            defer entries.deinit(allocator);
+            for (offsets.items) |oe| {
+                try entries.append(allocator, fast_sort.makeSortKey(
+                    oe.numeric_key,
+                    a.data[oe.sort_key_start..][0..oe.sort_key_len],
+                    a.data[oe.line_start..][0..oe.line_len],
+                ));
+            }
+
             const limit: ?usize = if (query.limit >= 0) @intCast(query.limit) else null;
             const sorted = try fast_sort.sortEntries(
                 allocator,
@@ -592,6 +640,7 @@ fn expandAndEmit(merged: [][]const u8, filled_w: usize, step_idx: usize, ctx: *J
                         .less => v < thr,
                         .less_equal => v <= thr,
                         .like => parser.matchLike(fv, comp.value),
+                        .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
                     };
                 } else parser.compareValues(comp, fv);
                 if (!ok) return;
@@ -915,13 +964,15 @@ fn executeFromStdin(
         }
     } else {
         for (query.columns) |col| {
-            const lower_col = try allocator.alloc(u8, col.len);
+            const sa = splitAlias(col);
+            const expr = sa.expr;
+            const lower_col = try allocator.alloc(u8, expr.len);
             defer allocator.free(lower_col);
-            _ = std.ascii.lowerString(lower_col, col);
+            _ = std.ascii.lowerString(lower_col, expr);
 
             const idx = column_map.get(lower_col) orelse return error.ColumnNotFound;
             try output_indices.append(allocator, idx);
-            try output_header.append(allocator, header[idx]);
+            try output_header.append(allocator, if (sa.alias) |a| a else header[idx]);
         }
     }
 
@@ -981,6 +1032,7 @@ fn executeFromStdin(
                                 .less => val < threshold,
                                 .less_equal => val <= threshold,
                                 .like => parser.matchLike(field_value, comp.value),
+                                .between, .is_null, .is_not_null => parser.compareValues(comp, field_value),
                             };
                         } else {
                             // String comparison
@@ -1199,6 +1251,7 @@ const AggSpec = struct {
     func_type: aggregation.AggregateType,
     col_idx: ?usize, // resolved CSV column index (null for COUNT(*))
     alias: []const u8, // output header name (allocator-owned)
+    round_digits: ?u8 = null, // non-null for ROUND(expr, n)
 };
 
 /// Compact per-group accumulator using flat arrays instead of HashMaps.
@@ -1213,18 +1266,21 @@ const CompactAccum = struct {
     sum_counts: []i64, // non-null input count per agg (for AVG), arena-alloc
     mins: []f64, // min[i], arena-alloc, init to +inf
     maxs: []f64, // max[i], arena-alloc, init to -inf
+    distinct_sets: []?std.StringHashMap(void), // per-slot distinct-value set for COUNT(DISTINCT)
 
     fn init(ka: Allocator, key_vals: [][]const u8, n_aggs: usize) !CompactAccum {
         const sums = try ka.alloc(f64, n_aggs);
         const sum_counts = try ka.alloc(i64, n_aggs);
         const mins = try ka.alloc(f64, n_aggs);
         const maxs = try ka.alloc(f64, n_aggs);
+        const distinct_sets = try ka.alloc(?std.StringHashMap(void), n_aggs);
         @memset(sums, 0.0);
         @memset(sum_counts, 0);
         for (mins, maxs) |*mn, *mx| {
             mn.* = std.math.inf(f64);
             mx.* = -std.math.inf(f64);
         }
+        for (distinct_sets) |*ds| ds.* = null;
         return CompactAccum{
             .key_values = key_vals,
             .count = 0,
@@ -1232,6 +1288,7 @@ const CompactAccum = struct {
             .sum_counts = sum_counts,
             .mins = mins,
             .maxs = maxs,
+            .distinct_sets = distinct_sets,
         };
     }
 };
@@ -1259,8 +1316,98 @@ inline fn splitLine(line: []const u8, buf: [][]const u8, delim: u8) []const []co
     return buf[0..n];
 }
 
+/// Strip a top-level " AS alias" suffix from a SELECT column expression.
+/// Scans left-to-right while skipping quoted strings and parenthesised sub-
+/// expressions, so `STRFTIME('%Y-%m', col) AS month` correctly splits into
+/// `STRFTIME('%Y-%m', col)` and `month`.
+/// The returned slices point into the original `expr` memory.
+fn splitAlias(expr: []const u8) struct { expr: []const u8, alias: ?[]const u8 } {
+    var depth: usize = 0;
+    var i: usize = 0;
+    var last_as: ?usize = null;
+    while (i < expr.len) {
+        if (expr[i] == '\'') {
+            i += 1;
+            while (i < expr.len and expr[i] != '\'') : (i += 1) {}
+            if (i < expr.len) i += 1;
+            continue;
+        }
+        if (expr[i] == '(') {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if (expr[i] == ')') {
+            if (depth > 0) depth -= 1;
+            i += 1;
+            continue;
+        }
+        // Check for " AS " (space-insensitive keyword) at nesting depth 0
+        if (depth == 0 and i + 4 <= expr.len and
+            std.ascii.eqlIgnoreCase(expr[i .. i + 4], " as "))
+        {
+            last_as = i;
+        }
+        i += 1;
+    }
+    if (last_as) |idx| {
+        const alias = std.mem.trim(u8, expr[idx + 4 ..], &std.ascii.whitespace);
+        // Alias must be a single bare identifier — no spaces, no parens
+        if (alias.len > 0 and
+            std.mem.indexOfScalar(u8, alias, ' ') == null and
+            std.mem.indexOfScalar(u8, alias, '(') == null)
+        {
+            return .{
+                .expr = std.mem.trim(u8, expr[0..idx], &std.ascii.whitespace),
+                .alias = alias,
+            };
+        }
+    }
+    return .{ .expr = expr, .alias = null };
+}
+
+/// Parse a ROUND(inner_expr, digits) wrapper.  Returns the inner expression and
+/// the number of decimal places, or null if the column is not a ROUND() call.
+fn parseRoundWrapper(col: []const u8) ?struct { inner: []const u8, digits: u8 } {
+    const t = std.mem.trim(u8, col, &std.ascii.whitespace);
+    if (t.len < 9) return null; // minimum length for ROUND(X,0)
+    if (!std.ascii.eqlIgnoreCase(t[0..6], "ROUND(")) return null;
+    const close = std.mem.lastIndexOfScalar(u8, t, ')') orelse return null;
+    if (close != t.len - 1) return null;
+    const inner_raw = t[6..close]; // content between ROUND( and )
+    const last_comma = std.mem.lastIndexOfScalar(u8, inner_raw, ',') orelse return null;
+    const agg_expr = std.mem.trim(u8, inner_raw[0..last_comma], &std.ascii.whitespace);
+    const digits_str = std.mem.trim(u8, inner_raw[last_comma + 1 ..], &std.ascii.whitespace);
+    const digits = std.fmt.parseInt(u8, digits_str, 10) catch return null;
+    return .{ .inner = agg_expr, .digits = digits };
+}
+
+/// Format a float with exactly `digits` decimal places (for ROUND(expr, n)).
+fn formatF64Rounded(allocator: Allocator, val: f64, digits: u8) ![]u8 {
+    return switch (digits) {
+        0 => std.fmt.allocPrint(allocator, "{d:.0}", .{val}),
+        1 => std.fmt.allocPrint(allocator, "{d:.1}", .{val}),
+        2 => std.fmt.allocPrint(allocator, "{d:.2}", .{val}),
+        3 => std.fmt.allocPrint(allocator, "{d:.3}", .{val}),
+        4 => std.fmt.allocPrint(allocator, "{d:.4}", .{val}),
+        5 => std.fmt.allocPrint(allocator, "{d:.5}", .{val}),
+        6 => std.fmt.allocPrint(allocator, "{d:.6}", .{val}),
+        else => std.fmt.allocPrint(allocator, "{d:.6}", .{val}),
+    };
+}
+
+/// Format a float aggregate result, applying ROUND if `round_digits` is set.
+fn fmtAggrF64(allocator: Allocator, val: f64, round_digits: ?u8) ![]u8 {
+    if (round_digits) |d| return formatF64Rounded(allocator, val, d);
+    return formatF64(allocator, val);
+}
+
 /// Returns true if any SELECT column is an aggregate expression (no alloc).
-inline fn isAggregateExpr(col: []const u8) bool {
+fn isAggregateExpr(col: []const u8) bool {
+    // Check for ROUND(inner, n) wrapper first
+    if (parseRoundWrapper(col)) |rw| {
+        return isAggregateExpr(rw.inner);
+    }
     const paren = std.mem.indexOf(u8, col, "(") orelse return false;
     const name_part = std.mem.trim(u8, col[0..paren], &std.ascii.whitespace);
     if (name_part.len == 0 or name_part.len > 5) return false;
@@ -1400,21 +1547,41 @@ fn executeDistinct(
         }
     }
 
-    // ORDER BY support: buffer unique rows then sort
-    var sort_entries: ?std.ArrayList(fast_sort.SortKey) = null;
+    // ORDER BY support: buffer unique rows then sort (offset-based, avoids dangling slices)
+    var sort_offsets_mmap: ?std.ArrayList(SortRowOffsets) = null;
     var sort_arena: ?ArenaBuffer = null;
     var order_by_out_pos: ?usize = null;
     defer {
-        if (sort_entries) |*e| e.deinit(allocator);
+        if (sort_offsets_mmap) |*e| e.deinit(allocator);
         if (sort_arena) |*a| a.deinit();
     }
     if (query.order_by) |ob| {
-        sort_entries = std.ArrayList(fast_sort.SortKey){};
+        sort_offsets_mmap = std.ArrayList(SortRowOffsets){};
         sort_arena = try ArenaBuffer.init(allocator, 4 * 1024 * 1024);
-        for (out_indices.items, 0..) |oi, pos| {
-            if (oi < lower_header.len and std.mem.eql(u8, lower_header[oi], ob.column)) {
-                order_by_out_pos = pos;
-                break;
+        // Positional ORDER BY: "ORDER BY 1" uses the 1-based column position.
+        const pos_num = std.fmt.parseInt(usize, ob.column, 10) catch 0;
+        if (pos_num >= 1 and pos_num <= out_header.items.len) {
+            order_by_out_pos = pos_num - 1;
+        }
+        if (order_by_out_pos == null) {
+            // Match against output header first (supports AS aliases)
+            for (out_header.items, 0..) |hdr, pos| {
+                const lower_hdr = try allocator.alloc(u8, hdr.len);
+                defer allocator.free(lower_hdr);
+                _ = std.ascii.lowerString(lower_hdr, hdr);
+                if (std.mem.eql(u8, lower_hdr, ob.column)) {
+                    order_by_out_pos = pos;
+                    break;
+                }
+            }
+        }
+        // Fall back to raw column name match
+        if (order_by_out_pos == null) {
+            for (out_indices.items, 0..) |oi, pos| {
+                if (oi < lower_header.len and std.mem.eql(u8, lower_header[oi], ob.column)) {
+                    order_by_out_pos = pos;
+                    break;
+                }
             }
         }
         if (order_by_out_pos == null) return error.OrderByColumnNotFound;
@@ -1467,6 +1634,7 @@ fn executeDistinct(
                         .less => val < threshold,
                         .less_equal => val <= threshold,
                         .like => parser.matchLike(fv, comp.value),
+                        .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
                     };
                 } else {
                     matches = parser.compareValues(comp, fv);
@@ -1497,12 +1665,16 @@ fn executeDistinct(
         if (seen.contains(key_buf.items)) continue;
         try seen.put(try key_arena.allocator().dupe(u8, key_buf.items), {});
 
-        if (query.limit >= 0 and rows_written >= query.limit and sort_entries == null) break;
+        if (query.limit >= 0 and rows_written >= query.limit and sort_offsets_mmap == null) break;
 
         // Either buffer for ORDER BY or write directly
-        if (sort_entries) |*entries| {
+        if (sort_offsets_mmap) |*offsets| {
             const a = &(sort_arena.?);
-            const sort_key = try a.append(out_row[order_by_out_pos.?]);
+            const sort_val = out_row[order_by_out_pos.?];
+            const numeric_key = std.fmt.parseFloat(f64, sort_val) catch std.math.nan(f64);
+            const sort_key_start = a.pos;
+            _ = try a.append(sort_val);
+            const sort_key_len = a.pos - sort_key_start;
             const line_start_a = a.pos;
             switch (opts.format) {
                 .csv => {
@@ -1522,12 +1694,14 @@ fn executeDistinct(
                     _ = try a.append("}");
                 },
             }
-            const line = a.data[line_start_a..a.pos];
-            try entries.append(allocator, fast_sort.makeSortKey(
-                std.fmt.parseFloat(f64, sort_key) catch std.math.nan(f64),
-                sort_key,
-                line,
-            ));
+            const line_len = a.pos - line_start_a;
+            try offsets.append(allocator, .{
+                .numeric_key = numeric_key,
+                .sort_key_start = sort_key_start,
+                .sort_key_len = sort_key_len,
+                .line_start = line_start_a,
+                .line_len = line_len,
+            });
         } else {
             try writer.writeRecord(out_row);
             rows_written += 1;
@@ -1535,8 +1709,19 @@ fn executeDistinct(
     }
 
     // Sort and emit if ORDER BY
-    if (sort_entries) |*entries| {
+    if (sort_offsets_mmap) |*offsets| {
         if (query.order_by) |ob| {
+            // Arena is done growing — materialise real slices from offsets.
+            const a = &(sort_arena.?);
+            var entries = std.ArrayList(fast_sort.SortKey){};
+            defer entries.deinit(allocator);
+            for (offsets.items) |oe| {
+                try entries.append(allocator, fast_sort.makeSortKey(
+                    oe.numeric_key,
+                    a.data[oe.sort_key_start..][0..oe.sort_key_len],
+                    a.data[oe.line_start..][0..oe.line_len],
+                ));
+            }
             const limit: ?usize = if (query.limit >= 0) @intCast(query.limit) else null;
             const sorted = try fast_sort.sortEntries(allocator, entries.items, ob.order == .desc, limit);
             for (sorted) |entry| {
@@ -1620,7 +1805,14 @@ fn executeScalarAgg(
     defer out_header_list.deinit(allocator);
 
     for (query.columns) |col| {
-        if (try aggregation.parseAggregateFunc(allocator, col)) |parsed_agg| {
+        const sa = splitAlias(col);
+        const col_base = sa.expr;
+        // Detect ROUND(inner_agg, n) wrapper
+        const rw = parseRoundWrapper(col_base);
+        const effective_col: []const u8 = if (rw) |r| r.inner else col_base;
+        const round_digits: ?u8 = if (rw) |r| r.digits else null;
+
+        if (try aggregation.parseAggregateFunc(allocator, effective_col)) |parsed_agg| {
             var agg_func = parsed_agg;
             errdefer agg_func.deinit(allocator);
             const agg_idx = agg_specs.items.len;
@@ -1633,20 +1825,29 @@ fn executeScalarAgg(
                 allocator.free(agg_col);
                 agg_func.column = null;
             }
+            // User alias overrides the auto-generated one; ROUND wrapper uses col_base
+            if (sa.alias) |user_alias| {
+                allocator.free(agg_func.alias);
+                agg_func.alias = try allocator.dupe(u8, user_alias);
+            } else if (rw != null) {
+                allocator.free(agg_func.alias);
+                agg_func.alias = try allocator.dupe(u8, col_base);
+            }
             try col_kinds.append(allocator, .{ .aggregate = agg_idx });
             try out_header_list.append(allocator, agg_func.alias);
             try agg_specs.append(allocator, AggSpec{
                 .func_type = agg_func.func_type,
                 .col_idx = col_idx,
                 .alias = agg_func.alias,
+                .round_digits = round_digits,
             });
         } else {
-            const lower = try allocator.alloc(u8, col.len);
+            const lower = try allocator.alloc(u8, effective_col.len);
             defer allocator.free(lower);
-            _ = std.ascii.lowerString(lower, col);
+            _ = std.ascii.lowerString(lower, effective_col);
             const cidx = column_map.get(lower) orelse return error.ColumnNotFound;
             try col_kinds.append(allocator, .{ .regular = cidx });
-            try out_header_list.append(allocator, header[cidx]);
+            try out_header_list.append(allocator, if (sa.alias) |a| a else header[cidx]);
         }
     }
     try writer.writeHeader(out_header_list.items, opts.no_header);
@@ -1720,6 +1921,18 @@ fn executeScalarAgg(
                 accum.sum_counts[i] += partial.sum_counts[i];
                 if (partial.mins[i] < accum.mins[i]) accum.mins[i] = partial.mins[i];
                 if (partial.maxs[i] > accum.maxs[i]) accum.maxs[i] = partial.maxs[i];
+                // Union distinct sets for COUNT(DISTINCT)
+                if (partial.distinct_sets[i] != null) {
+                    if (accum.distinct_sets[i] == null)
+                        accum.distinct_sets[i] = std.StringHashMap(void).init(ka.allocator());
+                    var partial_set = partial.distinct_sets[i].?;
+                    var it = partial_set.iterator();
+                    while (it.next()) |entry| {
+                        const gop_e = try accum.distinct_sets[i].?.getOrPut(entry.key_ptr.*);
+                        if (!gop_e.found_existing)
+                            gop_e.key_ptr.* = try ka.allocator().dupe(u8, entry.key_ptr.*);
+                    }
+                }
             }
         }
     } else {
@@ -1753,6 +1966,7 @@ fn executeScalarAgg(
                             .less => val < threshold,
                             .less_equal => val <= threshold,
                             .like => parser.matchLike(fv, comp.value),
+                        .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
                         };
                     } else {
                         matches = parser.compareValues(comp, fv);
@@ -1772,6 +1986,16 @@ fn executeScalarAgg(
             for (agg_specs.items, 0..) |spec, i| {
                 switch (spec.func_type) {
                     .count => {},
+                    .count_distinct => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len) {
+                                const ds_ptr = &accum.distinct_sets[i];
+                                if (ds_ptr.* == null) ds_ptr.* = std.StringHashMap(void).init(ka.allocator());
+                                const gop_e = try ds_ptr.*.?.getOrPut(record[cidx]);
+                                if (!gop_e.found_existing) gop_e.key_ptr.* = try ka.allocator().dupe(u8, record[cidx]);
+                            }
+                        }
+                    },
                     .sum, .avg => {
                         if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
@@ -1817,25 +2041,29 @@ fn executeScalarAgg(
     for (agg_specs.items, 0..) |spec, i| {
         const s: []u8 = switch (spec.func_type) {
             .count => try std.fmt.allocPrint(allocator, "{d}", .{accum.count}),
-            .sum => try formatF64(allocator, accum.sums[i]),
+            .count_distinct => blk: {
+                const cnt: u32 = if (accum.distinct_sets[i]) |ds| ds.count() else 0;
+                break :blk try std.fmt.allocPrint(allocator, "{d}", .{cnt});
+            },
+            .sum => try fmtAggrF64(allocator, accum.sums[i], spec.round_digits),
             .avg => blk: {
                 const cnt = accum.sum_counts[i];
                 break :blk if (cnt > 0)
-                    try formatF64(allocator, accum.sums[i] / @as(f64, @floatFromInt(cnt)))
+                    try fmtAggrF64(allocator, accum.sums[i] / @as(f64, @floatFromInt(cnt)), spec.round_digits)
                 else
                     try allocator.dupe(u8, "0");
             },
             .min => blk: {
                 const v = accum.mins[i];
                 break :blk if (v < std.math.inf(f64))
-                    try formatF64(allocator, v)
+                    try fmtAggrF64(allocator, v, spec.round_digits)
                 else
                     try allocator.dupe(u8, "");
             },
             .max => blk: {
                 const v = accum.maxs[i];
                 break :blk if (v > -std.math.inf(f64))
-                    try formatF64(allocator, v)
+                    try fmtAggrF64(allocator, v, spec.round_digits)
                 else
                     try allocator.dupe(u8, "");
             },
@@ -1943,6 +2171,7 @@ fn gbProcessRecord(
                     .less => val < threshold,
                     .less_equal => val <= threshold,
                     .like => parser.matchLike(fv, comp.value),
+                        .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
                 };
                 if (!matches) return;
             } else {
@@ -2003,6 +2232,16 @@ fn gbProcessRecord(
     for (ctx.agg_specs, 0..) |spec, i| {
         switch (spec.func_type) {
             .count => {},
+            .count_distinct => {
+                if (spec.col_idx) |cidx| {
+                    if (cidx < record.len) {
+                        const ds_ptr = &accum.distinct_sets[i];
+                        if (ds_ptr.* == null) ds_ptr.* = std.StringHashMap(void).init(aa);
+                        const gop_e = try ds_ptr.*.?.getOrPut(record[cidx]);
+                        if (!gop_e.found_existing) gop_e.key_ptr.* = try aa.dupe(u8, record[cidx]);
+                    }
+                }
+            },
             .sum, .avg => {
                 if (spec.col_idx) |cidx| {
                     if (cidx < record.len) {
@@ -2186,6 +2425,7 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                             .less => val < threshold,
                             .less_equal => val <= threshold,
                             .like => parser.matchLike(fv, comp.value),
+                        .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
                         };
                     } else {
                         matches = parser.compareValues(comp, fv);
@@ -2203,6 +2443,16 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
             for (ctx.agg_specs, 0..) |spec, i| {
                 switch (spec.func_type) {
                     .count => {},
+                    .count_distinct => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len) {
+                                const ds_ptr = &ctx.partial_accum.distinct_sets[i];
+                                if (ds_ptr.* == null) ds_ptr.* = std.StringHashMap(void).init(aa);
+                                const gop_e = try ds_ptr.*.?.getOrPut(record[cidx]);
+                                if (!gop_e.found_existing) gop_e.key_ptr.* = try aa.dupe(u8, record[cidx]);
+                            }
+                        }
+                    },
                     .sum, .avg => {
                         if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
@@ -2257,6 +2507,7 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                             .less => val < threshold,
                             .less_equal => val <= threshold,
                             .like => parser.matchLike(fv, comp.value),
+                        .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
                         };
                         if (!matches) break :row;
                     } else {
@@ -2274,6 +2525,16 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
             for (ctx.agg_specs, 0..) |spec, i| {
                 switch (spec.func_type) {
                     .count => {},
+                    .count_distinct => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len) {
+                                const ds_ptr = &ctx.partial_accum.distinct_sets[i];
+                                if (ds_ptr.* == null) ds_ptr.* = std.StringHashMap(void).init(aa);
+                                const gop_e = try ds_ptr.*.?.getOrPut(record[cidx]);
+                                if (!gop_e.found_existing) gop_e.key_ptr.* = try aa.dupe(u8, record[cidx]);
+                            }
+                        }
+                    },
                     .sum, .avg => {
                         if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
@@ -2431,7 +2692,14 @@ fn executeGroupBy(
         }
     } else {
         for (query.columns) |col| {
-            if (try aggregation.parseAggregateFunc(allocator, col)) |parsed_agg| {
+            const sa = splitAlias(col);
+            const col_base = sa.expr;
+            // Detect ROUND(inner_agg, n) wrapper
+            const rw = parseRoundWrapper(col_base);
+            const effective_col: []const u8 = if (rw) |r| r.inner else col_base;
+            const round_digits: ?u8 = if (rw) |r| r.digits else null;
+
+            if (try aggregation.parseAggregateFunc(allocator, effective_col)) |parsed_agg| {
                 var agg_func = parsed_agg;
                 errdefer agg_func.deinit(allocator);
                 const agg_idx = agg_specs.items.len;
@@ -2444,6 +2712,14 @@ fn executeGroupBy(
                     allocator.free(agg_col);
                     agg_func.column = null;
                 }
+                // User alias overrides the auto-generated one; ROUND wrapper uses col_base
+                if (sa.alias) |user_alias| {
+                    allocator.free(agg_func.alias);
+                    agg_func.alias = try allocator.dupe(u8, user_alias);
+                } else if (rw != null) {
+                    allocator.free(agg_func.alias);
+                    agg_func.alias = try allocator.dupe(u8, col_base);
+                }
                 try col_kinds.append(allocator, .{ .aggregate = agg_idx });
                 try out_header_list.append(allocator, agg_func.alias);
                 // alias ownership transfers to AggSpec
@@ -2451,26 +2727,27 @@ fn executeGroupBy(
                     .func_type = agg_func.func_type,
                     .col_idx = col_idx,
                     .alias = agg_func.alias,
+                    .round_digits = round_digits,
                 });
             } else {
-                const lower = try allocator.alloc(u8, col.len);
+                const lower = try allocator.alloc(u8, effective_col.len);
                 defer allocator.free(lower);
-                _ = std.ascii.lowerString(lower, col);
+                _ = std.ascii.lowerString(lower, effective_col);
                 if (column_map.get(lower)) |cidx| {
                     try col_kinds.append(allocator, .{ .regular = cidx });
-                    try out_header_list.append(allocator, header[cidx]);
+                    try out_header_list.append(allocator, if (sa.alias) |a| a else header[cidx]);
                 } else {
                     // Maybe a STRFTIME/SUBSTR expression that also appears in GROUP BY
                     var gi_found: ?usize = null;
                     var fn_hdr: []const u8 = "";
                     for (group_specs, 0..) |spec, gi| {
                         switch (spec) {
-                            .strftime => |sf| if (std.ascii.eqlIgnoreCase(col, sf.header)) {
+                            .strftime => |sf| if (std.ascii.eqlIgnoreCase(col_base, sf.header)) {
                                 gi_found = gi;
                                 fn_hdr = sf.header;
                                 break;
                             },
-                            .substr => |ss| if (std.ascii.eqlIgnoreCase(col, ss.header)) {
+                            .substr => |ss| if (std.ascii.eqlIgnoreCase(col_base, ss.header)) {
                                 gi_found = gi;
                                 fn_hdr = ss.header;
                                 break;
@@ -2480,7 +2757,7 @@ fn executeGroupBy(
                     }
                     if (gi_found) |gi| {
                         try col_kinds.append(allocator, .{ .group_key = gi });
-                        try out_header_list.append(allocator, fn_hdr);
+                        try out_header_list.append(allocator, if (sa.alias) |a| a else fn_hdr);
                     } else {
                         return error.ColumnNotFound;
                     }
@@ -2582,6 +2859,19 @@ fn executeGroupBy(
                     for (partial.key_values, 0..) |kv, ki| {
                         key_vals[ki] = try ka.dupe(u8, kv);
                     }
+                    const new_ds = try ka.alloc(?std.StringHashMap(void), n_aggs);
+                    for (new_ds) |*d| d.* = null;
+                    for (new_ds, 0..) |*nd, i| {
+                        if (partial.distinct_sets[i] != null) {
+                            var new_set = std.StringHashMap(void).init(ka);
+                            var partial_set = partial.distinct_sets[i].?;
+                            var ds_it = partial_set.iterator();
+                            while (ds_it.next()) |e| {
+                                try new_set.put(try ka.dupe(u8, e.key_ptr.*), {});
+                            }
+                            nd.* = new_set;
+                        }
+                    }
                     gop.value_ptr.* = CompactAccum{
                         .key_values = key_vals,
                         .count = partial.count,
@@ -2589,6 +2879,7 @@ fn executeGroupBy(
                         .sum_counts = try ka.dupe(i64, partial.sum_counts),
                         .mins = try ka.dupe(f64, partial.mins),
                         .maxs = try ka.dupe(f64, partial.maxs),
+                        .distinct_sets = new_ds,
                     };
                 } else {
                     // Existing group: fold arithmetic values
@@ -2599,6 +2890,18 @@ fn executeGroupBy(
                         accum.sum_counts[i] += partial.sum_counts[i];
                         if (partial.mins[i] < accum.mins[i]) accum.mins[i] = partial.mins[i];
                         if (partial.maxs[i] > accum.maxs[i]) accum.maxs[i] = partial.maxs[i];
+                        // Union distinct sets for COUNT(DISTINCT)
+                        if (partial.distinct_sets[i] != null) {
+                            if (accum.distinct_sets[i] == null)
+                                accum.distinct_sets[i] = std.StringHashMap(void).init(ka);
+                            var partial_set = partial.distinct_sets[i].?;
+                            var ds_it = partial_set.iterator();
+                            while (ds_it.next()) |e| {
+                                const gop_e = try accum.distinct_sets[i].?.getOrPut(e.key_ptr.*);
+                                if (!gop_e.found_existing)
+                                    gop_e.key_ptr.* = try ka.dupe(u8, e.key_ptr.*);
+                            }
+                        }
                     }
                 }
             }
@@ -2634,6 +2937,7 @@ fn executeGroupBy(
                             .less => val < threshold,
                             .less_equal => val <= threshold,
                             .like => parser.matchLike(fv, comp.value),
+                        .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
                         };
                     } else {
                         matches = parser.compareValues(comp, fv);
@@ -2697,6 +3001,16 @@ fn executeGroupBy(
             for (agg_specs.items, 0..) |spec, i| {
                 switch (spec.func_type) {
                     .count => {},
+                    .count_distinct => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len) {
+                                const ds_ptr = &accum.distinct_sets[i];
+                                if (ds_ptr.* == null) ds_ptr.* = std.StringHashMap(void).init(ka);
+                                const gop_e = try ds_ptr.*.?.getOrPut(record[cidx]);
+                                if (!gop_e.found_existing) gop_e.key_ptr.* = try ka.dupe(u8, record[cidx]);
+                            }
+                        }
+                    },
                     .sum, .avg => {
                         if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
@@ -2772,25 +3086,29 @@ fn executeGroupBy(
         for (agg_specs.items, 0..) |spec, i| {
             const s: []u8 = switch (spec.func_type) {
                 .count => try std.fmt.allocPrint(allocator, "{d}", .{accum.count}),
-                .sum => try formatF64(allocator, accum.sums[i]),
+                .count_distinct => blk: {
+                    const cnt: u32 = if (accum.distinct_sets[i]) |ds| ds.count() else 0;
+                    break :blk try std.fmt.allocPrint(allocator, "{d}", .{cnt});
+                },
+                .sum => try fmtAggrF64(allocator, accum.sums[i], spec.round_digits),
                 .avg => blk: {
                     const cnt = accum.sum_counts[i];
                     break :blk if (cnt > 0)
-                        try formatF64(allocator, accum.sums[i] / @as(f64, @floatFromInt(cnt)))
+                        try fmtAggrF64(allocator, accum.sums[i] / @as(f64, @floatFromInt(cnt)), spec.round_digits)
                     else
                         try allocator.dupe(u8, "0");
                 },
                 .min => blk: {
                     const v = accum.mins[i];
                     break :blk if (v < std.math.inf(f64))
-                        try formatF64(allocator, v)
+                        try fmtAggrF64(allocator, v, spec.round_digits)
                     else
                         try allocator.dupe(u8, "");
                 },
                 .max => blk: {
                     const v = accum.maxs[i];
                     break :blk if (v > -std.math.inf(f64))
-                        try formatF64(allocator, v)
+                        try fmtAggrF64(allocator, v, spec.round_digits)
                     else
                         try allocator.dupe(u8, "");
                 },

@@ -11,6 +11,9 @@ pub const Operator = enum {
     less,
     less_equal,
     like,
+    between,
+    is_null,
+    is_not_null,
 
     pub fn fromString(s: []const u8) ?Operator {
         if (std.mem.eql(u8, s, "=")) return .equal;
@@ -81,10 +84,21 @@ pub const Comparison = struct {
     operator: Operator,
     value: []u8,
     numeric_value: ?f64,
+    /// Non-null when this is an IN (...) expression; holds the list of values to match.
+    in_values: ?[][]u8 = null,
+    /// BETWEEN: upper bound string (value field holds lower bound)
+    between_high: ?[]u8 = null,
+    /// BETWEEN: upper bound as f64 (null if non-numeric)
+    between_high_num: ?f64 = null,
 
     pub fn deinit(self: Comparison, allocator: Allocator) void {
         allocator.free(self.column);
         allocator.free(self.value);
+        if (self.in_values) |vals| {
+            for (vals) |v| allocator.free(v);
+            allocator.free(vals);
+        }
+        if (self.between_high) |h| allocator.free(h);
     }
 };
 
@@ -604,13 +618,103 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
     return query;
 }
 
+/// Scan `s` for " KEYWORD " (case-insensitive, with a space on each side) while
+/// skipping over single-quoted strings.  Returns the index of the leading space.
+fn findTopLevelOp(s: []const u8, keyword: []const u8) ?usize {
+    const need = keyword.len + 2; // leading ' ' + keyword + trailing ' '
+    if (s.len < need) return null;
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '\'') {
+            i += 1;
+            while (i < s.len and s[i] != '\'') : (i += 1) {}
+            if (i < s.len) i += 1; // skip closing quote
+            continue;
+        }
+        if (s[i] == ' ' and i + need <= s.len and
+            std.ascii.eqlIgnoreCase(s[i + 1 .. i + 1 + keyword.len], keyword) and
+            s[i + 1 + keyword.len] == ' ')
+        {
+            return i;
+        }
+        i += 1;
+    }
+    return null;
+}
+
 fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
-    // Simplified expression parser - would need full implementation for complex cases
     const trimmed = std.mem.trim(u8, input, &std.ascii.whitespace);
+
+    // NOT prefix — must be checked BEFORE IS NULL/IS NOT NULL so that
+    // "NOT col IS NULL" recurses correctly (inner "col IS NULL" is parsed separately).
+    if (trimmed.len > 4 and std.ascii.eqlIgnoreCase(trimmed[0..4], "NOT ")) {
+        const inner = try parseExpression(allocator, std.mem.trim(u8, trimmed[4..], &std.ascii.whitespace));
+        const un = try allocator.create(UnaryExpr);
+        un.* = .{ .expr = inner };
+        return Expression{ .unary = un };
+    }
+
+    // IS NULL / IS NOT NULL — check before BETWEEN/AND/OR.
+    if (std.ascii.indexOfIgnoreCase(trimmed, " IS NOT NULL")) |idx| {
+        const col_part = std.mem.trim(u8, trimmed[0..idx], &std.ascii.whitespace);
+        const col_lower = try allocator.alloc(u8, col_part.len);
+        _ = std.ascii.lowerString(col_lower, col_part);
+        return Expression{ .comparison = Comparison{
+            .column = col_lower,
+            .operator = .is_not_null,
+            .value = try allocator.dupe(u8, ""),
+            .numeric_value = null,
+        }};
+    }
+    if (std.ascii.indexOfIgnoreCase(trimmed, " IS NULL")) |idx| {
+        const col_part = std.mem.trim(u8, trimmed[0..idx], &std.ascii.whitespace);
+        const col_lower = try allocator.alloc(u8, col_part.len);
+        _ = std.ascii.lowerString(col_lower, col_part);
+        return Expression{ .comparison = Comparison{
+            .column = col_lower,
+            .operator = .is_null,
+            .value = try allocator.dupe(u8, ""),
+            .numeric_value = null,
+        }};
+    }
+
+    // BETWEEN must be detected BEFORE the AND/OR split because
+    // "col BETWEEN 1 AND 5" contains " AND " as syntax, not a logical operator.
+    if (findTopLevelOp(trimmed, "BETWEEN")) |idx| {
+        return parseBetween(allocator, trimmed, idx);
+    }
+
+    // AND/OR must be split before LIKE/IN/operators so that compound conditions
+    // such as "col LIKE 'x%' AND other = 'y'" are not misinterpreted as a single
+    // LIKE expression whose pattern swallows the rest of the string.
+    // OR has lower precedence → check it first.
+    if (findTopLevelOp(trimmed, "OR")) |idx| {
+        const left = try parseExpression(allocator, trimmed[0..idx]);
+        const right = try parseExpression(allocator, std.mem.trim(u8, trimmed[idx + 4 ..], &std.ascii.whitespace));
+        const bin = try allocator.create(BinaryExpr);
+        bin.* = .{ .op = .@"or", .left = left, .right = right };
+        return Expression{ .binary = bin };
+    }
+    if (findTopLevelOp(trimmed, "AND")) |idx| {
+        const left = try parseExpression(allocator, trimmed[0..idx]);
+        const right = try parseExpression(allocator, std.mem.trim(u8, trimmed[idx + 5 ..], &std.ascii.whitespace));
+        const bin = try allocator.create(BinaryExpr);
+        bin.* = .{ .op = .@"and", .left = left, .right = right };
+        return Expression{ .binary = bin };
+    }
 
     // Check for LIKE operator before symbol operators (LIKE patterns may contain = > <)
     if (std.ascii.indexOfIgnoreCase(trimmed, " LIKE ")) |idx| {
         return parseLikeComparison(allocator, trimmed, idx);
+    }
+
+    // Check for IN (...) operator before = (so "col IN (...)" doesn't match the = path)
+    if (std.ascii.indexOfIgnoreCase(trimmed, " IN (")) |idx| {
+        const col_candidate = std.mem.trim(u8, trimmed[0..idx], &std.ascii.whitespace);
+        // Only treat as IN if the left-hand side looks like a plain identifier (no operators/quotes)
+        if (std.mem.indexOfAny(u8, col_candidate, "=<>!'\"(") == null) {
+            return parseInComparison(allocator, trimmed, idx);
+        }
     }
 
     // Check for operators (simple case - no parentheses)
@@ -634,6 +738,66 @@ fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
     }
 
     return error.InvalidExpression;
+}
+
+fn parseBetween(allocator: Allocator, input: []const u8, between_idx: usize) !Expression {
+    // " BETWEEN " is 9 bytes
+    const col_part = std.mem.trim(u8, input[0..between_idx], &std.ascii.whitespace);
+    const rest = std.mem.trim(u8, input[between_idx + 9 ..], &std.ascii.whitespace);
+    // rest = "low AND high" — split on " AND "
+    const and_idx = std.ascii.indexOfIgnoreCase(rest, " AND ") orelse return error.InvalidExpression;
+    const low_str = std.mem.trim(u8, rest[0..and_idx], &std.ascii.whitespace);
+    const high_str = std.mem.trim(u8, rest[and_idx + 5 ..], &std.ascii.whitespace);
+    const low_clean = trimQuotes(low_str);
+    const high_clean = trimQuotes(high_str);
+
+    const col_lower = try allocator.alloc(u8, col_part.len);
+    _ = std.ascii.lowerString(col_lower, col_part);
+
+    return Expression{ .comparison = Comparison{
+        .column = col_lower,
+        .operator = .between,
+        .value = try allocator.dupe(u8, low_clean),
+        .numeric_value = std.fmt.parseFloat(f64, low_clean) catch null,
+        .between_high = try allocator.dupe(u8, high_clean),
+        .between_high_num = std.fmt.parseFloat(f64, high_clean) catch null,
+    }};
+}
+
+fn parseInComparison(allocator: Allocator, input: []const u8, in_idx: usize) !Expression {
+    const column_part = std.mem.trim(u8, input[0..in_idx], &std.ascii.whitespace);
+    // Skip to the opening paren: " IN (" so paren is 4 chars after in_idx
+    const after_in = input[in_idx..];
+    const open_paren = std.mem.indexOfScalar(u8, after_in, '(') orelse return error.InvalidExpression;
+    const close_paren = std.mem.lastIndexOfScalar(u8, after_in, ')') orelse return error.InvalidExpression;
+    if (close_paren <= open_paren) return error.InvalidExpression;
+    const inner = std.mem.trim(u8, after_in[open_paren + 1 .. close_paren], &std.ascii.whitespace);
+
+    // Parse comma-separated values, trimming quotes from each
+    var values = std.ArrayListUnmanaged([]u8){};
+    errdefer {
+        for (values.items) |v| allocator.free(v);
+        values.deinit(allocator);
+    }
+    var it = std.mem.splitScalar(u8, inner, ',');
+    while (it.next()) |tok| {
+        const t = std.mem.trim(u8, tok, &std.ascii.whitespace);
+        try values.append(allocator, try allocator.dupe(u8, trimQuotes(t)));
+    }
+
+    const column_lower = try allocator.alloc(u8, column_part.len);
+    errdefer allocator.free(column_lower);
+    _ = std.ascii.lowerString(column_lower, column_part);
+
+    return Expression{
+        .comparison = Comparison{
+            .column = column_lower,
+            .operator = .equal,
+            .value = try allocator.dupe(u8, ""),
+            .numeric_value = null,
+            .in_values = try values.toOwnedSlice(allocator),
+        },
+    };
 }
 
 fn parseLikeComparison(allocator: Allocator, input: []const u8, like_idx: usize) !Expression {
@@ -711,6 +875,31 @@ pub fn evaluate(expr: Expression, row: std.StringHashMap([]const u8)) bool {
 }
 
 pub fn compareValues(comp: Comparison, candidate: []const u8) bool {
+    // IS NULL / IS NOT NULL
+    if (comp.operator == .is_null) return candidate.len == 0;
+    if (comp.operator == .is_not_null) return candidate.len != 0;
+
+    // IN (...) — check membership against the list of values
+    if (comp.in_values) |vals| {
+        for (vals) |v| {
+            if (std.mem.eql(u8, candidate, v)) return true;
+        }
+        return false;
+    }
+
+    // BETWEEN low AND high
+    if (comp.operator == .between) {
+        if (comp.numeric_value) |low| {
+            const high = comp.between_high_num orelse return false;
+            const val = std.fmt.parseFloat(f64, candidate) catch return false;
+            return val >= low and val <= high;
+        } else {
+            const high = comp.between_high orelse return false;
+            return std.mem.order(u8, candidate, comp.value) != .lt and
+                std.mem.order(u8, candidate, high) != .gt;
+        }
+    }
+
     // LIKE is always a string pattern match — skip numeric path entirely
     if (comp.operator == .like) return matchLike(candidate, comp.value);
 
@@ -725,7 +914,7 @@ pub fn compareValues(comp: Comparison, candidate: []const u8) bool {
                 .greater_equal => candidate_num >= expected,
                 .less => candidate_num < expected,
                 .less_equal => candidate_num <= expected,
-                .like => unreachable, // handled above
+                .like, .between, .is_null, .is_not_null => unreachable, // handled above
             };
         } else |_| {
             // Fall back to standard float parsing for decimals or parse errors
@@ -737,7 +926,7 @@ pub fn compareValues(comp: Comparison, candidate: []const u8) bool {
                 .greater_equal => candidate_num >= expected,
                 .less => candidate_num < expected,
                 .less_equal => candidate_num <= expected,
-                .like => unreachable, // handled above
+                .like, .between, .is_null, .is_not_null => unreachable, // handled above
             };
         }
     }
@@ -759,6 +948,7 @@ pub fn compareValues(comp: Comparison, candidate: []const u8) bool {
         .less => cmp == .lt,
         .less_equal => cmp == .lt or cmp == .eq,
         .like => matchLike(candidate, comp.value),
+        .between, .is_null, .is_not_null => unreachable, // handled above
     };
 }
 
