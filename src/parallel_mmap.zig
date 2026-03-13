@@ -85,12 +85,15 @@ pub fn executeParallelMapped(
         0,
     );
     defer std.posix.munmap(mapped);
+    std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
 
     const data = mapped[0..file_size];
 
     // Find end of header line
     const header_end = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
-    const header_line = data[0..header_end];
+    const header_line_raw = data[0..header_end];
+    // Strip trailing \r for CRLF files
+    const header_line = if (header_line_raw.len > 0 and header_line_raw[header_line_raw.len - 1] == '\r') header_line_raw[0 .. header_line_raw.len - 1] else header_line_raw;
 
     // Parse header
     var header = std.ArrayList([]const u8){};

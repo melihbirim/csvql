@@ -58,6 +58,7 @@ csvql "SELECT email FROM 'users.csv'" | wc -l
 | `--jsonl`            |       | Output as JSONL / NDJSON (one JSON object per line) |
 | `--version`          | `-v`  | Show version                                        |
 | `--help`             | `-h`  | Show help                                           |
+| `--mcp`              |       | Start as an MCP server (stdio JSON-RPC transport)   |
 
 ```bash
 # TSV file
@@ -199,6 +200,8 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 | **SUM**       | `SUM(col)` — with or without `GROUP BY`                                 |
 | **AVG**       | `AVG(col)` — full precision; with or without `GROUP BY`                 |
 | **MIN / MAX** | `MIN(col)`, `MAX(col)` — with or without `GROUP BY`                     |
+| **HAVING**    | `HAVING expr` — filter groups after aggregation (e.g. `HAVING COUNT(*) > 5`) |
+| **STRFTIME**  | `STRFTIME('%Y-%m', col)` — date bucketing in `SELECT` and `GROUP BY`    |
 | **ORDER BY**  | `ORDER BY col ASC/DESC`                                                 |
 | **LIMIT**     | `LIMIT n`                                                               |
 
@@ -211,12 +214,38 @@ csvql "SELECT COUNT(*), SUM(salary), AVG(salary), MIN(age), MAX(age) FROM 'data.
 # Grouped aggregates
 csvql "SELECT department, COUNT(*), AVG(salary) FROM 'data.csv' GROUP BY department ORDER BY department"
 
+# HAVING — filter groups after aggregation
+csvql "SELECT department, SUM(salary) FROM 'data.csv' GROUP BY department HAVING SUM(salary) > 500000"
+csvql "SELECT category, COUNT(*) FROM 'orders.csv' GROUP BY category HAVING COUNT(*) > 1000"
+
 # DISTINCT
 csvql "SELECT DISTINCT city FROM 'data.csv' ORDER BY city"
 csvql "SELECT DISTINCT city, department FROM 'data.csv'"
 
 # DISTINCT with WHERE
 csvql "SELECT DISTINCT department FROM 'data.csv' WHERE salary > 100000"
+```
+
+### Time-Series and Date Bucketing
+
+`STRFTIME('%fmt', column)` extracts or truncates date components for time-series aggregation.
+
+Supported format specifiers: `%Y` (year), `%m` (month), `%d` (day), `%H` (hour), `%M` (minute), `%S` (second).
+
+Input dates can be ISO-8601 date (`YYYY-MM-DD`) or datetime (`YYYY-MM-DD HH:MM:SS`).
+
+```bash
+# Monthly revenue trend
+csvql "SELECT STRFTIME('%Y-%m', order_date), COUNT(*), SUM(price) FROM 'orders.csv' GROUP BY STRFTIME('%Y-%m', order_date)"
+
+# Year-over-year breakdown by category
+csvql "SELECT category, STRFTIME('%Y', order_date), SUM(price) FROM 'orders.csv' GROUP BY category, STRFTIME('%Y', order_date)"
+
+# Date range filter + monthly bucketing + HAVING
+csvql "SELECT STRFTIME('%Y-%m', order_date), COUNT(*), SUM(price) FROM 'orders.csv' WHERE order_date >= '2026-01-01' GROUP BY STRFTIME('%Y-%m', order_date) HAVING COUNT(*) > 1000000"
+
+# Daily active users
+csvql "SELECT STRFTIME('%Y-%m-%d', event_date), COUNT(DISTINCT user_id) FROM 'events.csv' GROUP BY STRFTIME('%Y-%m-%d', event_date) ORDER BY 1"
 ```
 
 ### JOIN Examples
@@ -253,6 +282,54 @@ csvql data.csv "name,salary" "age>30" 10 "salary:desc"
 
 See [SIMPLE_QUERY_LANGUAGE.md](SIMPLE_QUERY_LANGUAGE.md) for the full reference.
 
+## MCP Server
+
+csvql ships as a [Model Context Protocol](https://modelcontextprotocol.io/) server, letting AI assistants (Claude, Copilot, etc.) query your CSV files directly.
+
+```bash
+csvql --mcp
+```
+
+### Exposed Tools
+
+| Tool | Description |
+|------|-------------|
+| `csv_query(sql)` | Execute any supported SQL query, returns results as JSON |
+| `csv_schema(file)` | Column names and sample rows for a CSV file |
+| `csv_list(directory?)` | List CSV files in a directory |
+
+### Setup
+
+**VS Code (Copilot)** — create `.vscode/mcp.json` in your workspace:
+
+```json
+{
+  "servers": {
+    "csvql": {
+      "type": "stdio",
+      "command": "/usr/local/bin/csvql",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
+
+**Claude Desktop** — add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "csvql": {
+      "command": "/usr/local/bin/csvql",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
+
+Once connected, you can ask your AI assistant to query CSV files directly:
+> *"What are the top 5 product categories by revenue this year?"*
+
 ## Documentation
 
 | Document                                             | Description                                         |
@@ -270,6 +347,9 @@ See [SIMPLE_QUERY_LANGUAGE.md](SIMPLE_QUERY_LANGUAGE.md) for the full reference.
 | `--no-header` / `--delimiter` flags | [#12](https://github.com/melihbirim/csvql/issues/12) | ✅ shipped (v0.5.0) |
 | `LIKE` operator in WHERE            | [#13](https://github.com/melihbirim/csvql/issues/13) | ✅ shipped          |
 | `--json` / `--jsonl` output format  | [#14](https://github.com/melihbirim/csvql/issues/14) | ✅ shipped          |
+| `HAVING` clause                     |                                                      | ✅ shipped          |
+| `STRFTIME()` date bucketing         |                                                      | ✅ shipped          |
+| MCP server (`--mcp`)                |                                                      | ✅ shipped          |
 
 ## Contributing
 
@@ -281,4 +361,4 @@ MIT — see [LICENSE.md](LICENSE.md).
 
 ---
 
-**Built with Zig** · **9x faster than DuckDB** · [GitHub](https://github.com/melihbirim/csvql)
+**Built with Zig** · **9x faster than DuckDB** · **MCP Server** · [GitHub](https://github.com/melihbirim/csvql)

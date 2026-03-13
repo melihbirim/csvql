@@ -138,6 +138,7 @@ pub const Query = struct {
     distinct: bool,
     file_path: []u8,
     where_expr: ?Expression,
+    having_expr: ?Expression,
     group_by: [][]u8,
     limit: i32,
     order_by: ?OrderBy,
@@ -153,6 +154,10 @@ pub const Query = struct {
         self.allocator.free(self.file_path);
 
         if (self.where_expr) |expr| {
+            expr.deinit(self.allocator);
+        }
+
+        if (self.having_expr) |expr| {
             expr.deinit(self.allocator);
         }
 
@@ -267,6 +272,43 @@ fn extractFileAndAlias(allocator: Allocator, input: []const u8) !FileAlias {
     }
 }
 
+/// Split a comma-separated list while respecting nested parentheses and single-quoted strings.
+/// Commas inside `(...)` or `'...'` are treated as part of the current token, not separators.
+/// Returns an ArrayList of trimmed, allocator-owned strings; caller frees each item + the list.
+fn splitCommaTerms(allocator: Allocator, input: []const u8) !std.ArrayList([]u8) {
+    var items = std.ArrayList([]u8){};
+    errdefer {
+        for (items.items) |s| allocator.free(s);
+        items.deinit(allocator);
+    }
+    var depth: usize = 0;
+    var in_quote = false;
+    var start: usize = 0;
+    for (input, 0..) |c, i| {
+        if (in_quote) {
+            if (c == '\'') in_quote = false;
+            continue;
+        }
+        switch (c) {
+            '\'' => in_quote = true,
+            '(' => depth += 1,
+            ')' => if (depth > 0) {
+                depth -= 1;
+            },
+            ',' => if (depth == 0) {
+                const term = std.mem.trim(u8, input[start..i], &std.ascii.whitespace);
+                if (term.len > 0) try items.append(allocator, try allocator.dupe(u8, term));
+                start = i + 1;
+            },
+            else => {},
+        }
+    }
+    // Last / only term
+    const last = std.mem.trim(u8, input[start..], &std.ascii.whitespace);
+    if (last.len > 0) try items.append(allocator, try allocator.dupe(u8, last));
+    return items;
+}
+
 /// Parse a SQL query string
 pub fn parse(allocator: Allocator, input: []const u8) !Query {
     // FIXED: Use undefined instead of static slices for initialization
@@ -277,6 +319,7 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
         .distinct = false,
         .file_path = undefined,
         .where_expr = null,
+        .having_expr = null,
         .group_by = undefined,
         .limit = -1,
         .order_by = null,
@@ -311,17 +354,10 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
         // FIXED: Always allocate empty slice instead of using static slice
         query.columns = try allocator.alloc([]u8, 0);
     } else {
-        // Parse column list
-        var col_list = std.ArrayList([]u8){};
+        // Parse column list — use paren/quote-aware splitter so STRFTIME('%Y-%m', col)
+        // is kept as a single token instead of splitting on the inner comma.
+        var col_list = try splitCommaTerms(allocator, columns_part);
         defer col_list.deinit(allocator);
-
-        var col_iter = std.mem.splitSequence(u8, columns_part, ",");
-        while (col_iter.next()) |col| {
-            const trimmed_col = std.mem.trim(u8, col, &std.ascii.whitespace);
-            if (trimmed_col.len > 0) {
-                try col_list.append(allocator, try allocator.dupe(u8, trimmed_col));
-            }
-        }
         query.columns = try col_list.toOwnedSlice(allocator);
     }
     // Ensure query.columns is freed on any error path from here on.
@@ -473,6 +509,7 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
     // Parse the clause keywords (WHERE / GROUP BY / ORDER BY / LIMIT) from `rest`
     const where_idx = std.ascii.indexOfIgnoreCase(rest, "WHERE");
     const group_by_idx = std.ascii.indexOfIgnoreCase(rest, "GROUP BY");
+    const having_idx = std.ascii.indexOfIgnoreCase(rest, "HAVING");
     const order_by_idx = std.ascii.indexOfIgnoreCase(rest, "ORDER BY");
     const limit_idx = std.ascii.indexOfIgnoreCase(rest, "LIMIT");
 
@@ -493,27 +530,34 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
     // Parse GROUP BY clause if present
     if (group_by_idx) |idx| {
         var group_by_part = rest[idx + 8 ..];
-        if (order_by_idx) |oidx| {
+        if (having_idx) |hidx| {
+            group_by_part = group_by_part[0..@min(group_by_part.len, hidx - idx - 8)];
+        } else if (order_by_idx) |oidx| {
             group_by_part = group_by_part[0..@min(group_by_part.len, oidx - idx - 8)];
         } else if (limit_idx) |lidx| {
             group_by_part = group_by_part[0..@min(group_by_part.len, lidx - idx - 8)];
         }
         group_by_part = std.mem.trim(u8, group_by_part, &std.ascii.whitespace);
 
-        var group_list = std.ArrayList([]u8){};
+        // Use paren/quote-aware splitter so STRFTIME('%Y-%m', col) stays as one token.
+        var group_list = try splitCommaTerms(allocator, group_by_part);
         defer group_list.deinit(allocator);
-
-        var group_iter = std.mem.splitSequence(u8, group_by_part, ",");
-        while (group_iter.next()) |col| {
-            const trimmed_col = std.mem.trim(u8, col, &std.ascii.whitespace);
-            if (trimmed_col.len > 0) {
-                try group_list.append(allocator, try allocator.dupe(u8, trimmed_col));
-            }
-        }
         query.group_by = try group_list.toOwnedSlice(allocator);
     } else {
         // FIXED: Always allocate empty slice instead of using static slice
         query.group_by = try allocator.alloc([]u8, 0);
+    }
+
+    // Parse HAVING clause if present (filter on aggregated results, evaluated post-GROUP-BY)
+    if (having_idx) |idx| {
+        var having_part = rest[idx + 6 ..];
+        if (order_by_idx) |oidx| {
+            having_part = having_part[0..@min(having_part.len, oidx - idx - 6)];
+        } else if (limit_idx) |lidx| {
+            having_part = having_part[0..@min(having_part.len, lidx - idx - 6)];
+        }
+        having_part = std.mem.trim(u8, having_part, &std.ascii.whitespace);
+        query.having_expr = try parseExpression(allocator, having_part);
     }
 
     // Parse ORDER BY clause if present
@@ -666,7 +710,7 @@ pub fn evaluate(expr: Expression, row: std.StringHashMap([]const u8)) bool {
     }
 }
 
-fn compareValues(comp: Comparison, candidate: []const u8) bool {
+pub fn compareValues(comp: Comparison, candidate: []const u8) bool {
     // LIKE is always a string pattern match — skip numeric path entirely
     if (comp.operator == .like) return matchLike(candidate, comp.value);
 

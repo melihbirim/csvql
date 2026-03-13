@@ -115,6 +115,12 @@ pub inline fn parseIntFast(str: []const u8) !i64 {
         result = result * 10 + (c - '0');
     }
 
+    // Reject strings with non-whitespace chars after the integer digits.
+    // "1117.43" must NOT silently truncate to 1117 — the caller must fall
+    // back to parseFloat to get the correct value.
+    while (i < str.len and std.ascii.isWhitespace(str[i])) : (i += 1) {}
+    if (i < str.len) return error.InvalidInput;
+
     return if (negative) -result else result;
 }
 

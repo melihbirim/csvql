@@ -301,12 +301,7 @@ fn executeSequential(
                             };
                         } else {
                             // String comparison
-                            matches = switch (comp.operator) {
-                                .equal => std.mem.eql(u8, field_value, comp.value),
-                                .not_equal => !std.mem.eql(u8, field_value, comp.value),
-                                .like => parser.matchLike(field_value, comp.value),
-                                else => false, // String doesn't support < > comparisons
-                            };
+                            matches = parser.compareValues(comp, field_value);
                         }
 
                         if (!matches) continue;
@@ -598,12 +593,7 @@ fn expandAndEmit(merged: [][]const u8, filled_w: usize, step_idx: usize, ctx: *J
                         .less_equal => v <= thr,
                         .like => parser.matchLike(fv, comp.value),
                     };
-                } else switch (comp.operator) {
-                    .equal => std.mem.eql(u8, fv, comp.value),
-                    .not_equal => !std.mem.eql(u8, fv, comp.value),
-                    .like => parser.matchLike(fv, comp.value),
-                    else => false,
-                };
+                } else parser.compareValues(comp, fv);
                 if (!ok) return;
             } else {
                 // Complex WHERE (AND/OR/NOT): build a temporary row map.
@@ -994,12 +984,7 @@ fn executeFromStdin(
                             };
                         } else {
                             // String comparison
-                            matches = switch (comp.operator) {
-                                .equal => std.mem.eql(u8, field_value, comp.value),
-                                .not_equal => !std.mem.eql(u8, field_value, comp.value),
-                                .like => parser.matchLike(field_value, comp.value),
-                                else => false, // String doesn't support < > comparisons
-                            };
+                            matches = parser.compareValues(comp, field_value);
                         }
 
                         if (!matches) continue;
@@ -1069,8 +1054,98 @@ fn executeFromStdin(
 /// Describes how each SELECT output column is derived.
 const ColKind = union(enum) {
     regular: usize, // direct CSV column index
+    group_key: usize, // key_values slot gi (used for STRFTIME group expressions)
     aggregate: usize, // index into AggSpec list
 };
+
+/// Describes a STRFTIME('%Y-%m', col) GROUP BY / SELECT expression.
+const StrftimeSpec = struct {
+    col_idx: usize,
+    fmt: []const u8, // allocator-owned format string, e.g. "%Y-%m"
+    header: []const u8, // allocator-owned display name, e.g. "STRFTIME('%Y-%m', order_date)"
+};
+
+/// Describes how a single GROUP BY key is extracted from a CSV row.
+const GroupSpec = union(enum) {
+    column: usize, // plain CSV column index
+    strftime: StrftimeSpec, // STRFTIME transform applied to a column value
+};
+
+/// Parse a STRFTIME('fmt', col) expression.  Returns an allocator-owned StrftimeSpec
+/// on success, or null if `raw` is not a STRFTIME call.  The fmt and header fields
+/// must be freed by the caller via allocator.free when no longer needed.
+fn parseStrftimeRaw(allocator: Allocator, raw: []const u8, column_map: std.StringHashMap(usize)) !?StrftimeSpec {
+    if (raw.len < 11 or !std.ascii.startsWithIgnoreCase(raw, "STRFTIME(")) return null;
+    const after = raw[9..]; // skip "STRFTIME("
+    // Quoted format string: find the pair of single-quotes
+    const q1 = std.mem.indexOfScalar(u8, after, '\'') orelse return error.InvalidQuery;
+    const q2 = std.mem.indexOfScalarPos(u8, after, q1 + 1, '\'') orelse return error.InvalidQuery;
+    const fmt = after[q1 + 1 .. q2];
+    // Column name: after the comma, before the last ')'
+    const comma = std.mem.indexOfScalarPos(u8, after, q2 + 1, ',') orelse return error.InvalidQuery;
+    const close = std.mem.lastIndexOfScalar(u8, after, ')') orelse return error.InvalidQuery;
+    const col_raw = std.mem.trim(u8, after[comma + 1 .. close], &std.ascii.whitespace);
+    const col_lower = try allocator.alloc(u8, col_raw.len);
+    defer allocator.free(col_lower);
+    _ = std.ascii.lowerString(col_lower, col_raw);
+    const col_idx = column_map.get(col_lower) orelse return error.ColumnNotFound;
+    const fmt_copy = try allocator.dupe(u8, fmt);
+    errdefer allocator.free(fmt_copy);
+    return StrftimeSpec{
+        .col_idx = col_idx,
+        .fmt = fmt_copy,
+        .header = try allocator.dupe(u8, raw),
+    };
+}
+
+/// Apply a strftime format to an ISO-8601 datetime string (YYYY-MM-DD HH:MM:SS).
+/// Writes the result into `buf` (64 bytes) and returns the filled slice.
+/// Supported specifiers: %Y %m %d %H %M %S; all other characters are copied literally.
+fn applyStrftime(fmt: []const u8, date_str: []const u8, buf: *[64]u8) []const u8 {
+    var pos: usize = 0;
+    var fi: usize = 0;
+    while (fi < fmt.len and pos + 4 <= buf.len) : (fi += 1) {
+        if (fmt[fi] == '%' and fi + 1 < fmt.len) {
+            fi += 1;
+            switch (fmt[fi]) {
+                'Y' => if (date_str.len >= 4) {
+                    @memcpy(buf[pos..][0..4], date_str[0..4]);
+                    pos += 4;
+                },
+                'm' => if (date_str.len >= 7) {
+                    @memcpy(buf[pos..][0..2], date_str[5..7]);
+                    pos += 2;
+                },
+                'd' => if (date_str.len >= 10) {
+                    @memcpy(buf[pos..][0..2], date_str[8..10]);
+                    pos += 2;
+                },
+                'H' => if (date_str.len >= 13) {
+                    @memcpy(buf[pos..][0..2], date_str[11..13]);
+                    pos += 2;
+                },
+                'M' => if (date_str.len >= 16) {
+                    @memcpy(buf[pos..][0..2], date_str[14..16]);
+                    pos += 2;
+                },
+                'S' => if (date_str.len >= 19) {
+                    @memcpy(buf[pos..][0..2], date_str[17..19]);
+                    pos += 2;
+                },
+                else => {
+                    buf[pos] = '%';
+                    pos += 1;
+                    buf[pos] = fmt[fi];
+                    pos += 1;
+                },
+            }
+        } else {
+            buf[pos] = fmt[fi];
+            pos += 1;
+        }
+    }
+    return buf[0..pos];
+}
 
 /// Pre-resolved aggregate function spec — no per-row allocations in hot loop.
 const AggSpec = struct {
@@ -1207,6 +1282,7 @@ fn executeDistinct(
         0,
     );
     defer std.posix.munmap(mapped);
+    std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
     const data = mapped[0..file_size];
 
     var writer = csv.RecordWriter.init(output_file, opts);
@@ -1346,12 +1422,7 @@ fn executeDistinct(
                         .like => parser.matchLike(fv, comp.value),
                     };
                 } else {
-                    matches = switch (comp.operator) {
-                        .equal => std.mem.eql(u8, fv, comp.value),
-                        .not_equal => !std.mem.eql(u8, fv, comp.value),
-                        .like => parser.matchLike(fv, comp.value),
-                        else => false,
-                    };
+                    matches = parser.compareValues(comp, fv);
                 }
                 if (!matches) continue;
             } else {
@@ -1456,6 +1527,7 @@ fn executeScalarAgg(
         0,
     );
     defer std.posix.munmap(mapped);
+    std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
     const data = mapped[0..file_size];
 
     var writer = csv.RecordWriter.init(output_file, opts);
@@ -1559,7 +1631,7 @@ fn executeScalarAgg(
     // -- Scan (parallel on large files, sequential on small) --
     const num_cores_sa = try std.Thread.getCpuCount();
     if (num_cores_sa > 1 and file_size > 10 * 1024 * 1024) {
-        const n_threads = @min(num_cores_sa, 8);
+        const n_threads = num_cores_sa;
         const chunks = try splitLineChunks(data, header_nl + 1, n_threads, allocator);
         defer allocator.free(chunks);
 
@@ -1570,7 +1642,7 @@ fn executeScalarAgg(
 
         for (0..n_threads) |i| {
             thread_ctxs[i] = .{
-                .data = data,
+                .file_path = query.file_path,
                 .chunk_start = chunks[i][0],
                 .chunk_end = chunks[i][1],
                 .lower_header = lower_header,
@@ -1636,12 +1708,7 @@ fn executeScalarAgg(
                             .like => parser.matchLike(fv, comp.value),
                         };
                     } else {
-                        matches = switch (comp.operator) {
-                            .equal => std.mem.eql(u8, fv, comp.value),
-                            .not_equal => !std.mem.eql(u8, fv, comp.value),
-                            .like => parser.matchLike(fv, comp.value),
-                            else => false,
-                        };
+                        matches = parser.compareValues(comp, fv);
                     }
                     if (!matches) continue;
                 } else {
@@ -1735,6 +1802,7 @@ fn executeScalarAgg(
     for (col_kinds.items, 0..) |kind, i| {
         output_row[i] = switch (kind) {
             .regular => "",
+            .group_key => "",
             .aggregate => |agg_idx| agg_results[agg_idx],
         };
     }
@@ -1783,11 +1851,11 @@ fn splitLineChunks(
 /// after the merge frees everything (partial_map, keys, CompactAccum arrays).
 const GbWorkerCtx = struct {
     // Shared read-only inputs
-    data: []const u8,
+    file_path: []const u8,
     chunk_start: usize,
     chunk_end: usize,
     lower_header: []const []const u8,
-    group_indices: []const usize,
+    group_specs: []const GroupSpec,
     agg_specs: []const AggSpec,
     where_col_idx: ?usize,
     where_expr: ?parser.Expression, // shallow copy — read-only
@@ -1798,6 +1866,119 @@ const GbWorkerCtx = struct {
     partial_map: std.StringHashMap(CompactAccum),
     err: ?anyerror = null,
 };
+
+/// WHERE filter + GROUP BY accumulation for a single parsed line.
+/// Returns early without error if the row is filtered by WHERE.
+fn gbProcessRecord(
+    ctx: *GbWorkerCtx,
+    aa: Allocator,
+    field_stk: *[256][]const u8,
+    key_buf: *std.ArrayListUnmanaged(u8),
+    fallback_row_map: *std.StringHashMap([]const u8),
+    line: []const u8,
+) !void {
+    const record = splitLine(line, field_stk, ctx.delimiter);
+
+    // WHERE filter
+    if (ctx.where_expr) |expr| {
+        if (expr == .comparison) {
+            const comp = expr.comparison;
+            const cidx = ctx.where_col_idx orelse return;
+            if (cidx >= record.len) return;
+            const fv = record[cidx];
+            if (comp.numeric_value) |threshold| {
+                const val = parseNumericFast(fv) catch return;
+                const matches = switch (comp.operator) {
+                    .equal => val == threshold,
+                    .not_equal => val != threshold,
+                    .greater => val > threshold,
+                    .greater_equal => val >= threshold,
+                    .less => val < threshold,
+                    .less_equal => val <= threshold,
+                    .like => parser.matchLike(fv, comp.value),
+                };
+                if (!matches) return;
+            } else {
+                if (!parser.compareValues(comp, fv)) return;
+            }
+        } else {
+            fallback_row_map.clearRetainingCapacity();
+            for (ctx.lower_header, 0..) |lh, i| {
+                if (i < record.len) try fallback_row_map.put(lh, record[i]);
+            }
+            if (!parser.evaluate(expr, fallback_row_map.*)) return;
+        }
+    }
+
+    // Build NUL-separated group key
+    key_buf.clearRetainingCapacity();
+    for (ctx.group_specs, 0..) |spec, i| {
+        if (i > 0) try key_buf.append(aa, 0);
+        var date_buf: [64]u8 = undefined;
+        const val: []const u8 = switch (spec) {
+            .column => |cidx| if (cidx < record.len) record[cidx] else "",
+            .strftime => |sf| if (sf.col_idx < record.len)
+                applyStrftime(sf.fmt, record[sf.col_idx], &date_buf)
+            else
+                "",
+        };
+        try key_buf.appendSlice(aa, val);
+    }
+
+    const gop = try ctx.partial_map.getOrPut(key_buf.items);
+    if (!gop.found_existing) {
+        gop.key_ptr.* = try aa.dupe(u8, key_buf.items);
+        var key_vals = try aa.alloc([]const u8, ctx.group_specs.len);
+        for (ctx.group_specs, 0..) |spec, gi| {
+            var date_buf_kv: [64]u8 = undefined;
+            const kv: []const u8 = switch (spec) {
+                .column => |cidx| if (cidx < record.len) record[cidx] else "",
+                .strftime => |sf| if (sf.col_idx < record.len)
+                    applyStrftime(sf.fmt, record[sf.col_idx], &date_buf_kv)
+                else
+                    "",
+            };
+            key_vals[gi] = try aa.dupe(u8, kv);
+        }
+        gop.value_ptr.* = try CompactAccum.init(aa, key_vals, ctx.n_aggs);
+    }
+    const accum = gop.value_ptr;
+
+    accum.count += 1;
+    for (ctx.agg_specs, 0..) |spec, i| {
+        switch (spec.func_type) {
+            .count => {},
+            .sum, .avg => {
+                if (spec.col_idx) |cidx| {
+                    if (cidx < record.len) {
+                        if (parseNumericFast(record[cidx])) |val| {
+                            accum.sums[i] += val;
+                            accum.sum_counts[i] += 1;
+                        } else |_| {}
+                    }
+                }
+            },
+            .min => {
+                if (spec.col_idx) |cidx| {
+                    if (cidx < record.len) {
+                        if (parseNumericFast(record[cidx])) |val| {
+                            if (val < accum.mins[i]) accum.mins[i] = val;
+                        } else |_| {}
+                    }
+                }
+            },
+            .max => {
+                if (spec.col_idx) |cidx| {
+                    if (cidx < record.len) {
+                        if (parseNumericFast(record[cidx])) |val| {
+                            if (val > accum.maxs[i]) accum.maxs[i] = val;
+                        } else |_| {}
+                    }
+                }
+            },
+        }
+    }
+}
 
 fn gbWorkerThread(ctx: *GbWorkerCtx) void {
     gbWorkerScan(ctx) catch |e| {
@@ -1810,116 +1991,66 @@ fn gbWorkerScan(ctx: *GbWorkerCtx) !void {
     ctx.partial_map = std.StringHashMap(CompactAccum).init(aa);
     try ctx.partial_map.ensureTotalCapacity(64);
 
+    // Use pread instead of scanning shared mmap data.  Each worker opens its
+    // own file descriptor and reads its chunk in 2 MB blocks, eliminating the
+    // VM page-fault serialization that occurs when 12 threads concurrently
+    // fault different regions of the same mmap'd file on macOS.
+    const file = try std.fs.cwd().openFile(ctx.file_path, .{});
+    defer file.close();
+
+    const IO_BUF: usize = 2 * 1024 * 1024;
+    const io_buf = try aa.alloc(u8, IO_BUF);
+    // seam_buf holds the tail bytes of an I/O block that did not end on '\n'.
+    var seam_buf = std.ArrayListUnmanaged(u8){};
+    // combined_buf is reused scratch space for lines that span two blocks.
+    var combined_buf = std.ArrayListUnmanaged(u8){};
+
     var field_stk: [256][]const u8 = undefined;
     var key_buf = std.ArrayListUnmanaged(u8){};
     var fallback_row_map = std.StringHashMap([]const u8).init(aa);
 
-    var pos = ctx.chunk_start;
-    while (pos < ctx.chunk_end) {
-        const line_start = pos;
-        const nl_pos = std.mem.indexOfScalarPos(u8, ctx.data, pos, '\n');
-        var line_end = if (nl_pos) |n| @min(n, ctx.chunk_end) else ctx.chunk_end;
-        pos = if (nl_pos) |n| @min(n + 1, ctx.chunk_end) else ctx.chunk_end;
-        if (line_end > line_start and ctx.data[line_end - 1] == '\r') line_end -= 1;
-        if (line_end <= line_start) continue;
+    var file_pos: usize = ctx.chunk_start;
+    while (file_pos < ctx.chunk_end) {
+        const to_read = @min(IO_BUF, ctx.chunk_end - file_pos);
+        const n = try std.posix.pread(file.handle, io_buf[0..to_read], @intCast(file_pos));
+        if (n == 0) break;
+        file_pos += n;
 
-        const record = splitLine(ctx.data[line_start..line_end], &field_stk, ctx.delimiter);
-
-        // WHERE filter
-        if (ctx.where_expr) |expr| {
-            if (expr == .comparison) {
-                const comp = expr.comparison;
-                const cidx = ctx.where_col_idx orelse continue;
-                if (cidx >= record.len) continue;
-                const fv = record[cidx];
-                var matches = false;
-                if (comp.numeric_value) |threshold| {
-                    const val = parseNumericFast(fv) catch continue;
-                    matches = switch (comp.operator) {
-                        .equal => val == threshold,
-                        .not_equal => val != threshold,
-                        .greater => val > threshold,
-                        .greater_equal => val >= threshold,
-                        .less => val < threshold,
-                        .less_equal => val <= threshold,
-                        .like => parser.matchLike(fv, comp.value),
-                    };
-                } else {
-                    matches = switch (comp.operator) {
-                        .equal => std.mem.eql(u8, fv, comp.value),
-                        .not_equal => !std.mem.eql(u8, fv, comp.value),
-                        .like => parser.matchLike(fv, comp.value),
-                        else => false,
-                    };
-                }
-                if (!matches) continue;
+        var scan: usize = 0;
+        while (scan < n) {
+            const nl = std.mem.indexOfScalarPos(u8, io_buf, scan, '\n') orelse {
+                // No newline in remaining bytes — carry them to the next block.
+                try seam_buf.appendSlice(aa, io_buf[scan..n]);
+                break;
+            };
+            // Assemble the complete line: seam (if any) + bytes up to '\n'.
+            var line: []const u8 = undefined;
+            if (seam_buf.items.len > 0) {
+                combined_buf.clearRetainingCapacity();
+                try combined_buf.appendSlice(aa, seam_buf.items);
+                try combined_buf.appendSlice(aa, io_buf[scan..nl]);
+                seam_buf.clearRetainingCapacity();
+                line = combined_buf.items;
             } else {
-                fallback_row_map.clearRetainingCapacity();
-                for (ctx.lower_header, 0..) |lh, i| {
-                    if (i < record.len) try fallback_row_map.put(lh, record[i]);
-                }
-                if (!parser.evaluate(expr, fallback_row_map)) continue;
+                line = io_buf[scan..nl];
             }
+            if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+            scan = nl + 1;
+            if (line.len == 0) continue;
+            try gbProcessRecord(ctx, aa, &field_stk, &key_buf, &fallback_row_map, line);
         }
-
-        // Build NUL-separated group key
-        key_buf.clearRetainingCapacity();
-        for (ctx.group_indices, 0..) |cidx, i| {
-            if (i > 0) try key_buf.append(aa, 0);
-            try key_buf.appendSlice(aa, if (cidx < record.len) record[cidx] else "");
-        }
-
-        const gop = try ctx.partial_map.getOrPut(key_buf.items);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try aa.dupe(u8, key_buf.items);
-            var key_vals = try aa.alloc([]const u8, ctx.group_indices.len);
-            for (ctx.group_indices, 0..) |gcidx, gi| {
-                key_vals[gi] = try aa.dupe(u8, if (gcidx < record.len) record[gcidx] else "");
-            }
-            gop.value_ptr.* = try CompactAccum.init(aa, key_vals, ctx.n_aggs);
-        }
-        const accum = gop.value_ptr;
-
-        accum.count += 1;
-        for (ctx.agg_specs, 0..) |spec, i| {
-            switch (spec.func_type) {
-                .count => {},
-                .sum, .avg => {
-                    if (spec.col_idx) |cidx| {
-                        if (cidx < record.len) {
-                            if (parseNumericFast(record[cidx])) |val| {
-                                accum.sums[i] += val;
-                                accum.sum_counts[i] += 1;
-                            } else |_| {}
-                        }
-                    }
-                },
-                .min => {
-                    if (spec.col_idx) |cidx| {
-                        if (cidx < record.len) {
-                            if (parseNumericFast(record[cidx])) |val| {
-                                if (val < accum.mins[i]) accum.mins[i] = val;
-                            } else |_| {}
-                        }
-                    }
-                },
-                .max => {
-                    if (spec.col_idx) |cidx| {
-                        if (cidx < record.len) {
-                            if (parseNumericFast(record[cidx])) |val| {
-                                if (val > accum.maxs[i]) accum.maxs[i] = val;
-                            } else |_| {}
-                        }
-                    }
-                },
-            }
-        }
+    }
+    // Flush remaining seam bytes (last line without trailing newline).
+    if (seam_buf.items.len > 0) {
+        var line: []const u8 = seam_buf.items;
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+        if (line.len > 0) try gbProcessRecord(ctx, aa, &field_stk, &key_buf, &fallback_row_map, line);
     }
 }
 
 /// Per-thread context for a parallel scalar aggregate chunk scan.
 const ScalarAggWorkerCtx = struct {
-    data: []const u8,
+    file_path: []const u8,
     chunk_start: usize,
     chunk_end: usize,
     lower_header: []const []const u8,
@@ -1944,88 +2075,179 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
     const empty_keys = try aa.alloc([]const u8, 0);
     ctx.partial_accum = try CompactAccum.init(aa, empty_keys, ctx.n_aggs);
 
+    const file = try std.fs.cwd().openFile(ctx.file_path, .{});
+    defer file.close();
+
+    const IO_BUF: usize = 2 * 1024 * 1024;
+    const io_buf = try aa.alloc(u8, IO_BUF);
+    var seam_buf = std.ArrayListUnmanaged(u8){};
+    var combined_buf = std.ArrayListUnmanaged(u8){};
+
     var field_stk: [256][]const u8 = undefined;
     var fallback_row_map = std.StringHashMap([]const u8).init(aa);
 
-    var pos = ctx.chunk_start;
-    while (pos < ctx.chunk_end) {
-        const line_start = pos;
-        const nl_pos = std.mem.indexOfScalarPos(u8, ctx.data, pos, '\n');
-        var line_end = if (nl_pos) |n| @min(n, ctx.chunk_end) else ctx.chunk_end;
-        pos = if (nl_pos) |n| @min(n + 1, ctx.chunk_end) else ctx.chunk_end;
-        if (line_end > line_start and ctx.data[line_end - 1] == '\r') line_end -= 1;
-        if (line_end <= line_start) continue;
+    var file_pos: usize = ctx.chunk_start;
+    while (file_pos < ctx.chunk_end) {
+        const to_read = @min(IO_BUF, ctx.chunk_end - file_pos);
+        const n = try std.posix.pread(file.handle, io_buf[0..to_read], @intCast(file_pos));
+        if (n == 0) break;
+        file_pos += n;
 
-        const record = splitLine(ctx.data[line_start..line_end], &field_stk, ctx.delimiter);
-
-        if (ctx.where_expr) |expr| {
-            if (expr == .comparison) {
-                const comp = expr.comparison;
-                const cidx = ctx.where_col_idx orelse continue;
-                if (cidx >= record.len) continue;
-                const fv = record[cidx];
-                var matches = false;
-                if (comp.numeric_value) |threshold| {
-                    const val = parseNumericFast(fv) catch continue;
-                    matches = switch (comp.operator) {
-                        .equal => val == threshold,
-                        .not_equal => val != threshold,
-                        .greater => val > threshold,
-                        .greater_equal => val >= threshold,
-                        .less => val < threshold,
-                        .less_equal => val <= threshold,
-                        .like => parser.matchLike(fv, comp.value),
-                    };
-                } else {
-                    matches = switch (comp.operator) {
-                        .equal => std.mem.eql(u8, fv, comp.value),
-                        .not_equal => !std.mem.eql(u8, fv, comp.value),
-                        .like => parser.matchLike(fv, comp.value),
-                        else => false,
-                    };
-                }
-                if (!matches) continue;
+        var scan: usize = 0;
+        while (scan < n) {
+            const nl = std.mem.indexOfScalarPos(u8, io_buf, scan, '\n') orelse {
+                try seam_buf.appendSlice(aa, io_buf[scan..n]);
+                break;
+            };
+            var line: []const u8 = undefined;
+            if (seam_buf.items.len > 0) {
+                combined_buf.clearRetainingCapacity();
+                try combined_buf.appendSlice(aa, seam_buf.items);
+                try combined_buf.appendSlice(aa, io_buf[scan..nl]);
+                seam_buf.clearRetainingCapacity();
+                line = combined_buf.items;
             } else {
-                fallback_row_map.clearRetainingCapacity();
-                for (ctx.lower_header, 0..) |lh, i| {
-                    if (i < record.len) try fallback_row_map.put(lh, record[i]);
+                line = io_buf[scan..nl];
+            }
+            if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+            scan = nl + 1;
+            if (line.len == 0) continue;
+
+            const record = splitLine(line, &field_stk, ctx.delimiter);
+            if (ctx.where_expr) |expr| {
+                if (expr == .comparison) {
+                    const comp = expr.comparison;
+                    const cidx = ctx.where_col_idx orelse continue;
+                    if (cidx >= record.len) continue;
+                    const fv = record[cidx];
+                    var matches = false;
+                    if (comp.numeric_value) |threshold| {
+                        const val = parseNumericFast(fv) catch continue;
+                        matches = switch (comp.operator) {
+                            .equal => val == threshold,
+                            .not_equal => val != threshold,
+                            .greater => val > threshold,
+                            .greater_equal => val >= threshold,
+                            .less => val < threshold,
+                            .less_equal => val <= threshold,
+                            .like => parser.matchLike(fv, comp.value),
+                        };
+                    } else {
+                        matches = parser.compareValues(comp, fv);
+                    }
+                    if (!matches) continue;
+                } else {
+                    fallback_row_map.clearRetainingCapacity();
+                    for (ctx.lower_header, 0..) |lh, i| {
+                        if (i < record.len) try fallback_row_map.put(lh, record[i]);
+                    }
+                    if (!parser.evaluate(expr, fallback_row_map)) continue;
                 }
-                if (!parser.evaluate(expr, fallback_row_map)) continue;
+            }
+            ctx.partial_accum.count += 1;
+            for (ctx.agg_specs, 0..) |spec, i| {
+                switch (spec.func_type) {
+                    .count => {},
+                    .sum, .avg => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len) {
+                                if (parseNumericFast(record[cidx])) |val| {
+                                    ctx.partial_accum.sums[i] += val;
+                                    ctx.partial_accum.sum_counts[i] += 1;
+                                } else |_| {}
+                            }
+                        }
+                    },
+                    .min => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len) {
+                                if (parseNumericFast(record[cidx])) |val| {
+                                    if (val < ctx.partial_accum.mins[i]) ctx.partial_accum.mins[i] = val;
+                                } else |_| {}
+                            }
+                        }
+                    },
+                    .max => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len) {
+                                if (parseNumericFast(record[cidx])) |val| {
+                                    if (val > ctx.partial_accum.maxs[i]) ctx.partial_accum.maxs[i] = val;
+                                } else |_| {}
+                            }
+                        }
+                    },
+                }
             }
         }
-
-        ctx.partial_accum.count += 1;
-        for (ctx.agg_specs, 0..) |spec, i| {
-            switch (spec.func_type) {
-                .count => {},
-                .sum, .avg => {
-                    if (spec.col_idx) |cidx| {
-                        if (cidx < record.len) {
-                            if (parseNumericFast(record[cidx])) |val| {
-                                ctx.partial_accum.sums[i] += val;
-                                ctx.partial_accum.sum_counts[i] += 1;
-                            } else |_| {}
-                        }
+    }
+    // Flush remaining seam bytes (last line without trailing newline).
+    if (seam_buf.items.len > 0) {
+        var line: []const u8 = seam_buf.items;
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+        if (line.len > 0) row: {
+            const record = splitLine(line, &field_stk, ctx.delimiter);
+            if (ctx.where_expr) |expr| {
+                if (expr == .comparison) {
+                    const comp = expr.comparison;
+                    const cidx = ctx.where_col_idx orelse break :row;
+                    if (cidx >= record.len) break :row;
+                    const fv = record[cidx];
+                    if (comp.numeric_value) |threshold| {
+                        const val = parseNumericFast(fv) catch break :row;
+                        const matches = switch (comp.operator) {
+                            .equal => val == threshold,
+                            .not_equal => val != threshold,
+                            .greater => val > threshold,
+                            .greater_equal => val >= threshold,
+                            .less => val < threshold,
+                            .less_equal => val <= threshold,
+                            .like => parser.matchLike(fv, comp.value),
+                        };
+                        if (!matches) break :row;
+                    } else {
+                        if (!parser.compareValues(comp, fv)) break :row;
                     }
-                },
-                .min => {
-                    if (spec.col_idx) |cidx| {
-                        if (cidx < record.len) {
-                            if (parseNumericFast(record[cidx])) |val| {
-                                if (val < ctx.partial_accum.mins[i]) ctx.partial_accum.mins[i] = val;
-                            } else |_| {}
-                        }
+                } else {
+                    fallback_row_map.clearRetainingCapacity();
+                    for (ctx.lower_header, 0..) |lh, i| {
+                        if (i < record.len) try fallback_row_map.put(lh, record[i]);
                     }
-                },
-                .max => {
-                    if (spec.col_idx) |cidx| {
-                        if (cidx < record.len) {
-                            if (parseNumericFast(record[cidx])) |val| {
-                                if (val > ctx.partial_accum.maxs[i]) ctx.partial_accum.maxs[i] = val;
-                            } else |_| {}
+                    if (!parser.evaluate(expr, fallback_row_map)) break :row;
+                }
+            }
+            ctx.partial_accum.count += 1;
+            for (ctx.agg_specs, 0..) |spec, i| {
+                switch (spec.func_type) {
+                    .count => {},
+                    .sum, .avg => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len) {
+                                if (parseNumericFast(record[cidx])) |val| {
+                                    ctx.partial_accum.sums[i] += val;
+                                    ctx.partial_accum.sum_counts[i] += 1;
+                                } else |_| {}
+                            }
                         }
-                    }
-                },
+                    },
+                    .min => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len) {
+                                if (parseNumericFast(record[cidx])) |val| {
+                                    if (val < ctx.partial_accum.mins[i]) ctx.partial_accum.mins[i] = val;
+                                } else |_| {}
+                            }
+                        }
+                    },
+                    .max => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len) {
+                                if (parseNumericFast(record[cidx])) |val| {
+                                    if (val > ctx.partial_accum.maxs[i]) ctx.partial_accum.maxs[i] = val;
+                                } else |_| {}
+                            }
+                        }
+                    },
+                }
             }
         }
     }
@@ -2058,6 +2280,7 @@ fn executeGroupBy(
         0,
     );
     defer std.posix.munmap(mapped);
+    std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
     const data = mapped[0..file_size];
 
     var writer = csv.RecordWriter.init(output_file, opts);
@@ -2092,13 +2315,30 @@ fn executeGroupBy(
     }
 
     // -- Resolve GROUP BY columns -------------------------------------------
-    var group_indices = try allocator.alloc(usize, query.group_by.len);
-    defer allocator.free(group_indices);
+    var group_specs = try allocator.alloc(GroupSpec, query.group_by.len);
+    var n_specs_init: usize = 0;
+    defer {
+        for (group_specs[0..n_specs_init]) |spec| {
+            switch (spec) {
+                .column => {},
+                .strftime => |sf| {
+                    allocator.free(sf.fmt);
+                    allocator.free(sf.header);
+                },
+            }
+        }
+        allocator.free(group_specs);
+    }
     for (query.group_by, 0..) |col, i| {
-        const lower = try allocator.alloc(u8, col.len);
-        defer allocator.free(lower);
-        _ = std.ascii.lowerString(lower, col);
-        group_indices[i] = column_map.get(lower) orelse return error.ColumnNotFound;
+        if (try parseStrftimeRaw(allocator, col, column_map)) |sf| {
+            group_specs[i] = .{ .strftime = sf };
+        } else {
+            const lower = try allocator.alloc(u8, col.len);
+            defer allocator.free(lower);
+            _ = std.ascii.lowerString(lower, col);
+            group_specs[i] = .{ .column = column_map.get(lower) orelse return error.ColumnNotFound };
+        }
+        n_specs_init += 1;
     }
 
     // -- Resolve SELECT columns into ColKind + AggSpec lists ---------------
@@ -2115,9 +2355,17 @@ fn executeGroupBy(
     defer out_header_list.deinit(allocator);
 
     if (query.all_columns) {
-        for (group_indices) |cidx| {
-            try col_kinds.append(allocator, .{ .regular = cidx });
-            try out_header_list.append(allocator, header[cidx]);
+        for (group_specs, 0..) |spec, gi| {
+            switch (spec) {
+                .column => |cidx| {
+                    try col_kinds.append(allocator, .{ .regular = cidx });
+                    try out_header_list.append(allocator, header[cidx]);
+                },
+                .strftime => |sf| {
+                    try col_kinds.append(allocator, .{ .group_key = gi });
+                    try out_header_list.append(allocator, sf.header);
+                },
+            }
         }
     } else {
         for (query.columns) |col| {
@@ -2146,9 +2394,30 @@ fn executeGroupBy(
                 const lower = try allocator.alloc(u8, col.len);
                 defer allocator.free(lower);
                 _ = std.ascii.lowerString(lower, col);
-                const cidx = column_map.get(lower) orelse return error.ColumnNotFound;
-                try col_kinds.append(allocator, .{ .regular = cidx });
-                try out_header_list.append(allocator, header[cidx]);
+                if (column_map.get(lower)) |cidx| {
+                    try col_kinds.append(allocator, .{ .regular = cidx });
+                    try out_header_list.append(allocator, header[cidx]);
+                } else {
+                    // Maybe a STRFTIME expression that also appears in GROUP BY
+                    var gi_found: ?usize = null;
+                    var sf_hdr: []const u8 = "";
+                    for (group_specs, 0..) |spec, gi| {
+                        switch (spec) {
+                            .strftime => |sf| if (std.ascii.eqlIgnoreCase(col, sf.header)) {
+                                gi_found = gi;
+                                sf_hdr = sf.header;
+                                break;
+                            },
+                            else => {},
+                        }
+                    }
+                    if (gi_found) |gi| {
+                        try col_kinds.append(allocator, .{ .group_key = gi });
+                        try out_header_list.append(allocator, sf_hdr);
+                    } else {
+                        return error.ColumnNotFound;
+                    }
+                }
             }
         }
     }
@@ -2198,7 +2467,7 @@ fn executeGroupBy(
     // Single-threaded fallback for small files or single-core environments.
     const num_cores = try std.Thread.getCpuCount();
     if (num_cores > 1 and file_size > 10 * 1024 * 1024) {
-        const n_threads = @min(num_cores, 8);
+        const n_threads = num_cores;
         const chunks = try splitLineChunks(data, header_nl + 1, n_threads, allocator);
         defer allocator.free(chunks);
 
@@ -2209,11 +2478,11 @@ fn executeGroupBy(
 
         for (0..n_threads) |i| {
             thread_ctxs[i] = .{
-                .data = data,
+                .file_path = query.file_path,
                 .chunk_start = chunks[i][0],
                 .chunk_end = chunks[i][1],
                 .lower_header = lower_header,
-                .group_indices = group_indices,
+                .group_specs = group_specs,
                 .agg_specs = agg_specs.items,
                 .where_col_idx = where_col_idx,
                 .where_expr = query.where_expr,
@@ -2300,16 +2569,10 @@ fn executeGroupBy(
                             .like => parser.matchLike(fv, comp.value),
                         };
                     } else {
-                        matches = switch (comp.operator) {
-                            .equal => std.mem.eql(u8, fv, comp.value),
-                            .not_equal => !std.mem.eql(u8, fv, comp.value),
-                            .like => parser.matchLike(fv, comp.value),
-                            else => false,
-                        };
+                        matches = parser.compareValues(comp, fv);
                     }
                     if (!matches) continue;
                 } else {
-                    // Fallback map is allocated once before the loop and cleared here.
                     fallback_row_map.clearRetainingCapacity();
                     for (lower_header, 0..) |lh, i| {
                         if (i < record.len) try fallback_row_map.put(lh, record[i]);
@@ -2320,9 +2583,17 @@ fn executeGroupBy(
 
             // Build NUL-separated group key (no alloc after first row warmup)
             key_buf.clearRetainingCapacity();
-            for (group_indices, 0..) |cidx, i| {
+            for (group_specs, 0..) |spec, i| {
                 if (i > 0) try key_buf.append(allocator, 0);
-                try key_buf.appendSlice(allocator, if (cidx < record.len) record[cidx] else "");
+                var date_buf: [64]u8 = undefined;
+                const val: []const u8 = switch (spec) {
+                    .column => |cidx| if (cidx < record.len) record[cidx] else "",
+                    .strftime => |sf| if (sf.col_idx < record.len)
+                        applyStrftime(sf.fmt, record[sf.col_idx], &date_buf)
+                    else
+                        "",
+                };
+                try key_buf.appendSlice(allocator, val);
             }
 
             // Look up or create group
@@ -2330,9 +2601,17 @@ fn executeGroupBy(
             if (!gop.found_existing) {
                 const stored_key = try ka.dupe(u8, key_buf.items);
                 gop.key_ptr.* = stored_key;
-                var key_vals = try ka.alloc([]const u8, group_indices.len);
-                for (group_indices, 0..) |cidx, gi| {
-                    key_vals[gi] = try ka.dupe(u8, if (cidx < record.len) record[cidx] else "");
+                var key_vals = try ka.alloc([]const u8, group_specs.len);
+                for (group_specs, 0..) |spec, gi| {
+                    var date_buf_kv: [64]u8 = undefined;
+                    const kv: []const u8 = switch (spec) {
+                        .column => |cidx| if (cidx < record.len) record[cidx] else "",
+                        .strftime => |sf| if (sf.col_idx < record.len)
+                            applyStrftime(sf.fmt, record[sf.col_idx], &date_buf_kv)
+                        else
+                            "",
+                    };
+                    key_vals[gi] = try ka.dupe(u8, kv);
                 }
                 gop.value_ptr.* = try CompactAccum.init(ka, key_vals, n_aggs);
             }
@@ -2448,13 +2727,31 @@ fn executeGroupBy(
         for (col_kinds.items, 0..) |kind, i| {
             output_row[i] = switch (kind) {
                 .regular => |cidx| blk: {
-                    for (group_indices, 0..) |gidx, gi| {
-                        if (gidx == cidx) break :blk accum.key_values[gi];
+                    for (group_specs, 0..) |spec, gi| {
+                        switch (spec) {
+                            .column => |gcidx| if (gcidx == cidx) break :blk accum.key_values[gi],
+                            .strftime => {},
+                        }
                     }
                     break :blk "";
                 },
+                .group_key => |gi| accum.key_values[gi],
                 .aggregate => |agg_idx| agg_results[agg_idx],
             };
+        }
+
+        // HAVING filter — evaluated against the assembled output row headers
+        if (query.having_expr) |hav_expr| {
+            var hav_arena = std.heap.ArenaAllocator.init(allocator);
+            defer hav_arena.deinit();
+            const ha = hav_arena.allocator();
+            var having_map = std.StringHashMap([]const u8).init(ha);
+            for (out_header_list.items, 0..) |hdr, hi| {
+                const lower_hdr = try ha.alloc(u8, hdr.len);
+                _ = std.ascii.lowerString(lower_hdr, hdr);
+                try having_map.put(lower_hdr, output_row[hi]);
+            }
+            if (!parser.evaluate(hav_expr, having_map)) continue;
         }
 
         // DISTINCT check for GROUP BY output

@@ -3,6 +3,7 @@ const parser = @import("parser.zig");
 const simple_parser = @import("simple_parser.zig");
 const engine = @import("engine.zig");
 const options_mod = @import("options.zig");
+const mcp = @import("mcp.zig");
 const Allocator = std.mem.Allocator;
 
 const version = "0.4.0";
@@ -57,6 +58,8 @@ const help_text =
     \\  -d, --delimiter <char>  Field delimiter (default: ',')  e.g. -d '\t' for TSV
     \\  --json                  Output results as a JSON array of objects
     \\  --jsonl                 Output results as newline-delimited JSON (NDJSON)
+    \\  --mcp                   Start as an MCP (Model Context Protocol) server
+    \\                          Exposes csv_query, csv_schema, csv_list tools
     \\
     \\EXAMPLES:
     \\  csvql "SELECT * FROM 'users.csv' WHERE age >= 18 LIMIT 100"
@@ -85,6 +88,10 @@ pub fn main() !void {
         }
         if (std.mem.eql(u8, args[1], "--help") or std.mem.eql(u8, args[1], "-h")) {
             try stdout_file.writeAll(help_text);
+            return;
+        }
+        if (std.mem.eql(u8, args[1], "--mcp")) {
+            try mcp.run(allocator);
             return;
         }
     }
