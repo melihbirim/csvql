@@ -1207,6 +1207,7 @@ fn executeDistinct(
         0,
     );
     defer std.posix.munmap(mapped);
+    std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
     const data = mapped[0..file_size];
 
     var writer = csv.RecordWriter.init(output_file, opts);
@@ -1456,6 +1457,7 @@ fn executeScalarAgg(
         0,
     );
     defer std.posix.munmap(mapped);
+    std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
     const data = mapped[0..file_size];
 
     var writer = csv.RecordWriter.init(output_file, opts);
@@ -1559,7 +1561,7 @@ fn executeScalarAgg(
     // -- Scan (parallel on large files, sequential on small) --
     const num_cores_sa = try std.Thread.getCpuCount();
     if (num_cores_sa > 1 and file_size > 10 * 1024 * 1024) {
-        const n_threads = @min(num_cores_sa, 8);
+        const n_threads = num_cores_sa;
         const chunks = try splitLineChunks(data, header_nl + 1, n_threads, allocator);
         defer allocator.free(chunks);
 
@@ -2058,6 +2060,7 @@ fn executeGroupBy(
         0,
     );
     defer std.posix.munmap(mapped);
+    std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
     const data = mapped[0..file_size];
 
     var writer = csv.RecordWriter.init(output_file, opts);
@@ -2198,7 +2201,7 @@ fn executeGroupBy(
     // Single-threaded fallback for small files or single-core environments.
     const num_cores = try std.Thread.getCpuCount();
     if (num_cores > 1 and file_size > 10 * 1024 * 1024) {
-        const n_threads = @min(num_cores, 8);
+        const n_threads = num_cores;
         const chunks = try splitLineChunks(data, header_nl + 1, n_threads, allocator);
         defer allocator.free(chunks);
 
