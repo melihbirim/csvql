@@ -90,14 +90,18 @@ pub fn matchILike(text: []const u8, pattern: []const u8) bool {
 /// Scalar function comparison in WHERE clause.
 /// e.g. DATEDIFF('day', shipped_at, delivered_at) > 5
 pub const ScalarWhereComparison = struct {
-    /// Lowercase function name: "datediff", "dateadd", or "extract"
-    func: []u8,
-    /// Unit string without quotes (e.g. "day") or EXTRACT part (e.g. "year")
-    unit: []u8,
-    /// First column name (start_col for datediff, date_col for dateadd/extract), lowercase
-    col1_name: []u8,
+    /// Lowercase function name: "datediff", "dateadd", or "extract".
+    /// Owned: allocated by the parser allocator, freed in deinit.
+    func: []const u8,
+    /// Unit string without quotes (e.g. "day") or EXTRACT part (e.g. "year").
+    /// Owned: allocated by the parser allocator, freed in deinit.
+    unit: []const u8,
+    /// First column name (start_col for datediff, date_col for dateadd/extract), lowercase.
+    /// Owned: allocated by the parser allocator, freed in deinit.
+    col1_name: []const u8,
     /// Second column name (end_col for datediff). null for dateadd/extract.
-    col2_name: ?[]u8,
+    /// Owned when non-null: allocated by the parser allocator, freed in deinit.
+    col2_name: ?[]const u8,
     /// Numeric amount for DATEADD; unused for datediff/extract
     amount: i32,
     operator: Operator,
@@ -1082,6 +1086,7 @@ fn parseScalarWhereComparison(allocator: Allocator, input: []const u8) !?Express
         _ = std.ascii.lowerString(col1_buf, start_str);
 
         const col2_buf = try allocator.alloc(u8, end_str.len);
+        errdefer allocator.free(col2_buf);
         _ = std.ascii.lowerString(col2_buf, end_str);
 
         return Expression{ .scalar_comparison = .{
@@ -1109,6 +1114,7 @@ fn parseScalarWhereComparison(allocator: Allocator, input: []const u8) !?Express
         errdefer allocator.free(unit_alloc);
 
         const col1_buf = try allocator.alloc(u8, date_str.len);
+        errdefer allocator.free(col1_buf);
         _ = std.ascii.lowerString(col1_buf, date_str);
 
         return Expression{ .scalar_comparison = .{
@@ -1124,6 +1130,9 @@ fn parseScalarWhereComparison(allocator: Allocator, input: []const u8) !?Express
 
     // is_extract
     // EXTRACT(part FROM date_col)
+    // Safety: args_str is the raw content between EXTRACT( and its closing ), e.g.
+    // "year FROM event_date". EXTRACT syntax never contains string literals inside
+    // the parentheses, so a simple case-insensitive search for " FROM " is safe.
     const from_idx = std.ascii.indexOfIgnoreCase(args_str, " FROM ") orelse return error.InvalidExpression;
     const part_raw = std.mem.trim(u8, args_str[0..from_idx], &std.ascii.whitespace);
     const date_str = std.mem.trim(u8, args_str[from_idx + 6 ..], &std.ascii.whitespace);
@@ -1132,6 +1141,7 @@ fn parseScalarWhereComparison(allocator: Allocator, input: []const u8) !?Express
     errdefer allocator.free(unit_alloc);
 
     const col1_buf = try allocator.alloc(u8, date_str.len);
+    errdefer allocator.free(col1_buf);
     _ = std.ascii.lowerString(col1_buf, date_str);
 
     return Expression{ .scalar_comparison = .{
