@@ -201,7 +201,7 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 | **NOT**       | `WHERE NOT expr` — logical negation of any condition                    |
 | **AND / OR**  | `WHERE cond1 AND cond2` / `WHERE cond1 OR cond2` — compound conditions  |
 | **JOIN**      | `FROM 'a.csv' a [INNER] JOIN 'b.csv' b ON a.key = b.key`               |
-| **GROUP BY**  | `GROUP BY col1` — groups rows for aggregation                           |
+| **GROUP BY**  | `GROUP BY col1` or `GROUP BY alias` — groups rows; accepts SELECT aliases |
 | **COUNT**     | `COUNT(*)` or `COUNT(col)` — with or without `GROUP BY`                 |
 | **SUM**       | `SUM(col)` — with or without `GROUP BY`                                 |
 | **AVG**       | `AVG(col)` — full precision; with or without `GROUP BY`                 |
@@ -273,17 +273,20 @@ Supported format specifiers: `%Y` (year), `%m` (month), `%d` (day), `%H` (hour),
 Input dates can be ISO-8601 date (`YYYY-MM-DD`) or datetime (`YYYY-MM-DD HH:MM:SS`).
 
 ```bash
-# Monthly revenue trend
+# Monthly revenue trend — GROUP BY the full STRFTIME expression
 csvql "SELECT STRFTIME('%Y-%m', order_date), COUNT(*), SUM(price) FROM 'orders.csv' GROUP BY STRFTIME('%Y-%m', order_date)"
 
+# Same query using AS alias — GROUP BY the alias name
+csvql "SELECT STRFTIME('%Y-%m', order_date) AS month, COUNT(*) AS orders, SUM(price) AS revenue FROM 'orders.csv' GROUP BY month ORDER BY month"
+
 # Year-over-year breakdown by category
-csvql "SELECT category, STRFTIME('%Y', order_date), SUM(price) FROM 'orders.csv' GROUP BY category, STRFTIME('%Y', order_date)"
+csvql "SELECT category, STRFTIME('%Y', order_date) AS yr, SUM(price) FROM 'orders.csv' GROUP BY category, yr"
 
 # Date range filter + monthly bucketing + HAVING
-csvql "SELECT STRFTIME('%Y-%m', order_date), COUNT(*), SUM(price) FROM 'orders.csv' WHERE order_date >= '2026-01-01' GROUP BY STRFTIME('%Y-%m', order_date) HAVING COUNT(*) > 1000000"
+csvql "SELECT STRFTIME('%Y-%m', order_date) AS month, COUNT(*), SUM(price) FROM 'orders.csv' WHERE order_date >= '2026-01-01' GROUP BY month HAVING COUNT(*) > 1000000"
 
 # Daily active users
-csvql "SELECT STRFTIME('%Y-%m-%d', event_date), COUNT(DISTINCT user_id) FROM 'events.csv' GROUP BY STRFTIME('%Y-%m-%d', event_date) ORDER BY 1"
+csvql "SELECT STRFTIME('%Y-%m-%d', event_date) AS day, COUNT(DISTINCT user_id) FROM 'events.csv' GROUP BY day ORDER BY day"
 ```
 
 ### JOIN Examples
@@ -412,6 +415,7 @@ Once connected, you can ask your AI assistant to query CSV files directly:
 | `IS NULL` / `IS NOT NULL`           |                                                      | ✅ shipped          |
 | `NOT` prefix for conditions         |                                                      | ✅ shipped          |
 | `ORDER BY` positional (`ORDER BY 1`)|                                                      | ✅ shipped          |
+| `GROUP BY` alias (`GROUP BY month`) |                                                      | ✅ shipped          |
 
 ## Contributing
 
