@@ -316,6 +316,50 @@ fn extractFileAndAlias(allocator: Allocator, input: []const u8) !FileAlias {
     }
 }
 
+/// Find the index of the table-level FROM keyword, starting the scan at `from`.
+/// Skips any FROM tokens that appear inside parentheses, so that
+/// EXTRACT(year FROM col) does not confuse the parser.
+/// Returns the byte offset of the 'F' in the matching FROM, or null.
+fn findTableFromIdx(s: []const u8, from: usize) ?usize {
+    var depth: usize = 0;
+    var in_quote = false;
+    var i: usize = from;
+    while (i < s.len) {
+        const c = s[i];
+        if (in_quote) {
+            if (c == '\'') in_quote = false;
+            i += 1;
+            continue;
+        }
+        switch (c) {
+            '\'' => {
+                in_quote = true;
+                i += 1;
+            },
+            '(' => {
+                depth += 1;
+                i += 1;
+            },
+            ')' => {
+                if (depth > 0) depth -= 1;
+                i += 1;
+            },
+            else => {
+                if (depth == 0 and
+                    i + 4 <= s.len and
+                    std.ascii.eqlIgnoreCase(s[i .. i + 4], "FROM") and
+                    (i == 0 or std.ascii.isWhitespace(s[i - 1])) and
+                    (i + 4 >= s.len or std.ascii.isWhitespace(s[i + 4])))
+                {
+                    return i;
+                }
+                i += 1;
+            },
+        }
+    }
+    return null;
+}
+
 /// Split a comma-separated list while respecting nested parentheses and single-quoted strings.
 /// Commas inside `(...)` or `'...'` are treated as part of the current token, not separators.
 /// Returns an ArrayList of trimmed, allocator-owned strings; caller frees each item + the list.
@@ -378,7 +422,8 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
 
     // Extract SELECT clause
     const select_idx = std.ascii.indexOfIgnoreCase(trimmed, "SELECT") orelse return error.InvalidQuery;
-    const from_idx = std.ascii.indexOfIgnoreCase(trimmed, "FROM") orelse return error.InvalidQuery;
+    // Use paren-aware search so EXTRACT(year FROM col) doesn't match as the table FROM.
+    const from_idx = findTableFromIdx(trimmed, select_idx + 6) orelse return error.InvalidQuery;
 
     var columns_part = std.mem.trim(u8, trimmed[select_idx + 6 .. from_idx], &std.ascii.whitespace);
 
