@@ -1053,21 +1053,21 @@ fn executeFromStdin(
 
 /// Describes how each SELECT output column is derived.
 const ColKind = union(enum) {
-    regular: usize,    // direct CSV column index
-    group_key: usize,  // key_values slot gi (used for STRFTIME group expressions)
-    aggregate: usize,  // index into AggSpec list
+    regular: usize, // direct CSV column index
+    group_key: usize, // key_values slot gi (used for STRFTIME group expressions)
+    aggregate: usize, // index into AggSpec list
 };
 
 /// Describes a STRFTIME('%Y-%m', col) GROUP BY / SELECT expression.
 const StrftimeSpec = struct {
     col_idx: usize,
-    fmt: []const u8,    // allocator-owned format string, e.g. "%Y-%m"
+    fmt: []const u8, // allocator-owned format string, e.g. "%Y-%m"
     header: []const u8, // allocator-owned display name, e.g. "STRFTIME('%Y-%m', order_date)"
 };
 
 /// Describes how a single GROUP BY key is extracted from a CSV row.
 const GroupSpec = union(enum) {
-    column: usize,          // plain CSV column index
+    column: usize, // plain CSV column index
     strftime: StrftimeSpec, // STRFTIME transform applied to a column value
 };
 
@@ -1108,13 +1108,36 @@ fn applyStrftime(fmt: []const u8, date_str: []const u8, buf: *[64]u8) []const u8
         if (fmt[fi] == '%' and fi + 1 < fmt.len) {
             fi += 1;
             switch (fmt[fi]) {
-                'Y' => if (date_str.len >= 4) { @memcpy(buf[pos..][0..4], date_str[0..4]); pos += 4; },
-                'm' => if (date_str.len >= 7) { @memcpy(buf[pos..][0..2], date_str[5..7]); pos += 2; },
-                'd' => if (date_str.len >= 10) { @memcpy(buf[pos..][0..2], date_str[8..10]); pos += 2; },
-                'H' => if (date_str.len >= 13) { @memcpy(buf[pos..][0..2], date_str[11..13]); pos += 2; },
-                'M' => if (date_str.len >= 16) { @memcpy(buf[pos..][0..2], date_str[14..16]); pos += 2; },
-                'S' => if (date_str.len >= 19) { @memcpy(buf[pos..][0..2], date_str[17..19]); pos += 2; },
-                else => { buf[pos] = '%'; pos += 1; buf[pos] = fmt[fi]; pos += 1; },
+                'Y' => if (date_str.len >= 4) {
+                    @memcpy(buf[pos..][0..4], date_str[0..4]);
+                    pos += 4;
+                },
+                'm' => if (date_str.len >= 7) {
+                    @memcpy(buf[pos..][0..2], date_str[5..7]);
+                    pos += 2;
+                },
+                'd' => if (date_str.len >= 10) {
+                    @memcpy(buf[pos..][0..2], date_str[8..10]);
+                    pos += 2;
+                },
+                'H' => if (date_str.len >= 13) {
+                    @memcpy(buf[pos..][0..2], date_str[11..13]);
+                    pos += 2;
+                },
+                'M' => if (date_str.len >= 16) {
+                    @memcpy(buf[pos..][0..2], date_str[14..16]);
+                    pos += 2;
+                },
+                'S' => if (date_str.len >= 19) {
+                    @memcpy(buf[pos..][0..2], date_str[17..19]);
+                    pos += 2;
+                },
+                else => {
+                    buf[pos] = '%';
+                    pos += 1;
+                    buf[pos] = fmt[fi];
+                    pos += 1;
+                },
             }
         } else {
             buf[pos] = fmt[fi];
@@ -2298,7 +2321,10 @@ fn executeGroupBy(
         for (group_specs[0..n_specs_init]) |spec| {
             switch (spec) {
                 .column => {},
-                .strftime => |sf| { allocator.free(sf.fmt); allocator.free(sf.header); },
+                .strftime => |sf| {
+                    allocator.free(sf.fmt);
+                    allocator.free(sf.header);
+                },
             }
         }
         allocator.free(group_specs);

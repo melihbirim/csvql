@@ -291,9 +291,11 @@ fn splitCommaTerms(allocator: Allocator, input: []const u8) !std.ArrayList([]u8)
         }
         switch (c) {
             '\'' => in_quote = true,
-            '('  => depth += 1,
-            ')'  => if (depth > 0) { depth -= 1; },
-            ','  => if (depth == 0) {
+            '(' => depth += 1,
+            ')' => if (depth > 0) {
+                depth -= 1;
+            },
+            ',' => if (depth == 0) {
                 const term = std.mem.trim(u8, input[start..i], &std.ascii.whitespace);
                 if (term.len > 0) try items.append(allocator, try allocator.dupe(u8, term));
                 start = i + 1;
