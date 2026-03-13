@@ -332,9 +332,18 @@ fn findTableFromIdx(s: []const u8, from: usize) ?usize {
             continue;
         }
         switch (c) {
-            '\'' => { in_quote = true; i += 1; },
-            '(' =>  { depth += 1; i += 1; },
-            ')' =>  { if (depth > 0) depth -= 1; i += 1; },
+            '\'' => {
+                in_quote = true;
+                i += 1;
+            },
+            '(' => {
+                depth += 1;
+                i += 1;
+            },
+            ')' => {
+                if (depth > 0) depth -= 1;
+                i += 1;
+            },
             else => {
                 if (depth == 0 and
                     i + 4 <= s.len and
