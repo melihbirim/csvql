@@ -3731,6 +3731,13 @@ fn executeGroupBy(
                         .substr => |*a| a.col_idx = 0,
                         .mod_op => |*a| a.col_idx = 0,
                         .coalesce => |*a| a.col_idx = 0,
+                        .datediff => |*a| {
+                            a.start_col = 0;
+                            a.end_col = 0;
+                        },
+                        .dateadd => |*a| a.date_col = 0,
+                        .extract => |*a| a.date_col = 0,
+                        .round_op => |*a| a.col_idx = 0,
                     }
                     break :blk scalar.eval(adj_spec, &rec, gb_scalar_arena.allocator());
                 },
@@ -5643,3 +5650,363 @@ test "WHERE OR: evaluateDirect passes rows matching either branch" {
     try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "Carol"));
     try std.testing.expect(!std.mem.containsAtLeast(u8, data, 1, "Dave"));
 }
+
+// ── DateTime function tests ────────────────────────────────────────────────────
+
+test "DATEDIFF minutes: calculates time difference in minutes" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("dt.csv", .{});
+        defer f.close();
+        try f.writeAll("id,start_time,end_time\n1,2026-01-15 09:30:00,2026-01-15 10:45:00\n2,01/15/2026 08:00:00,01/15/2026 09:30:00\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("dt.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT id, DATEDIFF('minute', start_time, end_time) FROM '{s}'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "75")); // 1:15 hours = 75 minutes
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "90")); // 1:30 hours = 90 minutes
+}
+
+test "DATEDIFF hours: calculates time difference in hours" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("dt.csv", .{});
+        defer f.close();
+        try f.writeAll("id,ordered_at,packaged_at\n1,2026-01-15 09:00:00,2026-01-15 11:00:00\n2,2026-01-16T08:00:00,2026-01-16T11:30:00\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("dt.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT id, DATEDIFF('hour', ordered_at, packaged_at) FROM '{s}'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "2")); // 2 hours
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "3.5")); // 3.5 hours
+}
+
+test "DATEDIFF days: calculates date difference in days" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("dt.csv", .{});
+        defer f.close();
+        try f.writeAll("id,shipped,delivered\n1,2026-01-15 14:00:00,2026-01-16 10:30:00\n2,15.01.2026 13:00:00,17.01.2026 09:00:00\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("dt.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT id, DATEDIFF('day', shipped, delivered) FROM '{s}'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "0.85")); // ~20.5 hours
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "1.83")); // ~44 hours
+}
+
+test "DATEADD: adds days to date" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("dt.csv", .{});
+        defer f.close();
+        try f.writeAll("id,shipped_at\n1,2026-01-20 14:30:00\n2,01/21/2026 13:00:00\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("dt.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT id, DATEADD('day', 2, shipped_at) FROM '{s}'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "2026-01-22 14:30:00"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "2026-01-23 13:00:00"));
+}
+
+test "DATEADD: adds hours to datetime" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("dt.csv", .{});
+        defer f.close();
+        try f.writeAll("id,time\n1,2026-01-15 09:00:00\n2,2026-01-15 14:30:00\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("dt.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT id, DATEADD('hour', 5, time) FROM '{s}'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "2026-01-15 14:00:00"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "2026-01-15 19:30:00"));
+}
+
+test "DateTime workflow: order processing time analysis" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("orders.csv", .{});
+        defer f.close();
+        try f.writeAll("order_id,ordered_at,picked_at,shipped_at,delivered_at\n1001,2026-01-15 09:30:00,2026-01-15 10:45:00,2026-01-15 14:00:00,2026-01-16 10:30:00\n1002,01/15/2026 08:00:00,01/15/2026 09:30:00,01/15/2026 13:30:00,01/16/2026 11:15:00\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("orders.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT order_id, DATEDIFF('hour', ordered_at, picked_at) AS pick_hours, DATEDIFF('day', shipped_at, delivered_at) AS ship_days FROM '{s}'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    // Check headers
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "pick_hours"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "ship_days"));
+    // Check calculated values - picking takes 1.25-1.5 hours
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "1.25") or std.mem.containsAtLeast(u8, data, 1, "1.50"));
+}
+
+test "EXTRACT: extracts year, month, day from datetime column" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("dt.csv", .{});
+        defer f.close();
+        try f.writeAll("id,event_date\n1,2026-03-15 09:30:00\n2,01/07/2026 14:00:00\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("dt.csv", &pb);
+
+    const sql_year = try std.fmt.allocPrint(allocator, "SELECT id, EXTRACT(year FROM event_date) FROM '{s}'", .{p});
+    defer allocator.free(sql_year);
+    var q = try parser.parse(allocator, sql_year);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out_year.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "2026")); // year extracted
+}
+
+test "EXTRACT: extracts month and day from datetime column" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("dt.csv", .{});
+        defer f.close();
+        try f.writeAll("id,event_date\n1,2026-03-15 09:30:00\n2,2026-07-04 00:00:00\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("dt.csv", &pb);
+
+    const sql_month = try std.fmt.allocPrint(allocator, "SELECT id, EXTRACT(month FROM event_date), EXTRACT(day FROM event_date) FROM '{s}'", .{p});
+    defer allocator.free(sql_month);
+    var q = try parser.parse(allocator, sql_month);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out_month.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "3"));  // March
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "15")); // 15th
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "7"));  // July
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "4"));  // 4th
+}
+
+test "EXTRACT: combined with DATEDIFF in same query" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("orders.csv", .{});
+        defer f.close();
+        try f.writeAll("id,ordered_at,delivered_at\n1,2026-01-15 09:00:00,2026-01-16 09:00:00\n2,2026-03-10 08:00:00,2026-03-11 08:00:00\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("orders.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT id, EXTRACT(month FROM ordered_at) AS order_month, DATEDIFF('day', ordered_at, delivered_at) AS ship_days FROM '{s}'",
+        .{p},
+    );
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out_combo.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "order_month"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "ship_days"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "1"));  // January = 1
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "3"));  // March = 3
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "1")); // 1 day exactly (whole number, no .00)
+}
+
+test "ROUND: rounds to integer when no digits given" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("prices.csv", .{});
+        defer f.close();
+        try f.writeAll("id,price\n1,1.20\n2,5.99\n3,2.30\n4,3.50\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("prices.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT id, ROUND(price) AS rounded_price FROM '{s}'",
+        .{p},
+    );
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out_round_int.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "rounded_price"));
+    // price=1.20 → 1, price=5.99 → 6, price=2.30 → 2, price=3.50 → 4
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "1"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "6"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "2"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "4"));
+}
+
+test "ROUND: rounds to specified decimal places" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("prices.csv", .{});
+        defer f.close();
+        try f.writeAll("id,price\n1,1.85\n2,1.20\n3,2.50\n4,5.994\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("prices.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT id, ROUND(price, 1) AS price_1dp FROM '{s}'",
+        .{p},
+    );
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out_round_1dp.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "price_1dp"));
+    // price=1.85 → 1.9, price=1.20 → 1.2, price=2.50 → 2.5, price=5.994 → 6.0
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "1.9"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "1.2"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "2.5"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "6.0"));
+}
+

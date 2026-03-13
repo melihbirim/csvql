@@ -11,6 +11,7 @@
 ///   3. Use OutputColSpec + evalOutputCol for unified column projection.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const datetime = @import("datetime.zig");
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -31,6 +32,10 @@ pub const ScalarSpec = union(enum) {
     cast_int: usize, // CAST(col AS INTEGER/BIGINT)
     cast_float: usize, // CAST(col AS FLOAT/REAL/NUMERIC/DECIMAL)
     cast_text: usize, // CAST(col AS TEXT/VARCHAR/CHAR/STRING) — identity
+    datediff: DatediffArgs, // DATEDIFF(unit, start_col, end_col)
+    dateadd: DateaddArgs, // DATEADD(unit, amount, date_col)
+    extract: ExtractArgs, // EXTRACT(part FROM date_col)
+    round_op: RoundArgs, // ROUND(col[, digits])
 
     pub const SubstrArgs = struct {
         col_idx: usize,
@@ -49,6 +54,28 @@ pub const ScalarSpec = union(enum) {
         fallback: []const u8,
     };
 
+    pub const DatediffArgs = struct {
+        unit: []const u8, // 'second', 'minute', 'hour', 'day', 'week', 'month', 'year'
+        start_col: usize,
+        end_col: usize,
+    };
+
+    pub const DateaddArgs = struct {
+        unit: []const u8,
+        amount: i32,
+        date_col: usize,
+    };
+
+    pub const ExtractArgs = struct {
+        part: []const u8, // 'year', 'month', 'day', 'hour', 'minute', 'second'
+        date_col: usize,
+    };
+
+    pub const RoundArgs = struct {
+        col_idx: usize,
+        digits: u8, // number of decimal places (0 = round to integer)
+    };
+
     /// Return the primary column index this spec operates on.
     pub fn colIdx(self: ScalarSpec) usize {
         return switch (self) {
@@ -56,6 +83,10 @@ pub const ScalarSpec = union(enum) {
             .substr => |a| a.col_idx,
             .mod_op => |a| a.col_idx,
             .coalesce => |a| a.col_idx,
+            .datediff => |a| a.start_col, // return first column
+            .dateadd => |a| a.date_col,
+            .extract => |a| a.date_col,
+            .round_op => |a| a.col_idx,
         };
     }
 };
@@ -154,6 +185,23 @@ pub fn tryParseScalar(
         return .{ .mod_op = .{ .col_idx = cidx, .divisor = divisor } };
     }
 
+    // ── ROUND ──────────────────────────────────────────────────────────────
+    if (std.mem.eql(u8, fn_lower, "round")) {
+        // ROUND(col) or ROUND(col, digits)
+        const comma = std.mem.indexOfScalar(u8, args_str, ',');
+        const col_str = std.mem.trim(u8, if (comma) |c| args_str[0..c] else args_str, &std.ascii.whitespace);
+        const digits: u8 = if (comma) |c| blk: {
+            const d_str = std.mem.trim(u8, args_str[c + 1 ..], &std.ascii.whitespace);
+            const d = std.fmt.parseInt(u8, d_str, 10) catch return null;
+            break :blk d;
+        } else 0;
+
+        const cidx = try resolveCol(col_str, column_map, allocator) orelse
+            return error.ColumnNotFound;
+
+        return .{ .round_op = .{ .col_idx = cidx, .digits = digits } };
+    }
+
     // ── COALESCE ───────────────────────────────────────────────────────────
     if (std.mem.eql(u8, fn_lower, "coalesce")) {
         const comma = std.mem.indexOfScalar(u8, args_str, ',') orelse return null;
@@ -208,6 +256,63 @@ pub fn tryParseScalar(
             return .{ .cast_text = cidx };
 
         return null; // unknown type — fall through to column lookup
+    }
+
+    // ── DATEDIFF ───────────────────────────────────────────────────────────
+    if (std.mem.eql(u8, fn_lower, "datediff")) {
+        // DATEDIFF(unit, start_col, end_col)
+        // Split by commas
+        var parts = std.mem.splitScalar(u8, args_str, ',');
+        const unit_raw = std.mem.trim(u8, parts.next() orelse return null, &std.ascii.whitespace);
+        const start_str = std.mem.trim(u8, parts.next() orelse return null, &std.ascii.whitespace);
+        const end_str = std.mem.trim(u8, parts.next() orelse return null, &std.ascii.whitespace);
+
+        // Strip quotes from unit string
+        const unit = if (unit_raw.len >= 2 and unit_raw[0] == '\'' and unit_raw[unit_raw.len - 1] == '\'')
+            unit_raw[1 .. unit_raw.len - 1]
+        else
+            unit_raw;
+
+        const start_col = try resolveCol(start_str, column_map, allocator) orelse
+            return error.ColumnNotFound;
+        const end_col = try resolveCol(end_str, column_map, allocator) orelse
+            return error.ColumnNotFound;
+
+        return .{ .datediff = .{ .unit = unit, .start_col = start_col, .end_col = end_col } };
+    }
+
+    // ── DATEADD ────────────────────────────────────────────────────────────
+    if (std.mem.eql(u8, fn_lower, "dateadd")) {
+        // DATEADD(unit, amount, date_col)
+        var parts = std.mem.splitScalar(u8, args_str, ',');
+        const unit_raw = std.mem.trim(u8, parts.next() orelse return null, &std.ascii.whitespace);
+        const amount_str = std.mem.trim(u8, parts.next() orelse return null, &std.ascii.whitespace);
+        const date_str = std.mem.trim(u8, parts.next() orelse return null, &std.ascii.whitespace);
+
+        // Strip quotes from unit string
+        const unit = if (unit_raw.len >= 2 and unit_raw[0] == '\'' and unit_raw[unit_raw.len - 1] == '\'')
+            unit_raw[1 .. unit_raw.len - 1]
+        else
+            unit_raw;
+
+        const amount = std.fmt.parseInt(i32, amount_str, 10) catch return null;
+        const date_col = try resolveCol(date_str, column_map, allocator) orelse
+            return error.ColumnNotFound;
+
+        return .{ .dateadd = .{ .unit = unit, .amount = amount, .date_col = date_col } };
+    }
+
+    // ── EXTRACT ────────────────────────────────────────────────────────────
+    if (std.mem.eql(u8, fn_lower, "extract")) {
+        // EXTRACT(part FROM date_col)
+        const from_idx = std.ascii.indexOfIgnoreCase(args_str, " FROM ") orelse return null;
+        const part_raw = std.mem.trim(u8, args_str[0..from_idx], &std.ascii.whitespace);
+        const date_str = std.mem.trim(u8, args_str[from_idx + 6 ..], &std.ascii.whitespace);
+
+        const date_col = try resolveCol(date_str, column_map, allocator) orelse
+            return error.ColumnNotFound;
+
+        return .{ .extract = .{ .part = part_raw, .date_col = date_col } };
     }
 
     return null; // not a recognized scalar function
@@ -299,6 +404,97 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
         },
         .cast_text => |cidx| {
             return field(record, cidx);
+        },
+        .datediff => |args| {
+            const start_val = field(record, args.start_col);
+            const end_val = field(record, args.end_col);
+            
+            // Parse both dates
+            const start_ts = datetime.parseDateTime(start_val) catch return "0";
+            const end_ts = datetime.parseDateTime(end_val) catch return "0";
+            
+            // Calculate difference based on unit
+            const diff_seconds = end_ts - start_ts;
+            const result: f64 = if (std.ascii.eqlIgnoreCase(args.unit, "second")) 
+                @floatFromInt(diff_seconds)
+            else if (std.ascii.eqlIgnoreCase(args.unit, "minute"))
+                @as(f64, @floatFromInt(diff_seconds)) / 60.0
+            else if (std.ascii.eqlIgnoreCase(args.unit, "hour"))
+                @as(f64, @floatFromInt(diff_seconds)) / 3600.0
+            else if (std.ascii.eqlIgnoreCase(args.unit, "day"))
+                @as(f64, @floatFromInt(diff_seconds)) / 86400.0
+            else if (std.ascii.eqlIgnoreCase(args.unit, "week"))
+                @as(f64, @floatFromInt(diff_seconds)) / 604800.0
+            else if (std.ascii.eqlIgnoreCase(args.unit, "month"))
+                @as(f64, @floatFromInt(diff_seconds)) / 2592000.0 // approximate: 30 days
+            else if (std.ascii.eqlIgnoreCase(args.unit, "year"))
+                @as(f64, @floatFromInt(diff_seconds)) / 31536000.0 // 365 days
+            else
+                0.0;
+            
+            const buf = arena.alloc(u8, 32) catch return "0";
+            return fmtNum(buf, result);
+        },
+        .dateadd => |args| {
+            const date_val = field(record, args.date_col);
+            const base_ts = datetime.parseDateTime(date_val) catch return date_val;
+            
+            // Add amount based on unit
+            const seconds_to_add: i64 = if (std.ascii.eqlIgnoreCase(args.unit, "second"))
+                args.amount
+            else if (std.ascii.eqlIgnoreCase(args.unit, "minute"))
+                @as(i64, args.amount) * 60
+            else if (std.ascii.eqlIgnoreCase(args.unit, "hour"))
+                @as(i64, args.amount) * 3600
+            else if (std.ascii.eqlIgnoreCase(args.unit, "day"))
+                @as(i64, args.amount) * 86400
+            else if (std.ascii.eqlIgnoreCase(args.unit, "week"))
+                @as(i64, args.amount) * 604800
+            else if (std.ascii.eqlIgnoreCase(args.unit, "month"))
+                @as(i64, args.amount) * 2592000 // approximate: 30 days
+            else if (std.ascii.eqlIgnoreCase(args.unit, "year"))
+                @as(i64, args.amount) * 31536000 // 365 days
+            else
+                0;
+            
+            const new_ts = base_ts + seconds_to_add;
+            return datetime.formatDateTime(arena, new_ts) catch date_val;
+        },
+        .round_op => |args| {
+            const v = field(record, args.col_idx);
+            const n = std.fmt.parseFloat(f64, v) catch return v;
+            const buf = arena.alloc(u8, 64) catch return v;
+            if (args.digits == 0) {
+                const rounded = @round(n);
+                return std.fmt.bufPrint(buf, "{d}", .{@as(i64, @intFromFloat(rounded))}) catch v;
+            }
+            // Shift, round, shift back
+            const factor = std.math.pow(f64, 10.0, @as(f64, @floatFromInt(args.digits)));
+            const rounded = @round(n * factor) / factor;
+            return std.fmt.bufPrint(buf, "{d:.[1]}", .{ rounded, @as(usize, args.digits) }) catch v;
+        },
+        .extract => |args| {
+            const date_val = field(record, args.date_col);
+            const ts = datetime.parseDateTime(date_val) catch return "0";
+            const dt = datetime.DateTime.fromTimestamp(ts);
+            
+            const result: i64 = if (std.ascii.eqlIgnoreCase(args.part, "year"))
+                dt.year
+            else if (std.ascii.eqlIgnoreCase(args.part, "month"))
+                dt.month
+            else if (std.ascii.eqlIgnoreCase(args.part, "day"))
+                dt.day
+            else if (std.ascii.eqlIgnoreCase(args.part, "hour"))
+                dt.hour
+            else if (std.ascii.eqlIgnoreCase(args.part, "minute"))
+                dt.minute
+            else if (std.ascii.eqlIgnoreCase(args.part, "second"))
+                dt.second
+            else
+                0;
+            
+            const buf = arena.alloc(u8, 32) catch return "0";
+            return std.fmt.bufPrint(buf, "{d}", .{result}) catch "0";
         },
     }
 }

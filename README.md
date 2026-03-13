@@ -217,8 +217,11 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 | **SUBSTR**    | `SELECT SUBSTR(col, start, len)` — substring (1-based, `len` optional)  |
 | **ABS / CEIL / FLOOR** | `SELECT ABS(col), CEIL(col), FLOOR(col)` — numeric functions  |
 | **MOD**       | `SELECT MOD(col, n)` — modulo by a numeric literal                      |
+| **ROUND**     | `SELECT ROUND(col)` — round to integer; `ROUND(col, n)` — round to `n` decimal places |
 | **COALESCE**  | `SELECT COALESCE(col, 'default')` — replace empty/null with fallback    |
 | **CAST**      | `SELECT CAST(col AS INTEGER/FLOAT/TEXT)` — type conversion              |
+| **DATEDIFF**  | `DATEDIFF('unit', start_col, end_col)` — duration between two datetime columns. Units: `second`, `minute`, `hour`, `day`, `week`. Auto-detects ISO-8601, US (MM/DD/YYYY), EU (DD.MM.YYYY) and mixed formats in the same file |
+| **DATEADD**   | `DATEADD('unit', amount, date_col)` — add/subtract interval from a datetime column. `amount` may be negative. Returns `YYYY-MM-DD HH:MM:SS` |
 | **ORDER BY**  | `ORDER BY col ASC/DESC`, `ORDER BY alias`, or `ORDER BY 1` (positional) |
 | **LIMIT**     | `LIMIT n`                                                               |
 
@@ -260,6 +263,7 @@ csvql "SELECT name, LENGTH(name), SUBSTR(name, 1, 3) FROM 'data.csv'"
 # Numeric functions
 csvql "SELECT name, ABS(balance), CEIL(score), FLOOR(score) FROM 'data.csv'"
 csvql "SELECT name, MOD(age, 10) AS age_decade FROM 'data.csv'"
+csvql "SELECT name, ROUND(price) AS rounded, ROUND(price, 2) AS price_2dp FROM 'data.csv'"
 
 # COALESCE — replace empty values with a fallback
 csvql "SELECT name, COALESCE(email, 'unknown') FROM 'data.csv'"
@@ -338,6 +342,43 @@ csvql "SELECT STRFTIME('%Y-%m', order_date) AS month, COUNT(*), SUM(price) FROM 
 csvql "SELECT STRFTIME('%Y-%m-%d', event_date) AS day, COUNT(DISTINCT user_id) FROM 'events.csv' GROUP BY day ORDER BY day"
 ```
 
+### DateTime and Duration Functions
+
+`DATEDIFF` and `DATEADD` work with **four datetime formats** in the same CSV — no pre-processing needed:
+
+| Format | Example |
+|--------|---------|
+| ISO-8601 (space) | `2026-01-15 09:30:00` |
+| ISO-8601 (T) | `2026-01-16T10:00:00` |
+| US (MM/DD/YYYY) | `01/15/2026 08:00:00` |
+| EU (DD.MM.YYYY) | `15.01.2026 07:30:00` |
+
+```bash
+# Order workflow: time from order to pick (in minutes)
+csvql "SELECT order_id, DATEDIFF('minute', ordered_at, picked_at) AS pick_min FROM 'orders.csv' WHERE picked_at != ''"
+
+# Delivery time in days
+csvql "SELECT order_id, DATEDIFF('day', shipped_at, delivered_at) AS ship_days FROM 'orders.csv' WHERE shipped_at != '' AND delivered_at != '' ORDER BY ship_days DESC"
+
+# SLA check — find orders where picking took more than 2 hours
+csvql "SELECT order_id, customer_name, DATEDIFF('hour', ordered_at, picked_at) AS hrs FROM 'orders.csv' WHERE DATEDIFF('hour', ordered_at, picked_at) > 2"
+
+# Average processing time by status
+csvql "SELECT status, AVG(DATEDIFF('minute', ordered_at, packaged_at)) AS avg_proc_min FROM 'orders.csv' WHERE packaged_at != '' GROUP BY status ORDER BY avg_proc_min"
+
+# DATEADD — compute SLA deadlines
+csvql "SELECT order_id, ordered_at, DATEADD('hour', 2, ordered_at) AS pick_deadline FROM 'orders.csv'"
+
+# Estimated delivery date (ship date + 2 days)
+csvql "SELECT order_id, shipped_at, DATEADD('day', 2, shipped_at) AS est_delivery FROM 'orders.csv' WHERE shipped_at != ''"
+
+# Supported units for both functions: second, minute, hour, day, week
+csvql "SELECT order_id, DATEDIFF('second', ordered_at, picked_at) AS pick_secs FROM 'orders.csv'"
+csvql "SELECT order_id, DATEADD('week', -1, delivered_at) AS sent_reminder FROM 'orders.csv'"
+```
+
+**Mixed formats work automatically** — a single CSV can have some dates as `2026-01-15 09:30:00`, others as `01/15/2026 08:00:00`, and `DATEDIFF` handles them all.
+
 ### JOIN Examples
 
 ```bash
@@ -396,6 +437,9 @@ csvql --mcp
 |---|---|
 | "Show me the top 10 customers by revenue" | `SELECT customer, SUM(revenue) AS total FROM 'sales.csv' GROUP BY customer ORDER BY total DESC LIMIT 10` |
 | "How many orders per month in 2025?" | `SELECT STRFTIME('%Y-%m', order_date) AS month, COUNT(*) AS orders FROM 'orders.csv' WHERE order_date BETWEEN '2025-01-01' AND '2025-12-31' GROUP BY month ORDER BY 1` |
+| "How long does delivery take on average?" | `SELECT AVG(DATEDIFF('hour', shipped_at, delivered_at)) AS avg_hours FROM 'orders.csv' WHERE delivered_at != ''` |
+| "Flag orders where picking exceeded SLA" | `SELECT order_id, DATEDIFF('minute', ordered_at, picked_at) AS mins FROM 'orders.csv' WHERE DATEDIFF('minute', ordered_at, picked_at) > 90` |
+| "Add 2-day estimated delivery to shipments" | `SELECT order_id, DATEADD('day', 2, shipped_at) AS est_delivery FROM 'orders.csv' WHERE shipped_at != ''` |
 | "Which employees have no department?" | `SELECT name FROM 'employees.csv' WHERE department IS NULL` |
 | "List all cities, deduplicated, sorted" | `SELECT DISTINCT city FROM 'data.csv' ORDER BY city` |
 | "Average salary by department, only > 80k avg" | `SELECT department, AVG(salary) AS avg_sal FROM 'data.csv' GROUP BY department HAVING AVG(salary) > 80000 ORDER BY avg_sal DESC` |
@@ -405,7 +449,7 @@ csvql --mcp
 
 **Full WHERE clause support:** `=`, `!=`, `>`, `>=`, `<`, `<=`, `LIKE`, `BETWEEN`, `IN`, `IS NULL`, `IS NOT NULL`, `NOT`, `AND`, `OR`
 
-**Full SELECT support:** column projections, `AS` aliases, `DISTINCT`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING`, `ORDER BY` (by name, alias, or position), `LIMIT`, `STRFTIME()`, `JOIN`, `UPPER`/`LOWER`/`TRIM`/`LENGTH`/`SUBSTR`, `ABS`/`CEIL`/`FLOOR`/`MOD`, `COALESCE`, `CAST`
+**Full SELECT support:** column projections, `AS` aliases, `DISTINCT`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING`, `ORDER BY` (by name, alias, or position), `LIMIT`, `STRFTIME()`, `JOIN`, `UPPER`/`LOWER`/`TRIM`/`LENGTH`/`SUBSTR`, `ABS`/`CEIL`/`FLOOR`/`MOD`/`ROUND`, `COALESCE`, `CAST`, `DATEDIFF`, `DATEADD`, `EXTRACT`
 
 ### Setup
 
@@ -469,6 +513,7 @@ Once connected, you can ask your AI assistant to query CSV files directly:
 | `ILIKE` in WHERE                    |                                                      | ✅ shipped          |
 | `UPPER`, `LOWER`, `TRIM`, `LENGTH`, `SUBSTR` in SELECT |                             | ✅ shipped          |
 | `ABS`, `CEIL`, `FLOOR`, `MOD` in SELECT |                                                 | ✅ shipped          |
+| `ROUND(col)` / `ROUND(col, n)` in SELECT |                                               | ✅ shipped          |
 | `COALESCE` in SELECT                |                                                      | ✅ shipped          |
 | `CAST` in SELECT                    |                                                      | ✅ shipped          |
 
