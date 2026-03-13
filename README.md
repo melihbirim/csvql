@@ -203,8 +203,9 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 | **JOIN**      | `FROM 'a.csv' a [INNER] JOIN 'b.csv' b ON a.key = b.key`               |
 | **GROUP BY**  | `GROUP BY col1` or `GROUP BY alias` — groups rows; accepts SELECT aliases |
 | **COUNT**     | `COUNT(*)` or `COUNT(col)` — with or without `GROUP BY`                 |
-| **SUM**       | `SUM(col)` — with or without `GROUP BY`                                 |
+| **SUM**       | `SUM(col)` or `SUM(CASE WHEN cond THEN n ELSE m END)` — conditional sum |
 | **AVG**       | `AVG(col)` — full precision; with or without `GROUP BY`                 |
+| **CASE WHEN** | `CASE WHEN col OP val THEN n ELSE m END` inside any aggregate function  |
 | **MIN / MAX** | `MIN(col)`, `MAX(col)` — with or without `GROUP BY`                     |
 | **HAVING**    | `HAVING expr` — filter groups after aggregation (e.g. `HAVING COUNT(*) > 5`) |
 | **STRFTIME**  | `STRFTIME('%Y-%m', col)` — date bucketing in `SELECT` and `GROUP BY`    |
@@ -223,6 +224,11 @@ csvql "SELECT department, COUNT(*), AVG(salary) FROM 'data.csv' GROUP BY departm
 # HAVING — filter groups after aggregation
 csvql "SELECT department, SUM(salary) FROM 'data.csv' GROUP BY department HAVING SUM(salary) > 500000"
 csvql "SELECT category, COUNT(*) FROM 'orders.csv' GROUP BY category HAVING COUNT(*) > 1000"
+
+# CASE WHEN inside aggregates — conditional counting and summing
+csvql "SELECT department, COUNT(*) AS total, SUM(CASE WHEN city = 'London' THEN 1 ELSE 0 END) AS london_count FROM 'data.csv' GROUP BY department"
+csvql "SELECT SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active, SUM(CASE WHEN status = 'inactive' THEN 1 ELSE 0 END) AS inactive FROM 'data.csv'"
+csvql "SELECT product, COUNT(*) AS total, SUM(CASE WHEN status = 'returned' THEN 1 ELSE 0 END) AS returns FROM 'orders.csv' GROUP BY product ORDER BY returns DESC"
 
 # DISTINCT
 csvql "SELECT DISTINCT city FROM 'data.csv' ORDER BY city"
@@ -416,6 +422,7 @@ Once connected, you can ask your AI assistant to query CSV files directly:
 | `NOT` prefix for conditions         |                                                      | ✅ shipped          |
 | `ORDER BY` positional (`ORDER BY 1`)|                                                      | ✅ shipped          |
 | `GROUP BY` alias (`GROUP BY month`) |                                                      | ✅ shipped          |
+| `CASE WHEN` inside aggregates       |                                                      | ✅ shipped          |
 
 ## Contributing
 

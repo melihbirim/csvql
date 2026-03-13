@@ -184,7 +184,7 @@ csvql "SELECT name FROM 'data.csv'"   # SQL mode
 Both syntaxes work simultaneously:
 
 - Simple mode: Fast, common operations with terse positional syntax
-- SQL mode: Full feature set — `GROUP BY`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), `DISTINCT`, complex WHERE expressions
+- SQL mode: Full feature set — `GROUP BY`, aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), `CASE WHEN` inside aggregates, `DISTINCT`, complex WHERE expressions
 
 For aggregates and `DISTINCT`, use SQL mode directly:
 
@@ -192,6 +192,9 @@ For aggregates and `DISTINCT`, use SQL mode directly:
 # Aggregates require SQL mode
 csvql "SELECT department, COUNT(*), AVG(salary) FROM 'data.csv' GROUP BY department"
 csvql "SELECT COUNT(*), SUM(salary) FROM 'data.csv' WHERE age > 30"
+
+# CASE WHEN inside aggregates — conditional counting/summing
+csvql "SELECT dept, SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active FROM 'data.csv' GROUP BY dept"
 
 # DISTINCT requires SQL mode
 csvql "SELECT DISTINCT city FROM 'data.csv' ORDER BY city"

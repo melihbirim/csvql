@@ -642,7 +642,7 @@ fn findTopLevelOp(s: []const u8, keyword: []const u8) ?usize {
     return null;
 }
 
-fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
+pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
     const trimmed = std.mem.trim(u8, input, &std.ascii.whitespace);
 
     // NOT prefix — must be checked BEFORE IS NULL/IS NOT NULL so that
