@@ -190,10 +190,16 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 | Feature       | Syntax                                                                  |
 | ------------- | ----------------------------------------------------------------------- |
 | **SELECT**    | `SELECT col1, col2` or `SELECT *`                                       |
+| **AS alias**  | `SELECT expr AS alias` — rename any column or expression in output      |
 | **DISTINCT**  | `SELECT DISTINCT col1, col2` — deduplicates output rows                 |
 | **FROM**      | `FROM 'file.csv'` or `FROM -` (stdin)                                   |
 | **WHERE**     | `=`, `!=`, `>`, `>=`, `<`, `<=` with auto numeric coercion              |
-| **LIKE**      | `WHERE col LIKE 'pattern'` — `%` any sequence, `_` any single character |
+| **LIKE**      | `WHERE col LIKE 'pattern'` — `%` any sequence, `_` any single char      |
+| **BETWEEN**   | `WHERE col BETWEEN low AND high` — inclusive numeric or string range    |
+| **IN**        | `WHERE col IN ('a', 'b', 'c')` — membership test                        |
+| **IS NULL**   | `WHERE col IS NULL` / `WHERE col IS NOT NULL` — empty-field test        |
+| **NOT**       | `WHERE NOT expr` — logical negation of any condition                    |
+| **AND / OR**  | `WHERE cond1 AND cond2` / `WHERE cond1 OR cond2` — compound conditions  |
 | **JOIN**      | `FROM 'a.csv' a [INNER] JOIN 'b.csv' b ON a.key = b.key`               |
 | **GROUP BY**  | `GROUP BY col1` — groups rows for aggregation                           |
 | **COUNT**     | `COUNT(*)` or `COUNT(col)` — with or without `GROUP BY`                 |
@@ -202,7 +208,7 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 | **MIN / MAX** | `MIN(col)`, `MAX(col)` — with or without `GROUP BY`                     |
 | **HAVING**    | `HAVING expr` — filter groups after aggregation (e.g. `HAVING COUNT(*) > 5`) |
 | **STRFTIME**  | `STRFTIME('%Y-%m', col)` — date bucketing in `SELECT` and `GROUP BY`    |
-| **ORDER BY**  | `ORDER BY col ASC/DESC`                                                 |
+| **ORDER BY**  | `ORDER BY col ASC/DESC`, `ORDER BY alias`, or `ORDER BY 1` (positional) |
 | **LIMIT**     | `LIMIT n`                                                               |
 
 ### Aggregate Examples
@@ -224,6 +230,38 @@ csvql "SELECT DISTINCT city, department FROM 'data.csv'"
 
 # DISTINCT with WHERE
 csvql "SELECT DISTINCT department FROM 'data.csv' WHERE salary > 100000"
+```
+
+### WHERE Filter Examples
+
+```bash
+# Comparison operators
+csvql "SELECT name, salary FROM 'data.csv' WHERE salary > 80000"
+
+# BETWEEN — inclusive range (numeric or string)
+csvql "SELECT name, salary FROM 'data.csv' WHERE salary BETWEEN 50000 AND 80000"
+csvql "SELECT * FROM 'orders.csv' WHERE order_date BETWEEN '2025-01-01' AND '2025-12-31'"
+
+# IN — membership test
+csvql "SELECT name FROM 'data.csv' WHERE city IN ('London', 'Paris', 'Berlin')"
+
+# IS NULL / IS NOT NULL — test for missing (empty) fields
+csvql "SELECT * FROM 'data.csv' WHERE email IS NULL"
+csvql "SELECT * FROM 'data.csv' WHERE email IS NOT NULL"
+
+# NOT — negate any condition
+csvql "SELECT * FROM 'data.csv' WHERE NOT city IN ('London', 'Paris')"
+csvql "SELECT * FROM 'data.csv' WHERE NOT salary BETWEEN 40000 AND 60000"
+
+# AND / OR — compound conditions
+csvql "SELECT * FROM 'data.csv' WHERE age > 30 AND department = 'Engineering'"
+csvql "SELECT * FROM 'data.csv' WHERE city = 'London' OR city = 'Berlin'"
+csvql "SELECT * FROM 'data.csv' WHERE status LIKE 'active%' AND salary > 50000"
+
+# AS alias + ORDER BY alias or positional
+csvql "SELECT name AS employee, salary AS pay FROM 'data.csv' ORDER BY pay DESC LIMIT 10"
+csvql "SELECT city, COUNT(*) AS cnt FROM 'data.csv' GROUP BY city ORDER BY cnt DESC"
+csvql "SELECT name, salary FROM 'data.csv' ORDER BY 2 DESC LIMIT 5"  # ORDER BY positional
 ```
 
 ### Time-Series and Date Bucketing
@@ -350,6 +388,11 @@ Once connected, you can ask your AI assistant to query CSV files directly:
 | `HAVING` clause                     |                                                      | ✅ shipped          |
 | `STRFTIME()` date bucketing         |                                                      | ✅ shipped          |
 | MCP server (`--mcp`)                |                                                      | ✅ shipped          |
+| `AS` alias in SELECT & ORDER BY     |                                                      | ✅ shipped          |
+| `BETWEEN low AND high`              |                                                      | ✅ shipped          |
+| `IS NULL` / `IS NOT NULL`           |                                                      | ✅ shipped          |
+| `NOT` prefix for conditions         |                                                      | ✅ shipped          |
+| `ORDER BY` positional (`ORDER BY 1`)|                                                      | ✅ shipped          |
 
 ## Contributing
 
