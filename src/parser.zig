@@ -1196,8 +1196,46 @@ pub fn evaluate(expr: Expression, row: std.StringHashMap([]const u8)) bool {
             const value = row.get(comp.column) orelse return false;
             return compareValues(comp, value);
         },
-        // scalar_comparison needs a field array and header; not available here — treat as false.
-        .scalar_comparison => return false,
+        .scalar_comparison => |sc| {
+            // Evaluate scalar comparison against the HashMap row (used by the JOIN path).
+            // Look up column values by name, build a tiny temporary slice, and delegate to
+            // the same scalar.eval hot path used by evaluateDirect.
+            var stack_buf: [64]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
+            const arena = fba.allocator();
+
+            const result_str: []const u8 = if (std.mem.eql(u8, sc.func, "datediff")) blk: {
+                const v1 = row.get(sc.col1_name) orelse return false;
+                const col2_name = sc.col2_name orelse return false;
+                const v2 = row.get(col2_name) orelse return false;
+                const tmp = [_][]const u8{ v1, v2 };
+                const spec = scalar.ScalarSpec{ .datediff = .{
+                    .unit = sc.unit,
+                    .start_col = 0,
+                    .end_col = 1,
+                } };
+                break :blk scalar.eval(spec, &tmp, arena);
+            } else if (std.mem.eql(u8, sc.func, "extract")) blk: {
+                const v1 = row.get(sc.col1_name) orelse return false;
+                const tmp = [_][]const u8{v1};
+                const spec = scalar.ScalarSpec{ .extract = .{
+                    .part = sc.unit,
+                    .date_col = 0,
+                } };
+                break :blk scalar.eval(spec, &tmp, arena);
+            } else return false; // DATEADD returns a datetime string; numeric comparison not supported
+
+            const result = std.fmt.parseFloat(f64, result_str) catch return false;
+            return switch (sc.operator) {
+                .equal => result == sc.rhs_value,
+                .not_equal => result != sc.rhs_value,
+                .greater => result > sc.rhs_value,
+                .greater_equal => result >= sc.rhs_value,
+                .less => result < sc.rhs_value,
+                .less_equal => result <= sc.rhs_value,
+                .like, .ilike, .between, .is_null, .is_not_null => false,
+            };
+        },
         .binary => |bin| {
             const left_result = evaluate(bin.left, row);
             const right_result = evaluate(bin.right, row);
@@ -1254,13 +1292,11 @@ pub fn evaluateDirect(expr: Expression, fields: []const []const u8, lower_header
                     .end_col = col2_idx,
                 } };
                 break :inner scalar.eval(spec, fields, arena);
-            } else if (std.mem.eql(u8, sc.func, "dateadd")) inner: {
-                const spec = scalar.ScalarSpec{ .dateadd = .{
-                    .unit = sc.unit,
-                    .amount = sc.amount,
-                    .date_col = col1_idx,
-                } };
-                break :inner scalar.eval(spec, fields, arena);
+            } else if (std.mem.eql(u8, sc.func, "dateadd")) {
+                // DATEADD returns a formatted datetime string (e.g. "2026-01-22 08:00:00"),
+                // which cannot be parsed as f64. Numeric/date comparisons on DATEADD results
+                // in WHERE are not supported; skip this predicate.
+                return false;
             } else if (std.mem.eql(u8, sc.func, "extract")) inner: {
                 const spec = scalar.ScalarSpec{ .extract = .{
                     .part = sc.unit,

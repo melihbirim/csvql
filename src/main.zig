@@ -53,9 +53,10 @@ const help_text =
     \\  AS       column aliases: SELECT name AS n
     \\  DISTINCT deduplicate output rows
     \\  SELECT   aggregate functions: COUNT, SUM, AVG, MIN, MAX, COUNT(DISTINCT)
+    \\  JOIN     inner join: SELECT ... FROM 'a.csv' JOIN 'b.csv' ON a.id = b.id
     \\
     \\NOT SUPPORTED:
-    \\  JOIN, subqueries, multiple ORDER BY columns,
+    \\  subqueries, multiple ORDER BY columns,
     \\  UNION, INSERT/UPDATE/DELETE
     \\
     \\OPTIONS:
