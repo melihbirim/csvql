@@ -42,14 +42,21 @@ const help_text =
     \\           combine with AND, OR, NOT, parentheses
     \\           string values: city = 'NYC'
     \\           numeric values: age > 30
-    \\  ORDER BY column ASC|DESC
+    \\           LIKE / ILIKE pattern matching: name LIKE 'A%'
+    \\           IN list: status IN ('active', 'pending')
+    \\           BETWEEN range: age BETWEEN 18 AND 65
+    \\           IS NULL / IS NOT NULL
+    \\  GROUP BY column grouping with aggregate functions
+    \\  HAVING   post-aggregation filter
+    \\  ORDER BY column ASC|DESC (positional ORDER BY 1 supported)
     \\  LIMIT    number of rows
+    \\  AS       column aliases: SELECT name AS n
+    \\  DISTINCT deduplicate output rows
+    \\  SELECT   aggregate functions: COUNT, SUM, AVG, MIN, MAX, COUNT(DISTINCT)
     \\
     \\NOT SUPPORTED:
-    \\  JOIN, GROUP BY, HAVING, DISTINCT, subqueries,
-    \\  aggregate functions (COUNT, SUM, AVG, etc.),
-    \\  multiple ORDER BY columns, LIKE, IN, BETWEEN,
-    \\  aliases (AS), UNION, INSERT/UPDATE/DELETE
+    \\  JOIN, subqueries, multiple ORDER BY columns,
+    \\  UNION, INSERT/UPDATE/DELETE
     \\
     \\OPTIONS:
     \\  -h, --help              Show this help

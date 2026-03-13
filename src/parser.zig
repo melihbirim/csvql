@@ -1,5 +1,6 @@
 const std = @import("std");
 const simd = @import("simd.zig");
+const scalar = @import("scalar.zig");
 const Allocator = std.mem.Allocator;
 
 /// Represents a comparison operator
@@ -86,15 +87,41 @@ pub fn matchILike(text: []const u8, pattern: []const u8) bool {
     return p == pattern.len;
 }
 
+/// Scalar function comparison in WHERE clause.
+/// e.g. DATEDIFF('day', shipped_at, delivered_at) > 5
+pub const ScalarWhereComparison = struct {
+    /// Lowercase function name: "datediff", "dateadd", or "extract"
+    func: []u8,
+    /// Unit string without quotes (e.g. "day") or EXTRACT part (e.g. "year")
+    unit: []u8,
+    /// First column name (start_col for datediff, date_col for dateadd/extract), lowercase
+    col1_name: []u8,
+    /// Second column name (end_col for datediff). null for dateadd/extract.
+    col2_name: ?[]u8,
+    /// Numeric amount for DATEADD; unused for datediff/extract
+    amount: i32,
+    operator: Operator,
+    rhs_value: f64,
+
+    pub fn deinit(self: ScalarWhereComparison, allocator: Allocator) void {
+        allocator.free(self.func);
+        allocator.free(self.unit);
+        allocator.free(self.col1_name);
+        if (self.col2_name) |c| allocator.free(c);
+    }
+};
+
 /// Represents a WHERE clause expression
 pub const Expression = union(enum) {
     comparison: Comparison,
+    scalar_comparison: ScalarWhereComparison,
     binary: *BinaryExpr,
     unary: *UnaryExpr,
 
     pub fn deinit(self: Expression, allocator: Allocator) void {
         switch (self) {
             .comparison => |c| c.deinit(allocator),
+            .scalar_comparison => |sc| sc.deinit(allocator),
             .binary => |b| {
                 b.left.deinit(allocator);
                 b.right.deinit(allocator);
@@ -578,10 +605,10 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
         query.joins = try joins_list.toOwnedSlice(allocator);
     } else {
         // No JOIN: single-file query — extract file path from between FROM and first clause keyword
-        const where_idx_pre = std.ascii.indexOfIgnoreCase(from_rest, "WHERE");
-        const group_by_idx_pre = std.ascii.indexOfIgnoreCase(from_rest, "GROUP BY");
-        const order_by_idx_pre = std.ascii.indexOfIgnoreCase(from_rest, "ORDER BY");
-        const limit_idx_pre = std.ascii.indexOfIgnoreCase(from_rest, "LIMIT");
+        const where_idx_pre = findClauseKeyword(from_rest, "WHERE");
+        const group_by_idx_pre = findClauseKeyword(from_rest, "GROUP BY");
+        const order_by_idx_pre = findClauseKeyword(from_rest, "ORDER BY");
+        const limit_idx_pre = findClauseKeyword(from_rest, "LIMIT");
 
         var fend = from_rest.len;
         if (where_idx_pre) |i| fend = @min(fend, i);
@@ -596,11 +623,11 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
     }
 
     // Parse the clause keywords (WHERE / GROUP BY / ORDER BY / LIMIT) from `rest`
-    const where_idx = std.ascii.indexOfIgnoreCase(rest, "WHERE");
-    const group_by_idx = std.ascii.indexOfIgnoreCase(rest, "GROUP BY");
-    const having_idx = std.ascii.indexOfIgnoreCase(rest, "HAVING");
-    const order_by_idx = std.ascii.indexOfIgnoreCase(rest, "ORDER BY");
-    const limit_idx = std.ascii.indexOfIgnoreCase(rest, "LIMIT");
+    const where_idx = findClauseKeyword(rest, "WHERE");
+    const group_by_idx = findClauseKeyword(rest, "GROUP BY");
+    const having_idx = findClauseKeyword(rest, "HAVING");
+    const order_by_idx = findClauseKeyword(rest, "ORDER BY");
+    const limit_idx = findClauseKeyword(rest, "LIMIT");
 
     // Parse WHERE clause if present
     if (where_idx) |idx| {
@@ -693,12 +720,41 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
     return query;
 }
 
+/// Find the first occurrence of `keyword` in `s` that is:
+///   - not inside a single-quoted string, and
+///   - preceded by whitespace or start-of-string, and
+///   - followed by whitespace or end-of-string.
+/// Returns the byte index of the start of `keyword` in `s`, or null.
+fn findClauseKeyword(s: []const u8, keyword: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '\'') {
+            i += 1;
+            while (i < s.len and s[i] != '\'') : (i += 1) {}
+            if (i < s.len) i += 1;
+            continue;
+        }
+        if (i + keyword.len <= s.len and
+            std.ascii.eqlIgnoreCase(s[i .. i + keyword.len], keyword))
+        {
+            const pre_ok = (i == 0) or std.ascii.isWhitespace(s[i - 1]);
+            const post_idx = i + keyword.len;
+            const post_ok = (post_idx >= s.len) or std.ascii.isWhitespace(s[post_idx]);
+            if (pre_ok and post_ok) return i;
+        }
+        i += 1;
+    }
+    return null;
+}
+
 /// Scan `s` for " KEYWORD " (case-insensitive, with a space on each side) while
-/// skipping over single-quoted strings.  Returns the index of the leading space.
+/// skipping over single-quoted strings and nested parentheses.
+/// Returns the index of the leading space.
 fn findTopLevelOp(s: []const u8, keyword: []const u8) ?usize {
     const need = keyword.len + 2; // leading ' ' + keyword + trailing ' '
     if (s.len < need) return null;
     var i: usize = 0;
+    var depth: usize = 0;
     while (i < s.len) {
         if (s[i] == '\'') {
             i += 1;
@@ -706,7 +762,17 @@ fn findTopLevelOp(s: []const u8, keyword: []const u8) ?usize {
             if (i < s.len) i += 1; // skip closing quote
             continue;
         }
-        if (s[i] == ' ' and i + need <= s.len and
+        if (s[i] == '(') {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if (s[i] == ')') {
+            if (depth > 0) depth -= 1;
+            i += 1;
+            continue;
+        }
+        if (depth == 0 and s[i] == ' ' and i + need <= s.len and
             std.ascii.eqlIgnoreCase(s[i + 1 .. i + 1 + keyword.len], keyword) and
             s[i + 1 + keyword.len] == ' ')
         {
@@ -719,6 +785,26 @@ fn findTopLevelOp(s: []const u8, keyword: []const u8) ?usize {
 
 pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
     const trimmed = std.mem.trim(u8, input, &std.ascii.whitespace);
+
+    // Strip outer parentheses: (expr) → expr
+    if (trimmed.len >= 2 and trimmed[0] == '(' and trimmed[trimmed.len - 1] == ')') {
+        // Verify the opening '(' closes at the very last position (not earlier).
+        var depth: usize = 0;
+        var outer = true;
+        for (trimmed, 0..) |c, ci| {
+            if (c == '(') depth += 1;
+            if (c == ')') {
+                depth -= 1;
+                if (depth == 0 and ci < trimmed.len - 1) {
+                    outer = false;
+                    break;
+                }
+            }
+        }
+        if (outer) {
+            return parseExpression(allocator, trimmed[1 .. trimmed.len - 1]);
+        }
+    }
 
     // NOT prefix — must be checked BEFORE IS NULL/IS NOT NULL so that
     // "NOT col IS NULL" recurses correctly (inner "col IS NULL" is parsed separately).
@@ -794,6 +880,11 @@ pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
             return parseInComparison(allocator, trimmed, idx);
         }
     }
+
+    // Check for scalar function as LHS: DATEDIFF(...) op rhs, DATEADD(...) op rhs,
+    // EXTRACT(... FROM ...) op rhs.  Must come before the bare-operator checks below
+    // so that e.g. DATEDIFF(...) > 5 is not parsed as a plain `>` comparison.
+    if (try parseScalarWhereComparison(allocator, trimmed)) |expr| return expr;
 
     // Check for operators (simple case - no parentheses)
     if (std.mem.indexOf(u8, trimmed, ">=")) |idx| {
@@ -916,6 +1007,144 @@ fn parseILikeComparison(allocator: Allocator, input: []const u8, ilike_idx: usiz
     };
 }
 
+/// Attempt to parse a scalar-function comparison such as
+///   DATEDIFF('day', col1, col2) > 5
+///   EXTRACT(year FROM date_col) = 2024
+///   DATEADD('day', 7, date_col) < '2024-06-01'   (treated as string RHS; rarely numeric)
+///
+/// Returns null when the input does not start with a recognised scalar function name,
+/// so the caller can fall through to regular operator parsing.
+fn parseScalarWhereComparison(allocator: Allocator, input: []const u8) !?Expression {
+    const t = input; // caller has already trimmed
+
+    // Must look like FUNCNAME(...)
+    const open = std.mem.indexOfScalar(u8, t, '(') orelse return null;
+    const func_raw = std.mem.trim(u8, t[0..open], &std.ascii.whitespace);
+
+    // Reject if func_raw contains whitespace (e.g. column names with spaces never reach here)
+    if (std.mem.indexOfAny(u8, func_raw, " \t\r\n") != null) return null;
+
+    var fn_buf: [16]u8 = undefined;
+    if (func_raw.len > fn_buf.len) return null;
+    const fn_lower = std.ascii.lowerString(fn_buf[0..func_raw.len], func_raw);
+
+    const is_datediff = std.mem.eql(u8, fn_lower, "datediff");
+    const is_dateadd = std.mem.eql(u8, fn_lower, "dateadd");
+    const is_extract = std.mem.eql(u8, fn_lower, "extract");
+
+    if (!is_datediff and !is_dateadd and !is_extract) return null;
+
+    // Find the matching closing parenthesis (depth-aware)
+    var depth: usize = 0;
+    var close_idx: ?usize = null;
+    for (t[open..], open..) |c, i| {
+        if (c == '(') depth += 1;
+        if (c == ')') {
+            depth -= 1;
+            if (depth == 0) {
+                close_idx = i;
+                break;
+            }
+        }
+    }
+    const close = close_idx orelse return error.InvalidExpression;
+
+    const args_str = std.mem.trim(u8, t[open + 1 .. close], &std.ascii.whitespace);
+
+    // Parse operator and RHS that follow the closing paren
+    const after_fn = std.mem.trim(u8, t[close + 1 ..], &std.ascii.whitespace);
+    if (after_fn.len == 0) return null; // bare function call in WHERE, not a comparison
+
+    const op_str: []const u8 =
+        if (std.mem.startsWith(u8, after_fn, ">=")) ">=" else if (std.mem.startsWith(u8, after_fn, "<=")) "<=" else if (std.mem.startsWith(u8, after_fn, "!=")) "!=" else if (after_fn[0] == '=') "=" else if (after_fn[0] == '>') ">" else if (after_fn[0] == '<') "<" else return null;
+
+    const operator = Operator.fromString(op_str) orelse return null;
+    const rhs_raw = std.mem.trim(u8, after_fn[op_str.len..], &std.ascii.whitespace);
+    const rhs_value = std.fmt.parseFloat(f64, rhs_raw) catch return error.InvalidExpression;
+
+    // Allocate the (lowercase) function name — used as a tag at eval time
+    const func_alloc = try allocator.dupe(u8, fn_lower);
+    errdefer allocator.free(func_alloc);
+
+    if (is_datediff) {
+        // DATEDIFF('unit', start_col, end_col)
+        var parts = std.mem.splitScalar(u8, args_str, ',');
+        const unit_raw = std.mem.trim(u8, parts.next() orelse return error.InvalidExpression, &std.ascii.whitespace);
+        const start_str = std.mem.trim(u8, parts.next() orelse return error.InvalidExpression, &std.ascii.whitespace);
+        const end_str = std.mem.trim(u8, parts.next() orelse return error.InvalidExpression, &std.ascii.whitespace);
+
+        const unit_clean = trimQuotes(unit_raw);
+        const unit_alloc = try allocator.dupe(u8, unit_clean);
+        errdefer allocator.free(unit_alloc);
+
+        const col1_buf = try allocator.alloc(u8, start_str.len);
+        errdefer allocator.free(col1_buf);
+        _ = std.ascii.lowerString(col1_buf, start_str);
+
+        const col2_buf = try allocator.alloc(u8, end_str.len);
+        _ = std.ascii.lowerString(col2_buf, end_str);
+
+        return Expression{ .scalar_comparison = .{
+            .func = func_alloc,
+            .unit = unit_alloc,
+            .col1_name = col1_buf,
+            .col2_name = col2_buf,
+            .amount = 0,
+            .operator = operator,
+            .rhs_value = rhs_value,
+        } };
+    }
+
+    if (is_dateadd) {
+        // DATEADD('unit', amount, date_col)
+        var parts = std.mem.splitScalar(u8, args_str, ',');
+        const unit_raw = std.mem.trim(u8, parts.next() orelse return error.InvalidExpression, &std.ascii.whitespace);
+        const amount_str = std.mem.trim(u8, parts.next() orelse return error.InvalidExpression, &std.ascii.whitespace);
+        const date_str = std.mem.trim(u8, parts.next() orelse return error.InvalidExpression, &std.ascii.whitespace);
+
+        const unit_clean = trimQuotes(unit_raw);
+        const amount = std.fmt.parseInt(i32, amount_str, 10) catch return error.InvalidExpression;
+
+        const unit_alloc = try allocator.dupe(u8, unit_clean);
+        errdefer allocator.free(unit_alloc);
+
+        const col1_buf = try allocator.alloc(u8, date_str.len);
+        _ = std.ascii.lowerString(col1_buf, date_str);
+
+        return Expression{ .scalar_comparison = .{
+            .func = func_alloc,
+            .unit = unit_alloc,
+            .col1_name = col1_buf,
+            .col2_name = null,
+            .amount = amount,
+            .operator = operator,
+            .rhs_value = rhs_value,
+        } };
+    }
+
+    // is_extract
+    // EXTRACT(part FROM date_col)
+    const from_idx = std.ascii.indexOfIgnoreCase(args_str, " FROM ") orelse return error.InvalidExpression;
+    const part_raw = std.mem.trim(u8, args_str[0..from_idx], &std.ascii.whitespace);
+    const date_str = std.mem.trim(u8, args_str[from_idx + 6 ..], &std.ascii.whitespace);
+
+    const unit_alloc = try allocator.dupe(u8, part_raw);
+    errdefer allocator.free(unit_alloc);
+
+    const col1_buf = try allocator.alloc(u8, date_str.len);
+    _ = std.ascii.lowerString(col1_buf, date_str);
+
+    return Expression{ .scalar_comparison = .{
+        .func = func_alloc,
+        .unit = unit_alloc,
+        .col1_name = col1_buf,
+        .col2_name = null,
+        .amount = 0,
+        .operator = operator,
+        .rhs_value = rhs_value,
+    } };
+}
+
 fn parseComparison(allocator: Allocator, input: []const u8, op_str: []const u8, op_idx: usize) !Expression {
     const column_part = std.mem.trim(u8, input[0..op_idx], &std.ascii.whitespace);
     const value_part = std.mem.trim(u8, input[op_idx + op_str.len ..], &std.ascii.whitespace);
@@ -957,6 +1186,8 @@ pub fn evaluate(expr: Expression, row: std.StringHashMap([]const u8)) bool {
             const value = row.get(comp.column) orelse return false;
             return compareValues(comp, value);
         },
+        // scalar_comparison needs a field array and header; not available here — treat as false.
+        .scalar_comparison => return false,
         .binary => |bin| {
             const left_result = evaluate(bin.left, row);
             const right_result = evaluate(bin.right, row);
@@ -984,6 +1215,61 @@ pub fn evaluateDirect(expr: Expression, fields: []const []const u8, lower_header
                 }
             }
             return false;
+        },
+        .scalar_comparison => |sc| {
+            // Resolve col1_name → index
+            const col1_idx: usize = blk: {
+                for (lower_header, 0..) |col, i| {
+                    if (std.mem.eql(u8, col, sc.col1_name)) break :blk i;
+                }
+                return false; // column not found
+            };
+
+            // Build the ScalarSpec and evaluate it using a tiny stack arena
+            var stack_buf: [64]u8 = undefined;
+            var fba = std.heap.FixedBufferAllocator.init(&stack_buf);
+            const arena = fba.allocator();
+
+            const result_str: []const u8 = if (std.mem.eql(u8, sc.func, "datediff")) inner: {
+                const col2_name = sc.col2_name orelse return false;
+                const col2_idx: usize = idx: {
+                    for (lower_header, 0..) |col, i| {
+                        if (std.mem.eql(u8, col, col2_name)) break :idx i;
+                    }
+                    return false;
+                };
+                const spec = scalar.ScalarSpec{ .datediff = .{
+                    .unit = sc.unit,
+                    .start_col = col1_idx,
+                    .end_col = col2_idx,
+                } };
+                break :inner scalar.eval(spec, fields, arena);
+            } else if (std.mem.eql(u8, sc.func, "dateadd")) inner: {
+                const spec = scalar.ScalarSpec{ .dateadd = .{
+                    .unit = sc.unit,
+                    .amount = sc.amount,
+                    .date_col = col1_idx,
+                } };
+                break :inner scalar.eval(spec, fields, arena);
+            } else if (std.mem.eql(u8, sc.func, "extract")) inner: {
+                const spec = scalar.ScalarSpec{ .extract = .{
+                    .part = sc.unit,
+                    .date_col = col1_idx,
+                } };
+                break :inner scalar.eval(spec, fields, arena);
+            } else return false;
+
+            const result = std.fmt.parseFloat(f64, result_str) catch return false;
+
+            return switch (sc.operator) {
+                .equal => result == sc.rhs_value,
+                .not_equal => result != sc.rhs_value,
+                .greater => result > sc.rhs_value,
+                .greater_equal => result >= sc.rhs_value,
+                .less => result < sc.rhs_value,
+                .less_equal => result <= sc.rhs_value,
+                .like, .ilike, .between, .is_null, .is_not_null => false,
+            };
         },
         .binary => |bin| {
             return switch (bin.op) {
