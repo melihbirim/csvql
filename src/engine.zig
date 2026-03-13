@@ -5709,8 +5709,14 @@ test "DATEDIFF hours: calculates time difference in hours" {
     const data = try out.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(data);
 
-    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "2")); // 2 hours
-    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "3.5")); // 3.5 hours
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "id,"));
+    // Validate exact per-row values by parsing lines
+    var lines_h = std.mem.tokenizeAny(u8, data, "\r\n");
+    _ = lines_h.next(); // skip header
+    const row1_h = lines_h.next() orelse "";
+    const row2_h = lines_h.next() orelse "";
+    try std.testing.expectEqualStrings("1,2", row1_h); // row 1: 2 hours
+    try std.testing.expectEqualStrings("2,3.5", row2_h); // row 2: 3.5 hours
 }
 
 test "DATEDIFF days: calculates date difference in days" {
@@ -5891,10 +5897,14 @@ test "EXTRACT: extracts month and day from datetime column" {
     const data = try out.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(data);
 
-    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "3"));  // March
-    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "15")); // 15th
-    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "7"));  // July
-    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "4"));  // 4th
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "id,"));
+    // Validate exact per-row values: id, EXTRACT(month), EXTRACT(day)
+    var lines_md = std.mem.tokenizeAny(u8, data, "\r\n");
+    _ = lines_md.next(); // skip header
+    const row1_md = lines_md.next() orelse "";
+    const row2_md = lines_md.next() orelse "";
+    try std.testing.expectEqualStrings("1,3,15", row1_md); // March (3), 15th
+    try std.testing.expectEqualStrings("2,7,4", row2_md); // July (7), 4th
 }
 
 test "EXTRACT: combined with DATEDIFF in same query" {
@@ -5929,9 +5939,13 @@ test "EXTRACT: combined with DATEDIFF in same query" {
 
     try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "order_month"));
     try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "ship_days"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "1"));  // January = 1
-    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "3"));  // March = 3
-    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "1")); // 1 day exactly (whole number, no .00)
+    // Validate exact per-row values: id, order_month, ship_days
+    var lines_cd = std.mem.tokenizeAny(u8, data, "\r\n");
+    _ = lines_cd.next(); // skip header
+    const row1_cd = lines_cd.next() orelse "";
+    const row2_cd = lines_cd.next() orelse "";
+    try std.testing.expectEqualStrings("1,1,1", row1_cd); // January=1, 1 day
+    try std.testing.expectEqualStrings("2,3,1", row2_cd); // March=3, 1 day
 }
 
 test "ROUND: rounds to integer when no digits given" {
@@ -5966,10 +5980,16 @@ test "ROUND: rounds to integer when no digits given" {
 
     try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "rounded_price"));
     // price=1.20 → 1, price=5.99 → 6, price=2.30 → 2, price=3.50 → 4
-    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "1"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "6"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "2"));
-    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "4"));
+    var lines_ri = std.mem.tokenizeAny(u8, data, "\r\n");
+    _ = lines_ri.next(); // skip header
+    const row1_ri = lines_ri.next() orelse "";
+    const row2_ri = lines_ri.next() orelse "";
+    const row3_ri = lines_ri.next() orelse "";
+    const row4_ri = lines_ri.next() orelse "";
+    try std.testing.expectEqualStrings("1,1", row1_ri);
+    try std.testing.expectEqualStrings("2,6", row2_ri);
+    try std.testing.expectEqualStrings("3,2", row3_ri);
+    try std.testing.expectEqualStrings("4,4", row4_ri);
 }
 
 test "ROUND: rounds to specified decimal places" {
@@ -6009,4 +6029,3 @@ test "ROUND: rounds to specified decimal places" {
     try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "2.5"));
     try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "6.0"));
 }
-

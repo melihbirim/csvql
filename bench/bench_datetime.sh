@@ -125,7 +125,6 @@ csvql_only_check() {
 
     if grep -q "$expected_contains" "$out_csvql"; then
         ok "$label — output contains expected: '$expected_contains'"
-        ((pass++)) || true
     else
         bad "$label — expected '$expected_contains' not found in output"
         cat "$out_csvql" | head -10
@@ -176,7 +175,6 @@ csvql_t_iso=$("$CSVQL" "SELECT order_id, DATEDIFF('minute', ordered_at, delivere
 echo "    $csvql_t_iso"
 if echo "$csvql_t_iso" | grep -qE "^1001,"; then
     ok "ISO-8601 space format parsed correctly"
-    ((pass++)) || true
 else
     bad "ISO-8601 space format parse failed"
 fi
@@ -186,7 +184,6 @@ csvql_t_isot=$("$CSVQL" "SELECT order_id, DATEDIFF('minute', ordered_at, deliver
 echo "    $csvql_t_isot"
 if echo "$csvql_t_isot" | grep -qE "^1003,"; then
     ok "ISO-8601 T format parsed correctly"
-    ((pass++)) || true
 else
     bad "ISO-8601 T format parse failed"
 fi
@@ -196,7 +193,6 @@ csvql_t_us=$("$CSVQL" "SELECT order_id, DATEDIFF('minute', ordered_at, delivered
 echo "    $csvql_t_us"
 if echo "$csvql_t_us" | grep -qE "^1005,"; then
     ok "US slash format parsed correctly"
-    ((pass++)) || true
 else
     bad "US slash format parse failed"
 fi
@@ -206,7 +202,6 @@ csvql_t_eu=$("$CSVQL" "SELECT order_id, DATEDIFF('minute', ordered_at, delivered
 echo "    $csvql_t_eu"
 if echo "$csvql_t_eu" | grep -qE "^1007,"; then
     ok "EU dot format parsed correctly"
-    ((pass++)) || true
 else
     bad "EU dot format parse failed"
 fi
@@ -224,7 +219,6 @@ csvql_mixed=$("$CSVQL" "SELECT order_id, DATEDIFF('minute', ordered_at, picked_a
 echo "    $csvql_mixed"
 if echo "$csvql_mixed" | grep -q "75" && echo "$csvql_mixed" | grep -q "90"; then
     ok "Mixed format parsing — all 4 rows computed correctly"
-    ((pass++)) || true
 else
     bad "Mixed format parsing failed"
 fi
@@ -291,17 +285,14 @@ header "4. Workflow Analysis — Full test_orders.csv (mixed formats)"
 info "Processing time breakdown (all completed orders)"
 "$CSVQL" "SELECT order_id, customer_name, DATEDIFF('minute', ordered_at, picked_at) AS picking_min, DATEDIFF('minute', picked_at, packaged_at) AS packaging_min FROM '$DUCK_CSV' WHERE status IN ('delivered', 'collected') ORDER BY order_id" 2>&1 | head -12
 ok "Workflow time breakdown completed"
-((pass++)) || true
 
 info "Shipping duration analysis (delivery orders)"
 "$CSVQL" "SELECT order_id, DATEDIFF('day', shipped_at, delivered_at) AS ship_days FROM '$DUCK_CSV' WHERE order_type = 'delivery' AND delivered_at != '' ORDER BY ship_days DESC" 2>&1 | head -10
 ok "Shipping duration query completed"
-((pass++)) || true
 
 info "In-transit orders — estimated delivery"
 "$CSVQL" "SELECT order_id, shipped_at, DATEADD('day', 2, shipped_at) AS estimated_delivery FROM '$DUCK_CSV' WHERE status = 'in_transit' ORDER BY order_id" 2>&1
 ok "DATEADD estimated delivery completed"
-((pass++)) || true
 
 # ── SECTION 5: Performance on large-ish file ──────────────────────────────────
 header "5. Performance — Generate 10K rows and benchmark"
@@ -407,7 +398,6 @@ else
     ((perf_slower++)) || true
 fi
 ok "10K rows DATEDIFF completed"
-((pass++)) || true
 
 info "DATEADD on 10K rows (ISO-only, DuckDB comparison)"
 t0=$(date +%s%N)
@@ -429,7 +419,6 @@ else
     ((perf_slower++)) || true
 fi
 ok "10K rows DATEADD completed"
-((pass++)) || true
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 echo

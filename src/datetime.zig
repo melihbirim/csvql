@@ -15,10 +15,17 @@ pub const DateTime = struct {
         // Days since epoch calculation
         var days: i64 = 0;
 
-        // Add years (accounting for leap years)
-        var year: i32 = 1970;
-        while (year < self.year) : (year += 1) {
-            days += if (isLeapYear(year)) 366 else 365;
+        // Add years (accounting for leap years, handles pre-1970 dates)
+        if (self.year >= 1970) {
+            var year: i32 = 1970;
+            while (year < self.year) : (year += 1) {
+                days += if (isLeapYear(year)) 366 else 365;
+            }
+        } else {
+            var year: i32 = 1969;
+            while (year >= self.year) : (year -= 1) {
+                days -= if (isLeapYear(year)) 366 else 365;
+            }
         }
 
         // Add months
@@ -41,33 +48,43 @@ pub const DateTime = struct {
     /// Create DateTime from Unix timestamp
     pub fn fromTimestamp(timestamp: i64) DateTime {
         var remaining_seconds = timestamp;
-        
+
         // Calculate days since epoch
         const days_since_epoch = @divFloor(remaining_seconds, 86400);
         remaining_seconds = @mod(remaining_seconds, 86400);
-        
+
         // Calculate time components
         const hour = @as(u8, @intCast(@divFloor(remaining_seconds, 3600)));
         remaining_seconds = @mod(remaining_seconds, 3600);
         const minute = @as(u8, @intCast(@divFloor(remaining_seconds, 60)));
         const second = @as(u8, @intCast(@mod(remaining_seconds, 60)));
-        
-        // Calculate date from days
+
+        // Calculate date from days (handles negative/pre-epoch timestamps)
         var year: i32 = 1970;
         var remaining_days = days_since_epoch;
-        
-        while (true) {
-            const days_in_year: i64 = if (isLeapYear(year)) 366 else 365;
-            if (remaining_days < days_in_year) break;
-            remaining_days -= days_in_year;
-            year += 1;
+
+        if (remaining_days >= 0) {
+            while (true) {
+                const days_in_year: i64 = if (isLeapYear(year)) 366 else 365;
+                if (remaining_days < days_in_year) break;
+                remaining_days -= days_in_year;
+                year += 1;
+            }
+        } else {
+            year = 1969;
+            while (true) {
+                const days_in_year: i64 = if (isLeapYear(year)) 366 else 365;
+                remaining_days += days_in_year;
+                if (remaining_days >= 0) break;
+                year -= 1;
+            }
         }
-        
+
         // Find month and day
         const days_in_month = [_]u8{ 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
         var month: u8 = 1;
         var day_in_month: i64 = remaining_days;
-        
+
         for (days_in_month) |days| {
             var month_days = @as(i64, days);
             if (month == 2 and isLeapYear(year)) {
@@ -77,7 +94,7 @@ pub const DateTime = struct {
             day_in_month -= month_days;
             month += 1;
         }
-        
+
         return DateTime{
             .year = year,
             .month = month,
@@ -91,6 +108,15 @@ pub const DateTime = struct {
 
 fn isLeapYear(year: i32) bool {
     return (@rem(year, 4) == 0 and @rem(year, 100) != 0) or (@rem(year, 400) == 0);
+}
+
+fn daysInMonth(month: u8, year: i32) u8 {
+    return switch (month) {
+        1, 3, 5, 7, 8, 10, 12 => 31,
+        4, 6, 9, 11 => 30,
+        2 => if (isLeapYear(year)) @as(u8, 29) else @as(u8, 28),
+        else => 0,
+    };
 }
 
 /// Parse a date/datetime string in various formats, auto-detecting the format
@@ -127,13 +153,14 @@ pub fn parseDateTime(s: []const u8) !i64 {
 
 /// Parse ISO-8601 format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS or YYYY-MM-DD HH:MM:SS
 fn parseISO(s: []const u8) !i64 {
-    // Find date/time separator (T or space)
-    const time_sep_idx = std.mem.indexOf(u8, s, "T") orelse std.mem.indexOf(u8, s, " ");
+    // Find date/time separator (T or space); explicit ?usize so null propagates correctly
+    const time_sep_idx: ?usize = std.mem.indexOf(u8, s, "T") orelse std.mem.indexOf(u8, s, " ");
 
     const date_part = if (time_sep_idx) |idx| s[0..idx] else s;
-    const time_part = if (time_sep_idx) |idx| 
-        if (idx + 1 < s.len) s[idx + 1 ..] else null 
-    else null;
+    const time_part = if (time_sep_idx) |idx|
+        if (idx + 1 < s.len) s[idx + 1 ..] else null
+    else
+        null;
 
     // Parse date: YYYY-MM-DD
     var it = std.mem.splitScalar(u8, date_part, '-');
@@ -146,7 +173,7 @@ fn parseISO(s: []const u8) !i64 {
     const day = try std.fmt.parseInt(u8, day_str, 10);
 
     if (month < 1 or month > 12) return error.InvalidMonth;
-    if (day < 1 or day > 31) return error.InvalidDay;
+    if (day < 1 or day > daysInMonth(month, year)) return error.InvalidDay;
 
     var dt = DateTime{
         .year = year,
@@ -157,11 +184,11 @@ fn parseISO(s: []const u8) !i64 {
     // Parse time if present: HH:MM:SS or HH:MM:SS.SSS
     if (time_part) |tp| {
         const time_clean = if (std.mem.indexOf(u8, tp, "Z")) |idx| tp[0..idx] else tp;
-        
+
         var time_it = std.mem.splitScalar(u8, time_clean, ':');
         const hour_str = time_it.next() orelse return error.InvalidTime;
         const minute_str = time_it.next() orelse return error.InvalidTime;
-        
+
         dt.hour = try std.fmt.parseInt(u8, hour_str, 10);
         dt.minute = try std.fmt.parseInt(u8, minute_str, 10);
 
@@ -189,9 +216,10 @@ fn parseISO(s: []const u8) !i64 {
 fn parseSlashDate(s: []const u8) !i64 {
     const space_idx = std.mem.indexOf(u8, s, " ");
     const date_part = if (space_idx) |idx| s[0..idx] else s;
-    const time_part = if (space_idx) |idx| 
-        if (idx + 1 < s.len) s[idx + 1 ..] else null 
-    else null;
+    const time_part = if (space_idx) |idx|
+        if (idx + 1 < s.len) s[idx + 1 ..] else null
+    else
+        null;
 
     // Parse date: MM/DD/YYYY
     var it = std.mem.splitScalar(u8, date_part, '/');
@@ -204,7 +232,7 @@ fn parseSlashDate(s: []const u8) !i64 {
     const year = try std.fmt.parseInt(i32, year_str, 10);
 
     if (month < 1 or month > 12) return error.InvalidMonth;
-    if (day < 1 or day > 31) return error.InvalidDay;
+    if (day < 1 or day > daysInMonth(month, year)) return error.InvalidDay;
 
     var dt = DateTime{
         .year = year,
@@ -217,7 +245,7 @@ fn parseSlashDate(s: []const u8) !i64 {
         var time_it = std.mem.splitScalar(u8, tp, ':');
         const hour_str = time_it.next() orelse return error.InvalidTime;
         const minute_str = time_it.next() orelse return error.InvalidTime;
-        
+
         dt.hour = try std.fmt.parseInt(u8, hour_str, 10);
         dt.minute = try std.fmt.parseInt(u8, minute_str, 10);
 
@@ -237,9 +265,10 @@ fn parseSlashDate(s: []const u8) !i64 {
 fn parseDotDate(s: []const u8) !i64 {
     const space_idx = std.mem.indexOf(u8, s, " ");
     const date_part = if (space_idx) |idx| s[0..idx] else s;
-    const time_part = if (space_idx) |idx| 
-        if (idx + 1 < s.len) s[idx + 1 ..] else null 
-    else null;
+    const time_part = if (space_idx) |idx|
+        if (idx + 1 < s.len) s[idx + 1 ..] else null
+    else
+        null;
 
     // Parse date: DD.MM.YYYY
     var it = std.mem.splitScalar(u8, date_part, '.');
@@ -252,7 +281,7 @@ fn parseDotDate(s: []const u8) !i64 {
     const year = try std.fmt.parseInt(i32, year_str, 10);
 
     if (month < 1 or month > 12) return error.InvalidMonth;
-    if (day < 1 or day > 31) return error.InvalidDay;
+    if (day < 1 or day > daysInMonth(month, year)) return error.InvalidDay;
 
     var dt = DateTime{
         .year = year,
@@ -265,7 +294,7 @@ fn parseDotDate(s: []const u8) !i64 {
         var time_it = std.mem.splitScalar(u8, tp, ':');
         const hour_str = time_it.next() orelse return error.InvalidTime;
         const minute_str = time_it.next() orelse return error.InvalidTime;
-        
+
         dt.hour = try std.fmt.parseInt(u8, hour_str, 10);
         dt.minute = try std.fmt.parseInt(u8, minute_str, 10);
 
@@ -290,7 +319,7 @@ fn parseCompact(s: []const u8) !i64 {
     const day = try std.fmt.parseInt(u8, s[6..8], 10);
 
     if (month < 1 or month > 12) return error.InvalidMonth;
-    if (day < 1 or day > 31) return error.InvalidDay;
+    if (day < 1 or day > daysInMonth(month, year)) return error.InvalidDay;
 
     var dt = DateTime{
         .year = year,
@@ -316,7 +345,7 @@ fn parseCompact(s: []const u8) !i64 {
 pub fn formatDateTime(allocator: std.mem.Allocator, timestamp: i64) ![]u8 {
     const dt = DateTime.fromTimestamp(timestamp);
     return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2}:{d:0>2}", .{
-        @as(u32, @intCast(dt.year)),
+        @as(u32, @intCast(if (dt.year >= 0) dt.year else -dt.year)),
         dt.month,
         dt.day,
         dt.hour,
@@ -329,7 +358,7 @@ pub fn formatDateTime(allocator: std.mem.Allocator, timestamp: i64) ![]u8 {
 pub fn formatDate(allocator: std.mem.Allocator, timestamp: i64) ![]u8 {
     const dt = DateTime.fromTimestamp(timestamp);
     return std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}", .{
-        @as(u32, @intCast(dt.year)),
+        @as(u32, @intCast(if (dt.year >= 0) dt.year else -dt.year)),
         dt.month,
         dt.day,
     });

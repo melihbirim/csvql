@@ -408,14 +408,14 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
         .datediff => |args| {
             const start_val = field(record, args.start_col);
             const end_val = field(record, args.end_col);
-            
+
             // Parse both dates
             const start_ts = datetime.parseDateTime(start_val) catch return "0";
             const end_ts = datetime.parseDateTime(end_val) catch return "0";
-            
+
             // Calculate difference based on unit
             const diff_seconds = end_ts - start_ts;
-            const result: f64 = if (std.ascii.eqlIgnoreCase(args.unit, "second")) 
+            const result: f64 = if (std.ascii.eqlIgnoreCase(args.unit, "second"))
                 @floatFromInt(diff_seconds)
             else if (std.ascii.eqlIgnoreCase(args.unit, "minute"))
                 @as(f64, @floatFromInt(diff_seconds)) / 60.0
@@ -431,14 +431,14 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
                 @as(f64, @floatFromInt(diff_seconds)) / 31536000.0 // 365 days
             else
                 0.0;
-            
+
             const buf = arena.alloc(u8, 32) catch return "0";
             return fmtNum(buf, result);
         },
         .dateadd => |args| {
             const date_val = field(record, args.date_col);
             const base_ts = datetime.parseDateTime(date_val) catch return date_val;
-            
+
             // Add amount based on unit
             const seconds_to_add: i64 = if (std.ascii.eqlIgnoreCase(args.unit, "second"))
                 args.amount
@@ -456,7 +456,7 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
                 @as(i64, args.amount) * 31536000 // 365 days
             else
                 0;
-            
+
             const new_ts = base_ts + seconds_to_add;
             return datetime.formatDateTime(arena, new_ts) catch date_val;
         },
@@ -471,13 +471,21 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
             // Shift, round, shift back
             const factor = std.math.pow(f64, 10.0, @as(f64, @floatFromInt(args.digits)));
             const rounded = @round(n * factor) / factor;
-            return std.fmt.bufPrint(buf, "{d:.[1]}", .{ rounded, @as(usize, args.digits) }) catch v;
+            return switch (args.digits) {
+                1 => std.fmt.bufPrint(buf, "{d:.1}", .{rounded}) catch v,
+                2 => std.fmt.bufPrint(buf, "{d:.2}", .{rounded}) catch v,
+                3 => std.fmt.bufPrint(buf, "{d:.3}", .{rounded}) catch v,
+                4 => std.fmt.bufPrint(buf, "{d:.4}", .{rounded}) catch v,
+                5 => std.fmt.bufPrint(buf, "{d:.5}", .{rounded}) catch v,
+                6 => std.fmt.bufPrint(buf, "{d:.6}", .{rounded}) catch v,
+                else => std.fmt.bufPrint(buf, "{d}", .{rounded}) catch v,
+            };
         },
         .extract => |args| {
             const date_val = field(record, args.date_col);
             const ts = datetime.parseDateTime(date_val) catch return "0";
             const dt = datetime.DateTime.fromTimestamp(ts);
-            
+
             const result: i64 = if (std.ascii.eqlIgnoreCase(args.part, "year"))
                 dt.year
             else if (std.ascii.eqlIgnoreCase(args.part, "month"))
@@ -492,7 +500,7 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
                 dt.second
             else
                 0;
-            
+
             const buf = arena.alloc(u8, 32) catch return "0";
             return std.fmt.bufPrint(buf, "{d}", .{result}) catch "0";
         },

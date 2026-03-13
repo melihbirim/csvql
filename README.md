@@ -220,8 +220,8 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 | **ROUND**     | `SELECT ROUND(col)` — round to integer; `ROUND(col, n)` — round to `n` decimal places |
 | **COALESCE**  | `SELECT COALESCE(col, 'default')` — replace empty/null with fallback    |
 | **CAST**      | `SELECT CAST(col AS INTEGER/FLOAT/TEXT)` — type conversion              |
-| **DATEDIFF**  | `DATEDIFF('unit', start_col, end_col)` — duration between two datetime columns. Units: `second`, `minute`, `hour`, `day`, `week`. Auto-detects ISO-8601, US (MM/DD/YYYY), EU (DD.MM.YYYY) and mixed formats in the same file |
-| **DATEADD**   | `DATEADD('unit', amount, date_col)` — add/subtract interval from a datetime column. `amount` may be negative. Returns `YYYY-MM-DD HH:MM:SS` |
+| **DATEDIFF**  | `DATEDIFF('unit', start_col, end_col)` — duration between two datetime columns. Units: `second`, `minute`, `hour`, `day`, `week`, `month` (≈30 days), `year` (≈365 days). Auto-detects ISO-8601, US (MM/DD/YYYY), EU (DD.MM.YYYY) and mixed formats in the same file |
+| **DATEADD**   | `DATEADD('unit', amount, date_col)` — add/subtract interval from a datetime column. `amount` may be negative. Units: `second`, `minute`, `hour`, `day`, `week`, `month` (≈30 days), `year` (≈365 days). Returns `YYYY-MM-DD HH:MM:SS` |
 | **ORDER BY**  | `ORDER BY col ASC/DESC`, `ORDER BY alias`, or `ORDER BY 1` (positional) |
 | **LIMIT**     | `LIMIT n`                                                               |
 
@@ -360,8 +360,8 @@ csvql "SELECT order_id, DATEDIFF('minute', ordered_at, picked_at) AS pick_min FR
 # Delivery time in days
 csvql "SELECT order_id, DATEDIFF('day', shipped_at, delivered_at) AS ship_days FROM 'orders.csv' WHERE shipped_at != '' AND delivered_at != '' ORDER BY ship_days DESC"
 
-# SLA check — find orders where picking took more than 2 hours
-csvql "SELECT order_id, customer_name, DATEDIFF('hour', ordered_at, picked_at) AS hrs FROM 'orders.csv' WHERE DATEDIFF('hour', ordered_at, picked_at) > 2"
+# SLA check — select orders with pick time, then filter in your shell (DATEDIFF in WHERE not yet supported)
+csvql "SELECT order_id, customer_name, DATEDIFF('hour', ordered_at, picked_at) AS hrs FROM 'orders.csv' WHERE picked_at != ''"
 
 # Average processing time by status
 csvql "SELECT status, AVG(DATEDIFF('minute', ordered_at, packaged_at)) AS avg_proc_min FROM 'orders.csv' WHERE packaged_at != '' GROUP BY status ORDER BY avg_proc_min"
@@ -372,7 +372,7 @@ csvql "SELECT order_id, ordered_at, DATEADD('hour', 2, ordered_at) AS pick_deadl
 # Estimated delivery date (ship date + 2 days)
 csvql "SELECT order_id, shipped_at, DATEADD('day', 2, shipped_at) AS est_delivery FROM 'orders.csv' WHERE shipped_at != ''"
 
-# Supported units for both functions: second, minute, hour, day, week
+# Supported units for both functions: second, minute, hour, day, week, month (approx 30 days), year (approx 365 days)
 csvql "SELECT order_id, DATEDIFF('second', ordered_at, picked_at) AS pick_secs FROM 'orders.csv'"
 csvql "SELECT order_id, DATEADD('week', -1, delivered_at) AS sent_reminder FROM 'orders.csv'"
 ```
@@ -438,7 +438,7 @@ csvql --mcp
 | "Show me the top 10 customers by revenue" | `SELECT customer, SUM(revenue) AS total FROM 'sales.csv' GROUP BY customer ORDER BY total DESC LIMIT 10` |
 | "How many orders per month in 2025?" | `SELECT STRFTIME('%Y-%m', order_date) AS month, COUNT(*) AS orders FROM 'orders.csv' WHERE order_date BETWEEN '2025-01-01' AND '2025-12-31' GROUP BY month ORDER BY 1` |
 | "How long does delivery take on average?" | `SELECT AVG(DATEDIFF('hour', shipped_at, delivered_at)) AS avg_hours FROM 'orders.csv' WHERE delivered_at != ''` |
-| "Flag orders where picking exceeded SLA" | `SELECT order_id, DATEDIFF('minute', ordered_at, picked_at) AS mins FROM 'orders.csv' WHERE DATEDIFF('minute', ordered_at, picked_at) > 90` |
+| "Flag orders where picking exceeded SLA" | `SELECT order_id, DATEDIFF('minute', ordered_at, picked_at) AS mins FROM 'orders.csv' WHERE picked_at != ''` (scalar functions in WHERE not yet supported — filter by `mins > 90` in your shell) |
 | "Add 2-day estimated delivery to shipments" | `SELECT order_id, DATEADD('day', 2, shipped_at) AS est_delivery FROM 'orders.csv' WHERE shipped_at != ''` |
 | "Which employees have no department?" | `SELECT name FROM 'employees.csv' WHERE department IS NULL` |
 | "List all cities, deduplicated, sorted" | `SELECT DISTINCT city FROM 'data.csv' ORDER BY city` |
