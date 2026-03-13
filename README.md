@@ -115,6 +115,7 @@ sudo cp zig-out/bin/csvql /usr/local/bin/
 | Full scan (all 1M rows)           | **0.196s** | 1.163s | **5.9x** |
 | `COUNT(*) GROUP BY` (6 groups)    | **0.060s** | 0.110s | **1.8x** |
 | `SUM + AVG GROUP BY` (6 groups)   | **0.070s** | 0.110s | **1.6x** |
+| `SUM(CASE WHEN) GROUP BY`         | **0.016s** | 0.114s | **7.1x** |
 | `SELECT DISTINCT city` (8 values) | **0.060s** | 0.110s | **1.8x** |
 | `SELECT COUNT(*)` scalar          | **0.050s** | 0.100s | **2x**   |
 | `SELECT SUM(salary)` scalar       | **0.050s** | 0.110s | **2.2x** |
@@ -190,19 +191,35 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 | Feature       | Syntax                                                                  |
 | ------------- | ----------------------------------------------------------------------- |
 | **SELECT**    | `SELECT col1, col2` or `SELECT *`                                       |
+| **AS alias**  | `SELECT expr AS alias` — rename any column or expression in output      |
 | **DISTINCT**  | `SELECT DISTINCT col1, col2` — deduplicates output rows                 |
 | **FROM**      | `FROM 'file.csv'` or `FROM -` (stdin)                                   |
 | **WHERE**     | `=`, `!=`, `>`, `>=`, `<`, `<=` with auto numeric coercion              |
-| **LIKE**      | `WHERE col LIKE 'pattern'` — `%` any sequence, `_` any single character |
+| **LIKE**      | `WHERE col LIKE 'pattern'` — `%` any sequence, `_` any single char      |
+| **ILIKE**     | `WHERE col ILIKE 'pattern'` — same as LIKE but case-insensitive         |
+| **BETWEEN**   | `WHERE col BETWEEN low AND high` — inclusive numeric or string range    |
+| **IN**        | `WHERE col IN ('a', 'b', 'c')` — membership test                        |
+| **IS NULL**   | `WHERE col IS NULL` / `WHERE col IS NOT NULL` — empty-field test        |
+| **NOT**       | `WHERE NOT expr` — logical negation of any condition                    |
+| **AND / OR**  | `WHERE cond1 AND cond2` / `WHERE cond1 OR cond2` — compound conditions  |
 | **JOIN**      | `FROM 'a.csv' a [INNER] JOIN 'b.csv' b ON a.key = b.key`               |
-| **GROUP BY**  | `GROUP BY col1` — groups rows for aggregation                           |
+| **GROUP BY**  | `GROUP BY col1` or `GROUP BY alias` — groups rows; accepts SELECT aliases |
 | **COUNT**     | `COUNT(*)` or `COUNT(col)` — with or without `GROUP BY`                 |
-| **SUM**       | `SUM(col)` — with or without `GROUP BY`                                 |
+| **SUM**       | `SUM(col)` or `SUM(CASE WHEN cond THEN n ELSE m END)` — conditional sum |
 | **AVG**       | `AVG(col)` — full precision; with or without `GROUP BY`                 |
+| **CASE WHEN** | `CASE WHEN col OP val THEN n ELSE m END` inside any aggregate function  |
 | **MIN / MAX** | `MIN(col)`, `MAX(col)` — with or without `GROUP BY`                     |
 | **HAVING**    | `HAVING expr` — filter groups after aggregation (e.g. `HAVING COUNT(*) > 5`) |
 | **STRFTIME**  | `STRFTIME('%Y-%m', col)` — date bucketing in `SELECT` and `GROUP BY`    |
-| **ORDER BY**  | `ORDER BY col ASC/DESC`                                                 |
+| **UPPER / LOWER** | `SELECT UPPER(col), LOWER(col)` — case conversion                  |
+| **TRIM**      | `SELECT TRIM(col)` — strip leading and trailing whitespace              |
+| **LENGTH**    | `SELECT LENGTH(col)` — byte length of the value                         |
+| **SUBSTR**    | `SELECT SUBSTR(col, start, len)` — substring (1-based, `len` optional)  |
+| **ABS / CEIL / FLOOR** | `SELECT ABS(col), CEIL(col), FLOOR(col)` — numeric functions  |
+| **MOD**       | `SELECT MOD(col, n)` — modulo by a numeric literal                      |
+| **COALESCE**  | `SELECT COALESCE(col, 'default')` — replace empty/null with fallback    |
+| **CAST**      | `SELECT CAST(col AS INTEGER/FLOAT/TEXT)` — type conversion              |
+| **ORDER BY**  | `ORDER BY col ASC/DESC`, `ORDER BY alias`, or `ORDER BY 1` (positional) |
 | **LIMIT**     | `LIMIT n`                                                               |
 
 ### Aggregate Examples
@@ -218,12 +235,82 @@ csvql "SELECT department, COUNT(*), AVG(salary) FROM 'data.csv' GROUP BY departm
 csvql "SELECT department, SUM(salary) FROM 'data.csv' GROUP BY department HAVING SUM(salary) > 500000"
 csvql "SELECT category, COUNT(*) FROM 'orders.csv' GROUP BY category HAVING COUNT(*) > 1000"
 
+# CASE WHEN inside aggregates — conditional counting and summing
+csvql "SELECT department, COUNT(*) AS total, SUM(CASE WHEN city = 'London' THEN 1 ELSE 0 END) AS london_count FROM 'data.csv' GROUP BY department"
+csvql "SELECT SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) AS active, SUM(CASE WHEN status = 'inactive' THEN 1 ELSE 0 END) AS inactive FROM 'data.csv'"
+csvql "SELECT product, COUNT(*) AS total, SUM(CASE WHEN status = 'returned' THEN 1 ELSE 0 END) AS returns FROM 'orders.csv' GROUP BY product ORDER BY returns DESC"
+
 # DISTINCT
 csvql "SELECT DISTINCT city FROM 'data.csv' ORDER BY city"
 csvql "SELECT DISTINCT city, department FROM 'data.csv'"
 
 # DISTINCT with WHERE
 csvql "SELECT DISTINCT department FROM 'data.csv' WHERE salary > 100000"
+```
+
+### Scalar Function Examples
+
+Scalar functions transform column values row-by-row in `SELECT`. They can also be used in `GROUP BY` projections.
+
+```bash
+# String functions
+csvql "SELECT UPPER(name), LOWER(city), TRIM(notes) FROM 'data.csv'"
+csvql "SELECT name, LENGTH(name), SUBSTR(name, 1, 3) FROM 'data.csv'"
+
+# Numeric functions
+csvql "SELECT name, ABS(balance), CEIL(score), FLOOR(score) FROM 'data.csv'"
+csvql "SELECT name, MOD(age, 10) AS age_decade FROM 'data.csv'"
+
+# COALESCE — replace empty values with a fallback
+csvql "SELECT name, COALESCE(email, 'unknown') FROM 'data.csv'"
+csvql "SELECT COALESCE(phone, COALESCE(email, 'no contact')) FROM 'contacts.csv'"
+
+# CAST — explicit type conversion
+csvql "SELECT name, CAST(price AS INTEGER), CAST(id AS TEXT) FROM 'products.csv'"
+csvql "SELECT CAST(year AS INTEGER) AS yr, SUM(revenue) FROM 'data.csv' GROUP BY yr"
+
+# ILIKE — case-insensitive LIKE
+csvql "SELECT * FROM 'data.csv' WHERE name ILIKE '%smith%'"
+csvql "SELECT * FROM 'data.csv' WHERE email ILIKE '%@gmail.com'"
+
+# Scalar functions work with GROUP BY
+csvql "SELECT UPPER(city), COUNT(*) FROM 'data.csv' GROUP BY city"
+csvql "SELECT LOWER(department) AS dept, AVG(salary) FROM 'data.csv' GROUP BY department"
+
+# Mix scalars with AS aliases
+csvql "SELECT UPPER(name) AS Name, CAST(salary AS INTEGER) AS Salary FROM 'data.csv' ORDER BY Salary DESC"
+```
+
+### WHERE Filter Examples
+
+```bash
+# Comparison operators
+csvql "SELECT name, salary FROM 'data.csv' WHERE salary > 80000"
+
+# BETWEEN — inclusive range (numeric or string)
+csvql "SELECT name, salary FROM 'data.csv' WHERE salary BETWEEN 50000 AND 80000"
+csvql "SELECT * FROM 'orders.csv' WHERE order_date BETWEEN '2025-01-01' AND '2025-12-31'"
+
+# IN — membership test
+csvql "SELECT name FROM 'data.csv' WHERE city IN ('London', 'Paris', 'Berlin')"
+
+# IS NULL / IS NOT NULL — test for missing (empty) fields
+csvql "SELECT * FROM 'data.csv' WHERE email IS NULL"
+csvql "SELECT * FROM 'data.csv' WHERE email IS NOT NULL"
+
+# NOT — negate any condition
+csvql "SELECT * FROM 'data.csv' WHERE NOT city IN ('London', 'Paris')"
+csvql "SELECT * FROM 'data.csv' WHERE NOT salary BETWEEN 40000 AND 60000"
+
+# AND / OR — compound conditions
+csvql "SELECT * FROM 'data.csv' WHERE age > 30 AND department = 'Engineering'"
+csvql "SELECT * FROM 'data.csv' WHERE city = 'London' OR city = 'Berlin'"
+csvql "SELECT * FROM 'data.csv' WHERE status LIKE 'active%' AND salary > 50000"
+
+# AS alias + ORDER BY alias or positional
+csvql "SELECT name AS employee, salary AS pay FROM 'data.csv' ORDER BY pay DESC LIMIT 10"
+csvql "SELECT city, COUNT(*) AS cnt FROM 'data.csv' GROUP BY city ORDER BY cnt DESC"
+csvql "SELECT name, salary FROM 'data.csv' ORDER BY 2 DESC LIMIT 5"  # ORDER BY positional
 ```
 
 ### Time-Series and Date Bucketing
@@ -235,17 +322,20 @@ Supported format specifiers: `%Y` (year), `%m` (month), `%d` (day), `%H` (hour),
 Input dates can be ISO-8601 date (`YYYY-MM-DD`) or datetime (`YYYY-MM-DD HH:MM:SS`).
 
 ```bash
-# Monthly revenue trend
+# Monthly revenue trend — GROUP BY the full STRFTIME expression
 csvql "SELECT STRFTIME('%Y-%m', order_date), COUNT(*), SUM(price) FROM 'orders.csv' GROUP BY STRFTIME('%Y-%m', order_date)"
 
+# Same query using AS alias — GROUP BY the alias name
+csvql "SELECT STRFTIME('%Y-%m', order_date) AS month, COUNT(*) AS orders, SUM(price) AS revenue FROM 'orders.csv' GROUP BY month ORDER BY month"
+
 # Year-over-year breakdown by category
-csvql "SELECT category, STRFTIME('%Y', order_date), SUM(price) FROM 'orders.csv' GROUP BY category, STRFTIME('%Y', order_date)"
+csvql "SELECT category, STRFTIME('%Y', order_date) AS yr, SUM(price) FROM 'orders.csv' GROUP BY category, yr"
 
 # Date range filter + monthly bucketing + HAVING
-csvql "SELECT STRFTIME('%Y-%m', order_date), COUNT(*), SUM(price) FROM 'orders.csv' WHERE order_date >= '2026-01-01' GROUP BY STRFTIME('%Y-%m', order_date) HAVING COUNT(*) > 1000000"
+csvql "SELECT STRFTIME('%Y-%m', order_date) AS month, COUNT(*), SUM(price) FROM 'orders.csv' WHERE order_date >= '2026-01-01' GROUP BY month HAVING COUNT(*) > 1000000"
 
 # Daily active users
-csvql "SELECT STRFTIME('%Y-%m-%d', event_date), COUNT(DISTINCT user_id) FROM 'events.csv' GROUP BY STRFTIME('%Y-%m-%d', event_date) ORDER BY 1"
+csvql "SELECT STRFTIME('%Y-%m-%d', event_date) AS day, COUNT(DISTINCT user_id) FROM 'events.csv' GROUP BY day ORDER BY day"
 ```
 
 ### JOIN Examples
@@ -297,6 +387,25 @@ csvql --mcp
 | `csv_query(sql)` | Execute any supported SQL query, returns results as JSON |
 | `csv_schema(file)` | Column names and sample rows for a CSV file |
 | `csv_list(directory?)` | List CSV files in a directory |
+
+### Supported Queries via MCP
+
+`csv_query` accepts the full SQL dialect supported by csvql. You can ask your AI assistant things like:
+
+| Natural language prompt | SQL sent to `csv_query` |
+|---|---|
+| "Show me the top 10 customers by revenue" | `SELECT customer, SUM(revenue) AS total FROM 'sales.csv' GROUP BY customer ORDER BY total DESC LIMIT 10` |
+| "How many orders per month in 2025?" | `SELECT STRFTIME('%Y-%m', order_date) AS month, COUNT(*) AS orders FROM 'orders.csv' WHERE order_date BETWEEN '2025-01-01' AND '2025-12-31' GROUP BY month ORDER BY 1` |
+| "Which employees have no department?" | `SELECT name FROM 'employees.csv' WHERE department IS NULL` |
+| "List all cities, deduplicated, sorted" | `SELECT DISTINCT city FROM 'data.csv' ORDER BY city` |
+| "Average salary by department, only > 80k avg" | `SELECT department, AVG(salary) AS avg_sal FROM 'data.csv' GROUP BY department HAVING AVG(salary) > 80000 ORDER BY avg_sal DESC` |
+| "Join orders with customers, filter by region" | `SELECT o.id, c.name FROM 'orders.csv' o JOIN 'customers.csv' c ON o.customer_id = c.id WHERE c.region = 'West'` |
+| "Salaries in range 50k–70k" | `SELECT name, salary FROM 'data.csv' WHERE salary BETWEEN 50000 AND 70000 ORDER BY salary` |
+| "Employees not in London or Paris" | `SELECT name, city FROM 'data.csv' WHERE NOT city IN ('London', 'Paris')` |
+
+**Full WHERE clause support:** `=`, `!=`, `>`, `>=`, `<`, `<=`, `LIKE`, `BETWEEN`, `IN`, `IS NULL`, `IS NOT NULL`, `NOT`, `AND`, `OR`
+
+**Full SELECT support:** column projections, `AS` aliases, `DISTINCT`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING`, `ORDER BY` (by name, alias, or position), `LIMIT`, `STRFTIME()`, `JOIN`, `UPPER`/`LOWER`/`TRIM`/`LENGTH`/`SUBSTR`, `ABS`/`CEIL`/`FLOOR`/`MOD`, `COALESCE`, `CAST`
 
 ### Setup
 
@@ -350,6 +459,18 @@ Once connected, you can ask your AI assistant to query CSV files directly:
 | `HAVING` clause                     |                                                      | ✅ shipped          |
 | `STRFTIME()` date bucketing         |                                                      | ✅ shipped          |
 | MCP server (`--mcp`)                |                                                      | ✅ shipped          |
+| `AS` alias in SELECT & ORDER BY     |                                                      | ✅ shipped          |
+| `BETWEEN low AND high`              |                                                      | ✅ shipped          |
+| `IS NULL` / `IS NOT NULL`           |                                                      | ✅ shipped          |
+| `NOT` prefix for conditions         |                                                      | ✅ shipped          |
+| `ORDER BY` positional (`ORDER BY 1`)|                                                      | ✅ shipped          |
+| `GROUP BY` alias (`GROUP BY month`) |                                                      | ✅ shipped          |
+| `CASE WHEN` inside aggregates       |                                                      | ✅ shipped          |
+| `ILIKE` in WHERE                    |                                                      | ✅ shipped          |
+| `UPPER`, `LOWER`, `TRIM`, `LENGTH`, `SUBSTR` in SELECT |                             | ✅ shipped          |
+| `ABS`, `CEIL`, `FLOOR`, `MOD` in SELECT |                                                 | ✅ shipped          |
+| `COALESCE` in SELECT                |                                                      | ✅ shipped          |
+| `CAST` in SELECT                    |                                                      | ✅ shipped          |
 
 ## Contributing
 

@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 /// Aggregate function types
 pub const AggregateType = enum {
     count,
+    count_distinct,
     sum,
     avg,
     min,
@@ -199,7 +200,12 @@ pub fn parseAggregateFunc(allocator: Allocator, expr: []const u8) !?AggregateFun
     _ = std.ascii.lowerString(func_lower, func_name);
 
     if (std.mem.eql(u8, func_lower, "count")) {
-        func_type = .count;
+        // COUNT(DISTINCT col) or COUNT(*) / COUNT(col)
+        if (column_part.len >= 9 and std.ascii.eqlIgnoreCase(column_part[0..9], "DISTINCT ")) {
+            func_type = .count_distinct;
+        } else {
+            func_type = .count;
+        }
     } else if (std.mem.eql(u8, func_lower, "sum")) {
         func_type = .sum;
     } else if (std.mem.eql(u8, func_lower, "avg")) {
@@ -212,11 +218,16 @@ pub fn parseAggregateFunc(allocator: Allocator, expr: []const u8) !?AggregateFun
         return null;
     }
 
-    // Handle column (or * for COUNT(*))
-    const column = if (std.mem.eql(u8, column_part, "*"))
+    // Handle column (or * for COUNT(*)); strip DISTINCT prefix if present
+    var actual_column_part = column_part;
+    if (func_type == .count_distinct) {
+        // Strip "DISTINCT " prefix (9 chars) already verified above
+        actual_column_part = std.mem.trim(u8, column_part[9..], &std.ascii.whitespace);
+    }
+    const column = if (std.mem.eql(u8, actual_column_part, "*"))
         null
     else
-        try allocator.dupe(u8, column_part);
+        try allocator.dupe(u8, actual_column_part);
 
     return AggregateFunc{
         .func_type = func_type,
