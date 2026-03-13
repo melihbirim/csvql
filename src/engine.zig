@@ -1255,14 +1255,27 @@ const AggSpec = struct {
     case_when: ?CaseWhenSpec = null, // non-null for CASE WHEN conditional aggregates
 };
 
+/// THEN/ELSE value in a CASE WHEN — either a numeric literal or a column reference.
+const CaseWhenValue = union(enum) {
+    constant: f64,
+    col_idx: usize,
+
+    fn resolve(self: CaseWhenValue, record: []const []const u8) f64 {
+        return switch (self) {
+            .constant => |v| v,
+            .col_idx => |idx| if (idx < record.len) parseNumericFast(record[idx]) catch 0.0 else 0.0,
+        };
+    }
+};
+
 /// Represents a parsed CASE WHEN condition inside an aggregate function,
 /// e.g. SUM(CASE WHEN status = 'returned' THEN 1 ELSE 0 END).
 /// All string fields inside comp are allocator-owned via comp.deinit().
 const CaseWhenSpec = struct {
     cond_col_idx: usize, // pre-resolved column index for the WHEN condition
     comp: parser.Comparison, // comparison operator + values (column field unused at eval time)
-    then_val: f64, // value to accumulate when condition is true
-    else_val: f64, // value to accumulate when condition is false
+    then_val: CaseWhenValue, // value to accumulate when condition is true
+    else_val: CaseWhenValue, // value to accumulate when condition is false
 };
 
 /// Compact per-group accumulator using flat arrays instead of HashMaps.
@@ -1424,9 +1437,25 @@ fn parseCaseAggCall(
         return null;
     };
 
-    // THEN/ELSE must be numeric constants (0, 1, -1, 3.14, …)
-    const then_val = std.fmt.parseFloat(f64, then_str) catch return null;
-    const else_val = std.fmt.parseFloat(f64, else_str) catch return null;
+    // THEN/ELSE: numeric constant or column reference.
+    const then_val: CaseWhenValue = if (std.fmt.parseFloat(f64, then_str)) |v|
+        .{ .constant = v }
+    else |_| blk: {
+        const lower_then = try allocator.alloc(u8, then_str.len);
+        defer allocator.free(lower_then);
+        _ = std.ascii.lowerString(lower_then, then_str);
+        const idx = column_map.get(lower_then) orelse return error.ColumnNotFound;
+        break :blk .{ .col_idx = idx };
+    };
+    const else_val: CaseWhenValue = if (std.fmt.parseFloat(f64, else_str)) |v|
+        .{ .constant = v }
+    else |_| blk: {
+        const lower_else = try allocator.alloc(u8, else_str.len);
+        defer allocator.free(lower_else);
+        _ = std.ascii.lowerString(lower_else, else_str);
+        const idx = column_map.get(lower_else) orelse return error.ColumnNotFound;
+        break :blk .{ .col_idx = idx };
+    };
 
     // Resolve outer function name
     const func_lower_buf = try allocator.alloc(u8, func_name.len);
@@ -2122,7 +2151,7 @@ fn executeScalarAgg(
                     .sum, .avg => {
                         if (spec.case_when) |cw| {
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
-                            const val = if (parser.compareValues(cw.comp, fv)) cw.then_val else cw.else_val;
+                            const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
                             accum.sums[i] += val;
                             accum.sum_counts[i] += 1;
                         } else if (spec.col_idx) |cidx| {
@@ -2373,7 +2402,7 @@ fn gbProcessRecord(
             .sum, .avg => {
                 if (spec.case_when) |cw| {
                     const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
-                    const val = if (parser.compareValues(cw.comp, fv)) cw.then_val else cw.else_val;
+                    const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
                     accum.sums[i] += val;
                     accum.sum_counts[i] += 1;
                 } else if (spec.col_idx) |cidx| {
@@ -2589,7 +2618,7 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                     .sum, .avg => {
                         if (spec.case_when) |cw| {
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
-                            const val = if (parser.compareValues(cw.comp, fv)) cw.then_val else cw.else_val;
+                            const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
                             ctx.partial_accum.sums[i] += val;
                             ctx.partial_accum.sum_counts[i] += 1;
                         } else if (spec.col_idx) |cidx| {
@@ -2676,7 +2705,7 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                     .sum, .avg => {
                         if (spec.case_when) |cw| {
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
-                            const val = if (parser.compareValues(cw.comp, fv)) cw.then_val else cw.else_val;
+                            const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
                             ctx.partial_accum.sums[i] += val;
                             ctx.partial_accum.sum_counts[i] += 1;
                         } else if (spec.col_idx) |cidx| {
@@ -3213,7 +3242,7 @@ fn executeGroupBy(
                     .sum, .avg => {
                         if (spec.case_when) |cw| {
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
-                            const val = if (parser.compareValues(cw.comp, fv)) cw.then_val else cw.else_val;
+                            const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
                             accum.sums[i] += val;
                             accum.sum_counts[i] += 1;
                         } else if (spec.col_idx) |cidx| {
