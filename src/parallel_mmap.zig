@@ -507,15 +507,9 @@ fn processSortChunk(ctx: *SortWorkerContext) !void {
                                     continue;
                                 }
                             } else {
-                                const matches = switch (comp.operator) {
-                                    .equal => std.mem.eql(u8, field_value, comp.value),
-                                    .not_equal => !std.mem.eql(u8, field_value, comp.value),
-                                    .like => parser.matchLike(field_value, comp.value),
-                                    .ilike => parser.matchILike(field_value, comp.value),
-                                    .between, .is_null, .is_not_null => parser.compareValues(comp, field_value),
-                                    else => false,
-                                };
-                                if (!matches) {
+                                // Delegate to compareValues which handles IN, BETWEEN,
+                                // IS NULL/NOT NULL, LIKE, ILIKE, and normal comparisons.
+                                if (!parser.compareValues(comp, field_value)) {
                                     line_start += line_end + 1;
                                     continue;
                                 }
@@ -615,26 +609,9 @@ fn processChunk(ctx: *WorkerContext) !void {
                                     continue;
                                 }
                             } else {
-                                // String comparison
-                                const matches = switch (comp.operator) {
-                                    .equal => std.mem.eql(u8, field_value, comp.value),
-                                    .not_equal => !std.mem.eql(u8, field_value, comp.value),
-                                    .like => parser.matchLike(field_value, comp.value),
-                                    .ilike => parser.matchILike(field_value, comp.value),
-                                    .between, .is_null, .is_not_null => parser.compareValues(comp, field_value),
-                                    else => blk: {
-                                        const cmp = std.mem.order(u8, field_value, comp.value);
-                                        break :blk switch (comp.operator) {
-                                            .greater => cmp == .gt,
-                                            .greater_equal => cmp == .gt or cmp == .eq,
-                                            .less => cmp == .lt,
-                                            .less_equal => cmp == .lt or cmp == .eq,
-                                            else => false,
-                                        };
-                                    },
-                                };
-
-                                if (!matches) {
+                                // Delegate to compareValues which handles IN, BETWEEN,
+                                // IS NULL/NOT NULL, LIKE, ILIKE, and normal comparisons.
+                                if (!parser.compareValues(comp, field_value)) {
                                     line_start += line_end + 1;
                                     continue;
                                 }
@@ -644,27 +621,15 @@ fn processChunk(ctx: *WorkerContext) !void {
                             continue;
                         }
                     } else {
-                        // Fallback to HashMap (complex WHERE clauses)
-                        var row_map = std.StringHashMap([]const u8).init(arena_alloc);
-                        for (ctx.lower_header, 0..) |lower_name, idx| {
-                            if (idx < fields.items.len) {
-                                try row_map.put(lower_name, fields.items[idx]);
-                            }
-                        }
-                        if (!parser.evaluate(expr, row_map)) {
+                        // Complex WHERE (AND/OR/NOT): evaluate directly, no per-row HashMap
+                        if (!parser.evaluateDirect(expr, fields.items, ctx.lower_header)) {
                             line_start += line_end + 1;
                             continue;
                         }
                     }
                 } else {
-                    // Complex expression - use HashMap fallback
-                    var row_map = std.StringHashMap([]const u8).init(arena_alloc);
-                    for (ctx.lower_header, 0..) |lower_name, idx| {
-                        if (idx < fields.items.len) {
-                            try row_map.put(lower_name, fields.items[idx]);
-                        }
-                    }
-                    if (!parser.evaluate(expr, row_map)) {
+                    // Complex expression (AND/OR/NOT): evaluate directly, no per-row HashMap
+                    if (!parser.evaluateDirect(expr, fields.items, ctx.lower_header)) {
                         line_start += line_end + 1;
                         continue;
                     }

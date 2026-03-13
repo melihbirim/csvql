@@ -108,8 +108,6 @@ fn hasScalarSelectFunctions(query: parser.Query) bool {
             std.ascii.eqlIgnoreCase(fn_raw, "max") or
             std.ascii.eqlIgnoreCase(fn_raw, "count_distinct") or
             std.ascii.eqlIgnoreCase(fn_raw, "strftime") or
-            std.ascii.eqlIgnoreCase(fn_raw, "substr") or
-            std.ascii.eqlIgnoreCase(fn_raw, "substring") or
             std.ascii.eqlIgnoreCase(fn_raw, "round") or
             std.ascii.startsWithIgnoreCase(fn_raw, "case")) continue;
         return true;
@@ -140,28 +138,47 @@ pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.Fi
         return;
     }
 
-    // DISTINCT without GROUP BY: route through the hash-based GROUP BY engine.
-    // SELECT DISTINCT c1,c2 ≡ SELECT c1,c2 GROUP BY c1,c2 — same O(unique rows)
-    // memory and a single sequential mmap scan, just like our GROUP BY path.
-    if (query.distinct and query.group_by.len == 0) {
-        try executeDistinct(allocator, query, output_file, opts);
-        return;
-    }
-
     // Check for GROUP BY - requires sequential processing
     if (query.group_by.len > 0) {
         try executeGroupBy(allocator, query, output_file, opts);
         return;
     }
 
-    // Scalar SELECT functions (UPPER, LOWER, TRIM, etc.) need per-row eval;
-    // route to executeSequential which now supports OutputColSpec projection.
-    // This check runs BEFORE opening the file so large-file routing is bypassed —
-    // acceptable since scalar SELECT on multi-GB files is uncommon and the
-    // BulkCsvReader path is still fast (no mmap overhead, just seq reads).
+    // DISTINCT without GROUP BY and without scalar functions: equivalent to
+    // GROUP BY all select columns. Route through the fast parallel GROUP BY engine
+    // for O(n) hash-based dedup instead of the O(n log n) sort-based fallback.
+    if (query.distinct and !query.all_columns and !hasScalarSelectFunctions(query)) {
+        var synth_gb = try allocator.alloc([]u8, query.columns.len);
+        defer allocator.free(synth_gb);
+        for (query.columns, 0..) |col, i| {
+            const sa = splitAlias(col);
+            synth_gb[i] = @constCast(sa.expr);
+        }
+        var dq = query;
+        dq.distinct = false;
+        dq.group_by = synth_gb;
+        try executeGroupBy(allocator, dq, output_file, opts);
+        return;
+    }
+
+    // Scalar SELECT functions (UPPER, LOWER, TRIM, etc.) need per-row eval.
+    // For large files on multi-core machines, use the parallel scalar executor.
+    // For ORDER BY, DISTINCT, or LIMIT — fall back to sequential (handles all cases).
     if (hasScalarSelectFunctions(query)) {
         const file_s = try std.fs.cwd().openFile(query.file_path, .{});
         defer file_s.close();
+        const stat_s = try file_s.stat();
+        if (stat_s.size > 10 * 1024 * 1024 and
+            query.order_by == null and
+            !query.distinct and
+            query.limit < 0)
+        {
+            const nc = try std.Thread.getCpuCount();
+            if (nc > 1) {
+                try executeParallelScalar(allocator, query, file_s, output_file, opts);
+                return;
+            }
+        }
         try executeSequential(allocator, query, file_s, output_file, opts);
         return;
     }
@@ -405,18 +422,8 @@ fn executeSequential(
                     continue;
                 }
             } else {
-                // Complex expressions (AND/OR/NOT) still use HashMap
-                // TODO: Optimize these as well
-                var row_map = std.StringHashMap([]const u8).init(allocator);
-                defer row_map.deinit();
-
-                for (lower_header, 0..) |lower_name, idx| {
-                    if (idx < record.len) {
-                        try row_map.put(lower_name, record[idx]);
-                    }
-                }
-
-                if (!parser.evaluate(expr, row_map)) {
+                // Complex expressions (AND/OR/NOT): evaluate directly without per-row HashMap
+                if (!parser.evaluateDirect(expr, record, lower_header)) {
                     continue;
                 }
             }
@@ -546,6 +553,277 @@ fn executeSequential(
 
     try writer.finish();
     try writer.flush();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Parallel scalar SELECT executor
+//
+// Handles queries like  SELECT UPPER(name), ABS(salary) FROM 'large.csv'
+// by spinning up N worker threads, each scanning its mmap chunk independently,
+// applying per-row scalar transforms, and writing directly into a per-thread
+// byte buffer.  Main thread stitches the buffers in order — no sorting needed,
+// no mutex in the hot path.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ScalarWorkerCtx = struct {
+    data: []const u8,
+    chunk_start: usize,
+    chunk_end: usize,
+    output_specs: []const scalar.OutputColSpec,
+    lower_header: []const []const u8,
+    where_column_idx: ?usize,
+    where_expr: ?parser.Expression,
+    delimiter: u8,
+    output_buf: std.ArrayList(u8),
+    allocator: Allocator,
+    err: ?anyerror = null,
+};
+
+fn scalarWorkerThread(ctx: *ScalarWorkerCtx) void {
+    scalarProcessChunk(ctx) catch |e| {
+        ctx.err = e;
+    };
+}
+
+fn scalarProcessChunk(ctx: *ScalarWorkerCtx) !void {
+    const chunk_data = ctx.data[ctx.chunk_start..ctx.chunk_end];
+
+    // Per-row arena: reset after each row so scalar allocations (UPPER/LOWER etc.)
+    // don't accumulate.  Capacity is retained so there's no system-call overhead
+    // after the first few rows.
+    var row_arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer row_arena.deinit();
+
+    var field_buf: [256][]const u8 = undefined;
+    var line_start: usize = 0;
+
+    while (line_start < chunk_data.len) {
+        _ = row_arena.reset(.retain_capacity);
+
+        const remaining = chunk_data[line_start..];
+        const line_end_off = std.mem.indexOfScalar(u8, remaining, '\n') orelse
+            chunk_data.len - line_start;
+        var line = remaining[0..line_end_off];
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+        line_start += line_end_off + 1;
+        if (line.len == 0) continue;
+
+        // Parse all fields into stack buffer (zero-alloc)
+        var n_fields: usize = 0;
+        var it = std.mem.splitScalar(u8, line, ctx.delimiter);
+        while (it.next()) |f| {
+            if (n_fields >= field_buf.len) break;
+            field_buf[n_fields] = f;
+            n_fields += 1;
+        }
+        const fields = field_buf[0..n_fields];
+
+        // WHERE filter
+        if (ctx.where_expr) |expr| {
+            if (expr == .comparison) {
+                const comp = expr.comparison;
+                if (ctx.where_column_idx) |ci| {
+                    const fv = if (ci < fields.len) fields[ci] else "";
+                    if (comp.numeric_value) |threshold| {
+                        const val = std.fmt.parseFloat(f64, fv) catch continue;
+                        const ok = switch (comp.operator) {
+                            .equal => val == threshold,
+                            .not_equal => val != threshold,
+                            .greater => val > threshold,
+                            .greater_equal => val >= threshold,
+                            .less => val < threshold,
+                            .less_equal => val <= threshold,
+                            .like => parser.matchLike(fv, comp.value),
+                            .ilike => parser.matchILike(fv, comp.value),
+                            .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
+                        };
+                        if (!ok) continue;
+                    } else {
+                        if (!parser.compareValues(comp, fv)) continue;
+                    }
+                } else continue;
+            } else {
+                // AND/OR/NOT — no HashMap needed
+                if (!parser.evaluateDirect(expr, fields, ctx.lower_header)) continue;
+            }
+        }
+
+        // Project through scalar specs and write CSV row to per-thread buffer
+        for (ctx.output_specs, 0..) |spec, j| {
+            if (j > 0) try ctx.output_buf.append(ctx.allocator, ctx.delimiter);
+            const value = scalar.evalOutputCol(spec, fields, row_arena.allocator());
+            // Minimal CSV quoting
+            var needs_quote = false;
+            for (value) |c| {
+                if (c == ctx.delimiter or c == '"' or c == '\r' or c == '\n') {
+                    needs_quote = true;
+                    break;
+                }
+            }
+            if (needs_quote) {
+                try ctx.output_buf.append(ctx.allocator, '"');
+                for (value) |c| {
+                    if (c == '"') try ctx.output_buf.append(ctx.allocator, '"');
+                    try ctx.output_buf.append(ctx.allocator, c);
+                }
+                try ctx.output_buf.append(ctx.allocator, '"');
+            } else {
+                try ctx.output_buf.appendSlice(ctx.allocator, value);
+            }
+        }
+        try ctx.output_buf.append(ctx.allocator, '\n');
+    }
+}
+
+fn executeParallelScalar(
+    allocator: Allocator,
+    query: parser.Query,
+    input_file: std.fs.File,
+    output_file: std.fs.File,
+    opts: options_mod.Options,
+) !void {
+    const file_size = (try input_file.stat()).size;
+    if (file_size == 0) return error.EmptyFile;
+
+    const mapped = try std.posix.mmap(
+        null,
+        file_size,
+        std.posix.PROT.READ,
+        .{ .TYPE = .SHARED },
+        input_file.handle,
+        0,
+    );
+    defer std.posix.munmap(mapped);
+    std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
+    const data = mapped[0..file_size];
+
+    // Parse header
+    const header_nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
+    var header_line = data[0..header_nl];
+    if (header_line.len > 0 and header_line[header_line.len - 1] == '\r')
+        header_line = header_line[0 .. header_line.len - 1];
+
+    var header_list = std.ArrayListUnmanaged([]const u8){};
+    defer header_list.deinit(allocator);
+    {
+        var hi = std.mem.splitScalar(u8, header_line, opts.delimiter);
+        while (hi.next()) |col| try header_list.append(allocator, col);
+    }
+    const header = header_list.items;
+
+    // Build lowercase column map
+    var lower_header_buf = try allocator.alloc([]u8, header.len);
+    defer {
+        for (lower_header_buf) |h| allocator.free(h);
+        allocator.free(lower_header_buf);
+    }
+    var column_map = std.StringHashMap(usize).init(allocator);
+    defer column_map.deinit();
+    for (header, 0..) |col, idx| {
+        const lower = try allocator.alloc(u8, col.len);
+        _ = std.ascii.lowerString(lower, col);
+        lower_header_buf[idx] = lower;
+        try column_map.put(lower, idx);
+    }
+    const lower_header: []const []const u8 = lower_header_buf;
+
+    // Build output_specs + output header names
+    var output_specs_list = std.ArrayListUnmanaged(scalar.OutputColSpec){};
+    defer output_specs_list.deinit(allocator);
+    var output_header = std.ArrayList([]const u8){};
+    defer output_header.deinit(allocator);
+
+    if (query.all_columns) {
+        for (header, 0..) |col_name, idx| {
+            try output_specs_list.append(allocator, .{ .column = idx });
+            try output_header.append(allocator, col_name);
+        }
+    } else {
+        for (query.columns) |col| {
+            const sa = splitAlias(col);
+            const expr = sa.expr;
+            if (try scalar.tryParseScalar(expr, column_map, allocator)) |sc_spec| {
+                try output_specs_list.append(allocator, .{ .scalar = sc_spec });
+                try output_header.append(allocator, if (sa.alias) |a| a else expr);
+                continue;
+            }
+            const lower_col = try allocator.alloc(u8, expr.len);
+            defer allocator.free(lower_col);
+            _ = std.ascii.lowerString(lower_col, expr);
+            const idx = column_map.get(lower_col) orelse return error.ColumnNotFound;
+            try output_specs_list.append(allocator, .{ .column = idx });
+            try output_header.append(allocator, if (sa.alias) |a| a else header[idx]);
+        }
+    }
+    const output_specs = output_specs_list.items;
+
+    // WHERE column index
+    var where_column_idx: ?usize = null;
+    if (query.where_expr) |expr| {
+        if (expr == .comparison) {
+            for (lower_header, 0..) |lh, i| {
+                if (std.mem.eql(u8, lh, expr.comparison.column)) {
+                    where_column_idx = i;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Write header
+    var writer = csv.RecordWriter.init(output_file, opts);
+    defer writer.deinit();
+    try writer.writeHeader(output_header.items, opts.no_header);
+    try writer.flush();
+
+    // Split into N worker chunks aligned to line boundaries
+    const num_cores = try std.Thread.getCpuCount();
+    const n_threads = @min(num_cores, 8);
+    const data_start = header_nl + 1;
+    const data_len = data.len - data_start;
+    const chunk_size = data_len / n_threads;
+
+    var worker_ctxs = try allocator.alloc(ScalarWorkerCtx, n_threads);
+    defer allocator.free(worker_ctxs);
+    var threads = try allocator.alloc(std.Thread, n_threads);
+    defer allocator.free(threads);
+
+    for (0..n_threads) |i| {
+        var start = data_start + i * chunk_size;
+        var end = if (i == n_threads - 1) data.len else data_start + (i + 1) * chunk_size;
+        // Align to line boundaries
+        if (i > 0) {
+            if (std.mem.indexOfScalarPos(u8, data, start, '\n')) |nl| start = nl + 1;
+        }
+        if (i < n_threads - 1) {
+            if (std.mem.indexOfScalarPos(u8, data, end, '\n')) |nl| end = nl + 1;
+        }
+        worker_ctxs[i] = ScalarWorkerCtx{
+            .data = data,
+            .chunk_start = start,
+            .chunk_end = end,
+            .output_specs = output_specs,
+            .lower_header = lower_header,
+            .where_column_idx = where_column_idx,
+            .where_expr = query.where_expr,
+            .delimiter = opts.delimiter,
+            .output_buf = std.ArrayList(u8){},
+            .allocator = allocator,
+        };
+        threads[i] = try std.Thread.spawn(.{}, scalarWorkerThread, .{&worker_ctxs[i]});
+    }
+
+    for (threads) |t| t.join();
+
+    // Propagate errors and stitch buffers
+    for (worker_ctxs) |*ctx| {
+        if (ctx.err) |e| return e;
+    }
+    for (worker_ctxs) |*ctx| {
+        if (ctx.output_buf.items.len > 0)
+            try output_file.writeAll(ctx.output_buf.items);
+        ctx.output_buf.deinit(allocator);
+    }
 }
 
 /// A fully-materialised in-memory table produced by hash-join steps.
@@ -1128,18 +1406,8 @@ fn executeFromStdin(
                     continue;
                 }
             } else {
-                // Complex expressions (AND/OR/NOT) still use HashMap
-                // TODO: Optimize these as well
-                var row_map = std.StringHashMap([]const u8).init(allocator);
-                defer row_map.deinit();
-
-                for (lower_header, 0..) |lower_name, idx| {
-                    if (idx < record.len) {
-                        try row_map.put(lower_name, record[idx]);
-                    }
-                }
-
-                if (!parser.evaluate(expr, row_map)) {
+                // Complex expressions (AND/OR/NOT): evaluate directly without per-row HashMap
+                if (!parser.evaluateDirect(expr, record, lower_header)) {
                     continue;
                 }
             }
@@ -1805,9 +2073,6 @@ fn executeDistinct(
     defer seen.deinit();
     try seen.ensureTotalCapacity(256);
 
-    var fallback_row_map = std.StringHashMap([]const u8).init(allocator);
-    defer fallback_row_map.deinit();
-
     var field_stk: [256][]const u8 = undefined;
     var out_row = try allocator.alloc([]const u8, out_indices.items.len);
     defer allocator.free(out_row);
@@ -1853,11 +2118,7 @@ fn executeDistinct(
                 }
                 if (!matches) continue;
             } else {
-                fallback_row_map.clearRetainingCapacity();
-                for (lower_header, 0..) |lh, i| {
-                    if (i < record.len) try fallback_row_map.put(lh, record[i]);
-                }
-                if (!parser.evaluate(expr, fallback_row_map)) continue;
+                if (!parser.evaluateDirect(expr, record, lower_header)) continue;
             }
         }
 
@@ -2109,8 +2370,6 @@ fn executeScalarAgg(
     const empty_keys = try ka.allocator().alloc([]const u8, 0);
     var accum = try CompactAccum.init(ka.allocator(), empty_keys, n_aggs);
 
-    var fallback_row_map = std.StringHashMap([]const u8).init(allocator);
-    defer fallback_row_map.deinit();
     var field_stk: [256][]const u8 = undefined;
 
     // -- Scan (parallel on large files, sequential on small) --
@@ -2211,11 +2470,7 @@ fn executeScalarAgg(
                     }
                     if (!matches) continue;
                 } else {
-                    fallback_row_map.clearRetainingCapacity();
-                    for (lower_header, 0..) |lh, i| {
-                        if (i < record.len) try fallback_row_map.put(lh, record[i]);
-                    }
-                    if (!parser.evaluate(expr, fallback_row_map)) continue;
+                    if (!parser.evaluateDirect(expr, record, lower_header)) continue;
                 }
             }
 
@@ -2393,7 +2648,6 @@ fn gbProcessRecord(
     aa: Allocator,
     field_stk: *[256][]const u8,
     key_buf: *std.ArrayListUnmanaged(u8),
-    fallback_row_map: *std.StringHashMap([]const u8),
     line: []const u8,
 ) !void {
     const record = splitLine(line, field_stk, ctx.delimiter);
@@ -2423,11 +2677,7 @@ fn gbProcessRecord(
                 if (!parser.compareValues(comp, fv)) return;
             }
         } else {
-            fallback_row_map.clearRetainingCapacity();
-            for (ctx.lower_header, 0..) |lh, i| {
-                if (i < record.len) try fallback_row_map.put(lh, record[i]);
-            }
-            if (!parser.evaluate(expr, fallback_row_map.*)) return;
+            if (!parser.evaluateDirect(expr, record, ctx.lower_header)) return;
         }
     }
 
@@ -2551,7 +2801,6 @@ fn gbWorkerScan(ctx: *GbWorkerCtx) !void {
 
     var field_stk: [256][]const u8 = undefined;
     var key_buf = std.ArrayListUnmanaged(u8){};
-    var fallback_row_map = std.StringHashMap([]const u8).init(aa);
 
     var file_pos: usize = ctx.chunk_start;
     while (file_pos < ctx.chunk_end) {
@@ -2581,14 +2830,14 @@ fn gbWorkerScan(ctx: *GbWorkerCtx) !void {
             if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
             scan = nl + 1;
             if (line.len == 0) continue;
-            try gbProcessRecord(ctx, aa, &field_stk, &key_buf, &fallback_row_map, line);
+            try gbProcessRecord(ctx, aa, &field_stk, &key_buf, line);
         }
     }
     // Flush remaining seam bytes (last line without trailing newline).
     if (seam_buf.items.len > 0) {
         var line: []const u8 = seam_buf.items;
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-        if (line.len > 0) try gbProcessRecord(ctx, aa, &field_stk, &key_buf, &fallback_row_map, line);
+        if (line.len > 0) try gbProcessRecord(ctx, aa, &field_stk, &key_buf, line);
     }
 }
 
@@ -2628,7 +2877,6 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
     var combined_buf = std.ArrayListUnmanaged(u8){};
 
     var field_stk: [256][]const u8 = undefined;
-    var fallback_row_map = std.StringHashMap([]const u8).init(aa);
 
     var file_pos: usize = ctx.chunk_start;
     while (file_pos < ctx.chunk_end) {
@@ -2683,11 +2931,7 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                     }
                     if (!matches) continue;
                 } else {
-                    fallback_row_map.clearRetainingCapacity();
-                    for (ctx.lower_header, 0..) |lh, i| {
-                        if (i < record.len) try fallback_row_map.put(lh, record[i]);
-                    }
-                    if (!parser.evaluate(expr, fallback_row_map)) continue;
+                    if (!parser.evaluateDirect(expr, record, ctx.lower_header)) continue;
                 }
             }
             ctx.partial_accum.count += 1;
@@ -2771,11 +3015,7 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                         if (!parser.compareValues(comp, fv)) break :row;
                     }
                 } else {
-                    fallback_row_map.clearRetainingCapacity();
-                    for (ctx.lower_header, 0..) |lh, i| {
-                        if (i < record.len) try fallback_row_map.put(lh, record[i]);
-                    }
-                    if (!parser.evaluate(expr, fallback_row_map)) break :row;
+                    if (!parser.evaluateDirect(expr, record, ctx.lower_header)) break :row;
                 }
             }
             ctx.partial_accum.count += 1;
@@ -3137,11 +3377,6 @@ fn executeGroupBy(
     // Stack field buffer: zero heap allocation for field splitting per row
     var field_stk: [256][]const u8 = undefined;
 
-    // Fallback HashMap for complex WHERE expressions (AND/OR) — hoisted out of
-    // the hot loop so that only one allocation happens for the entire scan.
-    var fallback_row_map = std.StringHashMap([]const u8).init(allocator);
-    defer fallback_row_map.deinit();
-
     // -- Main scan loop -------------------------------------------------------
     // For large files on multi-core machines: parallel map-reduce.
     // Each thread independently scans its chunk into its own partial_map;
@@ -3283,11 +3518,7 @@ fn executeGroupBy(
                     }
                     if (!matches) continue;
                 } else {
-                    fallback_row_map.clearRetainingCapacity();
-                    for (lower_header, 0..) |lh, i| {
-                        if (i < record.len) try fallback_row_map.put(lh, record[i]);
-                    }
-                    if (!parser.evaluate(expr, fallback_row_map)) continue;
+                    if (!parser.evaluateDirect(expr, record, lower_header)) continue;
                 }
             }
 
@@ -3512,10 +3743,22 @@ fn executeGroupBy(
             defer hav_arena.deinit();
             const ha = hav_arena.allocator();
             var having_map = std.StringHashMap([]const u8).init(ha);
+            // Map alias names (from out_header_list)
             for (out_header_list.items, 0..) |hdr, hi| {
                 const lower_hdr = try ha.alloc(u8, hdr.len);
                 _ = std.ascii.lowerString(lower_hdr, hdr);
                 try having_map.put(lower_hdr, output_row[hi]);
+            }
+            // Also map original column expressions (pre-alias) so that
+            // HAVING COUNT(*) > n works even when the column is aliased AS n.
+            for (query.columns, 0..) |col, hi| {
+                if (hi >= output_row.len) break;
+                const sa = splitAlias(col);
+                const expr_lower = try ha.alloc(u8, sa.expr.len);
+                _ = std.ascii.lowerString(expr_lower, sa.expr);
+                if (!having_map.contains(expr_lower)) {
+                    try having_map.put(expr_lower, output_row[hi]);
+                }
             }
             if (!parser.evaluate(hav_expr, having_map)) continue;
         }
@@ -4900,4 +5143,503 @@ test "INNER JOIN: unknown alias in WHERE returns ColumnNotFound" {
     defer out_file.close();
 
     try std.testing.expectError(error.ColumnNotFound, execute(allocator, query, out_file, .{}));
+}
+
+// ── Scalar SELECT function tests ──────────────────────────────────────────────
+
+test "UPPER: transforms column to uppercase" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("name\nAlice\nbob\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT UPPER(name) FROM '{s}'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "ALICE"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "BOB"));
+}
+
+test "LOWER: transforms column to lowercase" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("name\nALICE\nBOB\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT LOWER(name) FROM '{s}'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "alice"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "bob"));
+}
+
+test "TRIM: strips leading and trailing whitespace" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("name\n  hello  \n  world\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT TRIM(name) FROM '{s}'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "hello"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "world"));
+    // whitespace must not surround the values in the output
+    try std.testing.expect(!std.mem.containsAtLeast(u8, data, 1, "  hello  "));
+}
+
+test "LENGTH: returns string length as integer" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("name\nAlice\nBo\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT LENGTH(name) FROM '{s}'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "5")); // len("Alice")
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "2")); // len("Bo")
+}
+
+test "SUBSTR: extracts substring (1-based start index)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("name\nAlice\nBobby\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT SUBSTR(name,1,3) FROM '{s}'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "Ali"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "Bob"));
+}
+
+test "ABS: returns absolute value of negative numbers" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("n\n-42\n7\n-5\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT ABS(n) FROM '{s}'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "42"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "7"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "5"));
+    // negative sign must be gone
+    try std.testing.expect(!std.mem.containsAtLeast(u8, data, 1, "-42"));
+}
+
+test "CEIL: rounds up and emits .0 suffix" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("v\n42.3\n7.0\n-1.7\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT CEIL(v) FROM '{s}'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "43.0"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "7.0"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "-1.0"));
+}
+
+test "FLOOR: rounds down and emits .0 suffix" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("v\n42.9\n7.0\n-1.2\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT FLOOR(v) FROM '{s}'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "42.0"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "7.0"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "-2.0"));
+}
+
+test "MOD: returns remainder" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("n\n10\n9\n6\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT MOD(n,3) FROM '{s}'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "1")); // 10 % 3 = 1
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "0")); // 9 % 3 = 0 and 6 % 3 = 0
+}
+
+test "COALESCE: returns fallback for empty field" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("name\n\nBob\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT COALESCE(name,'unknown') FROM '{s}'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "unknown"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "Bob"));
+}
+
+test "CAST AS INT: truncates float to integer" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("v\n3.7\n-2.1\n5.0\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT CAST(v AS INT) FROM '{s}'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "3"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "-2"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "5"));
+    // decimal form must not appear in the output
+    try std.testing.expect(!std.mem.containsAtLeast(u8, data, 1, "3.7"));
+}
+
+test "CAST AS TEXT: passes value through unchanged" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("v\nhello\n42\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT CAST(v AS TEXT) FROM '{s}'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "hello"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "42"));
+}
+
+test "scalar AS alias: output header uses alias name" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("name\nAlice\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT UPPER(name) AS uname FROM '{s}'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "uname"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "ALICE"));
+}
+
+test "ILIKE WHERE: case-insensitive match filters rows" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("name\nAlice\nBob\nalice\nALICE\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT name FROM '{s}' WHERE name ILIKE 'alice'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    // all three alice variants must appear
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "Alice"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "alice"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "ALICE"));
+    // Bob must be absent
+    try std.testing.expect(!std.mem.containsAtLeast(u8, data, 1, "Bob"));
+}
+
+test "WHERE AND: evaluateDirect filters with compound condition" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("name,age\nAlice,30\nBob,25\nCarol,30\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT name FROM '{s}' WHERE age = 30 AND name != 'Carol'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "Alice"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, data, 1, "Bob"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, data, 1, "Carol"));
+}
+
+test "WHERE OR: evaluateDirect passes rows matching either branch" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("name,city\nAlice,NYC\nBob,LA\nCarol,NYC\nDave,Chicago\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT name FROM '{s}' WHERE city = 'NYC' OR city = 'LA'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "Alice"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "Bob"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "Carol"));
+    try std.testing.expect(!std.mem.containsAtLeast(u8, data, 1, "Dave"));
 }

@@ -926,6 +926,34 @@ pub fn evaluate(expr: Expression, row: std.StringHashMap([]const u8)) bool {
     }
 }
 
+/// Fast expression evaluation without HashMap construction.
+/// Takes the parsed field array and lowercase column-name array directly.
+/// Avoids per-row heap allocation for AND/OR/NOT WHERE clauses in hot loops.
+pub fn evaluateDirect(expr: Expression, fields: []const []const u8, lower_header: []const []const u8) bool {
+    switch (expr) {
+        .comparison => |comp| {
+            for (lower_header, 0..) |col, i| {
+                if (std.mem.eql(u8, col, comp.column)) {
+                    const value = if (i < fields.len) fields[i] else "";
+                    return compareValues(comp, value);
+                }
+            }
+            return false;
+        },
+        .binary => |bin| {
+            return switch (bin.op) {
+                .@"and" => evaluateDirect(bin.left, fields, lower_header) and
+                    evaluateDirect(bin.right, fields, lower_header),
+                .@"or" => evaluateDirect(bin.left, fields, lower_header) or
+                    evaluateDirect(bin.right, fields, lower_header),
+            };
+        },
+        .unary => |un| {
+            return !evaluateDirect(un.expr, fields, lower_header);
+        },
+    }
+}
+
 pub fn compareValues(comp: Comparison, candidate: []const u8) bool {
     // IS NULL / IS NOT NULL
     if (comp.operator == .is_null) return candidate.len == 0;

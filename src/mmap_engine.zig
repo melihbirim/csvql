@@ -251,14 +251,9 @@ pub fn executeMapped(
                                     .between, .is_null, .is_not_null => parser.compareValues(comp, field_value),
                                 };
                             } else {
-                                matches = switch (comp.operator) {
-                                    .equal => std.mem.eql(u8, field_value, comp.value),
-                                    .not_equal => !std.mem.eql(u8, field_value, comp.value),
-                                    .like => parser.matchLike(field_value, comp.value),
-                                    .ilike => parser.matchILike(field_value, comp.value),
-                                    .between, .is_null, .is_not_null => parser.compareValues(comp, field_value),
-                                    else => false,
-                                };
+                                // Delegate to compareValues which handles IN, BETWEEN,
+                                // IS NULL/NOT NULL, LIKE, ILIKE, and normal comparisons.
+                                matches = parser.compareValues(comp, field_value);
                             }
                             if (!matches) {
                                 line_start += line_end + 1;
@@ -273,15 +268,7 @@ pub fn executeMapped(
                         continue;
                     }
                 } else {
-                    // Complex WHERE — use HashMap fallback
-                    var row_map = std.StringHashMap([]const u8).init(allocator);
-                    defer row_map.deinit();
-                    for (lower_header, 0..) |lower_name, idx| {
-                        if (idx < fields.len) {
-                            try row_map.put(lower_name, fields[idx]);
-                        }
-                    }
-                    if (!parser.evaluate(expr, row_map)) {
+                    if (!parser.evaluateDirect(expr, fields, lower_header)) {
                         line_start += line_end + 1;
                         continue;
                     }

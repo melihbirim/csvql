@@ -333,3 +333,71 @@ test "quoted filename containing join keyword is not flagged as UnsupportedJoinT
     try std.testing.expectEqual(@as(usize, 1), query.joins.len);
     try std.testing.expectEqualStrings("/tmp/left join.csv", query.file_path);
 }
+
+// ── ILIKE and evaluateDirect tests ──────────────────────────────────────────
+
+test "ILIKE: parser recognises ILIKE operator" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(allocator, "SELECT name FROM 'test.csv' WHERE name ILIKE 'alice'");
+    defer query.deinit();
+
+    const where = query.where_expr orelse return error.TestUnexpectedNull;
+    const comp = switch (where) {
+        .comparison => |c| c,
+        else => return error.TestUnexpectedResult,
+    };
+    try std.testing.expectEqual(parser.Operator.ilike, comp.operator);
+    try std.testing.expectEqualStrings("name", comp.column);
+    try std.testing.expectEqualStrings("alice", comp.value);
+}
+
+test "evaluateDirect: AND passes when both conditions true" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(allocator, "SELECT * FROM 'test.csv' WHERE age = 30 AND city = 'NYC'");
+    defer query.deinit();
+
+    const where = query.where_expr orelse return error.TestUnexpectedNull;
+    const header = [_][]const u8{ "age", "city" };
+    const fields = [_][]const u8{ "30", "NYC" };
+    try std.testing.expect(parser.evaluateDirect(where, &fields, &header));
+
+    const fields_no = [_][]const u8{ "25", "NYC" };
+    try std.testing.expect(!parser.evaluateDirect(where, &fields_no, &header));
+}
+
+test "evaluateDirect: OR passes when at least one condition true" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(allocator, "SELECT * FROM 'test.csv' WHERE city = 'NYC' OR city = 'LA'");
+    defer query.deinit();
+
+    const where = query.where_expr orelse return error.TestUnexpectedNull;
+    const header = [_][]const u8{"city"};
+
+    const fields_nyc = [_][]const u8{"NYC"};
+    try std.testing.expect(parser.evaluateDirect(where, &fields_nyc, &header));
+
+    const fields_la = [_][]const u8{"LA"};
+    try std.testing.expect(parser.evaluateDirect(where, &fields_la, &header));
+
+    const fields_chi = [_][]const u8{"Chicago"};
+    try std.testing.expect(!parser.evaluateDirect(where, &fields_chi, &header));
+}
+
+test "evaluateDirect: NOT negates condition" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(allocator, "SELECT * FROM 'test.csv' WHERE NOT city = 'NYC'");
+    defer query.deinit();
+
+    const where = query.where_expr orelse return error.TestUnexpectedNull;
+    const header = [_][]const u8{"city"};
+
+    const fields_nyc = [_][]const u8{"NYC"};
+    try std.testing.expect(!parser.evaluateDirect(where, &fields_nyc, &header));
+
+    const fields_la = [_][]const u8{"LA"};
+    try std.testing.expect(parser.evaluateDirect(where, &fields_la, &header));
+}

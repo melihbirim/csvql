@@ -267,13 +267,13 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
             const v = field(record, cidx);
             const n = std.fmt.parseFloat(f64, v) catch return v;
             const buf = arena.alloc(u8, 32) catch return v;
-            return fmtNum(buf, @ceil(n));
+            return fmtFloat(buf, @ceil(n));
         },
         .floor => |cidx| {
             const v = field(record, cidx);
             const n = std.fmt.parseFloat(f64, v) catch return v;
             const buf = arena.alloc(u8, 32) catch return v;
-            return fmtNum(buf, @floor(n));
+            return fmtFloat(buf, @floor(n));
         },
         .mod_op => |args| {
             const v = field(record, args.col_idx);
@@ -344,6 +344,15 @@ fn resolveCol(col_str: []const u8, column_map: std.StringHashMap(usize), allocat
 pub fn fmtNum(buf: []u8, n: f64) []const u8 {
     if (n == @trunc(n) and n >= -1e15 and n <= 1e15) {
         return std.fmt.bufPrint(buf, "{d}", .{@as(i64, @intFromFloat(n))}) catch buf[0..0];
+    }
+    return std.fmt.bufPrint(buf, "{d}", .{n}) catch buf[0..0];
+}
+
+/// Like fmtNum but always emits a decimal point (e.g. "101055.0").
+/// Used for CEIL/FLOOR which always return DOUBLE in SQL.
+pub fn fmtFloat(buf: []u8, n: f64) []const u8 {
+    if (n == @trunc(n) and n >= -1e15 and n <= 1e15) {
+        return std.fmt.bufPrint(buf, "{d}.0", .{@as(i64, @intFromFloat(n))}) catch buf[0..0];
     }
     return std.fmt.bufPrint(buf, "{d}", .{n}) catch buf[0..0];
 }
