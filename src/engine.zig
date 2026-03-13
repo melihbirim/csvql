@@ -1065,11 +1065,58 @@ const StrftimeSpec = struct {
     header: []const u8, // allocator-owned display name, e.g. "STRFTIME('%Y-%m', order_date)"
 };
 
+const SubstrSpec = struct {
+    col_idx: usize,
+    start: usize, // 1-based SQL start position
+    length: ?usize, // null = to end of string
+    header: []const u8, // allocator-owned display name
+};
+
 /// Describes how a single GROUP BY key is extracted from a CSV row.
 const GroupSpec = union(enum) {
     column: usize, // plain CSV column index
     strftime: StrftimeSpec, // STRFTIME transform applied to a column value
+    substr: SubstrSpec, // SUBSTR(col, start[, length]) extraction
 };
+
+/// Parse a SUBSTR(col, start[, length]) expression. Returns an allocator-owned SubstrSpec
+/// on success, or null if `raw` is not a SUBSTR call.
+fn parseSubstrRaw(allocator: Allocator, raw: []const u8, column_map: std.StringHashMap(usize)) !?SubstrSpec {
+    if (raw.len < 8 or !std.ascii.startsWithIgnoreCase(raw, "SUBSTR(")) return null;
+    const after = raw[7..]; // skip "SUBSTR("
+    const close = std.mem.lastIndexOfScalar(u8, after, ')') orelse return error.InvalidQuery;
+    const inner = std.mem.trim(u8, after[0..close], &std.ascii.whitespace);
+    // Split arguments (col, start[, length]) — simple comma split safe here (no nested parens)
+    var args_it = std.mem.splitScalar(u8, inner, ',');
+    const col_raw_opt = args_it.next();
+    const start_raw_opt = args_it.next();
+    const length_raw_opt = args_it.next();
+    const col_raw = std.mem.trim(u8, col_raw_opt orelse return error.InvalidQuery, &std.ascii.whitespace);
+    const start_raw = std.mem.trim(u8, start_raw_opt orelse return error.InvalidQuery, &std.ascii.whitespace);
+    const col_lower = try allocator.alloc(u8, col_raw.len);
+    defer allocator.free(col_lower);
+    _ = std.ascii.lowerString(col_lower, col_raw);
+    const col_idx = column_map.get(col_lower) orelse return error.ColumnNotFound;
+    const start_1based = std.fmt.parseInt(usize, start_raw, 10) catch return error.InvalidQuery;
+    const length: ?usize = if (length_raw_opt) |lr| blk: {
+        const lt = std.mem.trim(u8, lr, &std.ascii.whitespace);
+        break :blk std.fmt.parseInt(usize, lt, 10) catch return error.InvalidQuery;
+    } else null;
+    return SubstrSpec{
+        .col_idx = col_idx,
+        .start = if (start_1based > 0) start_1based - 1 else 0, // convert to 0-based
+        .length = length,
+        .header = try allocator.dupe(u8, raw),
+    };
+}
+
+/// Apply SUBSTR extraction to a string value.
+fn applySubstr(spec: SubstrSpec, s: []const u8) []const u8 {
+    if (spec.start >= s.len) return "";
+    const tail = s[spec.start..];
+    if (spec.length) |len| return tail[0..@min(len, tail.len)];
+    return tail;
+}
 
 /// Parse a STRFTIME('fmt', col) expression.  Returns an allocator-owned StrftimeSpec
 /// on success, or null if `raw` is not a STRFTIME call.  The fmt and header fields
@@ -1921,6 +1968,10 @@ fn gbProcessRecord(
                 applyStrftime(sf.fmt, record[sf.col_idx], &date_buf)
             else
                 "",
+            .substr => |ss| if (ss.col_idx < record.len)
+                applySubstr(ss, record[ss.col_idx])
+            else
+                "",
         };
         try key_buf.appendSlice(aa, val);
     }
@@ -1935,6 +1986,10 @@ fn gbProcessRecord(
                 .column => |cidx| if (cidx < record.len) record[cidx] else "",
                 .strftime => |sf| if (sf.col_idx < record.len)
                     applyStrftime(sf.fmt, record[sf.col_idx], &date_buf_kv)
+                else
+                    "",
+                .substr => |ss| if (ss.col_idx < record.len)
+                    applySubstr(ss, record[ss.col_idx])
                 else
                     "",
             };
@@ -2325,6 +2380,7 @@ fn executeGroupBy(
                     allocator.free(sf.fmt);
                     allocator.free(sf.header);
                 },
+                .substr => |ss| allocator.free(ss.header),
             }
         }
         allocator.free(group_specs);
@@ -2332,6 +2388,8 @@ fn executeGroupBy(
     for (query.group_by, 0..) |col, i| {
         if (try parseStrftimeRaw(allocator, col, column_map)) |sf| {
             group_specs[i] = .{ .strftime = sf };
+        } else if (try parseSubstrRaw(allocator, col, column_map)) |ss| {
+            group_specs[i] = .{ .substr = ss };
         } else {
             const lower = try allocator.alloc(u8, col.len);
             defer allocator.free(lower);
@@ -2364,6 +2422,10 @@ fn executeGroupBy(
                 .strftime => |sf| {
                     try col_kinds.append(allocator, .{ .group_key = gi });
                     try out_header_list.append(allocator, sf.header);
+                },
+                .substr => |ss| {
+                    try col_kinds.append(allocator, .{ .group_key = gi });
+                    try out_header_list.append(allocator, ss.header);
                 },
             }
         }
@@ -2398,14 +2460,19 @@ fn executeGroupBy(
                     try col_kinds.append(allocator, .{ .regular = cidx });
                     try out_header_list.append(allocator, header[cidx]);
                 } else {
-                    // Maybe a STRFTIME expression that also appears in GROUP BY
+                    // Maybe a STRFTIME/SUBSTR expression that also appears in GROUP BY
                     var gi_found: ?usize = null;
-                    var sf_hdr: []const u8 = "";
+                    var fn_hdr: []const u8 = "";
                     for (group_specs, 0..) |spec, gi| {
                         switch (spec) {
                             .strftime => |sf| if (std.ascii.eqlIgnoreCase(col, sf.header)) {
                                 gi_found = gi;
-                                sf_hdr = sf.header;
+                                fn_hdr = sf.header;
+                                break;
+                            },
+                            .substr => |ss| if (std.ascii.eqlIgnoreCase(col, ss.header)) {
+                                gi_found = gi;
+                                fn_hdr = ss.header;
                                 break;
                             },
                             else => {},
@@ -2413,7 +2480,7 @@ fn executeGroupBy(
                     }
                     if (gi_found) |gi| {
                         try col_kinds.append(allocator, .{ .group_key = gi });
-                        try out_header_list.append(allocator, sf_hdr);
+                        try out_header_list.append(allocator, fn_hdr);
                     } else {
                         return error.ColumnNotFound;
                     }
@@ -2592,6 +2659,10 @@ fn executeGroupBy(
                         applyStrftime(sf.fmt, record[sf.col_idx], &date_buf)
                     else
                         "",
+                    .substr => |ss| if (ss.col_idx < record.len)
+                        applySubstr(ss, record[ss.col_idx])
+                    else
+                        "",
                 };
                 try key_buf.appendSlice(allocator, val);
             }
@@ -2608,6 +2679,10 @@ fn executeGroupBy(
                         .column => |cidx| if (cidx < record.len) record[cidx] else "",
                         .strftime => |sf| if (sf.col_idx < record.len)
                             applyStrftime(sf.fmt, record[sf.col_idx], &date_buf_kv)
+                        else
+                            "",
+                        .substr => |ss| if (ss.col_idx < record.len)
+                            applySubstr(ss, record[ss.col_idx])
                         else
                             "",
                     };
@@ -2730,7 +2805,7 @@ fn executeGroupBy(
                     for (group_specs, 0..) |spec, gi| {
                         switch (spec) {
                             .column => |gcidx| if (gcidx == cidx) break :blk accum.key_values[gi],
-                            .strftime => {},
+                            .strftime, .substr => {},
                         }
                     }
                     break :blk "";
