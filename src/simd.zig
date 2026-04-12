@@ -141,8 +141,8 @@ pub fn parseFloatsBatch(strings: []const []const u8, results: []f64) !void {
     }
 }
 
-/// Fast SIMD-optimized newline search
-/// Uses vectorized comparison for faster scanning of large buffers
+/// Newline search — delegates to std.mem.indexOfScalar in all cases.
+/// The "chunk size" branching has no effect; both branches call the same function.
 pub inline fn findNewline(haystack: []const u8, start: usize) ?usize {
     if (start >= haystack.len) return null;
 

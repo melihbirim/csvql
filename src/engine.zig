@@ -26,7 +26,16 @@ const SortRowOffsets = struct {
     line_len: usize,
 };
 
-/// Arena buffer for ORDER BY — single large allocation instead of per-field allocs
+/// Growable byte buffer for accumulating ORDER BY output lines.
+/// Uses a single backing allocation that doubles on overflow to minimise
+/// allocator calls on large result sets.
+///
+/// IMPORTANT — slice lifetime: `append` may reallocate `data`, which
+/// invalidates any previously returned slice. Callers that need to
+/// reference multiple appended regions while still accumulating MUST
+/// store (start, len) offsets into `data` and convert to slices only
+/// AFTER the final `append`. Storing raw slices across appends leads
+/// to dangling pointers. See SortRowOffsets for the canonical usage pattern.
 const ArenaBuffer = struct {
     data: []u8,
     pos: usize,
