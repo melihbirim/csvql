@@ -77,3 +77,85 @@ pub fn parseCSVFields(line: []const u8, fields: *std.ArrayList([]const u8), allo
     }
     try fields.append(allocator, line[start..]);
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+test "parseIntFast: valid positive integer" {
+    try std.testing.expectEqual(@as(i64, 42), try parseIntFast("42"));
+}
+
+test "parseIntFast: valid negative integer" {
+    try std.testing.expectEqual(@as(i64, -7), try parseIntFast("-7"));
+}
+
+test "parseIntFast: explicit plus sign" {
+    try std.testing.expectEqual(@as(i64, 10), try parseIntFast("+10"));
+}
+
+test "parseIntFast: leading and trailing whitespace" {
+    try std.testing.expectEqual(@as(i64, 99), try parseIntFast("  99  "));
+}
+
+test "parseIntFast: float string returns error" {
+    try std.testing.expectError(error.InvalidInput, parseIntFast("1117.43"));
+}
+
+test "parseIntFast: empty string returns error" {
+    try std.testing.expectError(error.InvalidInput, parseIntFast(""));
+}
+
+test "stringsEqualFast: equal strings" {
+    try std.testing.expect(stringsEqualFast("hello", "hello"));
+}
+
+test "stringsEqualFast: different strings" {
+    try std.testing.expect(!stringsEqualFast("hello", "world"));
+}
+
+test "stringsEqualFast: different lengths" {
+    try std.testing.expect(!stringsEqualFast("hi", "hii"));
+}
+
+test "stringsEqualFast: long strings equal (>16 chars)" {
+    try std.testing.expect(stringsEqualFast("abcdefghijklmnopq", "abcdefghijklmnopq"));
+}
+
+test "stringsEqualFast: long strings not equal" {
+    try std.testing.expect(!stringsEqualFast("abcdefghijklmnopq", "abcdefghijklmnopX"));
+}
+
+test "parseCSVFields: basic split small line" {
+    var fields = std.ArrayList([]const u8){};
+    defer fields.deinit(std.testing.allocator);
+    try parseCSVFields("a,b,c", &fields, std.testing.allocator, ',');
+    try std.testing.expectEqual(@as(usize, 3), fields.items.len);
+    try std.testing.expectEqualStrings("a", fields.items[0]);
+    try std.testing.expectEqualStrings("b", fields.items[1]);
+    try std.testing.expectEqualStrings("c", fields.items[2]);
+}
+
+test "parseCSVFields: single field no delimiter" {
+    var fields = std.ArrayList([]const u8){};
+    defer fields.deinit(std.testing.allocator);
+    try parseCSVFields("onlyfield", &fields, std.testing.allocator, ',');
+    try std.testing.expectEqual(@as(usize, 1), fields.items.len);
+    try std.testing.expectEqualStrings("onlyfield", fields.items[0]);
+}
+
+test "parseCSVFields: large line uses position-first path" {
+    // Line longer than 32 bytes to exercise the comma_positions_buf path
+    var fields = std.ArrayList([]const u8){};
+    defer fields.deinit(std.testing.allocator);
+    try parseCSVFields("field_one,field_two,field_three,field_four", &fields, std.testing.allocator, ',');
+    try std.testing.expectEqual(@as(usize, 4), fields.items.len);
+    try std.testing.expectEqualStrings("field_one", fields.items[0]);
+    try std.testing.expectEqualStrings("field_four", fields.items[3]);
+}
+
+test "parseCSVFields: custom delimiter" {
+    var fields = std.ArrayList([]const u8){};
+    defer fields.deinit(std.testing.allocator);
+    try parseCSVFields("x|y|z", &fields, std.testing.allocator, '|');
+    try std.testing.expectEqual(@as(usize, 3), fields.items.len);
+    try std.testing.expectEqualStrings("y", fields.items[1]);
+}

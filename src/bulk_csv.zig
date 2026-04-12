@@ -232,3 +232,28 @@ test "parseLineSlices returns exactly 256 fields for a 256-column row" {
     const fields = try reader.parseLineSlices(line_buf[0..pos]);
     try std.testing.expectEqual(@as(usize, 256), fields.len);
 }
+
+test "parseLineSlices: single field with no delimiter" {
+    var reader: BulkCsvReader = undefined;
+    reader.delimiter = ',';
+    const fields = try reader.parseLineSlices("onlyvalue");
+    try std.testing.expectEqual(@as(usize, 1), fields.len);
+    try std.testing.expectEqualStrings("onlyvalue", fields[0]);
+}
+
+test "parseLineSlices: empty line returns one empty field" {
+    var reader: BulkCsvReader = undefined;
+    reader.delimiter = ',';
+    const fields = try reader.parseLineSlices("");
+    try std.testing.expectEqual(@as(usize, 1), fields.len);
+    try std.testing.expectEqualStrings("", fields[0]);
+}
+
+test "parseLineSlices: custom tab delimiter" {
+    var reader: BulkCsvReader = undefined;
+    reader.delimiter = '\t';
+    const fields = try reader.parseLineSlices("col1\tcol2\tcol3");
+    try std.testing.expectEqual(@as(usize, 3), fields.len);
+    try std.testing.expectEqualStrings("col1", fields[0]);
+    try std.testing.expectEqualStrings("col3", fields[2]);
+}

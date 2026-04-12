@@ -64,3 +64,58 @@ pub fn appendJsonStringToArena(arena: *ArenaBuffer, s: []const u8) !void {
     }
     _ = try arena.append("\"");
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+
+test "ArenaBuffer: basic append and read back" {
+    var buf = try ArenaBuffer.init(std.testing.allocator, 64);
+    defer buf.deinit();
+    const s = try buf.append("hello");
+    try std.testing.expectEqualStrings("hello", s);
+}
+
+test "ArenaBuffer: multiple appends stay valid after grow" {
+    // Start with tiny initial size to force a realloc mid-way
+    var buf = try ArenaBuffer.init(std.testing.allocator, 4);
+    defer buf.deinit();
+
+    // Record offsets before appending (slice-after-grow pattern)
+    const off1_start = buf.pos;
+    _ = try buf.append("abc");
+    const off1_end = buf.pos;
+    const off2_start = buf.pos;
+    _ = try buf.append("defghijklmnopqrstu"); // triggers realloc
+    const off2_end = buf.pos;
+
+    // Convert offsets to slices AFTER all appends
+    try std.testing.expectEqualStrings("abc", buf.data[off1_start..off1_end]);
+    try std.testing.expectEqualStrings("defghijklmnopqrstu", buf.data[off2_start..off2_end]);
+}
+
+test "appendJsonStringToArena: plain string" {
+    var buf = try ArenaBuffer.init(std.testing.allocator, 64);
+    defer buf.deinit();
+    try appendJsonStringToArena(&buf, "hello");
+    try std.testing.expectEqualStrings("\"hello\"", buf.data[0..buf.pos]);
+}
+
+test "appendJsonStringToArena: escapes double-quote and backslash" {
+    var buf = try ArenaBuffer.init(std.testing.allocator, 64);
+    defer buf.deinit();
+    try appendJsonStringToArena(&buf, "say \"hi\" \\now");
+    try std.testing.expectEqualStrings("\"say \\\"hi\\\" \\\\now\"", buf.data[0..buf.pos]);
+}
+
+test "appendJsonStringToArena: escapes newline and tab" {
+    var buf = try ArenaBuffer.init(std.testing.allocator, 64);
+    defer buf.deinit();
+    try appendJsonStringToArena(&buf, "line1\nline2\ttabbed");
+    try std.testing.expectEqualStrings("\"line1\\nline2\\ttabbed\"", buf.data[0..buf.pos]);
+}
+
+test "appendJsonStringToArena: escapes control character as \\uXXXX" {
+    var buf = try ArenaBuffer.init(std.testing.allocator, 64);
+    defer buf.deinit();
+    try appendJsonStringToArena(&buf, "\x01");
+    try std.testing.expectEqualStrings("\"\\u0001\"", buf.data[0..buf.pos]);
+}

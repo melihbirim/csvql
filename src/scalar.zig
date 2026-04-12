@@ -622,3 +622,38 @@ test "COALESCE 3-arg returns first non-empty column" {
     // phone has value → return immediately
     try std.testing.expectEqualStrings("555-1234", eval(spec, &.{ "555-1234", "user@example.com" }, fba.allocator()));
 }
+
+test "COALESCE: whitespace-only field is treated as empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var column_map = std.StringHashMap(usize).init(allocator);
+    try column_map.put("val", 0);
+
+    const spec = (try tryParseScalar("COALESCE(val, 'default')", column_map, allocator)).?;
+
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+
+    try std.testing.expectEqualStrings("default", eval(spec, &.{"   "}, fba.allocator()));
+}
+
+test "COALESCE: returns error.TooManyArgs for more than 8 column args" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var column_map = std.StringHashMap(usize).init(allocator);
+    for (0..9) |i| {
+        var name_buf: [8]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "c{d}", .{i});
+        try column_map.put(try allocator.dupe(u8, name), i);
+    }
+
+    // 9 column args exceeds the inline buffer limit of 8
+    try std.testing.expectError(
+        error.TooManyArgs,
+        tryParseScalar("COALESCE(c0, c1, c2, c3, c4, c5, c6, c7, c8, 'x')", column_map, allocator),
+    );
+}
