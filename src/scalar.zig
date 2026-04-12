@@ -494,7 +494,9 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
                 4 => std.fmt.bufPrint(buf, "{d:.4}", .{rounded}) catch v,
                 5 => std.fmt.bufPrint(buf, "{d:.5}", .{rounded}) catch v,
                 6 => std.fmt.bufPrint(buf, "{d:.6}", .{rounded}) catch v,
-                else => std.fmt.bufPrint(buf, "{d}", .{rounded}) catch v,
+                7 => std.fmt.bufPrint(buf, "{d:.7}", .{rounded}) catch v,
+                8 => std.fmt.bufPrint(buf, "{d:.8}", .{rounded}) catch v,
+                else => std.fmt.bufPrint(buf, "{d:.9}", .{rounded}) catch v,
             };
         },
         .extract => |args| {
@@ -656,4 +658,23 @@ test "COALESCE: returns error.TooManyArgs for more than 8 column args" {
         error.TooManyArgs,
         tryParseScalar("COALESCE(c0, c1, c2, c3, c4, c5, c6, c7, c8, 'x')", column_map, allocator),
     );
+}
+
+test "ROUND: digits > 6 produces correct decimal places" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var column_map = std.StringHashMap(usize).init(allocator);
+    try column_map.put("val", 0);
+
+    const spec7 = (try tryParseScalar("ROUND(val, 7)", column_map, allocator)).?;
+    const spec9 = (try tryParseScalar("ROUND(val, 9)", column_map, allocator)).?;
+
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+
+    try std.testing.expectEqualStrings("1.0000000", eval(spec7, &.{"1.0"}, fba.allocator()));
+    fba.reset();
+    try std.testing.expectEqualStrings("1.000000000", eval(spec9, &.{"1.0"}, fba.allocator()));
 }
