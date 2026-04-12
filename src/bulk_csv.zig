@@ -139,13 +139,13 @@ pub const BulkCsvReader = struct {
                 }
                 const line = self.buffer[search_start..line_end];
                 self.line_start = search_start + pos + 1;
-                return self.parseLineSlices(line);
+                return try self.parseLineSlices(line);
             } else {
                 if (self.eof) {
                     if (self.line_start < self.buffer_len) {
                         const line = self.buffer[self.line_start..self.buffer_len];
                         self.line_start = self.buffer_len;
-                        return self.parseLineSlices(line);
+                        return try self.parseLineSlices(line);
                     }
                     return null;
                 }
@@ -156,11 +156,11 @@ pub const BulkCsvReader = struct {
     }
 
     /// Parse a line into field_buf without any allocation
-    fn parseLineSlices(self: *BulkCsvReader, line: []const u8) []const []const u8 {
+    fn parseLineSlices(self: *BulkCsvReader, line: []const u8) ![]const []const u8 {
         var count: usize = 0;
         var iter = std.mem.splitScalar(u8, line, self.delimiter);
         while (iter.next()) |field| {
-            if (count >= self.field_buf.len) break;
+            if (count >= self.field_buf.len) return error.TooManyColumns;
             self.field_buf[count] = field;
             count += 1;
         }
