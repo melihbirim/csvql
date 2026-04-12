@@ -8,7 +8,16 @@ const Allocator = std.mem.Allocator;
 /// Sort entry for ORDER BY — uses fast_sort SortKey
 const MmapSortEntry = fast_sort.SortKey;
 
-/// Arena buffer for building CSV lines
+/// Growable byte buffer for accumulating CSV/JSON output lines.
+/// Uses a single backing allocation that doubles on overflow to minimise
+/// allocator calls on large result sets.
+///
+/// IMPORTANT — slice lifetime: `append` may reallocate `data`, which
+/// invalidates any previously returned slice. Callers that need to
+/// reference multiple appended regions while still accumulating MUST
+/// store (start, len) offsets into `data` and convert to slices only
+/// AFTER the final `append`. Storing raw slices across appends leads
+/// to dangling pointers.
 const ArenaBuffer = struct {
     data: []u8,
     pos: usize,
