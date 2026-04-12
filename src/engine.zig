@@ -3729,7 +3729,9 @@ fn executeGroupBy(
                         .cast_text => |*ci| ci.* = 0,
                         .substr => |*a| a.col_idx = 0,
                         .mod_op => |*a| a.col_idx = 0,
-                        .coalesce => |*a| a.col_idx = 0,
+                        .coalesce => |*a| {
+                            for (a.colsMut()) |*ci| ci.* = 0;
+                        },
                         .datediff => |*a| {
                             a.start_col = 0;
                             a.end_col = 0;

@@ -48,10 +48,19 @@ pub const ScalarSpec = union(enum) {
         divisor: f64,
     };
 
-    /// cols is allocated from the parse-time allocator; fallback borrows from the query string.
+    /// Inline fixed-size buffer — no heap allocation. Supports up to 8 column args.
     pub const CoalesceArgs = struct {
-        cols: []const usize,
+        cols_buf: [8]usize = undefined,
+        cols_len: usize,
         fallback: []const u8,
+
+        pub fn cols(self: *const CoalesceArgs) []const usize {
+            return self.cols_buf[0..self.cols_len];
+        }
+
+        pub fn colsMut(self: *CoalesceArgs) []usize {
+            return self.cols_buf[0..self.cols_len];
+        }
     };
 
     pub const DatediffArgs = struct {
@@ -82,7 +91,7 @@ pub const ScalarSpec = union(enum) {
             .upper, .lower, .trim, .length, .abs, .ceil, .floor, .cast_int, .cast_float, .cast_text => |i| i,
             .substr => |a| a.col_idx,
             .mod_op => |a| a.col_idx,
-            .coalesce => |a| a.cols[0],
+            .coalesce => |a| a.cols()[0],
             .datediff => |a| a.start_col, // return first column
             .dateadd => |a| a.date_col,
             .extract => |a| a.date_col,
@@ -204,26 +213,26 @@ pub fn tryParseScalar(
 
     // ── COALESCE ───────────────────────────────────────────────────────────
     if (std.mem.eql(u8, fn_lower, "coalesce")) {
-        var cols = std.ArrayList(usize){};
-        defer cols.deinit(allocator);
+        var args = ScalarSpec.CoalesceArgs{ .cols_len = 0, .fallback = "" };
         var fallback: []const u8 = "";
 
         var it = std.mem.splitScalar(u8, args_str, ',');
         while (it.next()) |token| {
             const arg = std.mem.trim(u8, token, &std.ascii.whitespace);
             if (arg.len >= 2 and arg[0] == '\'' and arg[arg.len - 1] == '\'') {
-                // Quoted string literal — use as fallback (last one wins)
                 fallback = arg[1 .. arg.len - 1];
             } else {
+                if (args.cols_len >= args.cols_buf.len) return error.TooManyArgs;
                 const cidx = try resolveCol(arg, column_map, allocator) orelse
                     return error.ColumnNotFound;
-                try cols.append(allocator, cidx);
+                args.cols_buf[args.cols_len] = cidx;
+                args.cols_len += 1;
             }
         }
 
-        if (cols.items.len == 0) return null;
-
-        return .{ .coalesce = .{ .cols = try cols.toOwnedSlice(allocator), .fallback = fallback } };
+        if (args.cols_len == 0) return null;
+        args.fallback = fallback;
+        return .{ .coalesce = args };
     }
 
     // ── CAST ───────────────────────────────────────────────────────────────
@@ -392,7 +401,7 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
             return fmtNum(buf, @mod(n, args.divisor));
         },
         .coalesce => |args| {
-            for (args.cols) |cidx| {
+            for (args.cols()) |cidx| {
                 const v = field(record, cidx);
                 if (std.mem.trim(u8, v, &std.ascii.whitespace).len > 0) return v;
             }
