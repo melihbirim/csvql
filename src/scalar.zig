@@ -204,8 +204,8 @@ pub fn tryParseScalar(
 
     // ── COALESCE ───────────────────────────────────────────────────────────
     if (std.mem.eql(u8, fn_lower, "coalesce")) {
-        var cols = std.ArrayList(usize).init(allocator);
-        defer cols.deinit();
+        var cols = std.ArrayList(usize){};
+        defer cols.deinit(allocator);
         var fallback: []const u8 = "";
 
         var it = std.mem.splitScalar(u8, args_str, ',');
@@ -217,13 +217,13 @@ pub fn tryParseScalar(
             } else {
                 const cidx = try resolveCol(arg, column_map, allocator) orelse
                     return error.ColumnNotFound;
-                try cols.append(cidx);
+                try cols.append(allocator, cidx);
             }
         }
 
         if (cols.items.len == 0) return null;
 
-        return .{ .coalesce = .{ .cols = try cols.toOwnedSlice(), .fallback = fallback } };
+        return .{ .coalesce = .{ .cols = try cols.toOwnedSlice(allocator), .fallback = fallback } };
     }
 
     // ── CAST ───────────────────────────────────────────────────────────────
@@ -566,4 +566,50 @@ pub fn fmtFloat(buf: []u8, n: f64) []const u8 {
         return std.fmt.bufPrint(buf, "{d}.0", .{@as(i64, @intFromFloat(n))}) catch buf[0..0];
     }
     return std.fmt.bufPrint(buf, "{d}", .{n}) catch buf[0..0];
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+test "COALESCE 2-arg backwards compat" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var column_map = std.StringHashMap(usize).init(allocator);
+    try column_map.put("name", 0);
+
+    const spec = (try tryParseScalar("COALESCE(name, 'unknown')", column_map, allocator)).?;
+
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+
+    try std.testing.expectEqualStrings("unknown", eval(spec, &.{""}, fba.allocator()));
+    fba.reset();
+    try std.testing.expectEqualStrings("Alice", eval(spec, &.{"Alice"}, fba.allocator()));
+}
+
+test "COALESCE 3-arg returns first non-empty column" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var column_map = std.StringHashMap(usize).init(allocator);
+    try column_map.put("phone", 0);
+    try column_map.put("email", 1);
+
+    const spec = (try tryParseScalar("COALESCE(phone, email, 'N/A')", column_map, allocator)).?;
+
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+
+    // phone empty, email has value
+    try std.testing.expectEqualStrings("user@example.com", eval(spec, &.{ "", "user@example.com" }, fba.allocator()));
+    fba.reset();
+    // both empty → fallback literal
+    try std.testing.expectEqualStrings("N/A", eval(spec, &.{ "", "" }, fba.allocator()));
+    fba.reset();
+    // phone has value → return immediately
+    try std.testing.expectEqualStrings("555-1234", eval(spec, &.{ "555-1234", "user@example.com" }, fba.allocator()));
 }

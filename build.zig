@@ -156,4 +156,26 @@ pub fn build(b: *std.Build) void {
     });
     const run_engine_tests = b.addRunArtifact(engine_tests);
     test_step.dependOn(&run_engine_tests.step);
+
+    // Scalar tests (COALESCE multi-arg, etc.)
+    const scalar_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/scalar.zig"),
+        }),
+    });
+    const run_scalar_tests = b.addRunArtifact(scalar_tests);
+    test_step.dependOn(&run_scalar_tests.step);
+
+    // BulkCsvReader tests (TooManyColumns, etc.)
+    const bulk_csv_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/bulk_csv.zig"),
+        }),
+    });
+    const run_bulk_csv_tests = b.addRunArtifact(bulk_csv_tests);
+    test_step.dependOn(&run_bulk_csv_tests.step);
 }

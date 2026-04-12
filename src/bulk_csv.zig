@@ -195,3 +195,40 @@ pub const BulkCsvReader = struct {
         self.allocator.free(record);
     }
 };
+
+test "parseLineSlices returns TooManyColumns when row exceeds 256 fields" {
+    // Construct a CSV line with 257 comma-separated fields: "a,a,a,...,a"
+    var line_buf: [257 * 2]u8 = undefined;
+    var pos: usize = 0;
+    for (0..257) |i| {
+        line_buf[pos] = 'a';
+        pos += 1;
+        if (i < 256) {
+            line_buf[pos] = ',';
+            pos += 1;
+        }
+    }
+
+    var reader: BulkCsvReader = undefined;
+    reader.delimiter = ',';
+    try std.testing.expectError(error.TooManyColumns, reader.parseLineSlices(line_buf[0..pos]));
+}
+
+test "parseLineSlices returns exactly 256 fields for a 256-column row" {
+    // 256 fields = 255 commas + last field, all within limit
+    var line_buf: [256 * 2]u8 = undefined;
+    var pos: usize = 0;
+    for (0..256) |i| {
+        line_buf[pos] = 'a';
+        pos += 1;
+        if (i < 255) {
+            line_buf[pos] = ',';
+            pos += 1;
+        }
+    }
+
+    var reader: BulkCsvReader = undefined;
+    reader.delimiter = ',';
+    const fields = try reader.parseLineSlices(line_buf[0..pos]);
+    try std.testing.expectEqual(@as(usize, 256), fields.len);
+}
