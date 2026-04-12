@@ -63,11 +63,19 @@ pub fn parseCSVFields(line: []const u8, fields: *std.ArrayList([]const u8), allo
     var comma_count: usize = 0;
 
     var i: usize = 0;
-    while (i < line.len and comma_count < 64) : (i += 1) {
+    while (i < line.len and comma_count < comma_positions_buf.len) : (i += 1) {
         if (line[i] == delimiter) {
             comma_positions_buf[comma_count] = i;
             comma_count += 1;
         }
+    }
+
+    // If we hit the buffer limit and there are more delimiters remaining,
+    // the line has more fields than we can handle — refuse rather than silently corrupt.
+    if (comma_count == comma_positions_buf.len and
+        std.mem.indexOfScalar(u8, line[i..], delimiter) != null)
+    {
+        return error.TooManyColumns;
     }
 
     var start: usize = 0;
@@ -158,4 +166,24 @@ test "parseCSVFields: custom delimiter" {
     try parseCSVFields("x|y|z", &fields, std.testing.allocator, '|');
     try std.testing.expectEqual(@as(usize, 3), fields.items.len);
     try std.testing.expectEqualStrings("y", fields.items[1]);
+}
+
+test "parseCSVFields: returns TooManyColumns for lines with more than 64 fields" {
+    // Build a line with 66 comma-separated fields (all "a") — well above the 64 limit
+    var line_buf: [66 * 2]u8 = undefined;
+    var pos: usize = 0;
+    for (0..66) |i| {
+        line_buf[pos] = 'a';
+        pos += 1;
+        if (i < 65) {
+            line_buf[pos] = ',';
+            pos += 1;
+        }
+    }
+    var fields = std.ArrayList([]const u8){};
+    defer fields.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.TooManyColumns,
+        parseCSVFields(line_buf[0..pos], &fields, std.testing.allocator, ','),
+    );
 }
