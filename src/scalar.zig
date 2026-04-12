@@ -48,9 +48,9 @@ pub const ScalarSpec = union(enum) {
         divisor: f64,
     };
 
-    /// fallback points into the original query string (borrowed, not owned).
+    /// cols is allocated from the parse-time allocator; fallback borrows from the query string.
     pub const CoalesceArgs = struct {
-        col_idx: usize,
+        cols: []const usize,
         fallback: []const u8,
     };
 
@@ -82,7 +82,7 @@ pub const ScalarSpec = union(enum) {
             .upper, .lower, .trim, .length, .abs, .ceil, .floor, .cast_int, .cast_float, .cast_text => |i| i,
             .substr => |a| a.col_idx,
             .mod_op => |a| a.col_idx,
-            .coalesce => |a| a.col_idx,
+            .coalesce => |a| a.cols[0],
             .datediff => |a| a.start_col, // return first column
             .dateadd => |a| a.date_col,
             .extract => |a| a.date_col,
@@ -204,21 +204,26 @@ pub fn tryParseScalar(
 
     // ── COALESCE ───────────────────────────────────────────────────────────
     if (std.mem.eql(u8, fn_lower, "coalesce")) {
-        const comma = std.mem.indexOfScalar(u8, args_str, ',') orelse return null;
-        const col_str = std.mem.trim(u8, args_str[0..comma], &std.ascii.whitespace);
-        const fallback_raw = std.mem.trim(u8, args_str[comma + 1 ..], &std.ascii.whitespace);
+        var cols = std.ArrayList(usize).init(allocator);
+        defer cols.deinit();
+        var fallback: []const u8 = "";
 
-        const cidx = try resolveCol(col_str, column_map, allocator) orelse
-            return error.ColumnNotFound;
+        var it = std.mem.splitScalar(u8, args_str, ',');
+        while (it.next()) |token| {
+            const arg = std.mem.trim(u8, token, &std.ascii.whitespace);
+            if (arg.len >= 2 and arg[0] == '\'' and arg[arg.len - 1] == '\'') {
+                // Quoted string literal — use as fallback (last one wins)
+                fallback = arg[1 .. arg.len - 1];
+            } else {
+                const cidx = try resolveCol(arg, column_map, allocator) orelse
+                    return error.ColumnNotFound;
+                try cols.append(cidx);
+            }
+        }
 
-        // Strip surrounding single-quotes from the fallback literal
-        const fallback = if (fallback_raw.len >= 2 and
-            fallback_raw[0] == '\'' and fallback_raw[fallback_raw.len - 1] == '\'')
-            fallback_raw[1 .. fallback_raw.len - 1]
-        else
-            fallback_raw;
+        if (cols.items.len == 0) return null;
 
-        return .{ .coalesce = .{ .col_idx = cidx, .fallback = fallback } };
+        return .{ .coalesce = .{ .cols = try cols.toOwnedSlice(), .fallback = fallback } };
     }
 
     // ── CAST ───────────────────────────────────────────────────────────────
@@ -387,9 +392,11 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
             return fmtNum(buf, @mod(n, args.divisor));
         },
         .coalesce => |args| {
-            const v = field(record, args.col_idx);
-            const trimmed = std.mem.trim(u8, v, &std.ascii.whitespace);
-            return if (trimmed.len == 0) args.fallback else v;
+            for (args.cols) |cidx| {
+                const v = field(record, cidx);
+                if (std.mem.trim(u8, v, &std.ascii.whitespace).len > 0) return v;
+            }
+            return args.fallback;
         },
         .cast_int => |cidx| {
             const v = field(record, cidx);
