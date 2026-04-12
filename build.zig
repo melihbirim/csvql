@@ -178,4 +178,26 @@ pub fn build(b: *std.Build) void {
     });
     const run_bulk_csv_tests = b.addRunArtifact(bulk_csv_tests);
     test_step.dependOn(&run_bulk_csv_tests.step);
+
+    // Simd utility tests (parseIntFast, stringsEqualFast, parseCSVFields)
+    const simd_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/simd.zig"),
+        }),
+    });
+    const run_simd_tests = b.addRunArtifact(simd_tests);
+    test_step.dependOn(&run_simd_tests.step);
+
+    // ArenaBuffer tests (grow/realloc, JSON escaping)
+    const arena_buffer_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/arena_buffer.zig"),
+        }),
+    });
+    const run_arena_buffer_tests = b.addRunArtifact(arena_buffer_tests);
+    test_step.dependOn(&run_arena_buffer_tests.step);
 }
