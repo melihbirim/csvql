@@ -51,38 +51,6 @@ pub const CompareOp = enum {
     LessEqual,
 };
 
-/// Vectorized numeric comparison.
-/// NOT called from any hot path. Allocates via page_allocator with no
-/// free path — caller is responsible but has no allocator reference.
-/// Kept for potential future use.
-pub fn compareVectorized(values: []const []const u8, threshold: []const u8, comptime op: CompareOp) ![]bool {
-    const allocator = std.heap.page_allocator;
-    var results = try allocator.alloc(bool, values.len);
-
-    // Parse all values
-    for (values, 0..) |val, i| {
-        const val_int = std.fmt.parseInt(i64, val, 10) catch {
-            results[i] = false;
-            continue;
-        };
-        const threshold_int = std.fmt.parseInt(i64, threshold, 10) catch {
-            results[i] = false;
-            continue;
-        };
-
-        results[i] = switch (op) {
-            .Equal => val_int == threshold_int,
-            .NotEqual => val_int != threshold_int,
-            .Greater => val_int > threshold_int,
-            .GreaterEqual => val_int >= threshold_int,
-            .Less => val_int < threshold_int,
-            .LessEqual => val_int <= threshold_int,
-        };
-    }
-
-    return results;
-}
-
 /// String equality — delegates to std.mem.eql in all cases (no SIMD added).
 /// std.mem.eql may use SIMD internally on supported targets.
 pub inline fn stringsEqualFast(a: []const u8, b: []const u8) bool {
