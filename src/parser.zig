@@ -1237,14 +1237,10 @@ pub fn evaluate(expr: Expression, row: std.StringHashMap([]const u8)) bool {
             };
         },
         .binary => |bin| {
-            // Both branches are evaluated before combining — no short-circuit.
-            // This path is used by JOIN queries (HashMap-based). For the direct
-            // path (evaluateDirect) Zig's `and`/`or` provide short-circuit.
             const left_result = evaluate(bin.left, row);
-            const right_result = evaluate(bin.right, row);
             return switch (bin.op) {
-                .@"and" => left_result and right_result,
-                .@"or" => left_result or right_result,
+                .@"and" => left_result and evaluate(bin.right, row),
+                .@"or" => left_result or evaluate(bin.right, row),
             };
         },
         .unary => |un| {
