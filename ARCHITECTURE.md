@@ -1,6 +1,6 @@
 # Architecture Deep Dive
 
-This document explains how csvql achieves **9x faster performance** than DuckDB (and beats DataFusion and ClickHouse) on real-world CSV queries over **1 million rows**. We cover seven key technologies: memory-mapped I/O, SIMD vectorization, lock-free parallelism, zero-copy design, ORDER BY optimization, hardware-aware radix sort, and top-K heap selection.
+This document explains how csvql achieves **9x faster performance** than DuckDB (and beats DataFusion and ClickHouse) on real-world CSV queries over **1 million rows**. We cover seven key technologies: memory-mapped I/O, hardware-aware CSV parsing, lock-free parallelism, zero-copy design, ORDER BY optimization, hardware-aware radix sort, and top-K heap selection.
 
 ---
 
@@ -8,7 +8,7 @@ This document explains how csvql achieves **9x faster performance** than DuckDB 
 
 1. [Overview](#overview)
 2. [Memory-Mapped Files (mmap)](#memory-mapped-files-mmap)
-3. [SIMD Vectorization](#simd-vectorization)
+3. [CSV Field Parsing](#csv-field-parsing)
 4. [Lock-Free Parallel Architecture](#lock-free-parallel-architecture)
 5. [Zero-Copy Design](#zero-copy-design)
 6. [ORDER BY & LIMIT Optimizations](#order-by--limit-optimizations)
@@ -29,7 +29,7 @@ csvql is built on seven fundamental optimizations:
 │                    CSV Query Engine                       │
 ├──────────────────────────────────────────────────────────┤
 │  🗺️  Memory-Mapped I/O       → Zero-copy file access     │
-│  ⚡ SIMD Vectorization       → 16x parallel parsing      │
+│  ⚡ Tight-Loop CSV Parsing   → compiler-optimised splits  │
 │  🔀 Lock-Free Parallelism    → 7-core scaling            │
 │  📋 Zero-Copy Architecture   → Minimal allocations       │
 │  🔢 Pre-Parsed Sort Keys     → O(1) sort comparisons     │
@@ -120,119 +120,73 @@ For a 35MB CSV file:
 
 ---
 
-## SIMD Vectorization
+## CSV Field Parsing
 
-### What is SIMD?
+### Overview
 
-**SIMD** stands for **Single Instruction, Multiple Data**. It allows processing multiple values in a single CPU instruction.
+`src/simd.zig` provides three focused parsing utilities used throughout the engine:
 
-Think of it as the difference between:
+- **`parseIntFast`** — fast integer parsing that avoids `std.fmt.parseInt` overhead
+- **`stringsEqualFast`** — byte-equality comparison that delegates to `std.mem.eql` (which the compiler may auto-vectorize)
+- **`parseCSVFields`** — tight-loop comma splitter that records field start/end offsets into a fixed 64-slot stack buffer
 
-- **Scalar**: Checking one character at a time
-- **SIMD**: Checking 16 characters simultaneously
+There are no hand-written `@Vector` intrinsics in the hot path. The compiler is free to auto-vectorize the tight loops, and `std.mem.eql` may use SIMD internally on supported targets.
 
-### Finding Commas: Scalar vs SIMD
-
-**Scalar approach (traditional):**
-
-```zig
-// Check one byte per iteration
-for (line, 0..) |byte, i| {
-    if (byte == ',') {
-        comma_positions[count] = i;
-        count += 1;
-    }
-}
-// For a line "John,Doe,30,NYC" (16 bytes)
-// This requires 16 comparisons
-```
-
-**SIMD approach (csvql):**
-
-```zig
-// Check 16 bytes at once
-const Vec = @Vector(16, u8);           // SIMD vector type (16 bytes)
-const comma_vec: Vec = @splat(',');    // [',', ',', ',', ... × 16]
-
-const chunk: Vec = line[i..][0..16].*;  // Load 16 bytes
-const matches = chunk == comma_vec;     // Compare ALL 16 simultaneously!
-// matches = [false, true, false, false, true, ...]
-//                  ↑                     ↑
-//           comma at pos 1          comma at pos 4
-```
-
-**What happens in the CPU:**
-
-```bash
-Without SIMD (16 scalar comparisons):
-  CMP byte[0], ','  → 1 cycle
-  CMP byte[1], ','  → 1 cycle
-  ...
-  CMP byte[15], ',' → 1 cycle
-  Total: ~16 cycles
-
-With SIMD (vectorized comparison):
-  MOVDQA xmm0, [line]      → Load 16 bytes into XMM register (1 cycle)
-  PCMPEQB xmm0, xmm1       → Compare all 16 at once (1 cycle)
-  PMOVMSKB eax, xmm0       → Extract comparison mask (1 cycle)
-  Total: ~3 cycles
-```
-
-**Speed-up: ~5x faster** just for finding delimiters!
-
-### csvql's SIMD Implementation
+### parseCSVFields
 
 ```zig
 // src/simd.zig
-pub fn findCommasSIMD(line: []const u8, positions: []usize) usize {
+pub fn parseCSVFields(
+    line: []const u8,
+    delimiter: u8,
+    buf: []FieldSpan,
+) !usize {
     var count: usize = 0;
-    const VecSize = 16;                    // Process 16 bytes per iteration
-    const Vec = @Vector(VecSize, u8);
-    const comma_vec: Vec = @splat(',');    // Broadcast ',' to all 16 slots
-
-    var i: usize = 0;
-
-    // Main SIMD loop: process 16 bytes at a time
-    while (i + VecSize <= line.len) : (i += VecSize) {
-        const chunk: Vec = line[i..][0..VecSize].*;
-        const matches = chunk == comma_vec;    // SIMD magic happens here!
-
-        // Extract positions where matches occurred
-        var j: usize = 0;
-        while (j < VecSize) : (j += 1) {
-            if (matches[j] and count < positions.len) {
-                positions[count] = i + j;
-                count += 1;
-            }
-        }
-    }
-
-    // Handle remaining bytes (< 16) with scalar code
-    while (i < line.len and count < positions.len) : (i += 1) {
-        if (line[i] == ',') {
-            positions[count] = i;
+    var start: usize = 0;
+    for (line, 0..) |byte, i| {
+        if (byte == delimiter) {
+            if (count == buf.len) return error.TooManyColumns;
+            buf[count] = .{ .start = start, .end = i };
             count += 1;
+            start = i + 1;
         }
     }
-
-    return count;
+    // last field (no trailing delimiter)
+    if (count == buf.len) return error.TooManyColumns;
+    buf[count] = .{ .start = start, .end = line.len };
+    return count + 1;
 }
 ```
 
-**Example execution:**
+The function stores **offsets** (not slices) into the caller-supplied `buf`, so no allocation occurs and the result is safe even if the input buffer is later freed.
 
-```bash
-CSV line: "John,Doe,30,NYC,Engineer" (24 bytes)
+### parseIntFast
 
-Iteration 1 (SIMD): "John,Doe,30,NYC,"
-  - Process 16 bytes simultaneously
-  - Find commas at positions: 4, 8, 11, 15
+```zig
+// src/simd.zig
+pub fn parseIntFast(s: []const u8) !i64 {
+    if (s.len == 0) return error.InvalidCharacter;
+    var result: i64 = 0;
+    var i: usize = 0;
+    const negative = s[0] == '-';
+    if (negative) i += 1;
+    while (i < s.len) : (i += 1) {
+        const d = s[i];
+        if (d < '0' or d > '9') return error.InvalidCharacter;
+        result = result * 10 + (d - '0');
+    }
+    return if (negative) -result else result;
+}
+```
 
-Iteration 2 (Scalar): "Engineer"
-  - Process remaining 8 bytes one by one
-  - Find comma at position: 23
+### stringsEqualFast
 
-Total: 5 commas found in ~2 iterations instead of 24
+Delegates directly to `std.mem.eql` — simple, zero-allocation, and eligible for compiler auto-vectorization:
+
+```zig
+pub fn stringsEqualFast(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
+}
 ```
 
 ---
@@ -954,9 +908,9 @@ Not bottlenecked by:
   ❌ Allocation overhead (zero-copy design)
 
 Further optimization potential:
-  ✅ More aggressive SIMD (AVX-512: 64 bytes at once)
-  ✅ Better WHERE clause evaluation (SIMD comparisons)
+  ✅ Explicit SIMD field splitting (AVX-512: 64 bytes at once)
   ✅ Column-aware parsing (skip parsing unused columns)
+  ✅ Vectorised WHERE clause evaluation
 ```
 
 ---
@@ -966,7 +920,7 @@ Further optimization potential:
 csvql achieves industry-leading performance through seven key technologies:
 
 1. **Memory-Mapped I/O**: Zero-copy file access with automatic OS optimization
-2. **SIMD Vectorization**: 5x faster delimiter finding by processing 16 bytes simultaneously
+2. **CSV Field Parsing**: Tight-loop comma splitter with compiler-visible auto-vectorisation opportunities; `parseIntFast` and `stringsEqualFast` avoid library overhead on the hot path
 3. **Lock-Free Parallelism**: Perfect 7-core scaling with zero contention
 4. **Zero-Copy Design**: Slices into mmap'd data instead of allocating/copying
 5. **Pre-Parsed Sort Keys**: f64 keys parsed once via IEEE 754 float-to-integer conversion
@@ -997,6 +951,6 @@ For workloads requiring aggregations, joins, or complex query optimization, Duck
 - [src/mmap_engine.zig](src/mmap_engine.zig) - Memory-mapped engine with ORDER BY
 - [src/fast_sort.zig](src/fast_sort.zig) - Hardware-aware sort (radix sort, top-K heap)
 - [src/engine.zig](src/engine.zig) - Sequential engine and query router
-- [src/simd.zig](src/simd.zig) - SIMD CSV parsing
+- [src/simd.zig](src/simd.zig) - CSV parsing utilities (parseIntFast, stringsEqualFast, parseCSVFields)
 - [bench/csv_parse_bench.zig](bench/csv_parse_bench.zig) - Raw parsing benchmarks
 - [RFC 4180](https://tools.ietf.org/html/rfc4180) - CSV format specification
