@@ -3,6 +3,7 @@ const Allocator = std.mem.Allocator;
 
 /// High-performance bulk CSV reader - optimized for speed over RFC 4180 compliance
 /// Assumes: no quoted fields with embedded newlines/commas
+/// Limitation: maximum 256 columns per row (fixed field_buf size)
 pub const BulkCsvReader = struct {
     file: std.fs.File,
     allocator: Allocator,
@@ -12,7 +13,9 @@ pub const BulkCsvReader = struct {
     buffer_len: usize,
     eof: bool,
     line_start: usize,
-    // Pre-allocated field buffer for zero-copy reads (avoids per-field allocation)
+    // Pre-allocated field buffer for zero-copy reads (avoids per-field allocation).
+    // Hard limit: CSVs with more than 256 columns are not supported by this reader.
+    // Use csv.CsvReader instead for wide files.
     field_buf: [256][]const u8 = undefined,
 
     pub fn init(allocator: Allocator, file: std.fs.File) !BulkCsvReader {
