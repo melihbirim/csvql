@@ -6,7 +6,7 @@ const options_mod = @import("options.zig");
 const mcp = @import("mcp.zig");
 const Allocator = std.mem.Allocator;
 
-const version = "0.4.0";
+const version = "0.6.0";
 
 const help_text =
     \\csvql — the world's fastest CSV query engine
