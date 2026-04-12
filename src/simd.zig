@@ -1,6 +1,11 @@
 const std = @import("std");
 
-/// SIMD-accelerated utilities for query processing
+/// SIMD-accelerated utilities for query processing.
+/// NOTE: Most functions in this file are stubs or thin scalar wrappers —
+/// they are NOT called from any hot path (engine, mmap_engine, bulk_csv,
+/// parallel_mmap). The only function used in production code is
+/// `parseIntFast` (called from compareValues in parser.zig) and
+/// `findCommasSIMD` (which has real vector code but is unused).
 pub const simd = struct {
     /// Parse multiple integers in parallel using SIMD (when possible)
     pub fn parseIntsSimd(strings: []const []const u8, results: []i64) !void {
@@ -12,7 +17,8 @@ pub const simd = struct {
         }
     }
 
-    /// Compare integers using SIMD when batch size is large enough
+    /// Compare integers using SIMD when batch size is large enough.
+    /// NOT IMPLEMENTED — returns empty slice. Not called anywhere.
     pub fn compareIntsBatch(values: []const i64, threshold: i64, comptime op: CompareOp) []const bool {
         _ = values;
         _ = threshold;
@@ -21,9 +27,9 @@ pub const simd = struct {
         return &[_]bool{};
     }
 
-    /// Fast memory search for delimiter using SIMD
+    /// Fast memory search for delimiter.
+    /// Delegates entirely to std.mem.indexOfScalar (no SIMD added here).
     pub fn findDelimiter(haystack: []const u8, delimiter: u8) ?usize {
-        // Use SIMD to search for delimiter in chunks
         const vec_size = 16; // SSE/NEON vector size
 
         if (haystack.len < vec_size) {
@@ -45,7 +51,10 @@ pub const CompareOp = enum {
     LessEqual,
 };
 
-/// Vectorized numeric comparison - processes multiple values at once
+/// Vectorized numeric comparison.
+/// NOT called from any hot path. Allocates via page_allocator with no
+/// free path — caller is responsible but has no allocator reference.
+/// Kept for potential future use.
 pub fn compareVectorized(values: []const []const u8, threshold: []const u8, comptime op: CompareOp) ![]bool {
     const allocator = std.heap.page_allocator;
     var results = try allocator.alloc(bool, values.len);
@@ -74,7 +83,8 @@ pub fn compareVectorized(values: []const []const u8, threshold: []const u8, comp
     return results;
 }
 
-/// Fast string equality check using SIMD when available
+/// String equality — delegates to std.mem.eql in all cases (no SIMD added).
+/// std.mem.eql may use SIMD internally on supported targets.
 pub inline fn stringsEqualFast(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     if (a.ptr == b.ptr) return true;
