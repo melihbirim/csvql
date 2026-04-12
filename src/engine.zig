@@ -9,7 +9,10 @@ const aggregation = @import("aggregation.zig");
 const simd = @import("simd.zig");
 const options_mod = @import("options.zig");
 const scalar = @import("scalar.zig");
+const arena_buffer = @import("arena_buffer.zig");
 const Allocator = std.mem.Allocator;
+const ArenaBuffer = arena_buffer.ArenaBuffer;
+const appendJsonStringToArena = arena_buffer.appendJsonStringToArena;
 
 /// Result row for ORDER BY buffering — uses fast_sort SortKey
 const SortEntry = fast_sort.SortKey;
@@ -24,49 +27,6 @@ const SortRowOffsets = struct {
     sort_key_len: usize,
     line_start: usize,
     line_len: usize,
-};
-
-/// Growable byte buffer for accumulating ORDER BY output lines.
-/// Uses a single backing allocation that doubles on overflow to minimise
-/// allocator calls on large result sets.
-///
-/// IMPORTANT — slice lifetime: `append` may reallocate `data`, which
-/// invalidates any previously returned slice. Callers that need to
-/// reference multiple appended regions while still accumulating MUST
-/// store (start, len) offsets into `data` and convert to slices only
-/// AFTER the final `append`. Storing raw slices across appends leads
-/// to dangling pointers. See SortRowOffsets for the canonical usage pattern.
-const ArenaBuffer = struct {
-    data: []u8,
-    pos: usize,
-    allocator: Allocator,
-
-    pub fn init(allocator: Allocator, initial_size: usize) !ArenaBuffer {
-        return ArenaBuffer{
-            .data = try allocator.alloc(u8, initial_size),
-            .pos = 0,
-            .allocator = allocator,
-        };
-    }
-
-    pub fn deinit(self: *ArenaBuffer) void {
-        self.allocator.free(self.data);
-    }
-
-    pub fn append(self: *ArenaBuffer, bytes: []const u8) ![]const u8 {
-        if (self.pos + bytes.len > self.data.len) {
-            // Grow by doubling
-            const new_size = @max(self.data.len * 2, self.pos + bytes.len);
-            const new_data = try self.allocator.alloc(u8, new_size);
-            @memcpy(new_data[0..self.pos], self.data[0..self.pos]);
-            self.allocator.free(self.data);
-            self.data = new_data;
-        }
-        const start = self.pos;
-        @memcpy(self.data[start .. start + bytes.len], bytes);
-        self.pos += bytes.len;
-        return self.data[start .. start + bytes.len];
-    }
 };
 
 /// Append a CSV-escaped field to an ArenaBuffer.
@@ -93,28 +53,6 @@ fn appendCsvFieldToArena(arena: *ArenaBuffer, field: []const u8, delimiter: u8) 
     } else {
         _ = try arena.append(field);
     }
-}
-
-/// Append a JSON-escaped, double-quoted string to an ArenaBuffer.
-/// Used by the ORDER BY path when building JSON objects for sorting.
-fn appendJsonStringToArena(arena: *ArenaBuffer, s: []const u8) !void {
-    _ = try arena.append("\"");
-    for (s) |c| {
-        switch (c) {
-            '"' => _ = try arena.append("\\\""),
-            '\\' => _ = try arena.append("\\\\"),
-            '\n' => _ = try arena.append("\\n"),
-            '\r' => _ = try arena.append("\\r"),
-            '\t' => _ = try arena.append("\\t"),
-            0x00...0x08, 0x0B...0x0C, 0x0E...0x1F => {
-                var buf: [6]u8 = undefined;
-                const encoded = std.fmt.bufPrint(&buf, "\\u{X:0>4}", .{c}) catch unreachable;
-                _ = try arena.append(encoded);
-            },
-            else => _ = try arena.append(&[_]u8{c}),
-        }
-    }
-    _ = try arena.append("\"");
 }
 
 /// separate parser import — avoiding Zig 0.15 module-duplication errors.
