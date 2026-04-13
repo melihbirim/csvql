@@ -45,7 +45,8 @@ pub fn run(allocator: Allocator) !void {
     const stdin = std.fs.File{ .handle = std.posix.STDIN_FILENO };
     const stdout = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
 
-    const r = stdin.reader();
+    var read_buf: [4096]u8 = undefined;
+    const r = stdin.reader(&read_buf);
 
     var line_buf = ManagedList.init(allocator);
     defer line_buf.deinit();
