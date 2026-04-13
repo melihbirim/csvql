@@ -42,11 +42,51 @@ pub inline fn stringsEqualFast(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
+/// SIMD-vectorized delimiter search.
+/// Processes 16 bytes at a time using @Vector comparisons (SSE2/NEON).
+/// Fills `positions` with the byte offsets of every delimiter found.
+/// Returns the number of positions written; stops early if `positions` is full.
+pub fn findCommasSIMD(line: []const u8, positions: []usize, delimiter: u8) usize {
+    var count: usize = 0;
+
+    const VecSize = 16;
+    const Vec = @Vector(VecSize, u8);
+    const delim_vec: Vec = @splat(delimiter);
+
+    var i: usize = 0;
+
+    // SIMD main loop — 16 bytes per iteration
+    while (i + VecSize <= line.len and count < positions.len) : (i += VecSize) {
+        const chunk: Vec = line[i..][0..VecSize].*;
+        const matches = chunk == delim_vec;
+
+        var j: usize = 0;
+        while (j < VecSize) : (j += 1) {
+            if (matches[j] and count < positions.len) {
+                positions[count] = i + j;
+                count += 1;
+            }
+        }
+    }
+
+    // Scalar tail for remaining bytes (< 16)
+    while (i < line.len and count < positions.len) : (i += 1) {
+        if (line[i] == delimiter) {
+            positions[count] = i;
+            count += 1;
+        }
+    }
+
+    return count;
+}
+
 /// CSV field splitter used by parallel_mmap.zig.
+/// Uses findCommasSIMD for lines >= 32 bytes, scalar loop for shorter ones.
 /// Zero-copy: returned slices point into the original line buffer.
 pub fn parseCSVFields(line: []const u8, fields: *std.ArrayList([]const u8), allocator: std.mem.Allocator, delimiter: u8) !void {
     if (line.len == 0) return;
 
+    // Fast path for short lines — too small to benefit from SIMD overhead
     if (line.len < 32) {
         var start: usize = 0;
         for (line, 0..) |c, i| {
@@ -59,23 +99,17 @@ pub fn parseCSVFields(line: []const u8, fields: *std.ArrayList([]const u8), allo
         return;
     }
 
+    // SIMD path: find all delimiter positions at once (up to 64)
     var comma_positions_buf: [64]usize = undefined;
-    var comma_count: usize = 0;
+    const comma_count = findCommasSIMD(line, &comma_positions_buf, delimiter);
 
-    var i: usize = 0;
-    while (i < line.len and comma_count < comma_positions_buf.len) : (i += 1) {
-        if (line[i] == delimiter) {
-            comma_positions_buf[comma_count] = i;
-            comma_count += 1;
+    // If the buffer is full, check whether more delimiters exist after the last
+    // found one — if so the line exceeds 64 fields.
+    if (comma_count == comma_positions_buf.len) {
+        const last_comma = comma_positions_buf[comma_count - 1];
+        if (std.mem.indexOfScalar(u8, line[last_comma + 1 ..], delimiter) != null) {
+            return error.TooManyColumns;
         }
-    }
-
-    // If we hit the buffer limit and there are more delimiters remaining,
-    // the line has more fields than we can handle — refuse rather than silently corrupt.
-    if (comma_count == comma_positions_buf.len and
-        std.mem.indexOfScalar(u8, line[i..], delimiter) != null)
-    {
-        return error.TooManyColumns;
     }
 
     var start: usize = 0;

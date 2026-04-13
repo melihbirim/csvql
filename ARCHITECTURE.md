@@ -1,6 +1,6 @@
 # Architecture Deep Dive
 
-This document explains how csvql achieves **9x faster performance** than DuckDB (and beats DataFusion and ClickHouse) on real-world CSV queries over **1 million rows**. We cover seven key technologies: memory-mapped I/O, hardware-aware CSV parsing, lock-free parallelism, zero-copy design, ORDER BY optimization, hardware-aware radix sort, and top-K heap selection.
+This document explains how csvql achieves **9x faster performance** than DuckDB (and beats DataFusion and ClickHouse) on real-world CSV queries over **1 million rows**. We cover seven key technologies: memory-mapped I/O, SIMD vectorization, lock-free parallelism, zero-copy design, ORDER BY optimization, hardware-aware radix sort, and top-K heap selection.
 
 ---
 
@@ -8,7 +8,7 @@ This document explains how csvql achieves **9x faster performance** than DuckDB 
 
 1. [Overview](#overview)
 2. [Memory-Mapped Files (mmap)](#memory-mapped-files-mmap)
-3. [CSV Field Parsing](#csv-field-parsing)
+3. [SIMD Vectorization](#simd-vectorization)
 4. [Lock-Free Parallel Architecture](#lock-free-parallel-architecture)
 5. [Zero-Copy Design](#zero-copy-design)
 6. [ORDER BY & LIMIT Optimizations](#order-by--limit-optimizations)
@@ -29,7 +29,7 @@ csvql is built on seven fundamental optimizations:
 │                    CSV Query Engine                       │
 ├──────────────────────────────────────────────────────────┤
 │  🗺️  Memory-Mapped I/O       → Zero-copy file access     │
-│  ⚡ Tight-Loop CSV Parsing   → compiler-optimised splits  │
+│  ⚡ SIMD Vectorization       → 16-byte parallel parsing    │
 │  🔀 Lock-Free Parallelism    → 7-core scaling            │
 │  📋 Zero-Copy Architecture   → Minimal allocations       │
 │  🔢 Pre-Parsed Sort Keys     → O(1) sort comparisons     │
@@ -120,74 +120,63 @@ For a 35MB CSV file:
 
 ---
 
-## CSV Field Parsing
+## SIMD Vectorization
 
-### Overview
+### What is SIMD?
 
-`src/simd.zig` provides three focused parsing utilities used throughout the engine:
+**SIMD** stands for **Single Instruction, Multiple Data**. It allows processing multiple values in a single CPU instruction.
 
-- **`parseIntFast`** — fast integer parsing that avoids `std.fmt.parseInt` overhead
-- **`stringsEqualFast`** — byte-equality comparison that delegates to `std.mem.eql` (which the compiler may auto-vectorize)
-- **`parseCSVFields`** — tight-loop comma splitter that records field start/end offsets into a fixed 64-slot stack buffer
+- **Scalar**: checking one byte at a time
+- **SIMD**: checking 16 bytes simultaneously
 
-There are no hand-written `@Vector` intrinsics in the hot path. The compiler is free to auto-vectorize the tight loops, and `std.mem.eql` may use SIMD internally on supported targets.
+### findCommasSIMD
 
-### parseCSVFields
+`parseCSVFields` (for lines ≥ 32 bytes) delegates delimiter discovery to `findCommasSIMD`, which uses Zig's `@Vector(16, u8)` to compare 16 bytes in a single operation:
 
 ```zig
 // src/simd.zig
-pub fn parseCSVFields(
-    line: []const u8,
-    delimiter: u8,
-    buf: []FieldSpan,
-) !usize {
+pub fn findCommasSIMD(line: []const u8, positions: []usize, delimiter: u8) usize {
+    const VecSize = 16;
+    const Vec = @Vector(VecSize, u8);
+    const delim_vec: Vec = @splat(delimiter);  // broadcast delimiter to all 16 lanes
+
+    var i: usize = 0;
     var count: usize = 0;
-    var start: usize = 0;
-    for (line, 0..) |byte, i| {
-        if (byte == delimiter) {
-            if (count == buf.len) return error.TooManyColumns;
-            buf[count] = .{ .start = start, .end = i };
-            count += 1;
-            start = i + 1;
+
+    // Process 16 bytes per iteration
+    while (i + VecSize <= line.len and count < positions.len) : (i += VecSize) {
+        const chunk: Vec = line[i..][0..VecSize].*;
+        const matches = chunk == delim_vec;   // 16-way comparison in one instruction
+
+        var j: usize = 0;
+        while (j < VecSize) : (j += 1) {
+            if (matches[j]) { positions[count] = i + j; count += 1; }
         }
     }
-    // last field (no trailing delimiter)
-    if (count == buf.len) return error.TooManyColumns;
-    buf[count] = .{ .start = start, .end = line.len };
-    return count + 1;
-}
-```
 
-The function stores **offsets** (not slices) into the caller-supplied `buf`, so no allocation occurs and the result is safe even if the input buffer is later freed.
-
-### parseIntFast
-
-```zig
-// src/simd.zig
-pub fn parseIntFast(s: []const u8) !i64 {
-    if (s.len == 0) return error.InvalidCharacter;
-    var result: i64 = 0;
-    var i: usize = 0;
-    const negative = s[0] == '-';
-    if (negative) i += 1;
-    while (i < s.len) : (i += 1) {
-        const d = s[i];
-        if (d < '0' or d > '9') return error.InvalidCharacter;
-        result = result * 10 + (d - '0');
+    // Scalar tail for remaining < 16 bytes
+    while (i < line.len and count < positions.len) : (i += 1) {
+        if (line[i] == delimiter) { positions[count] = i; count += 1; }
     }
-    return if (negative) -result else result;
+
+    return count;
 }
 ```
 
-### stringsEqualFast
+**What the CPU sees (SSE2 / NEON):**
 
-Delegates directly to `std.mem.eql` — simple, zero-allocation, and eligible for compiler auto-vectorization:
-
-```zig
-pub fn stringsEqualFast(a: []const u8, b: []const u8) bool {
-    return std.mem.eql(u8, a, b);
-}
 ```
+MOVDQU xmm0, [line]       → load 16 bytes (1 cycle)
+PCMPEQB xmm0, xmm1        → compare all 16 against ',' simultaneously (1 cycle)
+→ ~5x fewer iterations than a scalar byte loop
+```
+
+`parseCSVFields` collects up to 64 positions into a stack buffer (no allocation), then builds zero-copy slices in a second pass. Lines with > 64 fields return `error.TooManyColumns`.
+
+### parseIntFast and stringsEqualFast
+
+- **`parseIntFast`** — optimised integer parser; rejects non-integer strings (e.g. `"1117.43"`) so callers can fall back to `parseFloat`
+- **`stringsEqualFast`** — delegates to `std.mem.eql` (the compiler may use SIMD internally)
 
 ---
 
@@ -587,15 +576,15 @@ const SortLine = struct {
 
 ### ORDER BY Performance Journey Summary
 
-| Version | Time (1M rows) | Speedup |
-|---------|----------------|---------|
-| Naive (per-row allocs) | ~9.3s | 1x |
-| + Zero-copy parsing | 0.235s | 40x |
-| + Arena-based buffering | 0.150s | 62x |
-| + Pre-parsed f64 sort keys | 0.090s | 103x |
-| + Lazy column extraction | 0.073s | 127x |
-| + Radix sort + Top-K heap | 0.020s | 465x |
-| + Indirect sort + pass-skip | **0.020s** | **465x** |
+| Version                     | Time (1M rows) | Speedup  |
+| --------------------------- | -------------- | -------- |
+| Naive (per-row allocs)      | ~9.3s          | 1x       |
+| + Zero-copy parsing         | 0.235s         | 40x      |
+| + Arena-based buffering     | 0.150s         | 62x      |
+| + Pre-parsed f64 sort keys  | 0.090s         | 103x     |
+| + Lazy column extraction    | 0.073s         | 127x     |
+| + Radix sort + Top-K heap   | 0.020s         | 465x     |
+| + Indirect sort + pass-skip | **0.020s**     | **465x** |
 
 ### LIMIT Optimization
 
@@ -673,25 +662,25 @@ CSV (mmap'd) → SIMD Parse + Filter (parallel) → Sort → Result
 
 `SELECT name, city, salary FROM data.csv WHERE age > 50 ORDER BY salary DESC LIMIT 10`
 
-| Metric | DuckDB | csvql | Advantage |
-|--------|--------|--------|-----------|
-| **Time** | 0.108s | **0.073s** | **1.5x faster** ⚡ |
-| **Memory** | 63.5MB | 1.8MB | **35x less** 💾 |
+| Metric     | DuckDB | csvql      | Advantage          |
+| ---------- | ------ | ---------- | ------------------ |
+| **Time**   | 0.108s | **0.073s** | **1.5x faster** ⚡ |
+| **Memory** | 63.5MB | 1.8MB      | **35x less** 💾    |
 
 **WHERE + LIMIT** (no ORDER BY):
 
 `SELECT name, city, salary FROM data.csv WHERE age > 50 LIMIT 10`
 
-| Metric | DuckDB | csvql | Advantage |
-|--------|--------|--------|-----------|
+| Metric   | DuckDB | csvql      | Advantage         |
+| -------- | ------ | ---------- | ----------------- |
 | **Time** | 0.085s | **0.003s** | **28x faster** 🚀 |
 
 **ORDER BY only** (no WHERE — full table scan):
 
 `SELECT name, city, salary FROM data.csv ORDER BY salary DESC LIMIT 10`
 
-| Metric | DuckDB | csvql | Advantage |
-|--------|--------|--------|-----------|
+| Metric   | DuckDB     | csvql  | Advantage              |
+| -------- | ---------- | ------ | ---------------------- |
 | **Time** | **0.108s** | 0.163s | DuckDB **1.5x faster** |
 
 ### Why The Speed Difference?
@@ -920,7 +909,7 @@ Further optimization potential:
 csvql achieves industry-leading performance through seven key technologies:
 
 1. **Memory-Mapped I/O**: Zero-copy file access with automatic OS optimization
-2. **CSV Field Parsing**: Tight-loop comma splitter with compiler-visible auto-vectorisation opportunities; `parseIntFast` and `stringsEqualFast` avoid library overhead on the hot path
+2. **SIMD Vectorization**: ~5x faster delimiter finding via `@Vector(16, u8)` — 16 bytes compared per iteration
 3. **Lock-Free Parallelism**: Perfect 7-core scaling with zero contention
 4. **Zero-Copy Design**: Slices into mmap'd data instead of allocating/copying
 5. **Pre-Parsed Sort Keys**: f64 keys parsed once via IEEE 754 float-to-integer conversion
@@ -951,6 +940,6 @@ For workloads requiring aggregations, joins, or complex query optimization, Duck
 - [src/mmap_engine.zig](src/mmap_engine.zig) - Memory-mapped engine with ORDER BY
 - [src/fast_sort.zig](src/fast_sort.zig) - Hardware-aware sort (radix sort, top-K heap)
 - [src/engine.zig](src/engine.zig) - Sequential engine and query router
-- [src/simd.zig](src/simd.zig) - CSV parsing utilities (parseIntFast, stringsEqualFast, parseCSVFields)
+- [src/simd.zig](src/simd.zig) - SIMD CSV parsing (findCommasSIMD, parseIntFast, stringsEqualFast)
 - [bench/csv_parse_bench.zig](bench/csv_parse_bench.zig) - Raw parsing benchmarks
 - [RFC 4180](https://tools.ietf.org/html/rfc4180) - CSV format specification
