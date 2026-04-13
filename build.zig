@@ -15,6 +15,12 @@ pub fn build(b: *std.Build) void {
     });
     exe.linkLibC();
 
+    const zigtable_dep = b.dependency("zigtable", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    exe.root_module.addImport("zigtable", zigtable_dep.module("zigtable"));
+
     b.installArtifact(exe);
 
     // Run command

@@ -4,6 +4,7 @@ const simple_parser = @import("simple_parser.zig");
 const engine = @import("engine.zig");
 const options_mod = @import("options.zig");
 const mcp = @import("mcp.zig");
+const zigtable = @import("zigtable");
 const Allocator = std.mem.Allocator;
 
 const version = "0.6.0";
@@ -119,6 +120,10 @@ pub fn main() !void {
             opts.format = .json;
         } else if (std.mem.eql(u8, arg, "--jsonl")) {
             opts.format = .jsonl;
+        } else if (std.mem.eql(u8, arg, "--table")) {
+            opts.table_mode = .on;
+        } else if (std.mem.eql(u8, arg, "--no-table")) {
+            opts.table_mode = .off;
         } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--delimiter")) {
             i += 1;
             if (i >= args.len) {
@@ -152,12 +157,158 @@ pub fn main() !void {
     };
     defer query.deinit();
 
-    // Execute query
-    engine.execute(allocator, query, stdout_file, opts) catch |err| {
-        std.debug.print("execution error: {}\n", .{err});
-        std.process.exit(1);
+    // Determine whether to render as a table
+    const use_table = opts.format == .csv and !opts.no_header and switch (opts.table_mode) {
+        .on => true,
+        .off => false,
+        .auto => std.posix.isatty(std.posix.STDOUT_FILENO),
     };
+
+    if (use_table) {
+        renderTableOutput(allocator, query, stdout_file, opts) catch |err| {
+            std.debug.print("execution error: {}\n", .{err});
+            std.process.exit(1);
+        };
+    } else {
+        engine.execute(allocator, query, stdout_file, opts) catch |err| {
+            std.debug.print("execution error: {}\n", .{err});
+            std.process.exit(1);
+        };
+    }
 }
+
+/// Run the engine into a temp file, read back, parse CSV, render via zigtable.
+fn renderTableOutput(allocator: Allocator, query: parser.Query, stdout_file: std.fs.File, opts: options_mod.Options) !void {
+    // Write CSV to a temp file
+    var tmp_buf: [128]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, "/tmp/csvql_{d}.tmp", .{std.time.milliTimestamp()});
+    {
+        const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{ .truncate = true });
+        defer tmp_file.close();
+        try engine.execute(allocator, query, tmp_file, opts);
+    }
+    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+
+    // Read back
+    const tmp_read = try std.fs.openFileAbsolute(tmp_path, .{});
+    defer tmp_read.close();
+    const csv_data = try tmp_read.readToEndAlloc(allocator, 4 * 1024 * 1024 * 1024);
+    defer allocator.free(csv_data);
+
+    // Parse header line into column definitions
+    var lines = std.mem.splitScalar(u8, csv_data, '\n');
+    const header_line_raw = lines.next() orelse return;
+    const header_line = if (header_line_raw.len > 0 and header_line_raw[header_line_raw.len - 1] == '\r')
+        header_line_raw[0 .. header_line_raw.len - 1]
+    else
+        header_line_raw;
+    if (header_line.len == 0) return;
+
+    var col_list: std.ArrayList(zigtable.Column) = .{};
+    defer col_list.deinit(allocator);
+    var hdr_it = CsvRowIterator.init(header_line, opts.delimiter);
+    while (hdr_it.next()) |col_name| {
+        try col_list.append(allocator, .{ .name = col_name });
+    }
+    if (col_list.items.len == 0) return;
+
+    var table = zigtable.Table.init(allocator, col_list.items);
+    defer table.deinit();
+
+    // Add data rows
+    var row_fields: std.ArrayList([]const u8) = .{};
+    defer row_fields.deinit(allocator);
+    while (lines.next()) |raw_line| {
+        const line = if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r')
+            raw_line[0 .. raw_line.len - 1]
+        else
+            raw_line;
+        if (line.len == 0) continue;
+        row_fields.clearRetainingCapacity();
+        var row_it = CsvRowIterator.init(line, opts.delimiter);
+        while (row_it.next()) |field| {
+            try row_fields.append(allocator, field);
+        }
+        try table.addRow(row_fields.items);
+    }
+
+    // Buffer the table output, then write to stdout in one shot.
+    var table_buf: std.ArrayList(u8) = .{};
+    defer table_buf.deinit(allocator);
+
+    const BufWriter = struct {
+        buf: *std.ArrayList(u8),
+        alloc: Allocator,
+        const WriteError = error{OutOfMemory};
+        pub fn write(self: @This(), data: []const u8) WriteError!usize {
+            try self.buf.appendSlice(self.alloc, data);
+            return data.len;
+        }
+    };
+    try table.render(BufWriter{ .buf = &table_buf, .alloc = allocator });
+    try stdout_file.writeAll(table_buf.items);
+}
+
+/// Minimal CSV field iterator: handles quoted and unquoted fields.
+/// Returns slices into the original line (quotes stripped, no unescape).
+const CsvRowIterator = struct {
+    line: []const u8,
+    pos: usize,
+    delimiter: u8,
+    done: bool = false,
+
+    fn init(line: []const u8, delimiter: u8) CsvRowIterator {
+        return .{ .line = line, .pos = 0, .delimiter = delimiter };
+    }
+
+    fn next(self: *CsvRowIterator) ?[]const u8 {
+        if (self.done) return null;
+        if (self.pos > self.line.len) return null;
+        // Trailing empty field after a delimiter at end
+        if (self.pos == self.line.len) {
+            self.done = true;
+            return "";
+        }
+        if (self.line[self.pos] == '"') {
+            // Quoted field
+            self.pos += 1;
+            const start = self.pos;
+            while (self.pos < self.line.len) {
+                if (self.line[self.pos] == '"') {
+                    if (self.pos + 1 < self.line.len and self.line[self.pos + 1] == '"') {
+                        self.pos += 2; // skip escaped quote
+                    } else {
+                        const field = self.line[start..self.pos];
+                        self.pos += 1; // skip closing quote
+                        if (self.pos < self.line.len and self.line[self.pos] == self.delimiter) {
+                            self.pos += 1;
+                        } else {
+                            self.done = true;
+                        }
+                        return field;
+                    }
+                } else {
+                    self.pos += 1;
+                }
+            }
+            self.done = true;
+            return self.line[start..self.pos];
+        } else {
+            // Unquoted field
+            const start = self.pos;
+            while (self.pos < self.line.len and self.line[self.pos] != self.delimiter) {
+                self.pos += 1;
+            }
+            const field = self.line[start..self.pos];
+            if (self.pos < self.line.len) {
+                self.pos += 1; // skip delimiter
+            } else {
+                self.done = true;
+            }
+            return field;
+        }
+    }
+};
 
 /// Detect if argument is SQL query (starts with SELECT)
 fn isSQL(arg: []const u8) bool {
