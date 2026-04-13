@@ -45,8 +45,7 @@ pub fn run(allocator: Allocator) !void {
     const stdin = std.fs.File{ .handle = std.posix.STDIN_FILENO };
     const stdout = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
 
-    var read_buf: [4096]u8 = undefined;
-    var r = stdin.readerStreaming(&read_buf);
+    const r = stdin.deprecatedReader();
 
     var line_buf = ManagedList.init(allocator);
     defer line_buf.deinit();
@@ -56,7 +55,7 @@ pub fn run(allocator: Allocator) !void {
 
     while (true) {
         line_buf.clearRetainingCapacity();
-        r.interface.streamUntilDelimiter(line_buf.writer(), '\n', 64 * 1024 * 1024) catch |err| {
+        r.readUntilDelimiterArrayList(&line_buf, '\n', 64 * 1024 * 1024) catch |err| {
             if (err == error.EndOfStream) break;
             return err;
         };
