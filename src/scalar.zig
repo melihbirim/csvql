@@ -48,10 +48,19 @@ pub const ScalarSpec = union(enum) {
         divisor: f64,
     };
 
-    /// fallback points into the original query string (borrowed, not owned).
+    /// Inline fixed-size buffer — no heap allocation. Supports up to 8 column args.
     pub const CoalesceArgs = struct {
-        col_idx: usize,
+        cols_buf: [8]usize = undefined,
+        cols_len: usize,
         fallback: []const u8,
+
+        pub fn cols(self: *const CoalesceArgs) []const usize {
+            return self.cols_buf[0..self.cols_len];
+        }
+
+        pub fn colsMut(self: *CoalesceArgs) []usize {
+            return self.cols_buf[0..self.cols_len];
+        }
     };
 
     pub const DatediffArgs = struct {
@@ -82,7 +91,7 @@ pub const ScalarSpec = union(enum) {
             .upper, .lower, .trim, .length, .abs, .ceil, .floor, .cast_int, .cast_float, .cast_text => |i| i,
             .substr => |a| a.col_idx,
             .mod_op => |a| a.col_idx,
-            .coalesce => |a| a.col_idx,
+            .coalesce => |a| a.cols()[0],
             .datediff => |a| a.start_col, // return first column
             .dateadd => |a| a.date_col,
             .extract => |a| a.date_col,
@@ -204,21 +213,26 @@ pub fn tryParseScalar(
 
     // ── COALESCE ───────────────────────────────────────────────────────────
     if (std.mem.eql(u8, fn_lower, "coalesce")) {
-        const comma = std.mem.indexOfScalar(u8, args_str, ',') orelse return null;
-        const col_str = std.mem.trim(u8, args_str[0..comma], &std.ascii.whitespace);
-        const fallback_raw = std.mem.trim(u8, args_str[comma + 1 ..], &std.ascii.whitespace);
+        var args = ScalarSpec.CoalesceArgs{ .cols_len = 0, .fallback = "" };
+        var fallback: []const u8 = "";
 
-        const cidx = try resolveCol(col_str, column_map, allocator) orelse
-            return error.ColumnNotFound;
+        var it = std.mem.splitScalar(u8, args_str, ',');
+        while (it.next()) |token| {
+            const arg = std.mem.trim(u8, token, &std.ascii.whitespace);
+            if (arg.len >= 2 and arg[0] == '\'' and arg[arg.len - 1] == '\'') {
+                fallback = arg[1 .. arg.len - 1];
+            } else {
+                if (args.cols_len >= args.cols_buf.len) return error.TooManyArgs;
+                const cidx = try resolveCol(arg, column_map, allocator) orelse
+                    return error.ColumnNotFound;
+                args.cols_buf[args.cols_len] = cidx;
+                args.cols_len += 1;
+            }
+        }
 
-        // Strip surrounding single-quotes from the fallback literal
-        const fallback = if (fallback_raw.len >= 2 and
-            fallback_raw[0] == '\'' and fallback_raw[fallback_raw.len - 1] == '\'')
-            fallback_raw[1 .. fallback_raw.len - 1]
-        else
-            fallback_raw;
-
-        return .{ .coalesce = .{ .col_idx = cidx, .fallback = fallback } };
+        if (args.cols_len == 0) return null;
+        args.fallback = fallback;
+        return .{ .coalesce = args };
     }
 
     // ── CAST ───────────────────────────────────────────────────────────────
@@ -387,9 +401,11 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
             return fmtNum(buf, @mod(n, args.divisor));
         },
         .coalesce => |args| {
-            const v = field(record, args.col_idx);
-            const trimmed = std.mem.trim(u8, v, &std.ascii.whitespace);
-            return if (trimmed.len == 0) args.fallback else v;
+            for (args.cols()) |cidx| {
+                const v = field(record, cidx);
+                if (std.mem.trim(u8, v, &std.ascii.whitespace).len > 0) return v;
+            }
+            return args.fallback;
         },
         .cast_int => |cidx| {
             const v = field(record, cidx);
@@ -478,7 +494,9 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
                 4 => std.fmt.bufPrint(buf, "{d:.4}", .{rounded}) catch v,
                 5 => std.fmt.bufPrint(buf, "{d:.5}", .{rounded}) catch v,
                 6 => std.fmt.bufPrint(buf, "{d:.6}", .{rounded}) catch v,
-                else => std.fmt.bufPrint(buf, "{d}", .{rounded}) catch v,
+                7 => std.fmt.bufPrint(buf, "{d:.7}", .{rounded}) catch v,
+                8 => std.fmt.bufPrint(buf, "{d:.8}", .{rounded}) catch v,
+                else => std.fmt.bufPrint(buf, "{d:.9}", .{rounded}) catch v,
             };
         },
         .extract => |args| {
@@ -559,4 +577,104 @@ pub fn fmtFloat(buf: []u8, n: f64) []const u8 {
         return std.fmt.bufPrint(buf, "{d}.0", .{@as(i64, @intFromFloat(n))}) catch buf[0..0];
     }
     return std.fmt.bufPrint(buf, "{d}", .{n}) catch buf[0..0];
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Tests
+// ──────────────────────────────────────────────────────────────────────────────
+
+test "COALESCE 2-arg backwards compat" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var column_map = std.StringHashMap(usize).init(allocator);
+    try column_map.put("name", 0);
+
+    const spec = (try tryParseScalar("COALESCE(name, 'unknown')", column_map, allocator)).?;
+
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+
+    try std.testing.expectEqualStrings("unknown", eval(spec, &.{""}, fba.allocator()));
+    fba.reset();
+    try std.testing.expectEqualStrings("Alice", eval(spec, &.{"Alice"}, fba.allocator()));
+}
+
+test "COALESCE 3-arg returns first non-empty column" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var column_map = std.StringHashMap(usize).init(allocator);
+    try column_map.put("phone", 0);
+    try column_map.put("email", 1);
+
+    const spec = (try tryParseScalar("COALESCE(phone, email, 'N/A')", column_map, allocator)).?;
+
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+
+    // phone empty, email has value
+    try std.testing.expectEqualStrings("user@example.com", eval(spec, &.{ "", "user@example.com" }, fba.allocator()));
+    fba.reset();
+    // both empty → fallback literal
+    try std.testing.expectEqualStrings("N/A", eval(spec, &.{ "", "" }, fba.allocator()));
+    fba.reset();
+    // phone has value → return immediately
+    try std.testing.expectEqualStrings("555-1234", eval(spec, &.{ "555-1234", "user@example.com" }, fba.allocator()));
+}
+
+test "COALESCE: whitespace-only field is treated as empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var column_map = std.StringHashMap(usize).init(allocator);
+    try column_map.put("val", 0);
+
+    const spec = (try tryParseScalar("COALESCE(val, 'default')", column_map, allocator)).?;
+
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+
+    try std.testing.expectEqualStrings("default", eval(spec, &.{"   "}, fba.allocator()));
+}
+
+test "COALESCE: returns error.TooManyArgs for more than 8 column args" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var column_map = std.StringHashMap(usize).init(allocator);
+    for (0..9) |i| {
+        var name_buf: [8]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "c{d}", .{i});
+        try column_map.put(try allocator.dupe(u8, name), i);
+    }
+
+    // 9 column args exceeds the inline buffer limit of 8
+    try std.testing.expectError(
+        error.TooManyArgs,
+        tryParseScalar("COALESCE(c0, c1, c2, c3, c4, c5, c6, c7, c8, 'x')", column_map, allocator),
+    );
+}
+
+test "ROUND: digits > 6 produces correct decimal places" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var column_map = std.StringHashMap(usize).init(allocator);
+    try column_map.put("val", 0);
+
+    const spec7 = (try tryParseScalar("ROUND(val, 7)", column_map, allocator)).?;
+    const spec9 = (try tryParseScalar("ROUND(val, 9)", column_map, allocator)).?;
+
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+
+    try std.testing.expectEqualStrings("1.0000000", eval(spec7, &.{"1.0"}, fba.allocator()));
+    fba.reset();
+    try std.testing.expectEqualStrings("1.000000000", eval(spec9, &.{"1.0"}, fba.allocator()));
 }

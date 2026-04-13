@@ -181,12 +181,27 @@ pub const SortOrder = enum {
     desc,
 };
 
-pub const OrderBy = struct {
+/// A single ORDER BY key (one column + direction)
+pub const OrderByKey = struct {
     column: []u8,
     order: SortOrder,
 
+    pub fn deinit(self: *OrderByKey, allocator: Allocator) void {
+        allocator.free(self.column);
+    }
+};
+
+pub const OrderBy = struct {
+    /// Primary sort key (first ORDER BY column)
+    column: []u8,
+    order: SortOrder,
+    /// Additional sort keys (second, third, … ORDER BY columns), empty when none
+    secondary: []OrderByKey,
+
     pub fn deinit(self: *OrderBy, allocator: Allocator) void {
         allocator.free(self.column);
+        for (self.secondary) |*k| k.deinit(allocator);
+        allocator.free(self.secondary);
     }
 };
 
@@ -688,30 +703,58 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
         }
         order_by_part = std.mem.trim(u8, order_by_part, &std.ascii.whitespace);
 
-        // Parse column and direction (ASC/DESC)
-        const asc_idx = std.ascii.indexOfIgnoreCase(order_by_part, " ASC");
-        const desc_idx = std.ascii.indexOfIgnoreCase(order_by_part, " DESC");
-
-        var column_part: []const u8 = undefined;
-        var order: SortOrder = .asc; // Default to ascending
-
-        if (desc_idx) |didx| {
-            column_part = std.mem.trim(u8, order_by_part[0..didx], &std.ascii.whitespace);
-            order = .desc;
-        } else if (asc_idx) |aidx| {
-            column_part = std.mem.trim(u8, order_by_part[0..aidx], &std.ascii.whitespace);
-            order = .asc;
-        } else {
-            column_part = order_by_part;
+        // Parse all comma-separated ORDER BY keys
+        var secondary_list = std.ArrayList(OrderByKey){};
+        errdefer {
+            for (secondary_list.items) |*k| k.deinit(allocator);
+            secondary_list.deinit(allocator);
         }
 
-        // Lowercase the column name for case-insensitive matching
-        const column_lower = try allocator.alloc(u8, column_part.len);
-        _ = std.ascii.lowerString(column_lower, column_part);
+        // Split on commas, parse each key-token as "<column> [ASC|DESC]"
+        var primary_column_lower: []u8 = undefined;
+        var primary_order: SortOrder = .asc;
+        var first = true;
+        var remaining = order_by_part;
+        while (remaining.len > 0) {
+            // Find the next comma that is not inside an expression (simple scan)
+            var token: []const u8 = remaining;
+            if (std.mem.indexOf(u8, remaining, ",")) |comma_pos| {
+                token = remaining[0..comma_pos];
+                remaining = std.mem.trim(u8, remaining[comma_pos + 1 ..], &std.ascii.whitespace);
+            } else {
+                remaining = "";
+            }
+            token = std.mem.trim(u8, token, &std.ascii.whitespace);
+
+            // Detect ASC / DESC suffix
+            var col_part: []const u8 = token;
+            var ord: SortOrder = .asc;
+            if (std.ascii.indexOfIgnoreCase(token, " DESC")) |didx| {
+                col_part = std.mem.trim(u8, token[0..didx], &std.ascii.whitespace);
+                ord = .desc;
+            } else if (std.ascii.indexOfIgnoreCase(token, " ASC")) |aidx| {
+                col_part = std.mem.trim(u8, token[0..aidx], &std.ascii.whitespace);
+                ord = .asc;
+            }
+
+            const col_lower = try allocator.alloc(u8, col_part.len);
+            _ = std.ascii.lowerString(col_lower, col_part);
+
+            if (first) {
+                primary_column_lower = col_lower;
+                primary_order = ord;
+                first = false;
+            } else {
+                try secondary_list.append(allocator, OrderByKey{ .column = col_lower, .order = ord });
+            }
+        }
+
+        const secondary = try secondary_list.toOwnedSlice(allocator);
 
         query.order_by = OrderBy{
-            .column = column_lower,
-            .order = order,
+            .column = primary_column_lower,
+            .order = primary_order,
+            .secondary = secondary,
         };
     }
 
@@ -1238,10 +1281,9 @@ pub fn evaluate(expr: Expression, row: std.StringHashMap([]const u8)) bool {
         },
         .binary => |bin| {
             const left_result = evaluate(bin.left, row);
-            const right_result = evaluate(bin.right, row);
             return switch (bin.op) {
-                .@"and" => left_result and right_result,
-                .@"or" => left_result or right_result,
+                .@"and" => left_result and evaluate(bin.right, row),
+                .@"or" => left_result or evaluate(bin.right, row),
             };
         },
         .unary => |un| {

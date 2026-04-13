@@ -162,6 +162,7 @@ fn parseOrderBy(allocator: Allocator, input: []const u8) !parser.OrderBy {
         return parser.OrderBy{
             .column = column_lower,
             .order = order,
+            .secondary = &.{},
         };
     } else {
         // No colon, default to ascending
@@ -171,6 +172,7 @@ fn parseOrderBy(allocator: Allocator, input: []const u8) !parser.OrderBy {
         return parser.OrderBy{
             .column = column_lower,
             .order = .asc,
+            .secondary = &.{},
         };
     }
 }

@@ -170,6 +170,8 @@ Run the full suite (all sections): [`bench/bench_all.sh`](bench/bench_all.sh)
 - **Top-K heap** — O(N log K) for LIMIT queries, avoids sorting entire dataset
 - **Hardware-aware thresholds** — ARM vs x86 tuned for L1 cache
 - **Zero per-row allocations** — arena buffers, zero-copy slices
+- **Adaptive GROUP BY pre-sizing** — hash table capacity tuned to chunk size, eliminates rehash cycles
+- **Zero-copy worker scans** — each thread iterates a direct mmap slice, no `pread` syscalls or seam buffers
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the full optimization story.
 
@@ -222,7 +224,7 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 | **CAST**      | `SELECT CAST(col AS INTEGER/FLOAT/TEXT)` — type conversion              |
 | **DATEDIFF**  | `DATEDIFF('unit', start_col, end_col)` — duration between two datetime columns. Units: `second`, `minute`, `hour`, `day`, `week`, `month` (≈30 days), `year` (≈365 days). Auto-detects ISO-8601, US (MM/DD/YYYY), EU (DD.MM.YYYY) and mixed formats in the same file |
 | **DATEADD**   | `DATEADD('unit', amount, date_col)` — add/subtract interval from a datetime column. `amount` may be negative. Units: `second`, `minute`, `hour`, `day`, `week`, `month` (≈30 days), `year` (≈365 days). Returns `YYYY-MM-DD HH:MM:SS` |
-| **ORDER BY**  | `ORDER BY col ASC/DESC`, `ORDER BY alias`, or `ORDER BY 1` (positional) |
+| **ORDER BY**  | `ORDER BY col [ASC\|DESC]`, multi-column `ORDER BY col1 ASC, col2 DESC`, alias, or positional (`ORDER BY 1`) |
 | **LIMIT**     | `LIMIT n`                                                               |
 
 ### Aggregate Examples
@@ -315,6 +317,28 @@ csvql "SELECT * FROM 'data.csv' WHERE status LIKE 'active%' AND salary > 50000"
 csvql "SELECT name AS employee, salary AS pay FROM 'data.csv' ORDER BY pay DESC LIMIT 10"
 csvql "SELECT city, COUNT(*) AS cnt FROM 'data.csv' GROUP BY city ORDER BY cnt DESC"
 csvql "SELECT name, salary FROM 'data.csv' ORDER BY 2 DESC LIMIT 5"  # ORDER BY positional
+```
+
+### ORDER BY Examples
+
+```bash
+# Single-column ORDER BY
+csvql "SELECT name, salary FROM 'data.csv' ORDER BY salary DESC LIMIT 10"
+csvql "SELECT * FROM 'data.csv' ORDER BY name ASC"
+
+# Multi-column ORDER BY — sort by primary key, then break ties with secondary key(s)
+csvql "SELECT name, department, salary FROM 'data.csv' ORDER BY department ASC, salary DESC"
+csvql "SELECT * FROM 'data.csv' ORDER BY city, age, name"
+csvql "SELECT name, city, salary FROM 'employees.csv' WHERE salary > 80000 ORDER BY city ASC, salary DESC"
+
+# Multi-column ORDER BY with GROUP BY results
+csvql "SELECT department, AVG(salary) AS avg_sal FROM 'data.csv' GROUP BY department ORDER BY avg_sal DESC, department ASC"
+
+# ORDER BY alias (resolved from SELECT clause)
+csvql "SELECT name, salary AS pay FROM 'data.csv' ORDER BY pay DESC LIMIT 5"
+
+# ORDER BY positional (1-based column index)
+csvql "SELECT name, city, salary FROM 'data.csv' ORDER BY 3 DESC LIMIT 10"
 ```
 
 ### Time-Series and Date Bucketing

@@ -9,7 +9,32 @@ const aggregation = @import("aggregation.zig");
 const simd = @import("simd.zig");
 const options_mod = @import("options.zig");
 const scalar = @import("scalar.zig");
+const arena_buffer = @import("arena_buffer.zig");
 const Allocator = std.mem.Allocator;
+const builtin = @import("builtin");
+
+/// macOS libc sysctl accessor — resolved at link time via linkLibC().
+extern fn sysctlbyname(
+    name: [*:0]const u8,
+    oldp: ?*anyopaque,
+    oldlenp: ?*usize,
+    newp: ?*anyopaque,
+    newlen: usize,
+) c_int;
+
+/// macOS pthread QoS — forces worker threads onto performance cores.
+/// QOS_CLASS_USER_INTERACTIVE (0x21) = highest UI priority, P-cores only.
+/// No-op on non-macOS (conditional compile).
+extern fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) c_int;
+
+/// Returns the thread count for parallel scans.
+/// Uses all logical CPUs — worker threads set QOS_CLASS_USER_INTERACTIVE to
+/// preference P-cores on Apple Silicon where that improves scheduling.
+fn getEffectiveThreadCount() usize {
+    return std.Thread.getCpuCount() catch 1;
+}
+const ArenaBuffer = arena_buffer.ArenaBuffer;
+const appendJsonStringToArena = arena_buffer.appendJsonStringToArena;
 
 /// Result row for ORDER BY buffering — uses fast_sort SortKey
 const SortEntry = fast_sort.SortKey;
@@ -26,37 +51,107 @@ const SortRowOffsets = struct {
     line_len: usize,
 };
 
-/// Arena buffer for ORDER BY — single large allocation instead of per-field allocs
-const ArenaBuffer = struct {
-    data: []u8,
-    pos: usize,
-    allocator: Allocator,
-
-    pub fn init(allocator: Allocator, initial_size: usize) !ArenaBuffer {
-        return ArenaBuffer{
-            .data = try allocator.alloc(u8, initial_size),
-            .pos = 0,
-            .allocator = allocator,
+/// Resolve one ORDER BY column name/position to its 0-based output-row index.
+/// Returns null when the column is not found (caller decides whether to error or skip).
+fn resolveOrderByIdx(
+    col: []const u8,
+    out_hdr: []const []const u8,
+    specs: []const scalar.OutputColSpec,
+    low_hdr: []const []const u8,
+    alloc: std.mem.Allocator,
+) !?usize {
+    // Positional reference: "1" → 0, "2" → 1, …
+    const pos_num = std.fmt.parseInt(usize, col, 10) catch 0;
+    if (pos_num >= 1 and pos_num <= out_hdr.len) return pos_num - 1;
+    // Match against output header (supports AS aliases and lowercase)
+    for (out_hdr, 0..) |hdr, pos| {
+        const lh = try alloc.alloc(u8, hdr.len);
+        defer alloc.free(lh);
+        _ = std.ascii.lowerString(lh, hdr);
+        if (std.mem.eql(u8, lh, col)) return pos;
+    }
+    // Fall back to raw-header match via output specs
+    for (specs, 0..) |spec, pos| {
+        const raw_idx: ?usize = switch (spec) {
+            .column => |i| i,
+            .scalar => null,
         };
-    }
-
-    pub fn deinit(self: *ArenaBuffer) void {
-        self.allocator.free(self.data);
-    }
-
-    pub fn append(self: *ArenaBuffer, bytes: []const u8) ![]const u8 {
-        if (self.pos + bytes.len > self.data.len) {
-            // Grow by doubling
-            const new_size = @max(self.data.len * 2, self.pos + bytes.len);
-            const new_data = try self.allocator.alloc(u8, new_size);
-            @memcpy(new_data[0..self.pos], self.data[0..self.pos]);
-            self.allocator.free(self.data);
-            self.data = new_data;
+        if (raw_idx) |i| {
+            if (i < low_hdr.len and std.mem.eql(u8, low_hdr[i], col)) return pos;
         }
-        const start = self.pos;
-        @memcpy(self.data[start .. start + bytes.len], bytes);
-        self.pos += bytes.len;
-        return self.data[start .. start + bytes.len];
+    }
+    return null;
+}
+
+/// Extract the 0-based field `idx` from a plain CSV line (no trailing newline).
+/// Handles RFC 4180 double-quoting. Returns an empty slice when `idx` is out of range.
+fn csvFieldAtPos(line: []const u8, delimiter: u8, idx: usize) []const u8 {
+    var field_num: usize = 0;
+    var pos: usize = 0;
+    while (pos <= line.len) {
+        const field_start = pos;
+        if (pos < line.len and line[pos] == '"') {
+            // Quoted field — skip past content until closing quote
+            pos += 1;
+            const content_start = pos;
+            while (pos < line.len) {
+                if (line[pos] == '"') {
+                    if (pos + 1 < line.len and line[pos + 1] == '"') {
+                        pos += 2; // escaped double-quote
+                    } else {
+                        break;
+                    }
+                } else {
+                    pos += 1;
+                }
+            }
+            const content_end = pos;
+            if (pos < line.len and line[pos] == '"') pos += 1; // closing quote
+            if (field_num == idx) return line[content_start..content_end];
+        } else {
+            // Unquoted field
+            while (pos < line.len and line[pos] != delimiter) pos += 1;
+            if (field_num == idx) return line[field_start..pos];
+        }
+        field_num += 1;
+        if (pos < line.len and line[pos] == delimiter) {
+            pos += 1;
+        } else {
+            break;
+        }
+    }
+    return "";
+}
+
+/// Describes one ORDER BY key resolved to an output-column index.
+const ResolvedOrderKey = struct {
+    col_idx: usize,
+    order: parser.SortOrder,
+};
+
+/// Multi-key sort comparator context — used when ORDER BY has ≥ 2 columns.
+const MultiKeyCtx = struct {
+    keys: []const ResolvedOrderKey,
+    delimiter: u8,
+
+    pub fn lessThan(ctx: MultiKeyCtx, a: fast_sort.SortKey, b: fast_sort.SortKey) bool {
+        for (ctx.keys) |k| {
+            const a_val = csvFieldAtPos(a.line, ctx.delimiter, k.col_idx);
+            const b_val = csvFieldAtPos(b.line, ctx.delimiter, k.col_idx);
+            const a_num = std.fmt.parseFloat(f64, a_val) catch std.math.nan(f64);
+            const b_num = std.fmt.parseFloat(f64, b_val) catch std.math.nan(f64);
+            if (!std.math.isNan(a_num) and !std.math.isNan(b_num)) {
+                if (a_num < b_num) return k.order != .desc;
+                if (a_num > b_num) return k.order == .desc;
+                // equal — continue to next key
+            } else {
+                const cmp = std.mem.order(u8, a_val, b_val);
+                if (cmp == .lt) return k.order != .desc;
+                if (cmp == .gt) return k.order == .desc;
+                // equal — continue to next key
+            }
+        }
+        return false; // fully equal
     }
 };
 
@@ -84,28 +179,6 @@ fn appendCsvFieldToArena(arena: *ArenaBuffer, field: []const u8, delimiter: u8) 
     } else {
         _ = try arena.append(field);
     }
-}
-
-/// Append a JSON-escaped, double-quoted string to an ArenaBuffer.
-/// Used by the ORDER BY path when building JSON objects for sorting.
-fn appendJsonStringToArena(arena: *ArenaBuffer, s: []const u8) !void {
-    _ = try arena.append("\"");
-    for (s) |c| {
-        switch (c) {
-            '"' => _ = try arena.append("\\\""),
-            '\\' => _ = try arena.append("\\\\"),
-            '\n' => _ = try arena.append("\\n"),
-            '\r' => _ = try arena.append("\\r"),
-            '\t' => _ = try arena.append("\\t"),
-            0x00...0x08, 0x0B...0x0C, 0x0E...0x1F => {
-                var buf: [6]u8 = undefined;
-                const encoded = std.fmt.bufPrint(&buf, "\\u{X:0>4}", .{c}) catch unreachable;
-                _ = try arena.append(encoded);
-            },
-            else => _ = try arena.append(&[_]u8{c}),
-        }
-    }
-    _ = try arena.append("\"");
 }
 
 /// separate parser import — avoiding Zig 0.15 module-duplication errors.
@@ -199,7 +272,7 @@ pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.Fi
             !query.distinct and
             query.limit < 0)
         {
-            const nc = try std.Thread.getCpuCount();
+            const nc = getEffectiveThreadCount();
             if (nc > 1) {
                 try executeParallelScalar(allocator, query, file_s, output_file, opts);
                 return;
@@ -333,6 +406,8 @@ fn executeSequential(
     var sort_offsets: ?std.ArrayList(SortRowOffsets) = null;
     var arena: ?ArenaBuffer = null;
     var order_by_column_idx: ?usize = null;
+    var order_by_resolved_keys = std.ArrayList(ResolvedOrderKey){};
+    defer order_by_resolved_keys.deinit(allocator);
     defer {
         if (sort_offsets) |*offsets| offsets.deinit(allocator);
         if (arena) |*a| a.deinit();
@@ -341,44 +416,20 @@ fn executeSequential(
     // If ORDER BY is specified, prepare buffer and find column index
     if (query.order_by) |order_by| {
         sort_offsets = std.ArrayList(SortRowOffsets){};
-        arena = try ArenaBuffer.init(allocator, 1024 * 1024); // 1MB initial
-        // Positional ORDER BY: "ORDER BY 1" uses the 1-based column position.
-        const pos_num = std.fmt.parseInt(usize, order_by.column, 10) catch 0;
-        if (pos_num >= 1 and pos_num <= output_header.items.len) {
-            order_by_column_idx = pos_num - 1;
-        }
-        if (order_by_column_idx == null) {
-            // Match against output header first (supports AS aliases), then raw header.
-            // order_by.column is already lowercase from parser.
-            for (output_header.items, 0..) |hdr, pos| {
-                const lower_hdr = try allocator.alloc(u8, hdr.len);
-                defer allocator.free(lower_hdr);
-                _ = std.ascii.lowerString(lower_hdr, hdr);
-                if (std.mem.eql(u8, lower_hdr, order_by.column)) {
-                    order_by_column_idx = pos;
-                    break;
-                }
-            }
-        }
-        // Fall back to raw column name match
-        if (order_by_column_idx == null) {
-            for (output_specs.items, 0..) |spec, pos| {
-                const raw_idx: ?usize = switch (spec) {
-                    .column => |i| i,
-                    .scalar => null,
-                };
-                if (raw_idx) |i| {
-                    if (i < lower_header.len and
-                        std.mem.eql(u8, lower_header[i], order_by.column))
-                    {
-                        order_by_column_idx = pos;
-                        break;
-                    }
-                }
-            }
-        }
+        arena = try ArenaBuffer.init(allocator, 16 * 1024 * 1024); // 16MB initial for large result sets
+
+        // Resolve primary key
+        order_by_column_idx = try resolveOrderByIdx(order_by.column, output_header.items, output_specs.items, lower_header, allocator);
         if (order_by_column_idx == null) {
             return error.OrderByColumnNotFound;
+        }
+        try order_by_resolved_keys.append(allocator, .{ .col_idx = order_by_column_idx.?, .order = order_by.order });
+
+        // Resolve secondary keys (skip any that can't be found)
+        for (order_by.secondary) |sk| {
+            if (try resolveOrderByIdx(sk.column, output_header.items, output_specs.items, lower_header, allocator)) |si| {
+                try order_by_resolved_keys.append(allocator, .{ .col_idx = si, .order = sk.order });
+            }
         }
     }
 
@@ -554,25 +605,49 @@ fn executeSequential(
             }
 
             const limit: ?usize = if (query.limit >= 0) @intCast(query.limit) else null;
-            const sorted = try fast_sort.sortEntries(
-                allocator,
-                entries.items,
-                order_by.order == .desc,
-                limit,
-            );
 
-            // Write sorted rows (with optional DISTINCT dedup on the output line)
-            var ob_distinct_arena = std.heap.ArenaAllocator.init(allocator);
-            defer ob_distinct_arena.deinit();
-            var ob_distinct_seen = std.StringHashMap(void).init(allocator);
-            defer ob_distinct_seen.deinit();
+            // Multi-column ORDER BY: use comparison sort with multi-key context.
+            // Single-column: use the hardware-aware fast_sort strategy (radix / heap / comparison).
+            if (order_by_resolved_keys.items.len > 1) {
+                const ctx = MultiKeyCtx{
+                    .keys = order_by_resolved_keys.items,
+                    .delimiter = opts.delimiter,
+                };
+                std.mem.sort(SortEntry, entries.items, ctx, MultiKeyCtx.lessThan);
+                const sorted_items = if (limit) |k| entries.items[0..@min(k, entries.items.len)] else entries.items;
 
-            for (sorted) |entry| {
-                if (query.distinct) {
-                    if (ob_distinct_seen.contains(entry.line)) continue;
-                    try ob_distinct_seen.put(try ob_distinct_arena.allocator().dupe(u8, entry.line), {});
+                var ob_distinct_arena = std.heap.ArenaAllocator.init(allocator);
+                defer ob_distinct_arena.deinit();
+                var ob_distinct_seen = std.StringHashMap(void).init(allocator);
+                defer ob_distinct_seen.deinit();
+                for (sorted_items) |entry| {
+                    if (query.distinct) {
+                        if (ob_distinct_seen.contains(entry.line)) continue;
+                        try ob_distinct_seen.put(try ob_distinct_arena.allocator().dupe(u8, entry.line), {});
+                    }
+                    try writer.writeRawLine(entry.line);
                 }
-                try writer.writeRawLine(entry.line);
+            } else {
+                const sorted = try fast_sort.sortEntries(
+                    allocator,
+                    entries.items,
+                    order_by.order == .desc,
+                    limit,
+                );
+
+                // Write sorted rows (with optional DISTINCT dedup on the output line)
+                var ob_distinct_arena = std.heap.ArenaAllocator.init(allocator);
+                defer ob_distinct_arena.deinit();
+                var ob_distinct_seen = std.StringHashMap(void).init(allocator);
+                defer ob_distinct_seen.deinit();
+
+                for (sorted) |entry| {
+                    if (query.distinct) {
+                        if (ob_distinct_seen.contains(entry.line)) continue;
+                        try ob_distinct_seen.put(try ob_distinct_arena.allocator().dupe(u8, entry.line), {});
+                    }
+                    try writer.writeRawLine(entry.line);
+                }
             }
         }
     }
@@ -803,8 +878,8 @@ fn executeParallelScalar(
     try writer.flush();
 
     // Split into N worker chunks aligned to line boundaries
-    const num_cores = try std.Thread.getCpuCount();
-    const n_threads = @min(num_cores, 8);
+    const num_cores = getEffectiveThreadCount();
+    const n_threads = num_cores;
     const data_start = header_nl + 1;
     const data_len = data.len - data_start;
     const chunk_size = data_len / n_threads;
@@ -2062,7 +2137,7 @@ fn executeDistinct(
     }
     if (query.order_by) |ob| {
         sort_offsets_mmap = std.ArrayList(SortRowOffsets){};
-        sort_arena = try ArenaBuffer.init(allocator, 4 * 1024 * 1024);
+        sort_arena = try ArenaBuffer.init(allocator, 16 * 1024 * 1024);
         // Positional ORDER BY: "ORDER BY 1" uses the 1-based column position.
         const pos_num = std.fmt.parseInt(usize, ob.column, 10) catch 0;
         if (pos_num >= 1 and pos_num <= out_header.items.len) {
@@ -2399,7 +2474,7 @@ fn executeScalarAgg(
     var field_stk: [256][]const u8 = undefined;
 
     // -- Scan (parallel on large files, sequential on small) --
-    const num_cores_sa = try std.Thread.getCpuCount();
+    const num_cores_sa = getEffectiveThreadCount();
     if (num_cores_sa > 1 and file_size > 10 * 1024 * 1024) {
         const n_threads = num_cores_sa;
         const chunks = try splitLineChunks(data, header_nl + 1, n_threads, allocator);
@@ -2664,9 +2739,7 @@ fn splitLineChunks(
 /// after the merge frees everything (partial_map, keys, CompactAccum arrays).
 const GbWorkerCtx = struct {
     // Shared read-only inputs
-    file_path: []const u8,
-    chunk_start: usize,
-    chunk_end: usize,
+    data: []const u8, // mmap slice for this worker's chunk (zero-copy)
     lower_header: []const []const u8,
     group_specs: []const GroupSpec,
     agg_specs: []const AggSpec,
@@ -2822,61 +2895,40 @@ fn gbWorkerThread(ctx: *GbWorkerCtx) void {
 fn gbWorkerScan(ctx: *GbWorkerCtx) !void {
     const aa = ctx.arena.allocator();
     ctx.partial_map = std.StringHashMap(CompactAccum).init(aa);
-    try ctx.partial_map.ensureTotalCapacity(64);
+    // Per-thread map pre-sizing: each worker handles 1/N of the file
+    // Use same adaptive sizing as main thread since chunk size correlates with total file size
+    const chunk_size = ctx.data.len;
+    const worker_capacity: u32 = if (chunk_size < 10 * 1024 * 1024)
+        128
+    else if (chunk_size < 100 * 1024 * 1024)
+        512
+    else
+        2048;
+    try ctx.partial_map.ensureTotalCapacity(worker_capacity);
 
-    // Use pread instead of scanning shared mmap data.  Each worker opens its
-    // own file descriptor and reads its chunk in 2 MB blocks, eliminating the
-    // VM page-fault serialization that occurs when 12 threads concurrently
-    // fault different regions of the same mmap'd file on macOS.
-    const file = try std.fs.cwd().openFile(ctx.file_path, .{});
-    defer file.close();
-
-    const IO_BUF: usize = 2 * 1024 * 1024;
-    const io_buf = try aa.alloc(u8, IO_BUF);
-    // seam_buf holds the tail bytes of an I/O block that did not end on '\n'.
-    var seam_buf = std.ArrayListUnmanaged(u8){};
-    // combined_buf is reused scratch space for lines that span two blocks.
-    var combined_buf = std.ArrayListUnmanaged(u8){};
-
+    // Zero-copy scan: iterate directly over the mmap'd data slice.
+    // The full file is already mmap'd by the calling thread; each worker
+    // just reads a pointer range — no pread syscalls, no data copies,
+    // no IO buffers, no seam handling.  After the warmup run the pages
+    // are in the page cache so access is at memory speed (~100 GB/s).
     var field_stk: [256][]const u8 = undefined;
     var key_buf = std.ArrayListUnmanaged(u8){};
 
-    var file_pos: usize = ctx.chunk_start;
-    while (file_pos < ctx.chunk_end) {
-        const to_read = @min(IO_BUF, ctx.chunk_end - file_pos);
-        const n = try std.posix.pread(file.handle, io_buf[0..to_read], @intCast(file_pos));
-        if (n == 0) break;
-        file_pos += n;
-
-        var scan: usize = 0;
-        while (scan < n) {
-            const nl = std.mem.indexOfScalarPos(u8, io_buf, scan, '\n') orelse {
-                // No newline in remaining bytes — carry them to the next block.
-                try seam_buf.appendSlice(aa, io_buf[scan..n]);
-                break;
-            };
-            // Assemble the complete line: seam (if any) + bytes up to '\n'.
-            var line: []const u8 = undefined;
-            if (seam_buf.items.len > 0) {
-                combined_buf.clearRetainingCapacity();
-                try combined_buf.appendSlice(aa, seam_buf.items);
-                try combined_buf.appendSlice(aa, io_buf[scan..nl]);
-                seam_buf.clearRetainingCapacity();
-                line = combined_buf.items;
-            } else {
-                line = io_buf[scan..nl];
-            }
+    var pos: usize = 0;
+    const data = ctx.data;
+    while (pos < data.len) {
+        const nl = std.mem.indexOfScalarPos(u8, data, pos, '\n') orelse {
+            // Last line with no trailing newline
+            var line: []const u8 = data[pos..];
             if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-            scan = nl + 1;
-            if (line.len == 0) continue;
-            try gbProcessRecord(ctx, aa, &field_stk, &key_buf, line);
-        }
-    }
-    // Flush remaining seam bytes (last line without trailing newline).
-    if (seam_buf.items.len > 0) {
-        var line: []const u8 = seam_buf.items;
+            if (line.len > 0) try gbProcessRecord(ctx, aa, &field_stk, &key_buf, line);
+            break;
+        };
+        var line: []const u8 = data[pos..nl];
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-        if (line.len > 0) try gbProcessRecord(ctx, aa, &field_stk, &key_buf, line);
+        pos = nl + 1;
+        if (line.len == 0) continue;
+        try gbProcessRecord(ctx, aa, &field_stk, &key_buf, line);
     }
 }
 
@@ -3404,8 +3456,16 @@ fn executeGroupBy(
 
     var group_map = std.StringHashMap(CompactAccum).init(allocator);
     defer group_map.deinit();
-    // Pre-size for typical low-cardinality GROUP BY (avoids rehashing)
-    try group_map.ensureTotalCapacity(64);
+    // Adaptive pre-sizing: larger files → more groups → fewer rehashes
+    const initial_capacity: u32 = if (file_size < 10 * 1024 * 1024)
+        128
+    else if (file_size < 100 * 1024 * 1024)
+        512
+    else if (file_size < 1024 * 1024 * 1024)
+        2048
+    else
+        8192; // 200GB files: starts at 8K, grows as needed
+    try group_map.ensureTotalCapacity(initial_capacity);
 
     const n_aggs = agg_specs.items.len;
 
@@ -3421,7 +3481,7 @@ fn executeGroupBy(
     // Each thread independently scans its chunk into its own partial_map;
     // main thread merges arithmetic results after join (O(num_groups), negligible).
     // Single-threaded fallback for small files or single-core environments.
-    const num_cores = try std.Thread.getCpuCount();
+    const num_cores = getEffectiveThreadCount();
     if (num_cores > 1 and file_size > 10 * 1024 * 1024) {
         const n_threads = num_cores;
         const chunks = try splitLineChunks(data, header_nl + 1, n_threads, allocator);
@@ -3434,9 +3494,7 @@ fn executeGroupBy(
 
         for (0..n_threads) |i| {
             thread_ctxs[i] = .{
-                .file_path = query.file_path,
-                .chunk_start = chunks[i][0],
-                .chunk_end = chunks[i][1],
+                .data = data[chunks[i][0]..chunks[i][1]],
                 .lower_header = lower_header,
                 .group_specs = group_specs,
                 .agg_specs = agg_specs.items,
@@ -3782,7 +3840,9 @@ fn executeGroupBy(
                         .cast_text => |*ci| ci.* = 0,
                         .substr => |*a| a.col_idx = 0,
                         .mod_op => |*a| a.col_idx = 0,
-                        .coalesce => |*a| a.col_idx = 0,
+                        .coalesce => |*a| {
+                            for (a.colsMut()) |*ci| ci.* = 0;
+                        },
                         .datediff => |*a| {
                             a.start_col = 0;
                             a.end_col = 0;

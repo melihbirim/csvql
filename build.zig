@@ -13,6 +13,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
         }),
     });
+    exe.linkLibC();
 
     b.installArtifact(exe);
 
@@ -36,6 +37,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("bench/csv_parse_bench.zig"),
         }),
     });
+    csv_bench.linkLibC();
     b.installArtifact(csv_bench);
 
     const bench_run = b.addRunArtifact(csv_bench);
@@ -62,6 +64,7 @@ pub fn build(b: *std.Build) void {
         .name = "groupby_bench",
         .root_module = groupby_bench_root,
     });
+    groupby_bench_exe.linkLibC();
     b.installArtifact(groupby_bench_exe);
 
     const groupby_bench_run = b.addRunArtifact(groupby_bench_exe);
@@ -81,6 +84,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("examples/csv_reader_example.zig"),
         }),
     });
+    csv_example.linkLibC();
 
     // Add src/ as a module so examples can import from it
     const csv_module = b.addModule("csv", .{
@@ -97,6 +101,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("examples/mmap_csv_example.zig"),
         }),
     });
+    mmap_example.linkLibC();
     b.installArtifact(mmap_example);
 
     // Tests
@@ -119,6 +124,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tests/parser_test.zig"),
         }),
     });
+    parser_tests.linkLibC();
     parser_tests.root_module.addImport("parser", parser_module);
     const run_parser_tests = b.addRunArtifact(parser_tests);
     test_step.dependOn(&run_parser_tests.step);
@@ -131,6 +137,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tests/csv_test.zig"),
         }),
     });
+    csv_tests.linkLibC();
     csv_tests.root_module.addImport("csv", csv_test_module);
     const run_csv_tests = b.addRunArtifact(csv_tests);
     test_step.dependOn(&run_csv_tests.step);
@@ -143,6 +150,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/fast_sort.zig"),
         }),
     });
+    fast_sort_tests.linkLibC();
     const run_fast_sort_tests = b.addRunArtifact(fast_sort_tests);
     test_step.dependOn(&run_fast_sort_tests.step);
 
@@ -154,6 +162,55 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/engine.zig"),
         }),
     });
+    engine_tests.linkLibC();
     const run_engine_tests = b.addRunArtifact(engine_tests);
     test_step.dependOn(&run_engine_tests.step);
+
+    // Scalar tests (COALESCE multi-arg, etc.)
+    const scalar_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/scalar.zig"),
+        }),
+    });
+    scalar_tests.linkLibC();
+    const run_scalar_tests = b.addRunArtifact(scalar_tests);
+    test_step.dependOn(&run_scalar_tests.step);
+
+    // BulkCsvReader tests (TooManyColumns, etc.)
+    const bulk_csv_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/bulk_csv.zig"),
+        }),
+    });
+    bulk_csv_tests.linkLibC();
+    const run_bulk_csv_tests = b.addRunArtifact(bulk_csv_tests);
+    test_step.dependOn(&run_bulk_csv_tests.step);
+
+    // Simd utility tests (parseIntFast, stringsEqualFast, parseCSVFields)
+    const simd_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/simd.zig"),
+        }),
+    });
+    simd_tests.linkLibC();
+    const run_simd_tests = b.addRunArtifact(simd_tests);
+    test_step.dependOn(&run_simd_tests.step);
+
+    // ArenaBuffer tests (grow/realloc, JSON escaping)
+    const arena_buffer_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/arena_buffer.zig"),
+        }),
+    });
+    arena_buffer_tests.linkLibC();
+    const run_arena_buffer_tests = b.addRunArtifact(arena_buffer_tests);
+    test_step.dependOn(&run_arena_buffer_tests.step);
 }

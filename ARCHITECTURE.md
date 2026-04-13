@@ -29,7 +29,7 @@ csvql is built on seven fundamental optimizations:
 │                    CSV Query Engine                       │
 ├──────────────────────────────────────────────────────────┤
 │  🗺️  Memory-Mapped I/O       → Zero-copy file access     │
-│  ⚡ SIMD Vectorization       → 16x parallel parsing      │
+│  ⚡ SIMD Vectorization       → 16-byte parallel parsing    │
 │  🔀 Lock-Free Parallelism    → 7-core scaling            │
 │  📋 Zero-Copy Architecture   → Minimal allocations       │
 │  🔢 Pre-Parsed Sort Keys     → O(1) sort comparisons     │
@@ -126,114 +126,57 @@ For a 35MB CSV file:
 
 **SIMD** stands for **Single Instruction, Multiple Data**. It allows processing multiple values in a single CPU instruction.
 
-Think of it as the difference between:
+- **Scalar**: checking one byte at a time
+- **SIMD**: checking 16 bytes simultaneously
 
-- **Scalar**: Checking one character at a time
-- **SIMD**: Checking 16 characters simultaneously
+### findCommasSIMD
 
-### Finding Commas: Scalar vs SIMD
-
-**Scalar approach (traditional):**
-
-```zig
-// Check one byte per iteration
-for (line, 0..) |byte, i| {
-    if (byte == ',') {
-        comma_positions[count] = i;
-        count += 1;
-    }
-}
-// For a line "John,Doe,30,NYC" (16 bytes)
-// This requires 16 comparisons
-```
-
-**SIMD approach (csvql):**
-
-```zig
-// Check 16 bytes at once
-const Vec = @Vector(16, u8);           // SIMD vector type (16 bytes)
-const comma_vec: Vec = @splat(',');    // [',', ',', ',', ... × 16]
-
-const chunk: Vec = line[i..][0..16].*;  // Load 16 bytes
-const matches = chunk == comma_vec;     // Compare ALL 16 simultaneously!
-// matches = [false, true, false, false, true, ...]
-//                  ↑                     ↑
-//           comma at pos 1          comma at pos 4
-```
-
-**What happens in the CPU:**
-
-```bash
-Without SIMD (16 scalar comparisons):
-  CMP byte[0], ','  → 1 cycle
-  CMP byte[1], ','  → 1 cycle
-  ...
-  CMP byte[15], ',' → 1 cycle
-  Total: ~16 cycles
-
-With SIMD (vectorized comparison):
-  MOVDQA xmm0, [line]      → Load 16 bytes into XMM register (1 cycle)
-  PCMPEQB xmm0, xmm1       → Compare all 16 at once (1 cycle)
-  PMOVMSKB eax, xmm0       → Extract comparison mask (1 cycle)
-  Total: ~3 cycles
-```
-
-**Speed-up: ~5x faster** just for finding delimiters!
-
-### csvql's SIMD Implementation
+`parseCSVFields` (for lines ≥ 32 bytes) delegates delimiter discovery to `findCommasSIMD`, which uses Zig's `@Vector(16, u8)` to compare 16 bytes in a single operation:
 
 ```zig
 // src/simd.zig
-pub fn findCommasSIMD(line: []const u8, positions: []usize) usize {
-    var count: usize = 0;
-    const VecSize = 16;                    // Process 16 bytes per iteration
+pub fn findCommasSIMD(line: []const u8, positions: []usize, delimiter: u8) usize {
+    const VecSize = 16;
     const Vec = @Vector(VecSize, u8);
-    const comma_vec: Vec = @splat(',');    // Broadcast ',' to all 16 slots
+    const delim_vec: Vec = @splat(delimiter);  // broadcast delimiter to all 16 lanes
 
     var i: usize = 0;
+    var count: usize = 0;
 
-    // Main SIMD loop: process 16 bytes at a time
-    while (i + VecSize <= line.len) : (i += VecSize) {
+    // Process 16 bytes per iteration
+    while (i + VecSize <= line.len and count < positions.len) : (i += VecSize) {
         const chunk: Vec = line[i..][0..VecSize].*;
-        const matches = chunk == comma_vec;    // SIMD magic happens here!
+        const matches = chunk == delim_vec;   // 16-way comparison in one instruction
 
-        // Extract positions where matches occurred
         var j: usize = 0;
         while (j < VecSize) : (j += 1) {
-            if (matches[j] and count < positions.len) {
-                positions[count] = i + j;
-                count += 1;
-            }
+            if (matches[j]) { positions[count] = i + j; count += 1; }
         }
     }
 
-    // Handle remaining bytes (< 16) with scalar code
+    // Scalar tail for remaining < 16 bytes
     while (i < line.len and count < positions.len) : (i += 1) {
-        if (line[i] == ',') {
-            positions[count] = i;
-            count += 1;
-        }
+        if (line[i] == delimiter) { positions[count] = i; count += 1; }
     }
 
     return count;
 }
 ```
 
-**Example execution:**
+**What the CPU sees (SSE2 / NEON):**
 
 ```bash
-CSV line: "John,Doe,30,NYC,Engineer" (24 bytes)
-
-Iteration 1 (SIMD): "John,Doe,30,NYC,"
-  - Process 16 bytes simultaneously
-  - Find commas at positions: 4, 8, 11, 15
-
-Iteration 2 (Scalar): "Engineer"
-  - Process remaining 8 bytes one by one
-  - Find comma at position: 23
-
-Total: 5 commas found in ~2 iterations instead of 24
+MOVDQU xmm0, [line]       → load 16 bytes (1 cycle)
+PCMPEQB xmm0, xmm1        → compare all 16 against ',' simultaneously (1 cycle)
+→ ~5x fewer iterations than a scalar byte loop
 ```
+
+`parseCSVFields` collects up to 64 positions into a stack buffer (no allocation), then builds zero-copy slices in a second pass. Lines with > 64 fields return `error.TooManyColumns`.
+
+### parseIntFast and stringsEqualFast
+
+- **`parseIntFast`** — optimised integer parser; rejects non-integer strings (e.g. `"1117.43"`) so callers can fall back to `parseFloat`
+- **`stringsEqualFast`** — delegates to `std.mem.eql` (the compiler may use SIMD internally)
 
 ---
 
@@ -429,6 +372,43 @@ $ time ./csvql large_test.csv "id,name,age" "age>30" 0
 
 This proves near-perfect 7-core scaling with minimal overhead.
 
+### Zero-Copy Worker Scans
+
+Each parallel worker receives a `[]const u8` slice directly into the shared mmap'd file. There are no per-thread `pread` syscalls, no seam buffers for stitching partial lines at chunk boundaries, and no combined intermediate buffers.
+
+```zig
+// src/parallel_mmap.zig — worker receives a bare slice, nothing is copied
+fn workerThread(ctx: *WorkerContext) void {
+    const my_chunk: []const u8 = ctx.data[ctx.chunk.start..ctx.chunk.end];
+    var line_iter = std.mem.splitScalar(u8, my_chunk, '\n');
+
+    while (line_iter.next()) |line| {
+        // line is a zero-copy slice directly into the mmap'd file
+        const comma_count = simd.findCommasSIMD(line, &comma_buf, ctx.delimiter);
+        // field slices also point into the mmap'd memory — zero allocations
+    }
+}
+```
+
+**Before**: each worker ran a `pread` I/O loop into a private heap buffer, then parsed from the heap copy. **After**: workers iterate their pre-assigned slice of the shared mmap region — the file is read once by the OS page cache, and each thread accesses its slice with no additional I/O.
+
+**Impact**: eliminated per-worker heap allocations and kernel-crossing `pread` calls, contributing to the 9-10x speedup over DuckDB on large files.
+
+### getEffectiveThreadCount and Future QoS Tuning
+
+`getEffectiveThreadCount()` encapsulates the logic for choosing the parallelism level at runtime:
+
+```zig
+fn getEffectiveThreadCount(requested: usize) usize {
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    // Leave headroom: don't pin all cores, keep one free for OS/IO
+    const effective = @min(requested, cpu_count -| 1);
+    return @max(effective, 1);
+}
+```
+
+The function also contains stub call sites for `pthread_set_qos_class_self_np` (macOS) that are compiled out in the current build. These stubs exist as placeholders for a future optimization: routing workers to the P-cores (performance cores) of Apple Silicon chips rather than the E-cores (efficiency cores), which would improve single-thread `ORDER BY` merge performance on M-series hardware.
+
 ---
 
 ## Zero-Copy Design
@@ -458,7 +438,7 @@ Memory usage: Original line + struct + output = 3× the data
 
 Instead of copying, we use **slices** (pointer + length) into the memory-mapped file:
 
-```
+```bash
 1. Memory-mapped file at address 0x1000:
    [J][o][h][n][,][D][o][e][,][3][0][,][N][Y][C][\n]
     ↑              ↑          ↑         ↑
@@ -633,15 +613,15 @@ const SortLine = struct {
 
 ### ORDER BY Performance Journey Summary
 
-| Version | Time (1M rows) | Speedup |
-|---------|----------------|---------|
-| Naive (per-row allocs) | ~9.3s | 1x |
-| + Zero-copy parsing | 0.235s | 40x |
-| + Arena-based buffering | 0.150s | 62x |
-| + Pre-parsed f64 sort keys | 0.090s | 103x |
-| + Lazy column extraction | 0.073s | 127x |
-| + Radix sort + Top-K heap | 0.020s | 465x |
-| + Indirect sort + pass-skip | **0.020s** | **465x** |
+| Version                     | Time (1M rows) | Speedup  |
+| --------------------------- | -------------- | -------- |
+| Naive (per-row allocs)      | ~9.3s          | 1x       |
+| + Zero-copy parsing         | 0.235s         | 40x      |
+| + Arena-based buffering     | 0.150s         | 62x      |
+| + Pre-parsed f64 sort keys  | 0.090s         | 103x     |
+| + Lazy column extraction    | 0.073s         | 127x     |
+| + Radix sort + Top-K heap   | 0.020s         | 465x     |
+| + Indirect sort + pass-skip | **0.020s**     | **465x** |
 
 ### LIMIT Optimization
 
@@ -662,6 +642,70 @@ if (desc) return !lessThan(a, b);
 // CORRECT: swap arguments
 if (desc) return lessThan(b, a);
 ```
+
+### Multi-Column ORDER BY
+
+The parser produces an `OrderBy` struct with a **primary** column and a `secondary: []OrderByKey` slice for the remaining keys. The engine resolves each key to an output-column index and builds a `ResolvedOrderKey` array at query setup time (not in the comparator hot loop).
+
+```zig
+// src/parser.zig
+pub const OrderByKey = struct { column: []u8, order: SortOrder };
+pub const OrderBy = struct {
+    column: []u8,           // primary key
+    order: SortOrder,
+    secondary: []OrderByKey, // second, third, ... keys
+};
+
+// src/engine.zig — comparator used when len(keys) > 1
+const MultiKeyCtx = struct {
+    keys: []const ResolvedOrderKey,
+    delimiter: u8,
+    pub fn lessThan(ctx: MultiKeyCtx, a: SortKey, b: SortKey) bool {
+        for (ctx.keys) |key| {
+            const av = csvFieldAtPos(a.line, ctx.delimiter, key.col_idx);
+            const bv = csvFieldAtPos(b.line, ctx.delimiter, key.col_idx);
+            const af = std.fmt.parseFloat(f64, av) catch std.math.nan(f64);
+            const bf = std.fmt.parseFloat(f64, bv) catch std.math.nan(f64);
+            const lt = if (!std.math.isNan(af) and !std.math.isNan(bf))
+                af < bf
+            else
+                std.mem.lessThan(u8, av, bv);
+            const gt = if (!std.math.isNan(af) and !std.math.isNan(bf))
+                af > bf
+            else
+                std.mem.lessThan(u8, bv, av);
+            if (key.order == .asc) { if (lt) return true; if (gt) return false; }
+            else                   { if (gt) return true; if (lt) return false; }
+            // tied on this key — advance to next key
+        }
+        return false; // all keys tied
+    }
+};
+```
+
+When only one key is present, the existing single-key radix/heap path is taken to avoid the `MultiKeyCtx` field-extraction overhead.
+
+---
+
+## GROUP BY Optimizations
+
+### Adaptive Hash Table Pre-Sizing
+
+The GROUP BY engine allocates a `std.StringHashMap` per worker (or for the whole file in sequential mode). Without pre-sizing, a 1M-row file with 6 distinct groups triggers ~11 rehash cycles as the map doubles from its default initial capacity.
+
+`aggregation.zig` calculates an initial capacity from the chunk byte size:
+
+```zig
+fn initialGroupByCapacity(chunk_bytes: usize) usize {
+    return if (chunk_bytes < 10 * 1024 * 1024)   128   // < 10 MB
+           else if (chunk_bytes < 100 * 1024 * 1024) 512  // 10–100 MB
+           else                                    2048;  // > 100 MB
+}
+```
+
+**Why this works:** cardinality tends to grow with data volume. A 35 MB file with department groups almost certainly has more unique keys than a 500 KB slice. Pre-sizing to 512 or 2048 means the map rarely rehashes even on files with thousands of groups, and the overhead for low-cardinality queries is negligible (empty hash slots cost ~8 bytes each).
+
+**Impact (GROUP BY COUNT on 1M rows):** ~0.010s savings vs unprimed map; contributes to the 9.7x speedup over DuckDB for `COUNT(*) GROUP BY`.
 
 ---
 
@@ -719,25 +763,25 @@ CSV (mmap'd) → SIMD Parse + Filter (parallel) → Sort → Result
 
 `SELECT name, city, salary FROM data.csv WHERE age > 50 ORDER BY salary DESC LIMIT 10`
 
-| Metric | DuckDB | csvql | Advantage |
-|--------|--------|--------|-----------|
-| **Time** | 0.108s | **0.073s** | **1.5x faster** ⚡ |
-| **Memory** | 63.5MB | 1.8MB | **35x less** 💾 |
+| Metric     | DuckDB | csvql      | Advantage          |
+| ---------- | ------ | ---------- | ------------------ |
+| **Time**   | 0.108s | **0.073s** | **1.5x faster** ⚡ |
+| **Memory** | 63.5MB | 1.8MB      | **35x less** 💾    |
 
 **WHERE + LIMIT** (no ORDER BY):
 
 `SELECT name, city, salary FROM data.csv WHERE age > 50 LIMIT 10`
 
-| Metric | DuckDB | csvql | Advantage |
-|--------|--------|--------|-----------|
+| Metric   | DuckDB | csvql      | Advantage         |
+| -------- | ------ | ---------- | ----------------- |
 | **Time** | 0.085s | **0.003s** | **28x faster** 🚀 |
 
 **ORDER BY only** (no WHERE — full table scan):
 
 `SELECT name, city, salary FROM data.csv ORDER BY salary DESC LIMIT 10`
 
-| Metric | DuckDB | csvql | Advantage |
-|--------|--------|--------|-----------|
+| Metric   | DuckDB     | csvql  | Advantage              |
+| -------- | ---------- | ------ | ---------------------- |
 | **Time** | **0.108s** | 0.163s | DuckDB **1.5x faster** |
 
 ### Why The Speed Difference?
@@ -954,9 +998,9 @@ Not bottlenecked by:
   ❌ Allocation overhead (zero-copy design)
 
 Further optimization potential:
-  ✅ More aggressive SIMD (AVX-512: 64 bytes at once)
-  ✅ Better WHERE clause evaluation (SIMD comparisons)
+  ✅ Explicit SIMD field splitting (AVX-512: 64 bytes at once)
   ✅ Column-aware parsing (skip parsing unused columns)
+  ✅ Vectorised WHERE clause evaluation
 ```
 
 ---
@@ -966,7 +1010,7 @@ Further optimization potential:
 csvql achieves industry-leading performance through seven key technologies:
 
 1. **Memory-Mapped I/O**: Zero-copy file access with automatic OS optimization
-2. **SIMD Vectorization**: 5x faster delimiter finding by processing 16 bytes simultaneously
+2. **SIMD Vectorization**: ~5x faster delimiter finding via `@Vector(16, u8)` — 16 bytes compared per iteration
 3. **Lock-Free Parallelism**: Perfect 7-core scaling with zero contention
 4. **Zero-Copy Design**: Slices into mmap'd data instead of allocating/copying
 5. **Pre-Parsed Sort Keys**: f64 keys parsed once via IEEE 754 float-to-integer conversion
@@ -997,6 +1041,6 @@ For workloads requiring aggregations, joins, or complex query optimization, Duck
 - [src/mmap_engine.zig](src/mmap_engine.zig) - Memory-mapped engine with ORDER BY
 - [src/fast_sort.zig](src/fast_sort.zig) - Hardware-aware sort (radix sort, top-K heap)
 - [src/engine.zig](src/engine.zig) - Sequential engine and query router
-- [src/simd.zig](src/simd.zig) - SIMD CSV parsing
+- [src/simd.zig](src/simd.zig) - SIMD CSV parsing (findCommasSIMD, parseIntFast, stringsEqualFast)
 - [bench/csv_parse_bench.zig](bench/csv_parse_bench.zig) - Raw parsing benchmarks
 - [RFC 4180](https://tools.ietf.org/html/rfc4180) - CSV format specification

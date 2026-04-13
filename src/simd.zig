@@ -1,102 +1,14 @@
 const std = @import("std");
 
-/// SIMD-accelerated utilities for query processing
-pub const simd = struct {
-    /// Parse multiple integers in parallel using SIMD (when possible)
-    pub fn parseIntsSimd(strings: []const []const u8, results: []i64) !void {
-        if (strings.len == 0) return;
-
-        // For now, fall back to scalar - full SIMD int parsing is complex
-        for (strings, 0..) |str, i| {
-            results[i] = try std.fmt.parseInt(i64, str, 10);
-        }
-    }
-
-    /// Compare integers using SIMD when batch size is large enough
-    pub fn compareIntsBatch(values: []const i64, threshold: i64, comptime op: CompareOp) []const bool {
-        _ = values;
-        _ = threshold;
-        _ = op;
-        // TODO: Implement SIMD comparison
-        return &[_]bool{};
-    }
-
-    /// Fast memory search for delimiter using SIMD
-    pub fn findDelimiter(haystack: []const u8, delimiter: u8) ?usize {
-        // Use SIMD to search for delimiter in chunks
-        const vec_size = 16; // SSE/NEON vector size
-
-        if (haystack.len < vec_size) {
-            // Fall back to scalar for small inputs
-            return std.mem.indexOfScalar(u8, haystack, delimiter);
-        }
-
-        // For now, use standard library (which may use SIMD internally)
-        return std.mem.indexOfScalar(u8, haystack, delimiter);
-    }
-};
-
-pub const CompareOp = enum {
-    Equal,
-    NotEqual,
-    Greater,
-    GreaterEqual,
-    Less,
-    LessEqual,
-};
-
-/// Vectorized numeric comparison - processes multiple values at once
-pub fn compareVectorized(values: []const []const u8, threshold: []const u8, comptime op: CompareOp) ![]bool {
-    const allocator = std.heap.page_allocator;
-    var results = try allocator.alloc(bool, values.len);
-
-    // Parse all values
-    for (values, 0..) |val, i| {
-        const val_int = std.fmt.parseInt(i64, val, 10) catch {
-            results[i] = false;
-            continue;
-        };
-        const threshold_int = std.fmt.parseInt(i64, threshold, 10) catch {
-            results[i] = false;
-            continue;
-        };
-
-        results[i] = switch (op) {
-            .Equal => val_int == threshold_int,
-            .NotEqual => val_int != threshold_int,
-            .Greater => val_int > threshold_int,
-            .GreaterEqual => val_int >= threshold_int,
-            .Less => val_int < threshold_int,
-            .LessEqual => val_int <= threshold_int,
-        };
-    }
-
-    return results;
-}
-
-/// Fast string equality check using SIMD when available
-pub inline fn stringsEqualFast(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    if (a.ptr == b.ptr) return true;
-
-    // For short strings, use direct comparison
-    if (a.len < 16) {
-        return std.mem.eql(u8, a, b);
-    }
-
-    // For longer strings, std.mem.eql may use SIMD internally
-    return std.mem.eql(u8, a, b);
-}
-
-/// Optimized integer parsing with SIMD hints
+/// Optimized integer parsing used by compareValues in parser.zig and engine.zig.
+/// Rejects non-integer strings (e.g. "1117.43") so callers can fall back to
+/// parseFloat rather than silently truncating.
 pub inline fn parseIntFast(str: []const u8) !i64 {
-    // Skip leading whitespace
     var i: usize = 0;
     while (i < str.len and std.ascii.isWhitespace(str[i])) : (i += 1) {}
 
     if (i >= str.len) return error.InvalidInput;
 
-    // Check for sign
     var negative = false;
     if (str[i] == '-') {
         negative = true;
@@ -107,7 +19,6 @@ pub inline fn parseIntFast(str: []const u8) !i64 {
 
     if (i >= str.len) return error.InvalidInput;
 
-    // Parse digits - compiler can vectorize this loop
     var result: i64 = 0;
     while (i < str.len) : (i += 1) {
         const c = str[i];
@@ -115,70 +26,67 @@ pub inline fn parseIntFast(str: []const u8) !i64 {
         result = result * 10 + (c - '0');
     }
 
-    // Reject strings with non-whitespace chars after the integer digits.
-    // "1117.43" must NOT silently truncate to 1117 — the caller must fall
-    // back to parseFloat to get the correct value.
+    // Reject strings with non-whitespace chars after the digits.
+    // "1117.43" must NOT silently truncate to 1117.
     while (i < str.len and std.ascii.isWhitespace(str[i])) : (i += 1) {}
     if (i < str.len) return error.InvalidInput;
 
     return if (negative) -result else result;
 }
 
-/// Batch parse floats (for future aggregation optimizations)
-pub fn parseFloatsBatch(strings: []const []const u8, results: []f64) !void {
-    for (strings, 0..) |str, i| {
-        results[i] = try std.fmt.parseFloat(f64, str);
-    }
+/// String equality check used by WHERE clause evaluation in parser.zig.
+/// Delegates to std.mem.eql (which may use SIMD internally on supported targets).
+pub inline fn stringsEqualFast(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    if (a.ptr == b.ptr) return true;
+    return std.mem.eql(u8, a, b);
 }
 
-/// Fast SIMD-optimized newline search
-/// Uses vectorized comparison for faster scanning of large buffers
-pub inline fn findNewline(haystack: []const u8, start: usize) ?usize {
-    if (start >= haystack.len) return null;
-
-    const data = haystack[start..];
-
-    // For small searches, use standard library
-    if (data.len < 64) {
-        if (std.mem.indexOfScalar(u8, data, '\n')) |pos| {
-            return start + pos;
-        }
-        return null;
-    }
-
-    // For larger searches, process in chunks
-    // The standard library may use SIMD internally
-    if (std.mem.indexOfScalar(u8, data, '\n')) |pos| {
-        return start + pos;
-    }
-
-    return null;
-}
-
-/// Find multiple newlines at once using SIMD
-pub fn findNewlinesBatch(haystack: []const u8, positions: []usize, max_count: usize) usize {
+/// SIMD-vectorized delimiter search.
+/// Processes 16 bytes at a time using @Vector comparisons (SSE2/NEON).
+/// Fills `positions` with the byte offsets of every delimiter found.
+/// Returns the number of positions written; stops early if `positions` is full.
+pub fn findCommasSIMD(line: []const u8, positions: []usize, delimiter: u8) usize {
     var count: usize = 0;
-    var pos: usize = 0;
 
-    while (count < max_count and pos < haystack.len) {
-        if (findNewline(haystack, pos)) |newline_pos| {
-            positions[count] = newline_pos;
+    const VecSize = 16;
+    const Vec = @Vector(VecSize, u8);
+    const delim_vec: Vec = @splat(delimiter);
+
+    var i: usize = 0;
+
+    // SIMD main loop — 16 bytes per iteration
+    while (i + VecSize <= line.len and count < positions.len) : (i += VecSize) {
+        const chunk: Vec = line[i..][0..VecSize].*;
+        const matches = chunk == delim_vec;
+
+        var j: usize = 0;
+        while (j < VecSize) : (j += 1) {
+            if (matches[j] and count < positions.len) {
+                positions[count] = i + j;
+                count += 1;
+            }
+        }
+    }
+
+    // Scalar tail for remaining bytes (< 16)
+    while (i < line.len and count < positions.len) : (i += 1) {
+        if (line[i] == delimiter) {
+            positions[count] = i;
             count += 1;
-            pos = newline_pos + 1;
-        } else {
-            break;
         }
     }
 
     return count;
 }
-/// SIMD-accelerated CSV field parser
-/// Finds all comma positions in a line to split into fields
-/// Returns slices pointing into the original line (zero-copy)
+
+/// CSV field splitter used by parallel_mmap.zig.
+/// Uses findCommasSIMD for lines >= 32 bytes, scalar loop for shorter ones.
+/// Zero-copy: returned slices point into the original line buffer.
 pub fn parseCSVFields(line: []const u8, fields: *std.ArrayList([]const u8), allocator: std.mem.Allocator, delimiter: u8) !void {
     if (line.len == 0) return;
 
-    // Fast path for small lines
+    // Fast path for short lines — too small to benefit from SIMD overhead
     if (line.len < 32) {
         var start: usize = 0;
         for (line, 0..) |c, i| {
@@ -191,20 +99,19 @@ pub fn parseCSVFields(line: []const u8, fields: *std.ArrayList([]const u8), allo
         return;
     }
 
-    // For larger lines, find all delimiter positions first, then slice
-    // This allows better prefetching and branch prediction
-    var comma_positions_buf: [64]usize = undefined; // Max 64 fields
-    var comma_count: usize = 0;
+    // SIMD path: find all delimiter positions at once (up to 64)
+    var comma_positions_buf: [64]usize = undefined;
+    const comma_count = findCommasSIMD(line, &comma_positions_buf, delimiter);
 
-    var i: usize = 0;
-    while (i < line.len and comma_count < 64) : (i += 1) {
-        if (line[i] == delimiter) {
-            comma_positions_buf[comma_count] = i;
-            comma_count += 1;
+    // If the buffer is full, check whether more delimiters exist after the last
+    // found one — if so the line exceeds 64 fields.
+    if (comma_count == comma_positions_buf.len) {
+        const last_comma = comma_positions_buf[comma_count - 1];
+        if (std.mem.indexOfScalar(u8, line[last_comma + 1 ..], delimiter) != null) {
+            return error.TooManyColumns;
         }
     }
 
-    // Build fields from comma positions
     var start: usize = 0;
     for (comma_positions_buf[0..comma_count]) |comma_pos| {
         try fields.append(allocator, line[start..comma_pos]);
@@ -213,39 +120,104 @@ pub fn parseCSVFields(line: []const u8, fields: *std.ArrayList([]const u8), allo
     try fields.append(allocator, line[start..]);
 }
 
-/// SIMD-vectorized comma search for CSV parsing
-/// Processes 16 bytes at once looking for comma delimiters
-pub fn findCommasSIMD(line: []const u8, positions: []usize) usize {
-    var count: usize = 0;
+// ── Tests ─────────────────────────────────────────────────────────────────
 
-    const VecSize = 16; // SSE/NEON vector size
-    const Vec = @Vector(VecSize, u8);
-    const comma_vec: Vec = @splat(',');
+test "parseIntFast: valid positive integer" {
+    try std.testing.expectEqual(@as(i64, 42), try parseIntFast("42"));
+}
 
-    var i: usize = 0;
+test "parseIntFast: valid negative integer" {
+    try std.testing.expectEqual(@as(i64, -7), try parseIntFast("-7"));
+}
 
-    // Process 16 bytes at a time with SIMD
-    while (i + VecSize <= line.len and count < positions.len) : (i += VecSize) {
-        const chunk: Vec = line[i..][0..VecSize].*;
-        const matches = chunk == comma_vec;
+test "parseIntFast: explicit plus sign" {
+    try std.testing.expectEqual(@as(i64, 10), try parseIntFast("+10"));
+}
 
-        // Extract positions of matches
-        var j: usize = 0;
-        while (j < VecSize) : (j += 1) {
-            if (matches[j] and count < positions.len) {
-                positions[count] = i + j;
-                count += 1;
-            }
+test "parseIntFast: leading and trailing whitespace" {
+    try std.testing.expectEqual(@as(i64, 99), try parseIntFast("  99  "));
+}
+
+test "parseIntFast: float string returns error" {
+    try std.testing.expectError(error.InvalidInput, parseIntFast("1117.43"));
+}
+
+test "parseIntFast: empty string returns error" {
+    try std.testing.expectError(error.InvalidInput, parseIntFast(""));
+}
+
+test "stringsEqualFast: equal strings" {
+    try std.testing.expect(stringsEqualFast("hello", "hello"));
+}
+
+test "stringsEqualFast: different strings" {
+    try std.testing.expect(!stringsEqualFast("hello", "world"));
+}
+
+test "stringsEqualFast: different lengths" {
+    try std.testing.expect(!stringsEqualFast("hi", "hii"));
+}
+
+test "stringsEqualFast: long strings equal (>16 chars)" {
+    try std.testing.expect(stringsEqualFast("abcdefghijklmnopq", "abcdefghijklmnopq"));
+}
+
+test "stringsEqualFast: long strings not equal" {
+    try std.testing.expect(!stringsEqualFast("abcdefghijklmnopq", "abcdefghijklmnopX"));
+}
+
+test "parseCSVFields: basic split small line" {
+    var fields = std.ArrayList([]const u8){};
+    defer fields.deinit(std.testing.allocator);
+    try parseCSVFields("a,b,c", &fields, std.testing.allocator, ',');
+    try std.testing.expectEqual(@as(usize, 3), fields.items.len);
+    try std.testing.expectEqualStrings("a", fields.items[0]);
+    try std.testing.expectEqualStrings("b", fields.items[1]);
+    try std.testing.expectEqualStrings("c", fields.items[2]);
+}
+
+test "parseCSVFields: single field no delimiter" {
+    var fields = std.ArrayList([]const u8){};
+    defer fields.deinit(std.testing.allocator);
+    try parseCSVFields("onlyfield", &fields, std.testing.allocator, ',');
+    try std.testing.expectEqual(@as(usize, 1), fields.items.len);
+    try std.testing.expectEqualStrings("onlyfield", fields.items[0]);
+}
+
+test "parseCSVFields: large line uses position-first path" {
+    // Line longer than 32 bytes to exercise the comma_positions_buf path
+    var fields = std.ArrayList([]const u8){};
+    defer fields.deinit(std.testing.allocator);
+    try parseCSVFields("field_one,field_two,field_three,field_four", &fields, std.testing.allocator, ',');
+    try std.testing.expectEqual(@as(usize, 4), fields.items.len);
+    try std.testing.expectEqualStrings("field_one", fields.items[0]);
+    try std.testing.expectEqualStrings("field_four", fields.items[3]);
+}
+
+test "parseCSVFields: custom delimiter" {
+    var fields = std.ArrayList([]const u8){};
+    defer fields.deinit(std.testing.allocator);
+    try parseCSVFields("x|y|z", &fields, std.testing.allocator, '|');
+    try std.testing.expectEqual(@as(usize, 3), fields.items.len);
+    try std.testing.expectEqualStrings("y", fields.items[1]);
+}
+
+test "parseCSVFields: returns TooManyColumns for lines with more than 64 fields" {
+    // Build a line with 66 comma-separated fields (all "a") — well above the 64 limit
+    var line_buf: [66 * 2]u8 = undefined;
+    var pos: usize = 0;
+    for (0..66) |i| {
+        line_buf[pos] = 'a';
+        pos += 1;
+        if (i < 65) {
+            line_buf[pos] = ',';
+            pos += 1;
         }
     }
-
-    // Handle remaining bytes
-    while (i < line.len and count < positions.len) : (i += 1) {
-        if (line[i] == ',') {
-            positions[count] = i;
-            count += 1;
-        }
-    }
-
-    return count;
+    var fields = std.ArrayList([]const u8){};
+    defer fields.deinit(std.testing.allocator);
+    try std.testing.expectError(
+        error.TooManyColumns,
+        parseCSVFields(line_buf[0..pos], &fields, std.testing.allocator, ','),
+    );
 }

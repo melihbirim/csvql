@@ -26,7 +26,7 @@ const ManagedList = std.array_list.Managed(u8);
 // ---------------------------------------------------------------------------
 
 const INIT_RESULT =
-    "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"csvql\",\"version\":\"0.4.0\"}}";
+    "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"csvql\",\"version\":\"0.6.0\"}}";
 
 // Multiline for readability; flattened to single line before sending.
 const TOOLS_JSON =
@@ -45,7 +45,6 @@ pub fn run(allocator: Allocator) !void {
     const stdin = std.fs.File{ .handle = std.posix.STDIN_FILENO };
     const stdout = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
 
-    // Zig 0.15: deprecatedReader() gives the old-style reader with readUntilDelimiterArrayList
     const r = stdin.deprecatedReader();
 
     var line_buf = ManagedList.init(allocator);
