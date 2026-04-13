@@ -165,7 +165,7 @@ pub fn findCommasSIMD(line: []const u8, positions: []usize, delimiter: u8) usize
 
 **What the CPU sees (SSE2 / NEON):**
 
-```
+```bash
 MOVDQU xmm0, [line]       → load 16 bytes (1 cycle)
 PCMPEQB xmm0, xmm1        → compare all 16 against ',' simultaneously (1 cycle)
 → ~5x fewer iterations than a scalar byte loop
@@ -401,7 +401,7 @@ Memory usage: Original line + struct + output = 3× the data
 
 Instead of copying, we use **slices** (pointer + length) into the memory-mapped file:
 
-```
+```bash
 1. Memory-mapped file at address 0x1000:
    [J][o][h][n][,][D][o][e][,][3][0][,][N][Y][C][\n]
     ↑              ↑          ↑         ↑
