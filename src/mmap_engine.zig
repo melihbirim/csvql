@@ -139,7 +139,7 @@ pub fn executeMapped(
 
     if (query.order_by) |order_by| {
         sort_entries = std.ArrayList(MmapSortEntry){};
-        arena = try ArenaBuffer.init(allocator, 4 * 1024 * 1024); // 4MB initial for larger files
+        arena = try ArenaBuffer.init(allocator, 16 * 1024 * 1024); // 16MB initial for large result sets
 
         // Positional ORDER BY: "ORDER BY 1" → position 0 in output
         const pos_num = std.fmt.parseInt(usize, order_by.column, 10) catch 0;

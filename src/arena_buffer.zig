@@ -29,13 +29,20 @@ pub const ArenaBuffer = struct {
         self.allocator.free(self.data);
     }
 
+    /// Ensure at least `additional` bytes are available without reallocating.
+    /// Useful when you know how much data you'll append.
+    pub fn ensureUnusedCapacity(self: *ArenaBuffer, additional: usize) !void {
+        const required = self.pos + additional;
+        if (required <= self.data.len) return;
+        
+        const new_size = @max(self.data.len * 2, required);
+        self.data = try self.allocator.realloc(self.data, new_size);
+    }
+
     pub fn append(self: *ArenaBuffer, bytes: []const u8) ![]const u8 {
         if (self.pos + bytes.len > self.data.len) {
             const new_size = @max(self.data.len * 2, self.pos + bytes.len);
-            const new_data = try self.allocator.alloc(u8, new_size);
-            @memcpy(new_data[0..self.pos], self.data[0..self.pos]);
-            self.allocator.free(self.data);
-            self.data = new_data;
+            self.data = try self.allocator.realloc(self.data, new_size);
         }
         const start = self.pos;
         @memcpy(self.data[start .. start + bytes.len], bytes);

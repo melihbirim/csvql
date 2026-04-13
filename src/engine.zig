@@ -288,7 +288,7 @@ fn executeSequential(
     // If ORDER BY is specified, prepare buffer and find column index
     if (query.order_by) |order_by| {
         sort_offsets = std.ArrayList(SortRowOffsets){};
-        arena = try ArenaBuffer.init(allocator, 1024 * 1024); // 1MB initial
+        arena = try ArenaBuffer.init(allocator, 16 * 1024 * 1024); // 16MB initial for large result sets
         // Positional ORDER BY: "ORDER BY 1" uses the 1-based column position.
         const pos_num = std.fmt.parseInt(usize, order_by.column, 10) catch 0;
         if (pos_num >= 1 and pos_num <= output_header.items.len) {
@@ -2009,7 +2009,7 @@ fn executeDistinct(
     }
     if (query.order_by) |ob| {
         sort_offsets_mmap = std.ArrayList(SortRowOffsets){};
-        sort_arena = try ArenaBuffer.init(allocator, 4 * 1024 * 1024);
+        sort_arena = try ArenaBuffer.init(allocator, 16 * 1024 * 1024);
         // Positional ORDER BY: "ORDER BY 1" uses the 1-based column position.
         const pos_num = std.fmt.parseInt(usize, ob.column, 10) catch 0;
         if (pos_num >= 1 and pos_num <= out_header.items.len) {
