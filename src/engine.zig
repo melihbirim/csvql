@@ -51,6 +51,110 @@ const SortRowOffsets = struct {
     line_len: usize,
 };
 
+/// Resolve one ORDER BY column name/position to its 0-based output-row index.
+/// Returns null when the column is not found (caller decides whether to error or skip).
+fn resolveOrderByIdx(
+    col: []const u8,
+    out_hdr: []const []const u8,
+    specs: []const scalar.OutputColSpec,
+    low_hdr: []const []const u8,
+    alloc: std.mem.Allocator,
+) !?usize {
+    // Positional reference: "1" → 0, "2" → 1, …
+    const pos_num = std.fmt.parseInt(usize, col, 10) catch 0;
+    if (pos_num >= 1 and pos_num <= out_hdr.len) return pos_num - 1;
+    // Match against output header (supports AS aliases and lowercase)
+    for (out_hdr, 0..) |hdr, pos| {
+        const lh = try alloc.alloc(u8, hdr.len);
+        defer alloc.free(lh);
+        _ = std.ascii.lowerString(lh, hdr);
+        if (std.mem.eql(u8, lh, col)) return pos;
+    }
+    // Fall back to raw-header match via output specs
+    for (specs, 0..) |spec, pos| {
+        const raw_idx: ?usize = switch (spec) {
+            .column => |i| i,
+            .scalar => null,
+        };
+        if (raw_idx) |i| {
+            if (i < low_hdr.len and std.mem.eql(u8, low_hdr[i], col)) return pos;
+        }
+    }
+    return null;
+}
+
+/// Extract the 0-based field `idx` from a plain CSV line (no trailing newline).
+/// Handles RFC 4180 double-quoting. Returns an empty slice when `idx` is out of range.
+fn csvFieldAtPos(line: []const u8, delimiter: u8, idx: usize) []const u8 {
+    var field_num: usize = 0;
+    var pos: usize = 0;
+    while (pos <= line.len) {
+        const field_start = pos;
+        if (pos < line.len and line[pos] == '"') {
+            // Quoted field — skip past content until closing quote
+            pos += 1;
+            const content_start = pos;
+            while (pos < line.len) {
+                if (line[pos] == '"') {
+                    if (pos + 1 < line.len and line[pos + 1] == '"') {
+                        pos += 2; // escaped double-quote
+                    } else {
+                        break;
+                    }
+                } else {
+                    pos += 1;
+                }
+            }
+            const content_end = pos;
+            if (pos < line.len and line[pos] == '"') pos += 1; // closing quote
+            if (field_num == idx) return line[content_start..content_end];
+        } else {
+            // Unquoted field
+            while (pos < line.len and line[pos] != delimiter) pos += 1;
+            if (field_num == idx) return line[field_start..pos];
+        }
+        field_num += 1;
+        if (pos < line.len and line[pos] == delimiter) {
+            pos += 1;
+        } else {
+            break;
+        }
+    }
+    return "";
+}
+
+/// Describes one ORDER BY key resolved to an output-column index.
+const ResolvedOrderKey = struct {
+    col_idx: usize,
+    order: parser.SortOrder,
+};
+
+/// Multi-key sort comparator context — used when ORDER BY has ≥ 2 columns.
+const MultiKeyCtx = struct {
+    keys: []const ResolvedOrderKey,
+    delimiter: u8,
+
+    pub fn lessThan(ctx: MultiKeyCtx, a: fast_sort.SortKey, b: fast_sort.SortKey) bool {
+        for (ctx.keys) |k| {
+            const a_val = csvFieldAtPos(a.line, ctx.delimiter, k.col_idx);
+            const b_val = csvFieldAtPos(b.line, ctx.delimiter, k.col_idx);
+            const a_num = std.fmt.parseFloat(f64, a_val) catch std.math.nan(f64);
+            const b_num = std.fmt.parseFloat(f64, b_val) catch std.math.nan(f64);
+            if (!std.math.isNan(a_num) and !std.math.isNan(b_num)) {
+                if (a_num < b_num) return k.order != .desc;
+                if (a_num > b_num) return k.order == .desc;
+                // equal — continue to next key
+            } else {
+                const cmp = std.mem.order(u8, a_val, b_val);
+                if (cmp == .lt) return k.order != .desc;
+                if (cmp == .gt) return k.order == .desc;
+                // equal — continue to next key
+            }
+        }
+        return false; // fully equal
+    }
+};
+
 /// Append a CSV-escaped field to an ArenaBuffer.
 /// Fields containing the delimiter, `"`, `\r`, or `\n` are wrapped in
 /// double-quotes with any internal `"` doubled (RFC 4180).
@@ -302,6 +406,8 @@ fn executeSequential(
     var sort_offsets: ?std.ArrayList(SortRowOffsets) = null;
     var arena: ?ArenaBuffer = null;
     var order_by_column_idx: ?usize = null;
+    var order_by_resolved_keys = std.ArrayList(ResolvedOrderKey){};
+    defer order_by_resolved_keys.deinit(allocator);
     defer {
         if (sort_offsets) |*offsets| offsets.deinit(allocator);
         if (arena) |*a| a.deinit();
@@ -311,43 +417,19 @@ fn executeSequential(
     if (query.order_by) |order_by| {
         sort_offsets = std.ArrayList(SortRowOffsets){};
         arena = try ArenaBuffer.init(allocator, 16 * 1024 * 1024); // 16MB initial for large result sets
-        // Positional ORDER BY: "ORDER BY 1" uses the 1-based column position.
-        const pos_num = std.fmt.parseInt(usize, order_by.column, 10) catch 0;
-        if (pos_num >= 1 and pos_num <= output_header.items.len) {
-            order_by_column_idx = pos_num - 1;
-        }
-        if (order_by_column_idx == null) {
-            // Match against output header first (supports AS aliases), then raw header.
-            // order_by.column is already lowercase from parser.
-            for (output_header.items, 0..) |hdr, pos| {
-                const lower_hdr = try allocator.alloc(u8, hdr.len);
-                defer allocator.free(lower_hdr);
-                _ = std.ascii.lowerString(lower_hdr, hdr);
-                if (std.mem.eql(u8, lower_hdr, order_by.column)) {
-                    order_by_column_idx = pos;
-                    break;
-                }
-            }
-        }
-        // Fall back to raw column name match
-        if (order_by_column_idx == null) {
-            for (output_specs.items, 0..) |spec, pos| {
-                const raw_idx: ?usize = switch (spec) {
-                    .column => |i| i,
-                    .scalar => null,
-                };
-                if (raw_idx) |i| {
-                    if (i < lower_header.len and
-                        std.mem.eql(u8, lower_header[i], order_by.column))
-                    {
-                        order_by_column_idx = pos;
-                        break;
-                    }
-                }
-            }
-        }
+
+        // Resolve primary key
+        order_by_column_idx = try resolveOrderByIdx(order_by.column, output_header.items, output_specs.items, lower_header, allocator);
         if (order_by_column_idx == null) {
             return error.OrderByColumnNotFound;
+        }
+        try order_by_resolved_keys.append(allocator, .{ .col_idx = order_by_column_idx.?, .order = order_by.order });
+
+        // Resolve secondary keys (skip any that can't be found)
+        for (order_by.secondary) |sk| {
+            if (try resolveOrderByIdx(sk.column, output_header.items, output_specs.items, lower_header, allocator)) |si| {
+                try order_by_resolved_keys.append(allocator, .{ .col_idx = si, .order = sk.order });
+            }
         }
     }
 
@@ -523,25 +605,49 @@ fn executeSequential(
             }
 
             const limit: ?usize = if (query.limit >= 0) @intCast(query.limit) else null;
-            const sorted = try fast_sort.sortEntries(
-                allocator,
-                entries.items,
-                order_by.order == .desc,
-                limit,
-            );
 
-            // Write sorted rows (with optional DISTINCT dedup on the output line)
-            var ob_distinct_arena = std.heap.ArenaAllocator.init(allocator);
-            defer ob_distinct_arena.deinit();
-            var ob_distinct_seen = std.StringHashMap(void).init(allocator);
-            defer ob_distinct_seen.deinit();
+            // Multi-column ORDER BY: use comparison sort with multi-key context.
+            // Single-column: use the hardware-aware fast_sort strategy (radix / heap / comparison).
+            if (order_by_resolved_keys.items.len > 1) {
+                const ctx = MultiKeyCtx{
+                    .keys = order_by_resolved_keys.items,
+                    .delimiter = opts.delimiter,
+                };
+                std.mem.sort(SortEntry, entries.items, ctx, MultiKeyCtx.lessThan);
+                const sorted_items = if (limit) |k| entries.items[0..@min(k, entries.items.len)] else entries.items;
 
-            for (sorted) |entry| {
-                if (query.distinct) {
-                    if (ob_distinct_seen.contains(entry.line)) continue;
-                    try ob_distinct_seen.put(try ob_distinct_arena.allocator().dupe(u8, entry.line), {});
+                var ob_distinct_arena = std.heap.ArenaAllocator.init(allocator);
+                defer ob_distinct_arena.deinit();
+                var ob_distinct_seen = std.StringHashMap(void).init(allocator);
+                defer ob_distinct_seen.deinit();
+                for (sorted_items) |entry| {
+                    if (query.distinct) {
+                        if (ob_distinct_seen.contains(entry.line)) continue;
+                        try ob_distinct_seen.put(try ob_distinct_arena.allocator().dupe(u8, entry.line), {});
+                    }
+                    try writer.writeRawLine(entry.line);
                 }
-                try writer.writeRawLine(entry.line);
+            } else {
+                const sorted = try fast_sort.sortEntries(
+                    allocator,
+                    entries.items,
+                    order_by.order == .desc,
+                    limit,
+                );
+
+                // Write sorted rows (with optional DISTINCT dedup on the output line)
+                var ob_distinct_arena = std.heap.ArenaAllocator.init(allocator);
+                defer ob_distinct_arena.deinit();
+                var ob_distinct_seen = std.StringHashMap(void).init(allocator);
+                defer ob_distinct_seen.deinit();
+
+                for (sorted) |entry| {
+                    if (query.distinct) {
+                        if (ob_distinct_seen.contains(entry.line)) continue;
+                        try ob_distinct_seen.put(try ob_distinct_arena.allocator().dupe(u8, entry.line), {});
+                    }
+                    try writer.writeRawLine(entry.line);
+                }
             }
         }
     }

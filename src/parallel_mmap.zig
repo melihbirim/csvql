@@ -546,8 +546,6 @@ fn processSortChunk(ctx: *SortWorkerContext) !void {
                                     continue;
                                 }
                             } else {
-                                // Delegate to compareValues which handles IN, BETWEEN,
-                                // IS NULL/NOT NULL, LIKE, ILIKE, and normal comparisons.
                                 if (!parser.compareValues(comp, field_value)) {
                                     line_start += line_end + 1;
                                     continue;
@@ -558,13 +556,20 @@ fn processSortChunk(ctx: *SortWorkerContext) !void {
                             continue;
                         }
                     } else {
+                        // Column not found via precomputed index: fall back to direct eval
+                        if (!parser.evaluateDirect(expr, field_buf[0..field_count], ctx.lower_header)) {
+                            line_start += line_end + 1;
+                            continue;
+                        }
+                    }
+                } else {
+                    // Complex expression (AND/OR/NOT): evaluate directly
+                    if (!parser.evaluateDirect(expr, field_buf[0..field_count], ctx.lower_header)) {
                         line_start += line_end + 1;
                         continue;
                     }
                 }
-                // Note: complex WHERE (AND/OR) not supported in sort worker — parser guarantees simple comparisons for ORDER BY queries
             }
-
             // Extract sort key and pre-parse numeric value — zero per-row allocation!
             const sort_key = if (order_col < field_count) field_buf[order_col] else "";
             const numeric_key = std.fmt.parseFloat(f64, sort_key) catch std.math.nan(f64);
