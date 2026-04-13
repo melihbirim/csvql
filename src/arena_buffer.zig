@@ -34,7 +34,7 @@ pub const ArenaBuffer = struct {
     pub fn ensureUnusedCapacity(self: *ArenaBuffer, additional: usize) !void {
         const required = self.pos + additional;
         if (required <= self.data.len) return;
-        
+
         const new_size = @max(self.data.len * 2, required);
         self.data = try self.allocator.realloc(self.data, new_size);
     }
