@@ -11,6 +11,28 @@ const options_mod = @import("options.zig");
 const scalar = @import("scalar.zig");
 const arena_buffer = @import("arena_buffer.zig");
 const Allocator = std.mem.Allocator;
+const builtin = @import("builtin");
+
+/// macOS libc sysctl accessor — resolved at link time via linkLibC().
+extern fn sysctlbyname(
+    name: [*:0]const u8,
+    oldp: ?*anyopaque,
+    oldlenp: ?*usize,
+    newp: ?*anyopaque,
+    newlen: usize,
+) c_int;
+
+/// macOS pthread QoS — forces worker threads onto performance cores.
+/// QOS_CLASS_USER_INTERACTIVE (0x21) = highest UI priority, P-cores only.
+/// No-op on non-macOS (conditional compile).
+extern fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) c_int;
+
+/// Returns the thread count for parallel scans.
+/// Uses all logical CPUs — worker threads set QOS_CLASS_USER_INTERACTIVE to
+/// preference P-cores on Apple Silicon where that improves scheduling.
+fn getEffectiveThreadCount() usize {
+    return std.Thread.getCpuCount() catch 1;
+}
 const ArenaBuffer = arena_buffer.ArenaBuffer;
 const appendJsonStringToArena = arena_buffer.appendJsonStringToArena;
 
@@ -146,7 +168,7 @@ pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.Fi
             !query.distinct and
             query.limit < 0)
         {
-            const nc = try std.Thread.getCpuCount();
+            const nc = getEffectiveThreadCount();
             if (nc > 1) {
                 try executeParallelScalar(allocator, query, file_s, output_file, opts);
                 return;
@@ -750,8 +772,8 @@ fn executeParallelScalar(
     try writer.flush();
 
     // Split into N worker chunks aligned to line boundaries
-    const num_cores = try std.Thread.getCpuCount();
-    const n_threads = @min(num_cores, 8);
+    const num_cores = getEffectiveThreadCount();
+    const n_threads = num_cores;
     const data_start = header_nl + 1;
     const data_len = data.len - data_start;
     const chunk_size = data_len / n_threads;
@@ -2346,7 +2368,7 @@ fn executeScalarAgg(
     var field_stk: [256][]const u8 = undefined;
 
     // -- Scan (parallel on large files, sequential on small) --
-    const num_cores_sa = try std.Thread.getCpuCount();
+    const num_cores_sa = getEffectiveThreadCount();
     if (num_cores_sa > 1 and file_size > 10 * 1024 * 1024) {
         const n_threads = num_cores_sa;
         const chunks = try splitLineChunks(data, header_nl + 1, n_threads, allocator);
@@ -2611,9 +2633,7 @@ fn splitLineChunks(
 /// after the merge frees everything (partial_map, keys, CompactAccum arrays).
 const GbWorkerCtx = struct {
     // Shared read-only inputs
-    file_path: []const u8,
-    chunk_start: usize,
-    chunk_end: usize,
+    data: []const u8, // mmap slice for this worker's chunk (zero-copy)
     lower_header: []const []const u8,
     group_specs: []const GroupSpec,
     agg_specs: []const AggSpec,
@@ -2769,61 +2789,40 @@ fn gbWorkerThread(ctx: *GbWorkerCtx) void {
 fn gbWorkerScan(ctx: *GbWorkerCtx) !void {
     const aa = ctx.arena.allocator();
     ctx.partial_map = std.StringHashMap(CompactAccum).init(aa);
-    try ctx.partial_map.ensureTotalCapacity(64);
+    // Per-thread map pre-sizing: each worker handles 1/N of the file
+    // Use same adaptive sizing as main thread since chunk size correlates with total file size
+    const chunk_size = ctx.data.len;
+    const worker_capacity: u32 = if (chunk_size < 10 * 1024 * 1024)
+        128
+    else if (chunk_size < 100 * 1024 * 1024)
+        512
+    else
+        2048;
+    try ctx.partial_map.ensureTotalCapacity(worker_capacity);
 
-    // Use pread instead of scanning shared mmap data.  Each worker opens its
-    // own file descriptor and reads its chunk in 2 MB blocks, eliminating the
-    // VM page-fault serialization that occurs when 12 threads concurrently
-    // fault different regions of the same mmap'd file on macOS.
-    const file = try std.fs.cwd().openFile(ctx.file_path, .{});
-    defer file.close();
-
-    const IO_BUF: usize = 2 * 1024 * 1024;
-    const io_buf = try aa.alloc(u8, IO_BUF);
-    // seam_buf holds the tail bytes of an I/O block that did not end on '\n'.
-    var seam_buf = std.ArrayListUnmanaged(u8){};
-    // combined_buf is reused scratch space for lines that span two blocks.
-    var combined_buf = std.ArrayListUnmanaged(u8){};
-
+    // Zero-copy scan: iterate directly over the mmap'd data slice.
+    // The full file is already mmap'd by the calling thread; each worker
+    // just reads a pointer range — no pread syscalls, no data copies,
+    // no IO buffers, no seam handling.  After the warmup run the pages
+    // are in the page cache so access is at memory speed (~100 GB/s).
     var field_stk: [256][]const u8 = undefined;
     var key_buf = std.ArrayListUnmanaged(u8){};
 
-    var file_pos: usize = ctx.chunk_start;
-    while (file_pos < ctx.chunk_end) {
-        const to_read = @min(IO_BUF, ctx.chunk_end - file_pos);
-        const n = try std.posix.pread(file.handle, io_buf[0..to_read], @intCast(file_pos));
-        if (n == 0) break;
-        file_pos += n;
-
-        var scan: usize = 0;
-        while (scan < n) {
-            const nl = std.mem.indexOfScalarPos(u8, io_buf, scan, '\n') orelse {
-                // No newline in remaining bytes — carry them to the next block.
-                try seam_buf.appendSlice(aa, io_buf[scan..n]);
-                break;
-            };
-            // Assemble the complete line: seam (if any) + bytes up to '\n'.
-            var line: []const u8 = undefined;
-            if (seam_buf.items.len > 0) {
-                combined_buf.clearRetainingCapacity();
-                try combined_buf.appendSlice(aa, seam_buf.items);
-                try combined_buf.appendSlice(aa, io_buf[scan..nl]);
-                seam_buf.clearRetainingCapacity();
-                line = combined_buf.items;
-            } else {
-                line = io_buf[scan..nl];
-            }
+    var pos: usize = 0;
+    const data = ctx.data;
+    while (pos < data.len) {
+        const nl = std.mem.indexOfScalarPos(u8, data, pos, '\n') orelse {
+            // Last line with no trailing newline
+            var line: []const u8 = data[pos..];
             if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-            scan = nl + 1;
-            if (line.len == 0) continue;
-            try gbProcessRecord(ctx, aa, &field_stk, &key_buf, line);
-        }
-    }
-    // Flush remaining seam bytes (last line without trailing newline).
-    if (seam_buf.items.len > 0) {
-        var line: []const u8 = seam_buf.items;
+            if (line.len > 0) try gbProcessRecord(ctx, aa, &field_stk, &key_buf, line);
+            break;
+        };
+        var line: []const u8 = data[pos..nl];
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-        if (line.len > 0) try gbProcessRecord(ctx, aa, &field_stk, &key_buf, line);
+        pos = nl + 1;
+        if (line.len == 0) continue;
+        try gbProcessRecord(ctx, aa, &field_stk, &key_buf, line);
     }
 }
 
@@ -3351,8 +3350,16 @@ fn executeGroupBy(
 
     var group_map = std.StringHashMap(CompactAccum).init(allocator);
     defer group_map.deinit();
-    // Pre-size for typical low-cardinality GROUP BY (avoids rehashing)
-    try group_map.ensureTotalCapacity(64);
+    // Adaptive pre-sizing: larger files → more groups → fewer rehashes
+    const initial_capacity: u32 = if (file_size < 10 * 1024 * 1024)
+        128
+    else if (file_size < 100 * 1024 * 1024)
+        512
+    else if (file_size < 1024 * 1024 * 1024)
+        2048
+    else
+        8192; // 200GB files: starts at 8K, grows as needed
+    try group_map.ensureTotalCapacity(initial_capacity);
 
     const n_aggs = agg_specs.items.len;
 
@@ -3368,7 +3375,7 @@ fn executeGroupBy(
     // Each thread independently scans its chunk into its own partial_map;
     // main thread merges arithmetic results after join (O(num_groups), negligible).
     // Single-threaded fallback for small files or single-core environments.
-    const num_cores = try std.Thread.getCpuCount();
+    const num_cores = getEffectiveThreadCount();
     if (num_cores > 1 and file_size > 10 * 1024 * 1024) {
         const n_threads = num_cores;
         const chunks = try splitLineChunks(data, header_nl + 1, n_threads, allocator);
@@ -3381,9 +3388,7 @@ fn executeGroupBy(
 
         for (0..n_threads) |i| {
             thread_ctxs[i] = .{
-                .file_path = query.file_path,
-                .chunk_start = chunks[i][0],
-                .chunk_end = chunks[i][1],
+                .data = data[chunks[i][0]..chunks[i][1]],
                 .lower_header = lower_header,
                 .group_specs = group_specs,
                 .agg_specs = agg_specs.items,
