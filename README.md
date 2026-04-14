@@ -73,7 +73,22 @@ cat data.tsv | csvql "SELECT * FROM '-'" -d $'\t' --no-header
 
 ## Installation
 
-### Prebuilt Binaries (recommended)
+### Homebrew (macOS / Linux)
+
+```bash
+brew install melihbirim/csvql/csvql
+```
+
+Or in two steps if you plan to install multiple tools from this tap:
+
+```bash
+brew tap melihbirim/csvql
+brew install csvql
+```
+
+> `melihbirim/csvql` is the tap (the formula repository), and the trailing `/csvql` is the formula name inside it.
+
+### Prebuilt Binaries
 
 Download from [GitHub Releases](https://github.com/melihbirim/csvql/releases):
 
