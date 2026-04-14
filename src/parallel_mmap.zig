@@ -34,7 +34,8 @@ const WorkerResult = struct {
 };
 
 const WorkerContext = struct {
-    data: []const u8,
+    data: []const u8, // mmap slice — used only when use_parallel_output=false (LIMIT/DISTINCT)
+    file_path: []const u8, // used by pread path (use_parallel_output=true)
     chunk: WorkChunk,
     query: parser.Query,
     lower_header: []const []const u8,
@@ -190,7 +191,7 @@ pub fn executeParallelMapped(
 
     // Get number of threads
     const num_cores = try std.Thread.getCpuCount();
-    const num_threads = @min(num_cores, 8);
+    const num_threads = num_cores;
 
     // Split into chunks aligned to line boundaries
     const chunk_size = data_len / num_threads;
@@ -383,6 +384,7 @@ pub fn executeParallelMapped(
         for (0..num_threads) |i| {
             contexts[i] = WorkerContext{
                 .data = data,
+                .file_path = query.file_path,
                 .chunk = chunks[i],
                 .query = query,
                 .lower_header = lower_header,
@@ -590,154 +592,173 @@ fn workerThread(ctx: *WorkerContext) void {
     };
 }
 
-fn processChunk(ctx: *WorkerContext) !void {
-    const chunk_data = ctx.data[ctx.chunk.start..ctx.chunk.end];
+/// Process a single CSV line: apply WHERE filter then serialize or collect the result.
+/// Called by both the pread (use_parallel_output=true) and mmap scan loops in processChunk.
+/// Returns immediately (row skipped) when the WHERE condition is not satisfied.
+fn processOneLine(
+    ctx: *WorkerContext,
+    arena_alloc: Allocator,
+    fields: *std.ArrayList([]const u8),
+    line: []const u8,
+) !void {
+    fields.clearRetainingCapacity();
+    try simd.parseCSVFields(line, fields, arena_alloc, ctx.delimiter);
 
-    // Use arena allocator for temporary allocations
+    // Fast WHERE evaluation using direct index lookup (avoid HashMap!)
+    if (ctx.query.where_expr) |expr| {
+        if (expr == .comparison) {
+            const comp = expr.comparison;
+            if (ctx.where_column_idx) |col_idx| {
+                if (col_idx < fields.items.len) {
+                    const field_value = fields.items[col_idx];
+                    if (comp.numeric_value) |threshold| {
+                        const val = std.fmt.parseFloat(f64, field_value) catch return;
+                        const matches = switch (comp.operator) {
+                            .equal => val == threshold,
+                            .not_equal => val != threshold,
+                            .greater => val > threshold,
+                            .greater_equal => val >= threshold,
+                            .less => val < threshold,
+                            .less_equal => val <= threshold,
+                            .like => parser.matchLike(field_value, comp.value),
+                            .ilike => parser.matchILike(field_value, comp.value),
+                            .between, .is_null, .is_not_null => parser.compareValues(comp, field_value),
+                        };
+                        if (!matches) return;
+                    } else {
+                        if (!parser.compareValues(comp, field_value)) return;
+                    }
+                } else return;
+            } else {
+                if (!parser.evaluateDirect(expr, fields.items, ctx.lower_header)) return;
+            }
+        } else {
+            if (!parser.evaluateDirect(expr, fields.items, ctx.lower_header)) return;
+        }
+    }
+
+    if (ctx.use_parallel_output) {
+        if (ctx.format == .csv) {
+            for (ctx.output_indices, 0..) |idx, j| {
+                if (j > 0) try ctx.output_buf.append(ctx.allocator, ctx.delimiter);
+                const value = if (idx < fields.items.len) fields.items[idx] else "";
+                var needs_quote = false;
+                for (value) |c| {
+                    if (c == ctx.delimiter or c == '"' or c == '\r' or c == '\n') {
+                        needs_quote = true;
+                        break;
+                    }
+                }
+                if (needs_quote) {
+                    try ctx.output_buf.append(ctx.allocator, '"');
+                    for (value) |c| {
+                        if (c == '"') try ctx.output_buf.append(ctx.allocator, '"');
+                        try ctx.output_buf.append(ctx.allocator, c);
+                    }
+                    try ctx.output_buf.append(ctx.allocator, '"');
+                } else {
+                    try ctx.output_buf.appendSlice(ctx.allocator, value);
+                }
+            }
+            try ctx.output_buf.append(ctx.allocator, '\n');
+        } else {
+            const is_jsonl = ctx.format == .jsonl;
+            if (ctx.output_buf.items.len > 0 and !is_jsonl) {
+                try ctx.output_buf.appendSlice(ctx.allocator, ",\n");
+            }
+            try ctx.output_buf.append(ctx.allocator, '{');
+            for (ctx.output_indices, 0..) |idx, j| {
+                if (j > 0) try ctx.output_buf.append(ctx.allocator, ',');
+                try ctx.output_buf.appendSlice(ctx.allocator, ctx.key_fragments[j]);
+                const value = if (idx < fields.items.len) fields.items[idx] else "";
+                if (csv.isJsonNumber(value)) {
+                    try ctx.output_buf.appendSlice(ctx.allocator, value);
+                } else {
+                    try ctx.output_buf.append(ctx.allocator, '"');
+                    try csv.appendJsonEscapedToList(&ctx.output_buf, ctx.allocator, value);
+                    try ctx.output_buf.append(ctx.allocator, '"');
+                }
+            }
+            try ctx.output_buf.append(ctx.allocator, '}');
+            if (is_jsonl) try ctx.output_buf.append(ctx.allocator, '\n');
+        }
+    } else {
+        // mmap path: build row from slices pointing into mmap data (valid until munmap)
+        var output_row = try ctx.allocator.alloc([]const u8, ctx.output_indices.len);
+        for (ctx.output_indices, 0..) |idx, j| {
+            output_row[j] = if (idx < fields.items.len) fields.items[idx] else "";
+        }
+        try ctx.result.append(ctx.allocator, output_row);
+    }
+}
+
+fn processChunk(ctx: *WorkerContext) !void {
     var arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    // Preallocate fields array (assume max 20 columns)
     var fields = try std.ArrayList([]const u8).initCapacity(arena_alloc, 20);
 
-    var line_start: usize = 0;
-    while (line_start < chunk_data.len) {
-        const remaining = chunk_data[line_start..];
-        const line_end = std.mem.indexOfScalar(u8, remaining, '\n') orelse chunk_data.len - line_start;
+    if (ctx.use_parallel_output) {
+        // pread path: each worker opens its own file descriptor and issues independent
+        // pread calls. Avoids mmap page-fault serialization on macOS for large files —
+        // concurrent pread calls on the same file hit separate kernel I/O channels,
+        // letting all cores read in parallel instead of queuing at the page-fault handler.
+        const file = try std.fs.cwd().openFile(ctx.file_path, .{});
+        defer file.close();
 
-        var line = remaining[0..line_end];
-        // Trim \r if present
-        if (line.len > 0 and line[line.len - 1] == '\r') {
-            line = line[0 .. line.len - 1];
-        }
+        const IO_BUF: usize = 2 * 1024 * 1024;
+        const io_buf = try arena_alloc.alloc(u8, IO_BUF);
+        var seam_buf = std.ArrayListUnmanaged(u8){};
+        var combined_buf = std.ArrayListUnmanaged(u8){};
 
-        if (line.len > 0) {
-            // Reset for reuse
-            fields.clearRetainingCapacity();
+        var file_pos: usize = ctx.chunk.start;
+        while (file_pos < ctx.chunk.end) {
+            const to_read = @min(IO_BUF, ctx.chunk.end - file_pos);
+            const n = try std.posix.pread(file.handle, io_buf[0..to_read], @intCast(file_pos));
+            if (n == 0) break;
+            file_pos += n;
 
-            // SIMD-accelerated CSV field parsing
-            try simd.parseCSVFields(line, &fields, arena_alloc, ctx.delimiter);
-
-            // Fast WHERE evaluation using direct index lookup (avoid HashMap!)
-            if (ctx.query.where_expr) |expr| {
-                if (expr == .comparison) {
-                    const comp = expr.comparison;
-
-                    // Direct column access by index
-                    if (ctx.where_column_idx) |col_idx| {
-                        if (col_idx < fields.items.len) {
-                            const field_value = fields.items[col_idx];
-
-                            // Fast numeric comparison
-                            if (comp.numeric_value) |threshold| {
-                                const val = std.fmt.parseFloat(f64, field_value) catch {
-                                    line_start += line_end + 1;
-                                    continue;
-                                };
-
-                                const matches = switch (comp.operator) {
-                                    .equal => val == threshold,
-                                    .not_equal => val != threshold,
-                                    .greater => val > threshold,
-                                    .greater_equal => val >= threshold,
-                                    .less => val < threshold,
-                                    .less_equal => val <= threshold,
-                                    .like => parser.matchLike(field_value, comp.value),
-                                    .ilike => parser.matchILike(field_value, comp.value),
-                                    .between, .is_null, .is_not_null => parser.compareValues(comp, field_value),
-                                };
-
-                                if (!matches) {
-                                    line_start += line_end + 1;
-                                    continue;
-                                }
-                            } else {
-                                // Delegate to compareValues which handles IN, BETWEEN,
-                                // IS NULL/NOT NULL, LIKE, ILIKE, and normal comparisons.
-                                if (!parser.compareValues(comp, field_value)) {
-                                    line_start += line_end + 1;
-                                    continue;
-                                }
-                            }
-                        } else {
-                            line_start += line_end + 1;
-                            continue;
-                        }
-                    } else {
-                        // Complex WHERE (AND/OR/NOT): evaluate directly, no per-row HashMap
-                        if (!parser.evaluateDirect(expr, fields.items, ctx.lower_header)) {
-                            line_start += line_end + 1;
-                            continue;
-                        }
-                    }
+            var scan: usize = 0;
+            while (scan < n) {
+                const nl = std.mem.indexOfScalarPos(u8, io_buf, scan, '\n') orelse {
+                    try seam_buf.appendSlice(arena_alloc, io_buf[scan..n]);
+                    break;
+                };
+                var line: []const u8 = undefined;
+                if (seam_buf.items.len > 0) {
+                    combined_buf.clearRetainingCapacity();
+                    try combined_buf.appendSlice(arena_alloc, seam_buf.items);
+                    try combined_buf.appendSlice(arena_alloc, io_buf[scan..nl]);
+                    seam_buf.clearRetainingCapacity();
+                    line = combined_buf.items;
                 } else {
-                    // Complex expression (AND/OR/NOT): evaluate directly, no per-row HashMap
-                    if (!parser.evaluateDirect(expr, fields.items, ctx.lower_header)) {
-                        line_start += line_end + 1;
-                        continue;
-                    }
+                    line = io_buf[scan..nl];
                 }
-            }
-
-            if (ctx.use_parallel_output) {
-                if (ctx.format == .csv) {
-                    // Fast parallel CSV serialization
-                    for (ctx.output_indices, 0..) |idx, j| {
-                        if (j > 0) try ctx.output_buf.append(ctx.allocator, ctx.delimiter);
-                        const value = if (idx < fields.items.len) fields.items[idx] else "";
-                        // Check if quoting is needed
-                        var needs_quote = false;
-                        for (value) |c| {
-                            if (c == ctx.delimiter or c == '"' or c == '\r' or c == '\n') {
-                                needs_quote = true;
-                                break;
-                            }
-                        }
-                        if (needs_quote) {
-                            try ctx.output_buf.append(ctx.allocator, '"');
-                            for (value) |c| {
-                                if (c == '"') try ctx.output_buf.append(ctx.allocator, '"');
-                                try ctx.output_buf.append(ctx.allocator, c);
-                            }
-                            try ctx.output_buf.append(ctx.allocator, '"');
-                        } else {
-                            try ctx.output_buf.appendSlice(ctx.allocator, value);
-                        }
-                    }
-                    try ctx.output_buf.append(ctx.allocator, '\n');
-                } else {
-                    // Serialize directly into the per-thread JSON buffer (no heap alloc per row)
-                    const is_jsonl = ctx.format == .jsonl;
-                    if (ctx.output_buf.items.len > 0 and !is_jsonl) {
-                        try ctx.output_buf.appendSlice(ctx.allocator, ",\n");
-                    }
-                    try ctx.output_buf.append(ctx.allocator, '{');
-                    for (ctx.output_indices, 0..) |idx, j| {
-                        if (j > 0) try ctx.output_buf.append(ctx.allocator, ',');
-                        try ctx.output_buf.appendSlice(ctx.allocator, ctx.key_fragments[j]);
-                        const value = if (idx < fields.items.len) fields.items[idx] else "";
-                        if (csv.isJsonNumber(value)) {
-                            try ctx.output_buf.appendSlice(ctx.allocator, value);
-                        } else {
-                            try ctx.output_buf.append(ctx.allocator, '"');
-                            try csv.appendJsonEscapedToList(&ctx.output_buf, ctx.allocator, value);
-                            try ctx.output_buf.append(ctx.allocator, '"');
-                        }
-                    }
-                    try ctx.output_buf.append(ctx.allocator, '}');
-                    if (is_jsonl) try ctx.output_buf.append(ctx.allocator, '\n');
-                }
-            } else {
-                // CSV mode (or JSON with LIMIT): build zero-copy output row slices into mmap data
-                var output_row = try ctx.allocator.alloc([]const u8, ctx.output_indices.len);
-                for (ctx.output_indices, 0..) |idx, j| {
-                    output_row[j] = if (idx < fields.items.len) fields.items[idx] else "";
-                }
-                try ctx.result.append(ctx.allocator, output_row);
+                if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+                scan = nl + 1;
+                if (line.len == 0) continue;
+                try processOneLine(ctx, arena_alloc, &fields, line);
             }
         }
-
-        line_start += line_end + 1;
+        // Flush any partial line in the seam buffer (last line without trailing newline)
+        if (seam_buf.items.len > 0) {
+            var line: []const u8 = seam_buf.items;
+            if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+            if (line.len > 0) try processOneLine(ctx, arena_alloc, &fields, line);
+        }
+    } else {
+        // mmap path: for LIMIT/DISTINCT collect-rows queries.
+        // Field slices point into the mmap'd data and remain valid until munmap (after thread join).
+        const chunk_data = ctx.data[ctx.chunk.start..ctx.chunk.end];
+        var line_start: usize = 0;
+        while (line_start < chunk_data.len) {
+            const remaining = chunk_data[line_start..];
+            const line_end = std.mem.indexOfScalar(u8, remaining, '\n') orelse chunk_data.len - line_start;
+            var line = remaining[0..line_end];
+            if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+            if (line.len > 0) try processOneLine(ctx, arena_alloc, &fields, line);
+            line_start += line_end + 1;
+        }
     }
 }

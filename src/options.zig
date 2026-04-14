@@ -8,6 +8,16 @@ pub const OutputFormat = enum {
     jsonl,
 };
 
+/// Table rendering mode.
+pub const TableMode = enum {
+    /// Auto-detect: use table when stdout is a TTY and format is csv.
+    auto,
+    /// Always render as a table (--table flag).
+    on,
+    /// Never render as a table (--no-table flag).
+    off,
+};
+
 /// Runtime options parsed from CLI flags.
 pub const Options = struct {
     /// Suppress the header row in output.
@@ -16,4 +26,6 @@ pub const Options = struct {
     delimiter: u8 = ',',
     /// Output format (default: csv).
     format: OutputFormat = .csv,
+    /// Table rendering mode (default: auto TTY detection).
+    table_mode: TableMode = .auto,
 };

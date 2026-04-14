@@ -667,7 +667,7 @@ fn executeSequential(
 // ─────────────────────────────────────────────────────────────────────────────
 
 const ScalarWorkerCtx = struct {
-    data: []const u8,
+    file_path: []const u8,
     chunk_start: usize,
     chunk_end: usize,
     output_specs: []const scalar.OutputColSpec,
@@ -687,29 +687,127 @@ fn scalarWorkerThread(ctx: *ScalarWorkerCtx) void {
 }
 
 fn scalarProcessChunk(ctx: *ScalarWorkerCtx) !void {
-    const chunk_data = ctx.data[ctx.chunk_start..ctx.chunk_end];
-
     // Per-row arena: reset after each row so scalar allocations (UPPER/LOWER etc.)
     // don't accumulate.  Capacity is retained so there's no system-call overhead
     // after the first few rows.
     var row_arena = std.heap.ArenaAllocator.init(ctx.allocator);
     defer row_arena.deinit();
 
+    // Chunk-level I/O buffers: live for the entire scan (not reset per row).
+    const IO_BUF: usize = 2 * 1024 * 1024;
+    const io_buf = try ctx.allocator.alloc(u8, IO_BUF);
+    defer ctx.allocator.free(io_buf);
+    var seam_buf = std.ArrayListUnmanaged(u8){};
+    defer seam_buf.deinit(ctx.allocator);
+    var combined_buf = std.ArrayListUnmanaged(u8){};
+    defer combined_buf.deinit(ctx.allocator);
+
+    const file = try std.fs.cwd().openFile(ctx.file_path, .{});
+    defer file.close();
+
     var field_buf: [256][]const u8 = undefined;
-    var line_start: usize = 0;
 
-    while (line_start < chunk_data.len) {
-        _ = row_arena.reset(.retain_capacity);
+    var file_pos: usize = ctx.chunk_start;
+    while (file_pos < ctx.chunk_end) {
+        const to_read = @min(IO_BUF, ctx.chunk_end - file_pos);
+        const n = try std.posix.pread(file.handle, io_buf[0..to_read], @intCast(file_pos));
+        if (n == 0) break;
+        file_pos += n;
 
-        const remaining = chunk_data[line_start..];
-        const line_end_off = std.mem.indexOfScalar(u8, remaining, '\n') orelse
-            chunk_data.len - line_start;
-        var line = remaining[0..line_end_off];
+        var scan: usize = 0;
+        while (scan < n) {
+            const nl = std.mem.indexOfScalarPos(u8, io_buf, scan, '\n') orelse {
+                try seam_buf.appendSlice(ctx.allocator, io_buf[scan..n]);
+                break;
+            };
+            var line: []const u8 = undefined;
+            if (seam_buf.items.len > 0) {
+                combined_buf.clearRetainingCapacity();
+                try combined_buf.appendSlice(ctx.allocator, seam_buf.items);
+                try combined_buf.appendSlice(ctx.allocator, io_buf[scan..nl]);
+                seam_buf.clearRetainingCapacity();
+                line = combined_buf.items;
+            } else {
+                line = io_buf[scan..nl];
+            }
+            if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+            scan = nl + 1;
+            if (line.len == 0) continue;
+
+            _ = row_arena.reset(.retain_capacity);
+
+            // Parse all fields into stack buffer (zero-alloc)
+            var n_fields: usize = 0;
+            var it = std.mem.splitScalar(u8, line, ctx.delimiter);
+            while (it.next()) |f| {
+                if (n_fields >= field_buf.len) break;
+                field_buf[n_fields] = f;
+                n_fields += 1;
+            }
+            const fields = field_buf[0..n_fields];
+
+            // WHERE filter
+            if (ctx.where_expr) |expr| {
+                if (expr == .comparison) {
+                    const comp = expr.comparison;
+                    if (ctx.where_column_idx) |ci| {
+                        const fv = if (ci < fields.len) fields[ci] else "";
+                        if (comp.numeric_value) |threshold| {
+                            const val = std.fmt.parseFloat(f64, fv) catch continue;
+                            const ok = switch (comp.operator) {
+                                .equal => val == threshold,
+                                .not_equal => val != threshold,
+                                .greater => val > threshold,
+                                .greater_equal => val >= threshold,
+                                .less => val < threshold,
+                                .less_equal => val <= threshold,
+                                .like => parser.matchLike(fv, comp.value),
+                                .ilike => parser.matchILike(fv, comp.value),
+                                .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
+                            };
+                            if (!ok) continue;
+                        } else {
+                            if (!parser.compareValues(comp, fv)) continue;
+                        }
+                    } else continue;
+                } else {
+                    // AND/OR/NOT — no HashMap needed
+                    if (!parser.evaluateDirect(expr, fields, ctx.lower_header)) continue;
+                }
+            }
+
+            // Project through scalar specs and write CSV row to per-thread buffer
+            for (ctx.output_specs, 0..) |spec, j| {
+                if (j > 0) try ctx.output_buf.append(ctx.allocator, ctx.delimiter);
+                const value = scalar.evalOutputCol(spec, fields, row_arena.allocator());
+                // Minimal CSV quoting
+                var needs_quote = false;
+                for (value) |c| {
+                    if (c == ctx.delimiter or c == '"' or c == '\r' or c == '\n') {
+                        needs_quote = true;
+                        break;
+                    }
+                }
+                if (needs_quote) {
+                    try ctx.output_buf.append(ctx.allocator, '"');
+                    for (value) |c| {
+                        if (c == '"') try ctx.output_buf.append(ctx.allocator, '"');
+                        try ctx.output_buf.append(ctx.allocator, c);
+                    }
+                    try ctx.output_buf.append(ctx.allocator, '"');
+                } else {
+                    try ctx.output_buf.appendSlice(ctx.allocator, value);
+                }
+            }
+            try ctx.output_buf.append(ctx.allocator, '\n');
+        }
+    }
+    // Flush any partial line remaining in the seam buffer
+    if (seam_buf.items.len > 0) flush: {
+        var line: []const u8 = seam_buf.items;
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-        line_start += line_end_off + 1;
-        if (line.len == 0) continue;
-
-        // Parse all fields into stack buffer (zero-alloc)
+        if (line.len == 0) break :flush;
+        _ = row_arena.reset(.retain_capacity);
         var n_fields: usize = 0;
         var it = std.mem.splitScalar(u8, line, ctx.delimiter);
         while (it.next()) |f| {
@@ -718,15 +816,13 @@ fn scalarProcessChunk(ctx: *ScalarWorkerCtx) !void {
             n_fields += 1;
         }
         const fields = field_buf[0..n_fields];
-
-        // WHERE filter
         if (ctx.where_expr) |expr| {
             if (expr == .comparison) {
                 const comp = expr.comparison;
                 if (ctx.where_column_idx) |ci| {
                     const fv = if (ci < fields.len) fields[ci] else "";
                     if (comp.numeric_value) |threshold| {
-                        const val = std.fmt.parseFloat(f64, fv) catch continue;
+                        const val = std.fmt.parseFloat(f64, fv) catch break :flush;
                         const ok = switch (comp.operator) {
                             .equal => val == threshold,
                             .not_equal => val != threshold,
@@ -738,22 +834,18 @@ fn scalarProcessChunk(ctx: *ScalarWorkerCtx) !void {
                             .ilike => parser.matchILike(fv, comp.value),
                             .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
                         };
-                        if (!ok) continue;
+                        if (!ok) break :flush;
                     } else {
-                        if (!parser.compareValues(comp, fv)) continue;
+                        if (!parser.compareValues(comp, fv)) break :flush;
                     }
-                } else continue;
+                } else break :flush;
             } else {
-                // AND/OR/NOT — no HashMap needed
-                if (!parser.evaluateDirect(expr, fields, ctx.lower_header)) continue;
+                if (!parser.evaluateDirect(expr, fields, ctx.lower_header)) break :flush;
             }
         }
-
-        // Project through scalar specs and write CSV row to per-thread buffer
         for (ctx.output_specs, 0..) |spec, j| {
             if (j > 0) try ctx.output_buf.append(ctx.allocator, ctx.delimiter);
             const value = scalar.evalOutputCol(spec, fields, row_arena.allocator());
-            // Minimal CSV quoting
             var needs_quote = false;
             for (value) |c| {
                 if (c == ctx.delimiter or c == '"' or c == '\r' or c == '\n') {
@@ -900,7 +992,7 @@ fn executeParallelScalar(
             if (std.mem.indexOfScalarPos(u8, data, end, '\n')) |nl| end = nl + 1;
         }
         worker_ctxs[i] = ScalarWorkerCtx{
-            .data = data,
+            .file_path = query.file_path,
             .chunk_start = start,
             .chunk_end = end,
             .output_specs = output_specs,
@@ -2739,7 +2831,9 @@ fn splitLineChunks(
 /// after the merge frees everything (partial_map, keys, CompactAccum arrays).
 const GbWorkerCtx = struct {
     // Shared read-only inputs
-    data: []const u8, // mmap slice for this worker's chunk (zero-copy)
+    file_path: []const u8, // path opened independently by each worker thread
+    chunk_start: usize, // byte offset into the file where this worker's chunk begins
+    chunk_end: usize, // byte offset where this worker's chunk ends (exclusive)
     lower_header: []const []const u8,
     group_specs: []const GroupSpec,
     agg_specs: []const AggSpec,
@@ -2895,9 +2989,8 @@ fn gbWorkerThread(ctx: *GbWorkerCtx) void {
 fn gbWorkerScan(ctx: *GbWorkerCtx) !void {
     const aa = ctx.arena.allocator();
     ctx.partial_map = std.StringHashMap(CompactAccum).init(aa);
-    // Per-thread map pre-sizing: each worker handles 1/N of the file
-    // Use same adaptive sizing as main thread since chunk size correlates with total file size
-    const chunk_size = ctx.data.len;
+    // Per-thread map pre-sizing based on chunk byte range
+    const chunk_size = ctx.chunk_end - ctx.chunk_start;
     const worker_capacity: u32 = if (chunk_size < 10 * 1024 * 1024)
         128
     else if (chunk_size < 100 * 1024 * 1024)
@@ -2906,29 +2999,56 @@ fn gbWorkerScan(ctx: *GbWorkerCtx) !void {
         2048;
     try ctx.partial_map.ensureTotalCapacity(worker_capacity);
 
-    // Zero-copy scan: iterate directly over the mmap'd data slice.
-    // The full file is already mmap'd by the calling thread; each worker
-    // just reads a pointer range — no pread syscalls, no data copies,
-    // no IO buffers, no seam handling.  After the warmup run the pages
-    // are in the page cache so access is at memory speed (~100 GB/s).
+    // Each worker opens the file independently and reads via pread.
+    // This avoids mmap page-fault serialization on macOS for large files:
+    // concurrent pread calls are served by separate kernel I/O paths, letting
+    // all 12 cores read in parallel rather than queuing behind a single
+    // page-fault handler.
+    const file = try std.fs.cwd().openFile(ctx.file_path, .{});
+    defer file.close();
+
+    const IO_BUF: usize = 2 * 1024 * 1024;
+    const io_buf = try aa.alloc(u8, IO_BUF);
+    var seam_buf = std.ArrayListUnmanaged(u8){};
+    var combined_buf = std.ArrayListUnmanaged(u8){};
+
     var field_stk: [256][]const u8 = undefined;
     var key_buf = std.ArrayListUnmanaged(u8){};
 
-    var pos: usize = 0;
-    const data = ctx.data;
-    while (pos < data.len) {
-        const nl = std.mem.indexOfScalarPos(u8, data, pos, '\n') orelse {
-            // Last line with no trailing newline
-            var line: []const u8 = data[pos..];
+    var file_pos: usize = ctx.chunk_start;
+    while (file_pos < ctx.chunk_end) {
+        const to_read = @min(IO_BUF, ctx.chunk_end - file_pos);
+        const n = try std.posix.pread(file.handle, io_buf[0..to_read], @intCast(file_pos));
+        if (n == 0) break;
+        file_pos += n;
+
+        var scan: usize = 0;
+        while (scan < n) {
+            const nl = std.mem.indexOfScalarPos(u8, io_buf, scan, '\n') orelse {
+                try seam_buf.appendSlice(aa, io_buf[scan..n]);
+                break;
+            };
+            var line: []const u8 = undefined;
+            if (seam_buf.items.len > 0) {
+                combined_buf.clearRetainingCapacity();
+                try combined_buf.appendSlice(aa, seam_buf.items);
+                try combined_buf.appendSlice(aa, io_buf[scan..nl]);
+                seam_buf.clearRetainingCapacity();
+                line = combined_buf.items;
+            } else {
+                line = io_buf[scan..nl];
+            }
             if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-            if (line.len > 0) try gbProcessRecord(ctx, aa, &field_stk, &key_buf, line);
-            break;
-        };
-        var line: []const u8 = data[pos..nl];
+            scan = nl + 1;
+            if (line.len == 0) continue;
+            try gbProcessRecord(ctx, aa, &field_stk, &key_buf, line);
+        }
+    }
+    // Flush any partial line remaining in the seam buffer
+    if (seam_buf.items.len > 0) {
+        var line: []const u8 = seam_buf.items;
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-        pos = nl + 1;
-        if (line.len == 0) continue;
-        try gbProcessRecord(ctx, aa, &field_stk, &key_buf, line);
+        if (line.len > 0) try gbProcessRecord(ctx, aa, &field_stk, &key_buf, line);
     }
 }
 
@@ -3494,7 +3614,9 @@ fn executeGroupBy(
 
         for (0..n_threads) |i| {
             thread_ctxs[i] = .{
-                .data = data[chunks[i][0]..chunks[i][1]],
+                .file_path = query.file_path,
+                .chunk_start = chunks[i][0],
+                .chunk_end = chunks[i][1],
                 .lower_header = lower_header,
                 .group_specs = group_specs,
                 .agg_specs = agg_specs.items,
