@@ -30,4 +30,5 @@ csvq
 # Local release helper
 release.sh
 
-DATETIME_PLAN.md__pycache__/
+DATETIME_PLAN.md
+__pycache__/
