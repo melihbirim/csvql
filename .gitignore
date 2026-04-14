@@ -27,4 +27,7 @@ csvq
 
 .bench_tmp/
 
+# Local release helper
+release.sh
+
 DATETIME_PLAN.md
