@@ -196,6 +196,9 @@ jobs:
         working-directory: python
         run: |
           pip install --upgrade setuptools build wheel
+          # Set version from git tag (strips leading 'v')
+          TAG="${GITHUB_REF_NAME#v}"
+          sed -i.bak "s/^version = .*/version = \"$TAG\"/" pyproject.toml
           python -m build --wheel --no-isolation
           # Rename wheel to correct platform tag
           cd dist
