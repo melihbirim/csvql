@@ -178,6 +178,14 @@ fn getQueryFromArgs(allocator: Allocator, clean_args: []const []const u8) ![]u8 
 
     // Read query from stdin
     const stdin = std.fs.File{ .handle = std.posix.STDIN_FILENO };
+
+    // If stdin is a TTY (no pipe), nothing will ever come — show help instead.
+    if (std.posix.isatty(std.posix.STDIN_FILENO)) {
+        const stdout_file = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
+        try stdout_file.writeAll(help_text);
+        std.process.exit(0);
+    }
+
     const query = try stdin.readToEndAlloc(allocator, 1024 * 1024);
     const trimmed = std.mem.trim(u8, query, &std.ascii.whitespace);
 
