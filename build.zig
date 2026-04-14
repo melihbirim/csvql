@@ -23,6 +23,24 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // Shared library — C ABI for Python ctypes and other FFI callers.
+    // Build: zig build lib -Doptimize=ReleaseFast
+    // Output: zig-out/lib/libcsvql.dylib (macOS) or libcsvql.so (Linux)
+    const lib = b.addLibrary(.{
+        .name = "csvql",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/lib.zig"),
+        }),
+    });
+    lib.linkLibC();
+    b.installArtifact(lib);
+
+    const lib_step = b.step("lib", "Build shared library (libcsvql)");
+    lib_step.dependOn(&lib.step);
+
     // Run command
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
