@@ -195,12 +195,11 @@ jobs:
       - name: Build wheel
         working-directory: python
         run: |
-          pip install build wheel
+          pip install --upgrade setuptools build wheel
           python -m build --wheel --no-isolation
           # Rename wheel to correct platform tag
           cd dist
           for f in *.whl; do
-            newname=$(echo "$f" | sed 's/py3-none-any/${{ matrix.plat }}/; s/py3-none-any/py3-none-${{ matrix.plat }}/')
             mv "$f" "${f/py3-none-any/py3-none-${{ matrix.plat }}}" 2>/dev/null || true
           done
 
