@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "csvql-query"
+version = "1.1.1"
+description = "Fast CSV querying from Python — powered by a Zig/SIMD engine"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+keywords = ["csv", "query", "sql", "fast", "simd"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.optional-dependencies]
+pandas = ["pandas>=1.5"]
+
+[project.urls]
+Homepage = "https://github.com/melihbirim/csvql"
+Repository = "https://github.com/melihbirim/csvql"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["csvql*"]
+
+[tool.setuptools.package-data]
+csvql = ["*.so", "*.dylib"]
