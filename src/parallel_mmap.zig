@@ -317,15 +317,9 @@ pub fn executeParallelMapped(
         for (sorted) |entry| {
             if (query.limit >= 0 and written >= @as(usize, @intCast(query.limit))) break;
 
-            // Parse the raw line to extract output columns
+            // Parse the raw line to extract output columns (quote-aware)
             var field_buf: [256][]const u8 = undefined;
-            var field_count: usize = 0;
-            var field_iter = std.mem.splitScalar(u8, entry.line, opts.delimiter);
-            while (field_iter.next()) |field| {
-                if (field_count >= field_buf.len) break;
-                field_buf[field_count] = field;
-                field_count += 1;
-            }
+            const field_count = simd.parseCSVFieldsStatic(entry.line, &field_buf, opts.delimiter) catch continue;
 
             for (output_indices.items, 0..) |idx, j| {
                 output_row[j] = if (idx < field_count) field_buf[idx] else "";
@@ -510,15 +504,12 @@ fn processSortChunk(ctx: *SortWorkerContext) !void {
         }
 
         if (line.len > 0) {
-            // Parse fields into stack buffer (zero-alloc)
+            // Parse fields into stack buffer (quote-aware, zero-alloc)
             var field_buf: [256][]const u8 = undefined;
-            var field_count: usize = 0;
-            var field_iter = std.mem.splitScalar(u8, line, ctx.delimiter);
-            while (field_iter.next()) |field| {
-                if (field_count >= field_buf.len) break;
-                field_buf[field_count] = field;
-                field_count += 1;
-            }
+            const field_count = simd.parseCSVFieldsStatic(line, &field_buf, ctx.delimiter) catch {
+                line_start += line_end + 1;
+                continue;
+            };
 
             // Fast WHERE evaluation
             if (ctx.query.where_expr) |expr| {

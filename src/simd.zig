@@ -80,44 +80,151 @@ pub fn findCommasSIMD(line: []const u8, positions: []usize, delimiter: u8) usize
     return count;
 }
 
+/// Quote-aware CSV field splitter into a caller-supplied static buffer.
+/// Returns the number of fields written.  All returned slices are zero-copy pointers into `line`.
+/// For quoted fields the surrounding `"` characters are stripped; `""` escape sequences are
+/// traversed correctly for boundary detection but are NOT unescaped in the returned slice.
+/// Use `parseCSVFields` (ArrayList version) when `""` → `"` unescaping is also required.
+/// Returns `error.TooManyColumns` if more fields are found than `buf` can hold.
+pub fn parseCSVFieldsStatic(line: []const u8, buf: [][]const u8, delimiter: u8) !usize {
+    // Fast path: no quotes — plain splitScalar (zero overhead), preserving the
+    // std.mem.splitScalar contract (empty line yields one empty field).
+    if (std.mem.indexOfScalar(u8, line, '"') == null) {
+        var count: usize = 0;
+        var iter = std.mem.splitScalar(u8, line, delimiter);
+        while (iter.next()) |field| {
+            if (count >= buf.len) return error.TooManyColumns;
+            buf[count] = field;
+            count += 1;
+        }
+        return count;
+    }
+
+    // Quote-aware path: walk byte-by-byte tracking quoted regions.
+    var count: usize = 0;
+    var i: usize = 0;
+    while (true) {
+        if (count >= buf.len) return error.TooManyColumns;
+        if (i < line.len and line[i] == '"') {
+            // Quoted field: collect until closing quote, honoring "" escape sequences.
+            i += 1; // skip opening quote
+            const start = i;
+            while (i < line.len) {
+                if (line[i] == '"') {
+                    if (i + 1 < line.len and line[i + 1] == '"') {
+                        i += 2; // skip "" pair and keep scanning
+                        continue;
+                    }
+                    break; // real closing quote
+                }
+                i += 1;
+            }
+            buf[count] = line[start..i];
+            if (i < line.len) i += 1; // skip closing quote
+            count += 1;
+            // Skip any trailing garbage before the next delimiter (RFC tolerance)
+            while (i < line.len and line[i] != delimiter) : (i += 1) {}
+        } else {
+            // Unquoted field
+            const start = i;
+            while (i < line.len and line[i] != delimiter) : (i += 1) {}
+            buf[count] = line[start..i];
+            count += 1;
+        }
+        if (i >= line.len or line[i] != delimiter) break;
+        i += 1; // consume delimiter
+    }
+    return count;
+}
+
 /// CSV field splitter used by parallel_mmap.zig.
-/// Uses findCommasSIMD for lines >= 32 bytes, scalar loop for shorter ones.
-/// Zero-copy: returned slices point into the original line buffer.
+/// Uses findCommasSIMD for lines >= 32 bytes that contain no quotes, scalar loop for shorter ones.
+/// Zero-copy: returned slices point into the original line buffer when no quoting is present.
+/// Quote-aware: when the line contains `"` characters the function falls back to a state-machine
+/// that correctly skips delimiters inside quoted fields and strips the surrounding quotes.
+/// Quoted field contents are heap-allocated via `allocator`; unquoted fields remain zero-copy.
 pub fn parseCSVFields(line: []const u8, fields: *std.ArrayList([]const u8), allocator: std.mem.Allocator, delimiter: u8) !void {
     if (line.len == 0) return;
 
-    // Fast path for short lines — too small to benefit from SIMD overhead
-    if (line.len < 32) {
-        var start: usize = 0;
-        for (line, 0..) |c, i| {
-            if (c == delimiter) {
-                try fields.append(allocator, line[start..i]);
-                start = i + 1;
+    // Fast path: no quotes anywhere — use SIMD splitting (fully zero-copy, no allocation).
+    if (std.mem.indexOfScalar(u8, line, '"') == null) {
+        if (line.len < 32) {
+            var start: usize = 0;
+            for (line, 0..) |c, i| {
+                if (c == delimiter) {
+                    try fields.append(allocator, line[start..i]);
+                    start = i + 1;
+                }
             }
+            try fields.append(allocator, line[start..]);
+            return;
+        }
+
+        // SIMD path: find all delimiter positions at once (up to 64)
+        var comma_positions_buf: [64]usize = undefined;
+        const comma_count = findCommasSIMD(line, &comma_positions_buf, delimiter);
+
+        // If the buffer is full, check whether more delimiters exist after the last
+        // found one — if so the line exceeds 64 fields.
+        if (comma_count == comma_positions_buf.len) {
+            const last_comma = comma_positions_buf[comma_count - 1];
+            if (std.mem.indexOfScalar(u8, line[last_comma + 1 ..], delimiter) != null) {
+                return error.TooManyColumns;
+            }
+        }
+
+        var start: usize = 0;
+        for (comma_positions_buf[0..comma_count]) |comma_pos| {
+            try fields.append(allocator, line[start..comma_pos]);
+            start = comma_pos + 1;
         }
         try fields.append(allocator, line[start..]);
         return;
     }
 
-    // SIMD path: find all delimiter positions at once (up to 64)
-    var comma_positions_buf: [64]usize = undefined;
-    const comma_count = findCommasSIMD(line, &comma_positions_buf, delimiter);
+    // Slow path: quote-aware state machine (RFC 4180).
+    // Quoted fields are heap-allocated (quotes stripped, "" → "); unquoted fields are zero-copy.
+    var i: usize = 0;
+    while (true) {
+        if (i < line.len and line[i] == '"') {
+            // Quoted field: consume content until the matching closing quote.
+            i += 1; // skip opening quote
+            var field_buf = std.ArrayList(u8){};
+            defer field_buf.deinit(allocator);
 
-    // If the buffer is full, check whether more delimiters exist after the last
-    // found one — if so the line exceeds 64 fields.
-    if (comma_count == comma_positions_buf.len) {
-        const last_comma = comma_positions_buf[comma_count - 1];
-        if (std.mem.indexOfScalar(u8, line[last_comma + 1 ..], delimiter) != null) {
-            return error.TooManyColumns;
+            while (i < line.len) {
+                const c = line[i];
+                if (c == '"') {
+                    i += 1;
+                    if (i < line.len and line[i] == '"') {
+                        // Escaped quote "" → emit single "
+                        try field_buf.append(allocator, '"');
+                        i += 1;
+                    } else {
+                        // End of quoted region
+                        break;
+                    }
+                } else {
+                    try field_buf.append(allocator, c);
+                    i += 1;
+                }
+            }
+
+            // Skip any trailing garbage between closing quote and next delimiter (RFC tolerance)
+            while (i < line.len and line[i] != delimiter) : (i += 1) {}
+
+            try fields.append(allocator, try field_buf.toOwnedSlice(allocator));
+        } else {
+            // Unquoted field — zero-copy slice into the original line buffer
+            const start = i;
+            while (i < line.len and line[i] != delimiter) : (i += 1) {}
+            try fields.append(allocator, line[start..i]);
         }
-    }
 
-    var start: usize = 0;
-    for (comma_positions_buf[0..comma_count]) |comma_pos| {
-        try fields.append(allocator, line[start..comma_pos]);
-        start = comma_pos + 1;
+        // Advance past delimiter, or stop if we've reached the end of the line.
+        if (i >= line.len or line[i] != delimiter) break;
+        i += 1; // consume delimiter, continue to next field
     }
-    try fields.append(allocator, line[start..]);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -220,4 +327,78 @@ test "parseCSVFields: returns TooManyColumns for lines with more than 64 fields"
         error.TooManyColumns,
         parseCSVFields(line_buf[0..pos], &fields, std.testing.allocator, ','),
     );
+}
+
+// ── Quoted-field tests (fix for issue #42) ────────────────────────────────
+
+test "parseCSVFields: quoted field with embedded comma (short line)" {
+    // Reproduces the bug from issue #42: Bob,"Enjoys biscuits, has a bike"
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var fields = std.ArrayList([]const u8){};
+    defer fields.deinit(alloc);
+    try parseCSVFields("Bob,\"Enjoys biscuits, has a bike\"", &fields, alloc, ',');
+    try std.testing.expectEqual(@as(usize, 2), fields.items.len);
+    try std.testing.expectEqualStrings("Bob", fields.items[0]);
+    try std.testing.expectEqualStrings("Enjoys biscuits, has a bike", fields.items[1]);
+}
+
+test "parseCSVFields: quoted field with embedded comma (large line >=32 bytes)" {
+    // Verifies that the quote-aware path is also triggered for lines beyond the 32-byte threshold
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var fields = std.ArrayList([]const u8){};
+    defer fields.deinit(alloc);
+    try parseCSVFields("first_column,second_column,\"third, has a comma\",fourth_column", &fields, alloc, ',');
+    try std.testing.expectEqual(@as(usize, 4), fields.items.len);
+    try std.testing.expectEqualStrings("first_column", fields.items[0]);
+    try std.testing.expectEqualStrings("second_column", fields.items[1]);
+    try std.testing.expectEqualStrings("third, has a comma", fields.items[2]);
+    try std.testing.expectEqualStrings("fourth_column", fields.items[3]);
+}
+
+test "parseCSVFields: escaped double-quote inside quoted field" {
+    // RFC 4180: "" inside a quoted field is a literal "
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var fields = std.ArrayList([]const u8){};
+    defer fields.deinit(alloc);
+    try parseCSVFields("name,\"She said \"\"hello\"\"\"", &fields, alloc, ',');
+    try std.testing.expectEqual(@as(usize, 2), fields.items.len);
+    try std.testing.expectEqualStrings("name", fields.items[0]);
+    try std.testing.expectEqualStrings("She said \"hello\"", fields.items[1]);
+}
+
+test "parseCSVFields: empty quoted field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var fields = std.ArrayList([]const u8){};
+    defer fields.deinit(alloc);
+    try parseCSVFields("a,\"\",b", &fields, alloc, ',');
+    try std.testing.expectEqual(@as(usize, 3), fields.items.len);
+    try std.testing.expectEqualStrings("a", fields.items[0]);
+    try std.testing.expectEqualStrings("", fields.items[1]);
+    try std.testing.expectEqualStrings("b", fields.items[2]);
+}
+
+test "parseCSVFields: mixed quoted and unquoted fields" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var fields = std.ArrayList([]const u8){};
+    defer fields.deinit(alloc);
+    try parseCSVFields("Garry,Likes beer,active", &fields, alloc, ',');
+    try std.testing.expectEqual(@as(usize, 3), fields.items.len);
+    try std.testing.expectEqualStrings("Garry", fields.items[0]);
+    try std.testing.expectEqualStrings("Likes beer", fields.items[1]);
+    try std.testing.expectEqualStrings("active", fields.items[2]);
 }

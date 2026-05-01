@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const simd = @import("simd.zig");
 
 /// High-performance bulk CSV reader - optimized for speed over RFC 4180 compliance
 /// Assumes: no quoted fields with embedded newlines/commas
@@ -155,35 +156,59 @@ pub const BulkCsvReader = struct {
         }
     }
 
-    /// Parse a line into field_buf without any allocation
+    /// Parse a line into field_buf without any allocation.
+    /// Quote-aware: quoted fields have their surrounding `"` stripped.
     fn parseLineSlices(self: *BulkCsvReader, line: []const u8) ![]const []const u8 {
-        var count: usize = 0;
-        var iter = std.mem.splitScalar(u8, line, self.delimiter);
-        while (iter.next()) |field| {
-            if (count >= self.field_buf.len) return error.TooManyColumns;
-            self.field_buf[count] = field;
-            count += 1;
-        }
+        const count = try simd.parseCSVFieldsStatic(line, &self.field_buf, self.delimiter);
         return self.field_buf[0..count];
     }
 
     fn parseLine(self: *BulkCsvReader, line: []const u8) ![][]u8 {
         var fields = std.ArrayList([]u8){};
         errdefer {
-            for (fields.items) |field| {
-                self.allocator.free(field);
-            }
+            for (fields.items) |field| self.allocator.free(field);
             fields.deinit(self.allocator);
         }
 
-        // Fast path: split by delimiter
-        var iter = std.mem.splitScalar(u8, line, self.delimiter);
-        while (iter.next()) |field| {
-            // Duplicate the field
-            const field_copy = try self.allocator.dupe(u8, field);
-            try fields.append(self.allocator, field_copy);
+        if (std.mem.indexOfScalar(u8, line, '"') == null) {
+            // Fast path: no quotes — split by delimiter and dupe
+            var iter = std.mem.splitScalar(u8, line, self.delimiter);
+            while (iter.next()) |field| {
+                try fields.append(self.allocator, try self.allocator.dupe(u8, field));
+            }
+            return try fields.toOwnedSlice(self.allocator);
         }
 
+        // Quote-aware path: strip surrounding quotes and unescape "" → "
+        var i: usize = 0;
+        while (true) {
+            if (i < line.len and line[i] == '"') {
+                i += 1; // skip opening quote
+                var field_buf = std.ArrayList(u8){};
+                defer field_buf.deinit(self.allocator);
+                while (i < line.len) {
+                    const c = line[i];
+                    if (c == '"') {
+                        i += 1;
+                        if (i < line.len and line[i] == '"') {
+                            try field_buf.append(self.allocator, '"');
+                            i += 1;
+                        } else break; // end of quoted region
+                    } else {
+                        try field_buf.append(self.allocator, c);
+                        i += 1;
+                    }
+                }
+                while (i < line.len and line[i] != self.delimiter) : (i += 1) {}
+                try fields.append(self.allocator, try field_buf.toOwnedSlice(self.allocator));
+            } else {
+                const start = i;
+                while (i < line.len and line[i] != self.delimiter) : (i += 1) {}
+                try fields.append(self.allocator, try self.allocator.dupe(u8, line[start..i]));
+            }
+            if (i >= line.len or line[i] != self.delimiter) break;
+            i += 1; // consume delimiter
+        }
         return try fields.toOwnedSlice(self.allocator);
     }
 
