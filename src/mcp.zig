@@ -299,7 +299,7 @@ fn runQuery(allocator: Allocator, sql: []const u8, format: options_mod.OutputFor
     try engine.execute(allocator, q, tmp_file, opts);
 
     try tmp_file.seekTo(0);
-    return tmp_file.readToEndAlloc(allocator, 100 * 1024 * 1024);
+    return tmp_file.readToEndAlloc(allocator, 1024 * 1024 * 1024);
 }
 
 // ---------------------------------------------------------------------------
