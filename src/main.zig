@@ -161,7 +161,7 @@ pub fn main() !void {
     const use_table = opts.format == .csv and !opts.no_header and switch (opts.table_mode) {
         .on => true,
         .off => false,
-        .auto => std.posix.isatty(std.posix.STDOUT_FILENO),
+        .auto => stdout_file.isTty(),
     };
 
     if (use_table) {
@@ -204,7 +204,7 @@ fn renderTableOutput(allocator: Allocator, query: parser.Query, stdout_file: std
         header_line_raw;
     if (header_line.len == 0) return;
 
-    var col_list: std.ArrayList(zigtable.Column) = .{};
+    var col_list: std.ArrayList(zigtable.Column) = .empty;
     defer col_list.deinit(allocator);
     var hdr_it = CsvRowIterator.init(header_line, opts.delimiter);
     while (hdr_it.next()) |col_name| {
@@ -216,7 +216,7 @@ fn renderTableOutput(allocator: Allocator, query: parser.Query, stdout_file: std
     defer table.deinit();
 
     // Add data rows
-    var row_fields: std.ArrayList([]const u8) = .{};
+    var row_fields: std.ArrayList([]const u8) = .empty;
     defer row_fields.deinit(allocator);
     while (lines.next()) |raw_line| {
         const line = if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r')
@@ -233,7 +233,7 @@ fn renderTableOutput(allocator: Allocator, query: parser.Query, stdout_file: std
     }
 
     // Buffer the table output, then write to stdout in one shot.
-    var table_buf: std.ArrayList(u8) = .{};
+    var table_buf: std.ArrayList(u8) = .empty;
     defer table_buf.deinit(allocator);
 
     const BufWriter = struct {
@@ -331,7 +331,7 @@ fn getQueryFromArgs(allocator: Allocator, clean_args: []const []const u8) ![]u8 
     const stdin = std.fs.File{ .handle = std.posix.STDIN_FILENO };
 
     // If stdin is a TTY (no pipe), nothing will ever come — show help instead.
-    if (std.posix.isatty(std.posix.STDIN_FILENO)) {
+    if (stdin.isTty()) {
         const stdout_file = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
         try stdout_file.writeAll(help_text);
         std.process.exit(0);

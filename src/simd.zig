@@ -274,7 +274,7 @@ test "stringsEqualFast: long strings not equal" {
 }
 
 test "parseCSVFields: basic split small line" {
-    var fields = std.ArrayList([]const u8){};
+    var fields = std.ArrayList([]const u8).empty;
     defer fields.deinit(std.testing.allocator);
     try parseCSVFields("a,b,c", &fields, std.testing.allocator, ',');
     try std.testing.expectEqual(@as(usize, 3), fields.items.len);
@@ -284,7 +284,7 @@ test "parseCSVFields: basic split small line" {
 }
 
 test "parseCSVFields: single field no delimiter" {
-    var fields = std.ArrayList([]const u8){};
+    var fields = std.ArrayList([]const u8).empty;
     defer fields.deinit(std.testing.allocator);
     try parseCSVFields("onlyfield", &fields, std.testing.allocator, ',');
     try std.testing.expectEqual(@as(usize, 1), fields.items.len);
@@ -293,7 +293,7 @@ test "parseCSVFields: single field no delimiter" {
 
 test "parseCSVFields: large line uses position-first path" {
     // Line longer than 32 bytes to exercise the comma_positions_buf path
-    var fields = std.ArrayList([]const u8){};
+    var fields = std.ArrayList([]const u8).empty;
     defer fields.deinit(std.testing.allocator);
     try parseCSVFields("field_one,field_two,field_three,field_four", &fields, std.testing.allocator, ',');
     try std.testing.expectEqual(@as(usize, 4), fields.items.len);
@@ -302,7 +302,7 @@ test "parseCSVFields: large line uses position-first path" {
 }
 
 test "parseCSVFields: custom delimiter" {
-    var fields = std.ArrayList([]const u8){};
+    var fields = std.ArrayList([]const u8).empty;
     defer fields.deinit(std.testing.allocator);
     try parseCSVFields("x|y|z", &fields, std.testing.allocator, '|');
     try std.testing.expectEqual(@as(usize, 3), fields.items.len);
@@ -321,7 +321,7 @@ test "parseCSVFields: returns TooManyColumns for lines with more than 64 fields"
             pos += 1;
         }
     }
-    var fields = std.ArrayList([]const u8){};
+    var fields = std.ArrayList([]const u8).empty;
     defer fields.deinit(std.testing.allocator);
     try std.testing.expectError(
         error.TooManyColumns,

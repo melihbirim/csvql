@@ -108,7 +108,7 @@ sudo mv csvql-linux-x86_64 /usr/local/bin/csvql
 
 ### Build from Source
 
-Requires [Zig](https://ziglang.org/) 0.13.0+ (tested with 0.15.2):
+Requires [Zig](https://ziglang.org/) 0.16.0+:
 
 ```bash
 git clone https://github.com/melihbirim/csvql.git

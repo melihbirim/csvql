@@ -350,10 +350,10 @@ fn executeSequential(
     }
 
     // Determine output columns
-    var output_specs = std.ArrayListUnmanaged(scalar.OutputColSpec){};
+    var output_specs = std.ArrayListUnmanaged(scalar.OutputColSpec).empty;
     defer output_specs.deinit(allocator);
 
-    var output_header = std.ArrayList([]const u8){};
+    var output_header = std.ArrayList([]const u8).empty;
     defer output_header.deinit(allocator);
 
     if (query.all_columns) {
@@ -406,7 +406,7 @@ fn executeSequential(
     var sort_offsets: ?std.ArrayList(SortRowOffsets) = null;
     var arena: ?ArenaBuffer = null;
     var order_by_column_idx: ?usize = null;
-    var order_by_resolved_keys = std.ArrayList(ResolvedOrderKey){};
+    var order_by_resolved_keys = std.ArrayList(ResolvedOrderKey).empty;
     defer order_by_resolved_keys.deinit(allocator);
     defer {
         if (sort_offsets) |*offsets| offsets.deinit(allocator);
@@ -415,7 +415,7 @@ fn executeSequential(
 
     // If ORDER BY is specified, prepare buffer and find column index
     if (query.order_by) |order_by| {
-        sort_offsets = std.ArrayList(SortRowOffsets){};
+        sort_offsets = std.ArrayList(SortRowOffsets).empty;
         arena = try ArenaBuffer.init(allocator, 16 * 1024 * 1024); // 16MB initial for large result sets
 
         // Resolve primary key
@@ -594,7 +594,7 @@ fn executeSequential(
         if (query.order_by) |order_by| {
             // Arena is done growing — now safe to materialise real slices from offsets.
             const a = &(arena.?);
-            var entries = std.ArrayList(SortEntry){};
+            var entries = std.ArrayList(SortEntry).empty;
             defer entries.deinit(allocator);
             for (offsets.items) |oe| {
                 try entries.append(allocator, fast_sort.makeSortKey(
@@ -697,9 +697,9 @@ fn scalarProcessChunk(ctx: *ScalarWorkerCtx) !void {
     const IO_BUF: usize = 2 * 1024 * 1024;
     const io_buf = try ctx.allocator.alloc(u8, IO_BUF);
     defer ctx.allocator.free(io_buf);
-    var seam_buf = std.ArrayListUnmanaged(u8){};
+    var seam_buf = std.ArrayListUnmanaged(u8).empty;
     defer seam_buf.deinit(ctx.allocator);
-    var combined_buf = std.ArrayListUnmanaged(u8){};
+    var combined_buf = std.ArrayListUnmanaged(u8).empty;
     defer combined_buf.deinit(ctx.allocator);
 
     const file = try std.fs.cwd().openFile(ctx.file_path, .{});
@@ -896,7 +896,7 @@ fn executeParallelScalar(
     if (header_line.len > 0 and header_line[header_line.len - 1] == '\r')
         header_line = header_line[0 .. header_line.len - 1];
 
-    var header_list = std.ArrayListUnmanaged([]const u8){};
+    var header_list = std.ArrayListUnmanaged([]const u8).empty;
     defer header_list.deinit(allocator);
     {
         var hi = std.mem.splitScalar(u8, header_line, opts.delimiter);
@@ -921,9 +921,9 @@ fn executeParallelScalar(
     const lower_header: []const []const u8 = lower_header_buf;
 
     // Build output_specs + output header names
-    var output_specs_list = std.ArrayListUnmanaged(scalar.OutputColSpec){};
+    var output_specs_list = std.ArrayListUnmanaged(scalar.OutputColSpec).empty;
     defer output_specs_list.deinit(allocator);
-    var output_header = std.ArrayList([]const u8){};
+    var output_header = std.ArrayList([]const u8).empty;
     defer output_header.deinit(allocator);
 
     if (query.all_columns) {
@@ -1000,7 +1000,7 @@ fn executeParallelScalar(
             .where_column_idx = where_column_idx,
             .where_expr = query.where_expr,
             .delimiter = opts.delimiter,
-            .output_buf = std.ArrayList(u8){},
+            .output_buf = std.ArrayList(u8).empty,
             .allocator = allocator,
         };
         threads[i] = try std.Thread.spawn(.{}, scalarWorkerThread, .{&worker_ctxs[i]});
@@ -1100,7 +1100,7 @@ fn joinOneStep(
         const key = try arena.dupe(u8, rrow[rjidx]);
         const gop = try right_index.getOrPut(key);
         if (!gop.found_existing) {
-            gop.value_ptr.* = std.ArrayList([][]const u8){};
+            gop.value_ptr.* = std.ArrayList([][]const u8).empty;
         }
         const rcopy = try arena.alloc([]const u8, rrow.len);
         for (rrow, 0..) |f, fi| rcopy[fi] = try arena.dupe(u8, f);
@@ -1113,7 +1113,7 @@ fn joinOneStep(
     for (right_lh, 0..) |h, i| merged_headers[lw + i] = h;
 
     // --- Probe: build output rows ---
-    var out_rows = std.ArrayList([][]const u8){};
+    var out_rows = std.ArrayList([][]const u8).empty;
 
     // left_rows is a flat slice of lw fields per logical row
     const n_left_rows = left_rows.len / lw;
@@ -1262,7 +1262,7 @@ fn executeJoin(
     alias_ranges[0] = .{ .name = joins[0].left_alias, .start = 0, .width = base_w };
     var acc_offset: usize = base_w;
 
-    var acc_hdrs = std.ArrayList([]const u8){};
+    var acc_hdrs = std.ArrayList([]const u8).empty;
     for (base_headers) |h| try acc_hdrs.append(aa, h);
 
     for (joins, 0..) |join, ji| {
@@ -1320,7 +1320,7 @@ fn executeJoin(
             if (rjidx >= rrow.len) continue;
             const key = try aa.dupe(u8, rrow[rjidx]);
             const gop = try rmap.getOrPut(key);
-            if (!gop.found_existing) gop.value_ptr.* = std.ArrayList([][]const u8){};
+            if (!gop.found_existing) gop.value_ptr.* = std.ArrayList([][]const u8).empty;
             const rcopy = try aa.alloc([]const u8, rrow.len);
             for (rrow, 0..) |f, fi| rcopy[fi] = try aa.dupe(u8, f);
             try gop.value_ptr.append(allocator, rcopy);
@@ -1364,8 +1364,8 @@ fn executeJoin(
         }
     }
 
-    var output_indices = std.ArrayList(usize){};
-    var output_header_names = std.ArrayList([]const u8){};
+    var output_indices = std.ArrayList(usize).empty;
+    var output_header_names = std.ArrayList([]const u8).empty;
 
     if (query.all_columns) {
         for (0..total_w) |i| {
@@ -1488,10 +1488,10 @@ fn executeFromStdin(
     }
 
     // Determine output columns
-    var output_specs = std.ArrayListUnmanaged(scalar.OutputColSpec){};
+    var output_specs = std.ArrayListUnmanaged(scalar.OutputColSpec).empty;
     defer output_specs.deinit(allocator);
 
-    var output_header = std.ArrayList([]const u8){};
+    var output_header = std.ArrayList([]const u8).empty;
     defer output_header.deinit(allocator);
 
     if (query.all_columns) {
@@ -2160,7 +2160,7 @@ fn executeDistinct(
     if (header_line.len > 0 and header_line[header_line.len - 1] == '\r')
         header_line = header_line[0 .. header_line.len - 1];
 
-    var header_list = std.ArrayListUnmanaged([]const u8){};
+    var header_list = std.ArrayListUnmanaged([]const u8).empty;
     defer header_list.deinit(allocator);
     {
         var it = std.mem.splitScalar(u8, header_line, opts.delimiter);
@@ -2184,9 +2184,9 @@ fn executeDistinct(
     }
 
     // Resolve output column indices
-    var out_indices = std.ArrayListUnmanaged(usize){};
+    var out_indices = std.ArrayListUnmanaged(usize).empty;
     defer out_indices.deinit(allocator);
-    var out_header = std.ArrayListUnmanaged([]const u8){};
+    var out_header = std.ArrayListUnmanaged([]const u8).empty;
     defer out_header.deinit(allocator);
 
     if (query.all_columns) {
@@ -2228,7 +2228,7 @@ fn executeDistinct(
         if (sort_arena) |*a| a.deinit();
     }
     if (query.order_by) |ob| {
-        sort_offsets_mmap = std.ArrayList(SortRowOffsets){};
+        sort_offsets_mmap = std.ArrayList(SortRowOffsets).empty;
         sort_arena = try ArenaBuffer.init(allocator, 16 * 1024 * 1024);
         // Positional ORDER BY: "ORDER BY 1" uses the 1-based column position.
         const pos_num = std.fmt.parseInt(usize, ob.column, 10) catch 0;
@@ -2269,7 +2269,7 @@ fn executeDistinct(
     var field_stk: [256][]const u8 = undefined;
     var out_row = try allocator.alloc([]const u8, out_indices.items.len);
     defer allocator.free(out_row);
-    var key_buf = std.ArrayListUnmanaged(u8){};
+    var key_buf = std.ArrayListUnmanaged(u8).empty;
     defer key_buf.deinit(allocator);
 
     var rows_written: i32 = 0;
@@ -2379,7 +2379,7 @@ fn executeDistinct(
         if (query.order_by) |ob| {
             // Arena is done growing — materialise real slices from offsets.
             const a = &(sort_arena.?);
-            var entries = std.ArrayList(fast_sort.SortKey){};
+            var entries = std.ArrayList(fast_sort.SortKey).empty;
             defer entries.deinit(allocator);
             for (offsets.items) |oe| {
                 try entries.append(allocator, fast_sort.makeSortKey(
@@ -2437,7 +2437,7 @@ fn executeScalarAgg(
     if (header_line.len > 0 and header_line[header_line.len - 1] == '\r')
         header_line = header_line[0 .. header_line.len - 1];
 
-    var header_list = std.ArrayListUnmanaged([]const u8){};
+    var header_list = std.ArrayListUnmanaged([]const u8).empty;
     defer header_list.deinit(allocator);
     {
         var it = std.mem.splitScalar(u8, header_line, opts.delimiter);
@@ -2460,9 +2460,9 @@ fn executeScalarAgg(
     }
 
     // -- Resolve SELECT into ColKind + AggSpec lists --
-    var col_kinds = std.ArrayListUnmanaged(ColKind){};
+    var col_kinds = std.ArrayListUnmanaged(ColKind).empty;
     defer col_kinds.deinit(allocator);
-    var agg_specs = std.ArrayListUnmanaged(AggSpec){};
+    var agg_specs = std.ArrayListUnmanaged(AggSpec).empty;
     defer {
         for (agg_specs.items) |spec| {
             allocator.free(spec.alias);
@@ -2470,7 +2470,7 @@ fn executeScalarAgg(
         }
         agg_specs.deinit(allocator);
     }
-    var out_header_list = std.ArrayListUnmanaged([]const u8){};
+    var out_header_list = std.ArrayListUnmanaged([]const u8).empty;
     defer out_header_list.deinit(allocator);
 
     for (query.columns) |col| {
@@ -2729,7 +2729,7 @@ fn executeScalarAgg(
     }
 
     // -- Emit one result row --
-    var agg_allocs = std.ArrayListUnmanaged([]u8){};
+    var agg_allocs = std.ArrayListUnmanaged([]u8).empty;
     defer {
         for (agg_allocs.items) |s| allocator.free(s);
         agg_allocs.deinit(allocator);
@@ -3009,11 +3009,11 @@ fn gbWorkerScan(ctx: *GbWorkerCtx) !void {
 
     const IO_BUF: usize = 2 * 1024 * 1024;
     const io_buf = try aa.alloc(u8, IO_BUF);
-    var seam_buf = std.ArrayListUnmanaged(u8){};
-    var combined_buf = std.ArrayListUnmanaged(u8){};
+    var seam_buf = std.ArrayListUnmanaged(u8).empty;
+    var combined_buf = std.ArrayListUnmanaged(u8).empty;
 
     var field_stk: [256][]const u8 = undefined;
-    var key_buf = std.ArrayListUnmanaged(u8){};
+    var key_buf = std.ArrayListUnmanaged(u8).empty;
 
     var file_pos: usize = ctx.chunk_start;
     while (file_pos < ctx.chunk_end) {
@@ -3084,8 +3084,8 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
 
     const IO_BUF: usize = 2 * 1024 * 1024;
     const io_buf = try aa.alloc(u8, IO_BUF);
-    var seam_buf = std.ArrayListUnmanaged(u8){};
-    var combined_buf = std.ArrayListUnmanaged(u8){};
+    var seam_buf = std.ArrayListUnmanaged(u8).empty;
+    var combined_buf = std.ArrayListUnmanaged(u8).empty;
 
     var field_stk: [256][]const u8 = undefined;
 
@@ -3321,7 +3321,7 @@ fn executeGroupBy(
     if (header_line.len > 0 and header_line[header_line.len - 1] == '\r')
         header_line = header_line[0 .. header_line.len - 1];
 
-    var header_list = std.ArrayListUnmanaged([]const u8){};
+    var header_list = std.ArrayListUnmanaged([]const u8).empty;
     defer header_list.deinit(allocator);
     {
         var it = std.mem.splitScalar(u8, header_line, opts.delimiter);
@@ -3408,16 +3408,16 @@ fn executeGroupBy(
     }
 
     // -- Resolve SELECT columns into ColKind + AggSpec lists ---------------
-    var col_kinds = std.ArrayListUnmanaged(ColKind){};
+    var col_kinds = std.ArrayListUnmanaged(ColKind).empty;
     defer col_kinds.deinit(allocator);
 
-    var agg_specs = std.ArrayListUnmanaged(AggSpec){};
+    var agg_specs = std.ArrayListUnmanaged(AggSpec).empty;
     defer {
         for (agg_specs.items) |spec| allocator.free(spec.alias);
         agg_specs.deinit(allocator);
     }
 
-    var out_header_list = std.ArrayListUnmanaged([]const u8){};
+    var out_header_list = std.ArrayListUnmanaged([]const u8).empty;
     defer out_header_list.deinit(allocator);
 
     if (query.all_columns) {
@@ -3590,7 +3590,7 @@ fn executeGroupBy(
     const n_aggs = agg_specs.items.len;
 
     // Reusable key builder (grows once, then reused without allocation)
-    var key_buf = std.ArrayListUnmanaged(u8){};
+    var key_buf = std.ArrayListUnmanaged(u8).empty;
     defer key_buf.deinit(allocator);
 
     // Stack field buffer: zero heap allocation for field splitting per row
@@ -3881,7 +3881,7 @@ fn executeGroupBy(
         const accum = group_map.getPtr(key).?;
 
         // Format aggregate results (handful of groups, negligible cost)
-        var agg_allocs = std.ArrayListUnmanaged([]u8){};
+        var agg_allocs = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (agg_allocs.items) |s| allocator.free(s);
             agg_allocs.deinit(allocator);

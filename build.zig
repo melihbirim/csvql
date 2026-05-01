@@ -13,7 +13,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
         }),
     });
-    exe.linkLibC();
+    exe.root_module.link_libc = true;
 
     const zigtable_dep = b.dependency("zigtable", .{
         .target = target,
@@ -35,7 +35,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/lib.zig"),
         }),
     });
-    lib.linkLibC();
+    lib.root_module.link_libc = true;
     b.installArtifact(lib);
 
     const lib_step = b.step("lib", "Build shared library (libcsvql)");
@@ -61,7 +61,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("bench/csv_parse_bench.zig"),
         }),
     });
-    csv_bench.linkLibC();
+    csv_bench.root_module.link_libc = true;
     b.installArtifact(csv_bench);
 
     const bench_run = b.addRunArtifact(csv_bench);
@@ -88,7 +88,7 @@ pub fn build(b: *std.Build) void {
         .name = "groupby_bench",
         .root_module = groupby_bench_root,
     });
-    groupby_bench_exe.linkLibC();
+    groupby_bench_exe.root_module.link_libc = true;
     b.installArtifact(groupby_bench_exe);
 
     const groupby_bench_run = b.addRunArtifact(groupby_bench_exe);
@@ -108,7 +108,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("examples/csv_reader_example.zig"),
         }),
     });
-    csv_example.linkLibC();
+    csv_example.root_module.link_libc = true;
 
     // Add src/ as a module so examples can import from it
     const csv_module = b.addModule("csv", .{
@@ -125,7 +125,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("examples/mmap_csv_example.zig"),
         }),
     });
-    mmap_example.linkLibC();
+    mmap_example.root_module.link_libc = true;
     b.installArtifact(mmap_example);
 
     // Tests
@@ -148,7 +148,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tests/parser_test.zig"),
         }),
     });
-    parser_tests.linkLibC();
+    parser_tests.root_module.link_libc = true;
     parser_tests.root_module.addImport("parser", parser_module);
     const run_parser_tests = b.addRunArtifact(parser_tests);
     test_step.dependOn(&run_parser_tests.step);
@@ -161,7 +161,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tests/csv_test.zig"),
         }),
     });
-    csv_tests.linkLibC();
+    csv_tests.root_module.link_libc = true;
     csv_tests.root_module.addImport("csv", csv_test_module);
     const run_csv_tests = b.addRunArtifact(csv_tests);
     test_step.dependOn(&run_csv_tests.step);
@@ -174,7 +174,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/fast_sort.zig"),
         }),
     });
-    fast_sort_tests.linkLibC();
+    fast_sort_tests.root_module.link_libc = true;
     const run_fast_sort_tests = b.addRunArtifact(fast_sort_tests);
     test_step.dependOn(&run_fast_sort_tests.step);
 
@@ -186,7 +186,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/engine.zig"),
         }),
     });
-    engine_tests.linkLibC();
+    engine_tests.root_module.link_libc = true;
     const run_engine_tests = b.addRunArtifact(engine_tests);
     test_step.dependOn(&run_engine_tests.step);
 
@@ -198,7 +198,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/scalar.zig"),
         }),
     });
-    scalar_tests.linkLibC();
+    scalar_tests.root_module.link_libc = true;
     const run_scalar_tests = b.addRunArtifact(scalar_tests);
     test_step.dependOn(&run_scalar_tests.step);
 
@@ -210,7 +210,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/bulk_csv.zig"),
         }),
     });
-    bulk_csv_tests.linkLibC();
+    bulk_csv_tests.root_module.link_libc = true;
     const run_bulk_csv_tests = b.addRunArtifact(bulk_csv_tests);
     test_step.dependOn(&run_bulk_csv_tests.step);
 
@@ -222,7 +222,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/simd.zig"),
         }),
     });
-    simd_tests.linkLibC();
+    simd_tests.root_module.link_libc = true;
     const run_simd_tests = b.addRunArtifact(simd_tests);
     test_step.dependOn(&run_simd_tests.step);
 
@@ -234,7 +234,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/arena_buffer.zig"),
         }),
     });
-    arena_buffer_tests.linkLibC();
+    arena_buffer_tests.root_module.link_libc = true;
     const run_arena_buffer_tests = b.addRunArtifact(arena_buffer_tests);
     test_step.dependOn(&run_arena_buffer_tests.step);
 }

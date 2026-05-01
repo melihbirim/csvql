@@ -239,7 +239,7 @@ fn toolCsvList(
     defer dir.close();
 
     // Collect file names — use unmanaged ArrayList since we pass allocator per-call.
-    var files = std.ArrayList([]const u8){};
+    var files = std.ArrayList([]const u8).empty;
     defer {
         for (files.items) |f| allocator.free(f);
         files.deinit(allocator);
@@ -299,7 +299,7 @@ fn runQuery(allocator: Allocator, sql: []const u8, format: options_mod.OutputFor
     try engine.execute(allocator, q, tmp_file, opts);
 
     try tmp_file.seekTo(0);
-    return tmp_file.readToEndAlloc(allocator, 100 * 1024 * 1024);
+    return tmp_file.readToEndAlloc(allocator, 1024 * 1024 * 1024);
 }
 
 // ---------------------------------------------------------------------------
