@@ -7,16 +7,17 @@ This document explains how csvql achieves **9x faster performance** than DuckDB 
 ## Table of Contents
 
 1. [Overview](#overview)
-2. [Memory-Mapped Files (mmap)](#memory-mapped-files-mmap)
-3. [SIMD Vectorization](#simd-vectorization)
-4. [Lock-Free Parallel Architecture](#lock-free-parallel-architecture)
-5. [Zero-Copy Design](#zero-copy-design)
-6. [ORDER BY & LIMIT Optimizations](#order-by--limit-optimizations)
-7. [Hardware-Aware Radix Sort & Top-K Heap](#hardware-aware-radix-sort--top-k-heap)
-8. [Why We Beat DuckDB, DataFusion & ClickHouse](#why-we-beat-duckdb-datafusion--clickhouse)
-9. [The Complete Flow](#the-complete-flow)
-10. [Performance Characteristics](#performance-characteristics)
-11. [Summary](#summary)
+2. [Execution Strategy: File-Size Routing](#execution-strategy-file-size-routing)
+3. [Memory-Mapped Files (mmap)](#memory-mapped-files-mmap)
+4. [SIMD Vectorization](#simd-vectorization)
+5. [Lock-Free Parallel Architecture](#lock-free-parallel-architecture)
+6. [Zero-Copy Design](#zero-copy-design)
+7. [ORDER BY & LIMIT Optimizations](#order-by--limit-optimizations)
+8. [Hardware-Aware Radix Sort & Top-K Heap](#hardware-aware-radix-sort--top-k-heap)
+9. [Why We Beat DuckDB, DataFusion & ClickHouse](#why-we-beat-duckdb-datafusion--clickhouse)
+10. [The Complete Flow](#the-complete-flow)
+11. [Performance Characteristics](#performance-characteristics)
+12. [Summary](#summary)
 
 ---
 
@@ -43,6 +44,121 @@ csvql is built on seven fundamental optimizations:
     35x less memory usage
     669% CPU utilization
 ```
+
+---
+
+## Execution Strategy: File-Size Routing
+
+`engine.execute()` in `src/engine.zig` is the single entry point for all queries. It selects the most efficient implementation based on file size, query shape, and core count. The decision tree runs top-to-bottom and the first matching branch wins.
+
+```
+engine.execute(query)
+│
+├─ stdin?                    → executeFromStdin (streaming, no mmap)
+├─ JOIN?                     → executeJoin (hash-join, sequential)
+├─ scalar agg only?          → executeScalarAgg (single-pass reduction)
+├─ GROUP BY?                 → executeGroupBy (hash-table aggregation)
+├─ DISTINCT (no scalar fns)? → executeGroupBy (DISTINCT ≡ GROUP BY all cols)
+│
+├─ has scalar SELECT fns?    (UPPER/LOWER/TRIM/etc.)
+│   ├─ file > 10 MB AND no ORDER BY, DISTINCT, LIMIT AND cores > 1
+│   │   └─→ executeParallelScalar   (parallel mmap + per-row scalar eval)
+│   └─→ executeSequential           (BulkCsvReader, single-threaded)
+│
+├─ file > 10 MB AND (no LIMIT or LIMIT > 100 000 or has ORDER BY)
+│   └─ cores > 1
+│       └─→ executeParallelMapped   (parallel mmap, N worker threads)
+│
+├─ file > 5 MB
+│   └─→ executeMapped               (single-threaded mmap, src/mmap_engine.zig)
+│
+└─→ executeSequential               (BulkCsvReader, no mmap, src/engine.zig)
+```
+
+### Tier 1 — Small files (≤ 5 MB): `executeSequential`
+
+**Entry point:** `src/engine.zig → executeSequential`  
+**Reader:** `BulkCsvReader` — a 2 MB ring-buffer reader with no `mmap` call.
+
+`BulkCsvReader.readRecordSlices()` returns `[]const []const u8` slices that point directly into its 2 MB heap buffer (zero per-field allocation). The buffer is refilled via `read()` syscalls; partial lines that straddle the buffer boundary are shifted to the front with `std.mem.copyForwards`.
+
+Field splitting uses `parseCSVFieldsStatic` (quote-aware, zero-copy) for unquoted lines and a full state-machine with `""` → `"` unescaping for quoted ones.
+
+```
+CSV file  ──read()──►  2 MB ring buffer  ──slices──►  WHERE eval  ──►  output
+                       (single alloc)      (zero-copy)
+```
+
+**Why no mmap here:**  
+For files under a few MB the kernel already has the pages in page-cache after the first read. The extra `mmap` setup syscall and virtual-address mapping overhead are not justified.
+
+**Scalar SELECT functions** (`UPPER`, `LOWER`, `TRIM`, etc.) always go through `executeSequential` when the file is ≤ 10 MB or when `ORDER BY`/`DISTINCT`/`LIMIT` are present — even for larger files — because the per-row scalar eval needs the per-record allocator that the sequential path provides.
+
+### Tier 2 — Medium files (5 MB – 10 MB): `executeMapped`
+
+**Entry point:** `src/mmap_engine.zig → executeMapped`  
+**Reader:** `std.posix.mmap` — entire file mapped as a single `[]const u8`.
+
+The engine iterates over newline-delimited lines in the mapped region using `std.mem.indexOfScalar`. Fields are split with `parseCSVFieldsStatic` (quote-aware) into a fixed 256-element stack buffer — no heap allocation per row.
+
+`ORDER BY` is handled by a single-threaded `fast_sort.sortEntries` call after collecting all `SortLine` entries; `LIMIT` with `ORDER BY` uses top-K heap selection instead.
+
+```
+mmap(file) → []const u8 ──line scan──► parseCSVFieldsStatic ──► WHERE eval ──► output
+              (entire file,            (stack buf, zero-copy)
+               OS lazy-loads pages)
+```
+
+**Why single-threaded here:**  
+Splitting work across threads has fixed overhead (thread spawn, chunk alignment, result merge). For files in the 5–10 MB range the total work is small enough that this overhead dominates and single-threaded is faster.
+
+### Tier 3 — Large files (> 10 MB): `executeParallelMapped`
+
+**Entry point:** `src/parallel_mmap.zig → executeParallelMapped`  
+**Reader:** `std.posix.mmap` + `std.posix.madvise(MADV_SEQUENTIAL)`.
+
+The file is memory-mapped once. The data region (after the header line) is split into `N = getCpuCount()` chunks aligned to newline boundaries. One OS thread per chunk is spawned via `std.Thread.spawn`.
+
+```
+mmap(file, MADV_SEQUENTIAL)
+│
+├── worker 0 ── chunk [0 .. 1/N]  ─► parseCSVFieldsStatic ─► WHERE ─► local buf
+├── worker 1 ── chunk [1/N .. 2/N] ─► parseCSVFieldsStatic ─► WHERE ─► local buf
+│   ...
+└── worker N ── chunk [(N-1)/N..end] ─► parseCSVFieldsStatic ─► WHERE ─► local buf
+                                                                          │
+                                                              join() ◄────┘
+                                                                │
+                                                          sequential merge ──► output
+```
+
+There are **two sub-paths** inside the parallel engine:
+
+**`use_parallel_output = true`** (no `DISTINCT`, no `LIMIT`):  
+Each worker serialises its matching rows into a private `std.ArrayList(u8)` byte buffer — the final output format (CSV / JSON / JSONL) is written in the worker, not in the merge step. The main thread flushes the header, then `write()`s each buffer in order. No per-row allocation in the main thread; the only coordination is the final ordered write.
+
+**`use_parallel_output = false`** (has `DISTINCT` or `LIMIT`):  
+Workers collect `[][]const u8` row slices into a private `std.ArrayList`. The main thread iterates them in order, applies `DISTINCT` dedup (via `std.StringHashMap`) and `LIMIT` counting, then writes via the shared `RecordWriter`.
+
+**ORDER BY path:**  
+Workers build `SortLine{numeric_key, sort_key, line}` entries instead of output rows. After all workers finish, entries are merged into a single `fast_sort.SortKey` array and sorted with `fast_sort.sortEntries` (radix sort or top-K heap, depending on whether `LIMIT` is set). Only the top-K lines are re-parsed for SELECT column extraction.
+
+**LIMIT guard:**  
+If `LIMIT ≤ 100 000` and there is no `ORDER BY`, the parallel engine is **skipped** and the sequential tier is used instead. Reading 100 000 rows sequentially is faster than the thread-spawn overhead plus the full-file mmap.
+
+### Routing at a glance
+
+| File size | Query shape | Path | Source |
+|-----------|-------------|------|--------|
+| any | JOIN | `executeJoin` | `src/engine.zig` |
+| any | GROUP BY / DISTINCT | `executeGroupBy` | `src/engine.zig` |
+| any | scalar agg only | `executeScalarAgg` | `src/engine.zig` |
+| any (stdin) | any | `executeFromStdin` | `src/engine.zig` |
+| > 10 MB | scalar SELECT fns, no ORDER BY/DISTINCT/LIMIT, cores > 1 | `executeParallelScalar` | `src/engine.zig` |
+| ≤ 5 MB | plain SELECT | `executeSequential` | `src/engine.zig` |
+| 5–10 MB | plain SELECT | `executeMapped` | `src/mmap_engine.zig` |
+| > 10 MB, LIMIT ≤ 100 000 (no ORDER BY) | plain SELECT | `executeSequential` | `src/engine.zig` |
+| > 10 MB | plain SELECT | `executeParallelMapped` | `src/parallel_mmap.zig` |
 
 ---
 
@@ -941,19 +1057,20 @@ Result: 457,234 rows output
 ### Scaling with File Size
 
 ```bash
-Small files (< 5MB):
-  → Single-threaded sequential (src/sequential.zig)
-  → Overhead of parallelism not worth it
-  → ~0.05s for 1MB
+Small files (≤ 5 MB):
+  → Sequential BulkCsvReader (src/engine.zig)
+  → No mmap overhead, 2 MB ring buffer
+  → ~0.003s for 1 MB
 
-Medium files (5-10MB):
-  → Memory-mapped single-threaded (mmap without parallelism)
-  → ~0.10s for 10MB
+Medium files (5–10 MB):
+  → Single-threaded mmap (src/mmap_engine.zig)
+  → Lazy page loading, zero per-row allocation
+  → ~0.05s for 10 MB
 
-Large files (> 10MB):
-  → Parallel memory-mapped (src/parallel_mmap.zig)
-  → Linear scaling: ~0.23s per 35MB
-  → 7-core parallelism kicks in
+Large files (> 10 MB):
+  → Parallel mmap (src/parallel_mmap.zig)
+  → N-core scaling, lock-free workers
+  → ~0.23s per 35 MB at 7 cores
 ```
 
 ### Scaling with Cores

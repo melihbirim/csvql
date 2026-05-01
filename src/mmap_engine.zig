@@ -4,6 +4,7 @@ const csv = @import("csv.zig");
 const fast_sort = @import("fast_sort.zig");
 const options_mod = @import("options.zig");
 const arena_buffer = @import("arena_buffer.zig");
+const simd = @import("simd.zig");
 const Allocator = std.mem.Allocator;
 const ArenaBuffer = arena_buffer.ArenaBuffer;
 const appendJsonStringToArena = arena_buffer.appendJsonStringToArena;
@@ -203,15 +204,9 @@ pub fn executeMapped(
         }
 
         if (line.len > 0) {
-            // Parse fields as slices into mmap data (zero-copy)
+            // Parse fields as slices into mmap data (quote-aware, zero-copy where possible)
             var field_buf: [256][]const u8 = undefined;
-            var field_count: usize = 0;
-            var field_iter = std.mem.splitScalar(u8, line, opts.delimiter);
-            while (field_iter.next()) |field| {
-                if (field_count >= field_buf.len) break;
-                field_buf[field_count] = field;
-                field_count += 1;
-            }
+            const field_count = simd.parseCSVFieldsStatic(line, &field_buf, opts.delimiter) catch break;
             const fields = field_buf[0..field_count];
 
             // Fast WHERE evaluation
