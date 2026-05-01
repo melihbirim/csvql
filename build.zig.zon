@@ -1,6 +1,7 @@
 .{
     .name = .csvql,
-    .version = "0.15.2",
+    .version = "1.3.0",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zigtable = .{
             .url = "https://github.com/melihbirim/zigtable/archive/refs/tags/v0.1.0.tar.gz",

@@ -97,7 +97,7 @@ pub fn executeParallelMapped(
     const header_line = if (header_line_raw.len > 0 and header_line_raw[header_line_raw.len - 1] == '\r') header_line_raw[0 .. header_line_raw.len - 1] else header_line_raw;
 
     // Parse header
-    var header = std.ArrayList([]const u8){};
+    var header = std.ArrayList([]const u8).empty;
     defer header.deinit(allocator);
 
     var header_iter = std.mem.splitScalar(u8, header_line, opts.delimiter);
@@ -125,7 +125,7 @@ pub fn executeParallelMapped(
     }
 
     // Determine output columns
-    var output_indices = std.ArrayList(usize){};
+    var output_indices = std.ArrayList(usize).empty;
     defer output_indices.deinit(allocator);
 
     if (query.all_columns) {
@@ -151,7 +151,7 @@ pub fn executeParallelMapped(
     var writer = csv.RecordWriter.init(output_file, opts);
     defer writer.deinit();
 
-    var output_header = std.ArrayList([]const u8){};
+    var output_header = std.ArrayList([]const u8).empty;
     defer output_header.deinit(allocator);
 
     if (query.all_columns) {
@@ -266,7 +266,7 @@ pub fn executeParallelMapped(
                 .lower_header = lower_header,
                 .where_column_idx = where_column_idx,
                 .order_by_col_idx = order_by_raw_idx.?,
-                .result = std.ArrayList(SortLine){},
+                .result = std.ArrayList(SortLine).empty,
                 .allocator = allocator,
                 .delimiter = opts.delimiter,
             };
@@ -390,9 +390,9 @@ pub fn executeParallelMapped(
                 .lower_header = lower_header,
                 .output_indices = output_indices.items,
                 .where_column_idx = where_column_idx,
-                .result = std.ArrayList([][]const u8){},
+                .result = std.ArrayList([][]const u8).empty,
                 .use_parallel_output = use_parallel_output,
-                .output_buf = std.ArrayList(u8){},
+                .output_buf = std.ArrayList(u8).empty,
                 .key_fragments = key_fragments,
                 .format = opts.format,
                 .allocator = allocator,
@@ -709,8 +709,8 @@ fn processChunk(ctx: *WorkerContext) !void {
 
         const IO_BUF: usize = 2 * 1024 * 1024;
         const io_buf = try arena_alloc.alloc(u8, IO_BUF);
-        var seam_buf = std.ArrayListUnmanaged(u8){};
-        var combined_buf = std.ArrayListUnmanaged(u8){};
+        var seam_buf = std.ArrayListUnmanaged(u8).empty;
+        var combined_buf = std.ArrayListUnmanaged(u8).empty;
 
         var file_pos: usize = ctx.chunk.start;
         while (file_pos < ctx.chunk.end) {

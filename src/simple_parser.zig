@@ -60,7 +60,7 @@ pub fn parseSimple(allocator: Allocator, args: []const []const u8) !parser.Query
 
 /// Parse columns: "id,name,score" -> ["id", "name", "score"]
 fn parseColumns(allocator: Allocator, input: []const u8) ![][]u8 {
-    var columns = std.ArrayList([]u8){};
+    var columns = std.ArrayList([]u8).empty;
     errdefer {
         for (columns.items) |col| allocator.free(col);
         columns.deinit(allocator);

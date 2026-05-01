@@ -29,7 +29,7 @@ fn runQuery(sql: []const u8, format: options_mod.OutputFormat) ![*:0]u8 {
     defer query.deinit();
 
     // Capture engine output into a buffer instead of a real file.
-    var buf = std.ArrayList(u8){};
+    var buf = std.ArrayList(u8).empty;
     defer buf.deinit(allocator);
 
     // The engine writes to a std.fs.File. We create a pipe: engine writes to

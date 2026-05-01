@@ -41,7 +41,7 @@ pub fn executeMapped(
     const header_line = if (header_line_raw.len > 0 and header_line_raw[header_line_raw.len - 1] == '\r') header_line_raw[0 .. header_line_raw.len - 1] else header_line_raw;
 
     // Parse header
-    var header = std.ArrayList([]const u8){};
+    var header = std.ArrayList([]const u8).empty;
     defer header.deinit(allocator);
 
     var header_iter = std.mem.splitScalar(u8, header_line, opts.delimiter);
@@ -69,7 +69,7 @@ pub fn executeMapped(
     }
 
     // Determine output columns
-    var output_indices = std.ArrayList(usize){};
+    var output_indices = std.ArrayList(usize).empty;
     defer output_indices.deinit(allocator);
 
     if (query.all_columns) {
@@ -95,7 +95,7 @@ pub fn executeMapped(
     var writer = csv.RecordWriter.init(output_file, opts);
     defer writer.deinit();
 
-    var output_header = std.ArrayList([]const u8){};
+    var output_header = std.ArrayList([]const u8).empty;
     defer output_header.deinit(allocator);
 
     if (query.all_columns) {
@@ -138,7 +138,7 @@ pub fn executeMapped(
     }
 
     if (query.order_by) |order_by| {
-        sort_entries = std.ArrayList(MmapSortEntry){};
+        sort_entries = std.ArrayList(MmapSortEntry).empty;
         arena = try ArenaBuffer.init(allocator, 16 * 1024 * 1024); // 16MB initial for large result sets
 
         // Positional ORDER BY: "ORDER BY 1" → position 0 in output

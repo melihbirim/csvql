@@ -239,7 +239,7 @@ fn toolCsvList(
     defer dir.close();
 
     // Collect file names — use unmanaged ArrayList since we pass allocator per-call.
-    var files = std.ArrayList([]const u8){};
+    var files = std.ArrayList([]const u8).empty;
     defer {
         for (files.items) |f| allocator.free(f);
         files.deinit(allocator);

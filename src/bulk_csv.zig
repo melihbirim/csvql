@@ -168,7 +168,7 @@ pub const BulkCsvReader = struct {
     }
 
     fn parseLine(self: *BulkCsvReader, line: []const u8) ![][]u8 {
-        var fields = std.ArrayList([]u8){};
+        var fields = std.ArrayList([]u8).empty;
         errdefer {
             for (fields.items) |field| {
                 self.allocator.free(field);

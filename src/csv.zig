@@ -56,7 +56,7 @@ pub const CsvReader = struct {
 
     /// Read the next CSV record
     pub fn readRecord(self: *CsvReader) !?[][]u8 {
-        var fields = std.ArrayList([]u8){};
+        var fields = std.ArrayList([]u8).empty;
         errdefer {
             for (fields.items) |field| {
                 self.allocator.free(field);
@@ -64,7 +64,7 @@ pub const CsvReader = struct {
             fields.deinit(self.allocator);
         }
 
-        var field_buffer = std.ArrayList(u8){};
+        var field_buffer = std.ArrayList(u8).empty;
         defer field_buffer.deinit(self.allocator);
 
         var in_quotes = false;
@@ -113,7 +113,7 @@ pub const CsvReader = struct {
                 } else if (byte == self.delimiter) {
                     // End of field
                     try fields.append(self.allocator, try field_buffer.toOwnedSlice(self.allocator));
-                    field_buffer = std.ArrayList(u8){};
+                    field_buffer = std.ArrayList(u8).empty;
                 } else if (byte == '\r') {
                     // Handle CR - check for LF
                     const next_opt = try self.readByte();
@@ -161,7 +161,7 @@ pub const FastCsvReader = struct {
             .file = file,
             .allocator = allocator,
             .delimiter = ',',
-            .line_buffer = std.ArrayList(u8){},
+            .line_buffer = std.ArrayList(u8).empty,
             .buffer = undefined,
             .buffer_pos = 0,
             .buffer_len = 0,
@@ -208,7 +208,7 @@ pub const FastCsvReader = struct {
         }
 
         // Split by delimiter
-        var fields = std.ArrayList([]u8){};
+        var fields = std.ArrayList([]u8).empty;
         errdefer {
             for (fields.items) |field| {
                 self.allocator.free(field);
@@ -359,7 +359,7 @@ pub fn appendJsonEscapedToList(out: *std.ArrayList(u8), allocator: Allocator, s:
 
 /// Allocate a JSON key fragment like `"colname":` (caller must free with `allocator`).
 pub fn allocJsonKeyFragment(allocator: Allocator, key: []const u8) ![]const u8 {
-    var out = std.ArrayList(u8){};
+    var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
     try out.append(allocator, '"');
     try appendJsonEscapedToList(&out, allocator, key);

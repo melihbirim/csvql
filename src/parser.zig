@@ -410,7 +410,7 @@ fn findTableFromIdx(s: []const u8, from: usize) ?usize {
 /// Commas inside `(...)` or `'...'` are treated as part of the current token, not separators.
 /// Returns an ArrayList of trimmed, allocator-owned strings; caller frees each item + the list.
 fn splitCommaTerms(allocator: Allocator, input: []const u8) !std.ArrayList([]u8) {
-    var items = std.ArrayList([]u8){};
+    var items = std.ArrayList([]u8).empty;
     errdefer {
         for (items.items) |s| allocator.free(s);
         items.deinit(allocator);
@@ -515,7 +515,7 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
     }
 
     // Collect all JOIN clauses into a temporary list.
-    var joins_list = std.ArrayList(JoinClause){};
+    var joins_list = std.ArrayList(JoinClause).empty;
     // On error, free any already-collected JoinClause items.
     errdefer {
         for (joins_list.items) |*jc| jc.deinit(allocator);
@@ -704,7 +704,7 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
         order_by_part = std.mem.trim(u8, order_by_part, &std.ascii.whitespace);
 
         // Parse all comma-separated ORDER BY keys
-        var secondary_list = std.ArrayList(OrderByKey){};
+        var secondary_list = std.ArrayList(OrderByKey).empty;
         errdefer {
             for (secondary_list.items) |*k| k.deinit(allocator);
             secondary_list.deinit(allocator);
@@ -990,7 +990,7 @@ fn parseInComparison(allocator: Allocator, input: []const u8, in_idx: usize) !Ex
     const inner = std.mem.trim(u8, after_in[open_paren + 1 .. close_paren], &std.ascii.whitespace);
 
     // Parse comma-separated values, trimming quotes from each
-    var values = std.ArrayListUnmanaged([]u8){};
+    var values = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
         for (values.items) |v| allocator.free(v);
         values.deinit(allocator);
