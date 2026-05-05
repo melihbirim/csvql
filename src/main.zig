@@ -68,8 +68,13 @@ const help_text =
     \\  -d, --delimiter <char>  Field delimiter (default: ',')  e.g. -d '\t' for TSV
     \\  --json                  Output results as a JSON array of objects
     \\  --jsonl                 Output results as newline-delimited JSON (NDJSON)
+    \\  --table                 Always render output as a table (default: auto on TTY)
+    \\  --no-table              Never render output as a table
+    \\  --wrap                  Wrap long cell text across lines instead of dropping columns
+    \\  --schema <file>         Show column names, inferred types, row count, and file size
     \\  --mcp                   Start as an MCP (Model Context Protocol) server
-    \\                          Exposes csv_query, csv_schema, csv_list tools    \  --schema <file>         Show column names, types, row count, and file size    \\
+    \\                          Exposes csv_query, csv_schema, csv_list tools
+    \\
     \\EXAMPLES:
     \\  csvql "SELECT * FROM 'users.csv' WHERE age >= 18 LIMIT 100"
     \\  csvql "SELECT * FROM 'data.csv' WHERE status = 'active'" > out.csv
@@ -103,7 +108,7 @@ pub fn main() !void {
             try mcp.run(allocator);
             return;
         }
-        if (std.mem.eql(u8, args[1], "--schema")) {
+        if (std.mem.eql(u8, args[1], "--schema") or std.mem.eql(u8, args[1], "-schema") or std.mem.eql(u8, args[1], "-s")) {
             if (args.len < 3) {
                 try stderr_file.writeAll("error: --schema requires a file path argument\n");
                 std.process.exit(1);
@@ -385,8 +390,8 @@ fn runSchema(allocator: Allocator, raw_path: []const u8, stdout_file: std.fs.Fil
         }
     };
 
-    // --- Summary header line ---
-    const summary = try std.fmt.allocPrint(allocator, "File: {s}  |  Rows: {d}  |  Columns: {d}  |  Size: {s}\n", .{
+    // --- Summary header lines ---
+    const summary = try std.fmt.allocPrint(allocator, "File: {s}\nRows: {d}  |  Columns: {d}  |  Size: {s}\n", .{
         file_path, total_rows, n_cols, size_str,
     });
     defer allocator.free(summary);
