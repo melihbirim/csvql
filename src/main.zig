@@ -195,18 +195,14 @@ fn renderTableOutput(allocator: Allocator, query: parser.Query, stdout_file: std
     const csv_data = try tmp_read.readToEndAlloc(allocator, 4 * 1024 * 1024 * 1024);
     defer allocator.free(csv_data);
 
-    // Parse header line into column definitions
-    var lines = std.mem.splitScalar(u8, csv_data, '\n');
-    const header_line_raw = lines.next() orelse return;
-    const header_line = if (header_line_raw.len > 0 and header_line_raw[header_line_raw.len - 1] == '\r')
-        header_line_raw[0 .. header_line_raw.len - 1]
-    else
-        header_line_raw;
-    if (header_line.len == 0) return;
+    // Use a quote-aware record iterator so multiline quoted fields are not split prematurely.
+    var records = CsvRecordIterator.init(csv_data);
 
+    // Parse header
+    const header_record = records.next() orelse return;
     var col_list: std.ArrayList(zigtable.Column) = .{};
     defer col_list.deinit(allocator);
-    var hdr_it = CsvRowIterator.init(header_line, opts.delimiter);
+    var hdr_it = CsvRowIterator.init(header_record, opts.delimiter);
     while (hdr_it.next()) |col_name| {
         try col_list.append(allocator, .{ .name = col_name });
     }
@@ -215,19 +211,25 @@ fn renderTableOutput(allocator: Allocator, query: parser.Query, stdout_file: std
     var table = zigtable.Table.init(allocator, col_list.items);
     defer table.deinit();
 
-    // Add data rows
+    // Add data rows; sanitize embedded newlines so the table renders correctly.
     var row_fields: std.ArrayList([]const u8) = .{};
     defer row_fields.deinit(allocator);
-    while (lines.next()) |raw_line| {
-        const line = if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r')
-            raw_line[0 .. raw_line.len - 1]
-        else
-            raw_line;
-        if (line.len == 0) continue;
+    // Track sanitized allocations — must outlive table.render().
+    var owned: std.ArrayList([]u8) = .{};
+    defer {
+        for (owned.items) |s| allocator.free(s);
+        owned.deinit(allocator);
+    }
+    while (records.next()) |raw_record| {
         row_fields.clearRetainingCapacity();
-        var row_it = CsvRowIterator.init(line, opts.delimiter);
+        var row_it = CsvRowIterator.init(raw_record, opts.delimiter);
         while (row_it.next()) |field| {
-            try row_fields.append(allocator, field);
+            if (try sanitizeField(allocator, field)) |sanitized| {
+                try owned.append(allocator, sanitized);
+                try row_fields.append(allocator, sanitized);
+            } else {
+                try row_fields.append(allocator, field);
+            }
         }
         try table.addRow(row_fields.items);
     }
@@ -248,6 +250,80 @@ fn renderTableOutput(allocator: Allocator, query: parser.Query, stdout_file: std
     try table.render(BufWriter{ .buf = &table_buf, .alloc = allocator });
     try stdout_file.writeAll(table_buf.items);
 }
+
+/// Replace embedded '\n'/'\r' in a field value with the literal two-character string "\n".
+/// Returns an owned slice only when replacement is needed; null means use the original.
+fn sanitizeField(allocator: Allocator, field: []const u8) !?[]u8 {
+    var needs = false;
+    for (field) |c| {
+        if (c == '\n' or c == '\r') {
+            needs = true;
+            break;
+        }
+    }
+    if (!needs) return null;
+    var buf = std.ArrayList(u8){};
+    errdefer buf.deinit(allocator);
+    for (field) |c| {
+        switch (c) {
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => {}, // drop bare \r
+            else => try buf.append(allocator, c),
+        }
+    }
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Quote-aware CSV record iterator over an in-memory buffer.
+/// Treats '\n' inside a quoted field as part of the record, not a boundary.
+/// Empty lines (blank records) are skipped automatically.
+const CsvRecordIterator = struct {
+    data: []const u8,
+    pos: usize,
+
+    fn init(data: []const u8) CsvRecordIterator {
+        return .{ .data = data, .pos = 0 };
+    }
+
+    fn next(self: *CsvRecordIterator) ?[]const u8 {
+        while (self.pos < self.data.len) {
+            const start = self.pos;
+            var in_quote = false;
+            while (self.pos < self.data.len) {
+                const c = self.data[self.pos];
+                if (c == '"') {
+                    if (in_quote) {
+                        // "" escaped quote — stay inside
+                        if (self.pos + 1 < self.data.len and self.data[self.pos + 1] == '"') {
+                            self.pos += 2;
+                            continue;
+                        }
+                        in_quote = false;
+                    } else {
+                        in_quote = true;
+                    }
+                    self.pos += 1;
+                } else if (c == '\n' and !in_quote) {
+                    var end = self.pos;
+                    if (end > start and self.data[end - 1] == '\r') end -= 1;
+                    self.pos += 1;
+                    const record = self.data[start..end];
+                    if (record.len > 0) return record;
+                    break; // empty line — restart outer loop
+                } else {
+                    self.pos += 1;
+                }
+            }
+            // End of data without trailing newline
+            if (self.pos > start) {
+                const record = self.data[start..self.pos];
+                self.pos = self.data.len;
+                return record;
+            }
+        }
+        return null;
+    }
+};
 
 /// Minimal CSV field iterator: handles quoted and unquoted fields.
 /// Returns slices into the original line (quotes stripped, no unescape).

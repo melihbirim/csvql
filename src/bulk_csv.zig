@@ -38,6 +38,33 @@ pub const BulkCsvReader = struct {
         self.allocator.free(self.buffer);
     }
 
+    /// Find the absolute buffer index of the '\n' that ends the current CSV record,
+    /// skipping '\n' characters that appear inside quoted fields.
+    /// Returns null when no record-ending newline exists before `buffer_len`.
+    fn findRecordEnd(self: *BulkCsvReader) ?usize {
+        var i = self.line_start;
+        var in_quote = false;
+        while (i < self.buffer_len) {
+            const c = self.buffer[i];
+            if (c == '"') {
+                if (in_quote) {
+                    // "" inside a quoted field — escaped quote, stay in quoted mode
+                    if (i + 1 < self.buffer_len and self.buffer[i + 1] == '"') {
+                        i += 2;
+                        continue;
+                    }
+                    in_quote = false;
+                } else {
+                    in_quote = true;
+                }
+            } else if (c == '\n' and !in_quote) {
+                return i;
+            }
+            i += 1;
+        }
+        return null;
+    }
+
     fn fillBuffer(self: *BulkCsvReader) !void {
         if (self.eof) return;
 
@@ -65,41 +92,24 @@ pub const BulkCsvReader = struct {
     /// Read next CSV record using bulk operations
     pub fn readRecord(self: *BulkCsvReader) !?[][]u8 {
         while (true) {
-            // Find next newline in buffer
-            const search_start = self.line_start;
-            if (search_start >= self.buffer_len) {
-                // Need more data
+            if (self.line_start >= self.buffer_len) {
                 try self.fillBuffer();
-                if (self.eof and self.buffer_len == 0) {
-                    return null; // No more data
-                }
-                if (self.line_start >= self.buffer_len) {
-                    return null;
-                }
+                if (self.eof and self.buffer_len == 0) return null;
+                if (self.line_start >= self.buffer_len) return null;
                 continue;
             }
 
-            const remaining = self.buffer[search_start..self.buffer_len];
-            const newline_pos = std.mem.indexOfScalar(u8, remaining, '\n');
-
-            if (newline_pos) |pos| {
-                // Found a complete line
-                var line_end = search_start + pos;
-
-                // Trim \r if present
-                if (line_end > search_start and self.buffer[line_end - 1] == '\r') {
+            if (self.findRecordEnd()) |newline_abs| {
+                var line_end = newline_abs;
+                // Trim \r in \r\n endings
+                if (line_end > self.line_start and self.buffer[line_end - 1] == '\r') {
                     line_end -= 1;
                 }
-
-                const line = self.buffer[search_start..line_end];
-                self.line_start = search_start + pos + 1; // Move past the \n
-
-                // Parse the line by splitting on delimiter
+                const line = self.buffer[self.line_start..line_end];
+                self.line_start = newline_abs + 1;
                 return try self.parseLine(line);
             } else {
-                // No newline found - need more data
                 if (self.eof) {
-                    // Last line without newline
                     if (self.line_start < self.buffer_len) {
                         const line = self.buffer[self.line_start..self.buffer_len];
                         self.line_start = self.buffer_len;
@@ -107,12 +117,8 @@ pub const BulkCsvReader = struct {
                     }
                     return null;
                 }
-
-                // Need to read more data
                 try self.fillBuffer();
-                if (self.eof and self.line_start >= self.buffer_len) {
-                    return null;
-                }
+                if (self.eof and self.line_start >= self.buffer_len) return null;
             }
         }
     }
@@ -122,24 +128,20 @@ pub const BulkCsvReader = struct {
     /// No allocations are performed (uses pre-allocated field buffer).
     pub fn readRecordSlices(self: *BulkCsvReader) !?[]const []const u8 {
         while (true) {
-            const search_start = self.line_start;
-            if (search_start >= self.buffer_len) {
+            if (self.line_start >= self.buffer_len) {
                 try self.fillBuffer();
                 if (self.eof and self.buffer_len == 0) return null;
                 if (self.line_start >= self.buffer_len) return null;
                 continue;
             }
 
-            const remaining = self.buffer[search_start..self.buffer_len];
-            const newline_pos = std.mem.indexOfScalar(u8, remaining, '\n');
-
-            if (newline_pos) |pos| {
-                var line_end = search_start + pos;
-                if (line_end > search_start and self.buffer[line_end - 1] == '\r') {
+            if (self.findRecordEnd()) |newline_abs| {
+                var line_end = newline_abs;
+                if (line_end > self.line_start and self.buffer[line_end - 1] == '\r') {
                     line_end -= 1;
                 }
-                const line = self.buffer[search_start..line_end];
-                self.line_start = search_start + pos + 1;
+                const line = self.buffer[self.line_start..line_end];
+                self.line_start = newline_abs + 1;
                 return try self.parseLineSlices(line);
             } else {
                 if (self.eof) {
