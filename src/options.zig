@@ -28,4 +28,6 @@ pub const Options = struct {
     format: OutputFormat = .csv,
     /// Table rendering mode (default: auto TTY detection).
     table_mode: TableMode = .auto,
+    /// Wrap cell content to multiple lines instead of truncating with '…'.
+    wrap_cells: bool = false,
 };

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const parser = @import("parser.zig");
 const simple_parser = @import("simple_parser.zig");
 const engine = @import("engine.zig");
@@ -68,8 +69,7 @@ const help_text =
     \\  --json                  Output results as a JSON array of objects
     \\  --jsonl                 Output results as newline-delimited JSON (NDJSON)
     \\  --mcp                   Start as an MCP (Model Context Protocol) server
-    \\                          Exposes csv_query, csv_schema, csv_list tools
-    \\
+    \\                          Exposes csv_query, csv_schema, csv_list tools    \  --schema <file>         Show column names, types, row count, and file size    \\
     \\EXAMPLES:
     \\  csvql "SELECT * FROM 'users.csv' WHERE age >= 18 LIMIT 100"
     \\  csvql "SELECT * FROM 'data.csv' WHERE status = 'active'" > out.csv
@@ -103,6 +103,14 @@ pub fn main() !void {
             try mcp.run(allocator);
             return;
         }
+        if (std.mem.eql(u8, args[1], "--schema")) {
+            if (args.len < 3) {
+                try stderr_file.writeAll("error: --schema requires a file path argument\n");
+                std.process.exit(1);
+            }
+            try runSchema(allocator, args[2], stdout_file, stderr_file);
+            return;
+        }
     }
 
     // Strip --no-header / -d / --delimiter flags; collect remainder for query parsing.
@@ -122,6 +130,8 @@ pub fn main() !void {
             opts.format = .jsonl;
         } else if (std.mem.eql(u8, arg, "--table")) {
             opts.table_mode = .on;
+        } else if (std.mem.eql(u8, arg, "--wrap")) {
+            opts.wrap_cells = true;
         } else if (std.mem.eql(u8, arg, "--no-table")) {
             opts.table_mode = .off;
         } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--delimiter")) {
@@ -210,6 +220,8 @@ fn renderTableOutput(allocator: Allocator, query: parser.Query, stdout_file: std
 
     var table = zigtable.Table.init(allocator, col_list.items);
     defer table.deinit();
+    table.terminal_width = getTerminalWidth();
+    table.wrap_cells = opts.wrap_cells;
 
     // Add data rows; sanitize embedded newlines so the table renders correctly.
     var row_fields: std.ArrayList([]const u8) = .{};
@@ -249,6 +261,190 @@ fn renderTableOutput(allocator: Allocator, query: parser.Query, stdout_file: std
     };
     try table.render(BufWriter{ .buf = &table_buf, .alloc = allocator });
     try stdout_file.writeAll(table_buf.items);
+}
+
+/// Return the current terminal width in columns.
+/// Checks $COLUMNS env var first, then TIOCGWINSZ via libc ioctl, then falls back to 80.
+fn getTerminalWidth() usize {
+    if (std.process.getEnvVarOwned(std.heap.page_allocator, "COLUMNS") catch null) |s| {
+        defer std.heap.page_allocator.free(s);
+        if (std.fmt.parseInt(usize, std.mem.trim(u8, s, " \t"), 10) catch null) |n| {
+            if (n >= 20) return n;
+        }
+    }
+    // TIOCGWINSZ via libc (works on macOS and Linux; we always link libc).
+    const WinSize = extern struct { ws_row: u16, ws_col: u16, ws_xpixel: u16, ws_ypixel: u16 };
+    const tiocgwinsz: c_uint = switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos => 0x40087468,
+        else => 0x5413, // Linux / FreeBSD
+    };
+    var ws = std.mem.zeroes(WinSize);
+    _ = std.c.ioctl(std.posix.STDOUT_FILENO, tiocgwinsz, @intFromPtr(&ws));
+    if (ws.ws_col >= 20) return @as(usize, ws.ws_col);
+    return 80;
+}
+
+/// Analyse a CSV file and print a schema table: column index, name, inferred type,
+/// non-empty count, and empty count.  Also prints a summary header line.
+fn runSchema(allocator: Allocator, raw_path: []const u8, stdout_file: std.fs.File, stderr_file: std.fs.File) !void {
+    // Strip surrounding quotes that users sometimes include in shell invocations.
+    const file_path = blk: {
+        var p = raw_path;
+        if (p.len >= 2 and ((p[0] == '\'' and p[p.len - 1] == '\'') or (p[0] == '"' and p[p.len - 1] == '"'))) {
+            p = p[1 .. p.len - 1];
+        }
+        break :blk p;
+    };
+
+    // Stat the file for size.
+    const stat = std.fs.cwd().statFile(file_path) catch |err| {
+        const msg = try std.fmt.allocPrint(allocator, "error: cannot open '{s}': {}\n", .{ file_path, err });
+        defer allocator.free(msg);
+        try stderr_file.writeAll(msg);
+        std.process.exit(1);
+    };
+    const file_size = stat.size;
+
+    // Read the whole file.
+    const file = try std.fs.cwd().openFile(file_path, .{});
+    defer file.close();
+    const csv_data = try file.readToEndAlloc(allocator, 4 * 1024 * 1024 * 1024);
+    defer allocator.free(csv_data);
+
+    var records = CsvRecordIterator.init(csv_data);
+
+    // --- Parse header ---
+    const header_record = records.next() orelse {
+        try stderr_file.writeAll("error: file is empty\n");
+        std.process.exit(1);
+    };
+    var col_names = std.ArrayList([]const u8){};
+    defer col_names.deinit(allocator);
+    var hdr_it = CsvRowIterator.init(header_record, ',');
+    while (hdr_it.next()) |name| try col_names.append(allocator, name);
+
+    const n_cols = col_names.items.len;
+    if (n_cols == 0) {
+        try stderr_file.writeAll("error: no columns found\n");
+        std.process.exit(1);
+    }
+
+    // Per-column accumulators.
+    const ColStats = struct {
+        non_empty: u64 = 0,
+        empty: u64 = 0,
+        all_int: bool = true,
+        all_float: bool = true,
+    };
+    var stats = try allocator.alloc(ColStats, n_cols);
+    defer allocator.free(stats);
+    for (stats) |*s| s.* = .{};
+
+    var total_rows: u64 = 0;
+
+    while (records.next()) |raw_record| {
+        total_rows += 1;
+        var ci: usize = 0;
+        var row_it = CsvRowIterator.init(raw_record, ',');
+        while (row_it.next()) |field| : (ci += 1) {
+            if (ci >= n_cols) break;
+            const trimmed = std.mem.trim(u8, field, " \t\r");
+            if (trimmed.len == 0) {
+                stats[ci].empty += 1;
+            } else {
+                stats[ci].non_empty += 1;
+                if (stats[ci].all_int) {
+                    _ = std.fmt.parseInt(i64, trimmed, 10) catch {
+                        stats[ci].all_int = false;
+                    };
+                }
+                if (stats[ci].all_float) {
+                    _ = std.fmt.parseFloat(f64, trimmed) catch {
+                        stats[ci].all_float = false;
+                    };
+                }
+            }
+        }
+        // Fill missing columns as empty.
+        while (ci < n_cols) : (ci += 1) {
+            stats[ci].empty += 1;
+        }
+    }
+
+    // --- Format file size ---
+    var size_buf: [32]u8 = undefined;
+    const size_str: []const u8 = blk: {
+        if (file_size >= 1024 * 1024 * 1024) {
+            break :blk try std.fmt.bufPrint(&size_buf, "{d:.1} GB", .{@as(f64, @floatFromInt(file_size)) / (1024 * 1024 * 1024)});
+        } else if (file_size >= 1024 * 1024) {
+            break :blk try std.fmt.bufPrint(&size_buf, "{d:.1} MB", .{@as(f64, @floatFromInt(file_size)) / (1024 * 1024)});
+        } else if (file_size >= 1024) {
+            break :blk try std.fmt.bufPrint(&size_buf, "{d:.1} KB", .{@as(f64, @floatFromInt(file_size)) / 1024});
+        } else {
+            break :blk try std.fmt.bufPrint(&size_buf, "{d} B", .{file_size});
+        }
+    };
+
+    // --- Summary header line ---
+    const summary = try std.fmt.allocPrint(allocator, "File: {s}  |  Rows: {d}  |  Columns: {d}  |  Size: {s}\n", .{
+        file_path, total_rows, n_cols, size_str,
+    });
+    defer allocator.free(summary);
+    try stdout_file.writeAll(summary);
+
+    // --- Build schema table ---
+    const schema_cols = [_]zigtable.Column{
+        .{ .name = "#" },
+        .{ .name = "Column" },
+        .{ .name = "Type" },
+        .{ .name = "Non-Empty" },
+        .{ .name = "Empty" },
+    };
+    var table = zigtable.Table.init(allocator, &schema_cols);
+    defer table.deinit();
+
+    // Reusable buffers for row fields (all owned, freed after render).
+    var owned_bufs = std.ArrayList([]u8){};
+    defer {
+        for (owned_bufs.items) |b| allocator.free(b);
+        owned_bufs.deinit(allocator);
+    }
+
+    for (col_names.items, 0..) |col_name, i| {
+        const s = &stats[i];
+        const type_str: []const u8 = if (s.non_empty == 0)
+            "TEXT"
+        else if (s.all_int)
+            "INTEGER"
+        else if (s.all_float)
+            "FLOAT"
+        else
+            "TEXT";
+
+        const idx_s = try std.fmt.allocPrint(allocator, "{d}", .{i + 1});
+        try owned_bufs.append(allocator, idx_s);
+        const ne_s = try std.fmt.allocPrint(allocator, "{d}", .{s.non_empty});
+        try owned_bufs.append(allocator, ne_s);
+        const em_s = try std.fmt.allocPrint(allocator, "{d}", .{s.empty});
+        try owned_bufs.append(allocator, em_s);
+
+        try table.addRow(&.{ idx_s, col_name, type_str, ne_s, em_s });
+    }
+
+    // Render.
+    const BufWriter = struct {
+        buf: *std.ArrayList(u8),
+        alloc: Allocator,
+        const WriteError = error{OutOfMemory};
+        pub fn write(self: @This(), data: []const u8) WriteError!usize {
+            try self.buf.appendSlice(self.alloc, data);
+            return data.len;
+        }
+    };
+    var out_buf = std.ArrayList(u8){};
+    defer out_buf.deinit(allocator);
+    try table.render(BufWriter{ .buf = &out_buf, .alloc = allocator });
+    try stdout_file.writeAll(out_buf.items);
 }
 
 /// Replace embedded '\n'/'\r' in a field value with the literal two-character string "\n".

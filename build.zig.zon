@@ -1,12 +1,7 @@
 .{
     .name = .csvql,
     .version = "0.15.2",
-    .dependencies = .{
-        .zigtable = .{
-            .url = "https://github.com/melihbirim/zigtable/archive/refs/tags/v0.1.0.tar.gz",
-            .hash = "N-V-__8AAMR1AAAivmAvIvQAr05b7l_7idWEaWMDruD_Ug2Z",
-        },
-    },
+    .dependencies = .{},
     .paths = .{""},
     .fingerprint = 0x436684d4739c7bd9,
 }
