@@ -44,7 +44,7 @@ jobs:
             npm-pkg: csvql-query-darwin-arm64
             pkg-dir: darwin-arm64
 
-          - os: macos-13          # Intel Mac
+          - os: macos-14          # cross-compile x64 from arm64 (macos-13 runners are slow)
             npm-pkg: csvql-query-darwin-x64
             pkg-dir: darwin-x64
 
