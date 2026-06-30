@@ -15,14 +15,25 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-linux
+            zig-target: x86_64-linux
             artifact: csvql-linux-x86_64
+            ext: ""
+            pkg: tar.gz
           - os: macos-latest
-            target: x86_64-macos
-            artifact: csvql-macos-x86_64
-          - os: macos-latest
-            target: aarch64-macos
+            zig-target: aarch64-macos
             artifact: csvql-macos-aarch64
+            ext: ""
+            pkg: tar.gz
+          - os: macos-13
+            zig-target: x86_64-macos
+            artifact: csvql-macos-x86_64
+            ext: ""
+            pkg: tar.gz
+          - os: ubuntu-latest
+            zig-target: x86_64-windows
+            artifact: csvql-windows-x86_64
+            ext: ".exe"
+            pkg: zip
 
     runs-on: ${{ matrix.os }}
 
@@ -36,26 +47,33 @@ jobs:
           version: 0.15.2
 
       - name: Build release binary
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.zig-target }}
 
-      - name: Prepare artifact
+      - name: Package (tar.gz)
+        if: matrix.pkg == 'tar.gz'
         run: |
           mkdir -p release
           cp zig-out/bin/csvql release/${{ matrix.artifact }}
-          cd release
-          tar -czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+          cd release && tar -czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+
+      - name: Package (zip — Windows)
+        if: matrix.pkg == 'zip'
+        run: |
+          mkdir -p release
+          cp zig-out/bin/csvql${{ matrix.ext }} release/${{ matrix.artifact }}.exe
+          cd release && zip ${{ matrix.artifact }}.zip ${{ matrix.artifact }}.exe
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: release/${{ matrix.artifact }}.tar.gz
+          path: release/${{ matrix.artifact }}.${{ matrix.pkg }}
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: release/${{ matrix.artifact }}.tar.gz
+          files: release/${{ matrix.artifact }}.${{ matrix.pkg }}
           draft: false
           prerelease: false
 
