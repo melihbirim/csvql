@@ -1458,7 +1458,7 @@ fn executeFromStdin(
     opts: options_mod.Options,
 ) !void {
     const stdin = if (builtin.os.tag == .windows)
-        std.fs.File{ .handle = std.os.windows.GetStdHandle(std.os.windows.STD_INPUT_HANDLE).? }
+        std.fs.File{ .handle = try std.os.windows.GetStdHandle(std.os.windows.STD_INPUT_HANDLE) }
     else
         std.fs.File{ .handle = std.posix.STDIN_FILENO };
     var reader = csv.CsvReader.init(allocator, stdin);
