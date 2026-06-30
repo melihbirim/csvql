@@ -1,6 +1,6 @@
 {
   "name": "csvql-query-darwin-arm64",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "description": "csvql-query native binary for darwin-arm64",
   "main": "index.js",
   "os": [

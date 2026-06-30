@@ -1,6 +1,6 @@
 {
   "name": "csvql-query-win32-x64",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "description": "csvql-query native binary for win32-x64",
   "main": "index.js",
   "os": [

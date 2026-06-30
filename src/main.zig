@@ -8,7 +8,7 @@ const mcp = @import("mcp.zig");
 const zigtable = @import("zigtable");
 const Allocator = std.mem.Allocator;
 
-const version = "1.5.3";
+const version = "1.5.4";
 
 const help_text =
     \\csvql — the world's fastest CSV query engine
