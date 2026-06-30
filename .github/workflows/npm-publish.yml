@@ -11,89 +11,58 @@ name: Publish npm package
 #     Environment name : npm
 
 on:
-  push:
-    tags:
-      - "v*"
+  # Auto-trigger after Release workflow completes successfully
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
+
+  # Manual trigger: provide the Release workflow run ID to reuse its built artifacts.
+  # Find the run ID in the URL: github.com/melihbirim/csvql/actions/runs/<ID>
   workflow_dispatch:
+    inputs:
+      run-id:
+        description: "Release workflow run ID to pull node addon artifacts from"
+        required: true
+        type: string
 
 permissions:
   contents: read
   id-token: write  # OIDC trusted publishing
+  actions: read    # download artifacts from other workflow runs
 
 jobs:
-  # ── Build native addon on each platform ──────────────────────────────────────
-  build:
-    name: Build ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-14
-            name: darwin-arm64
-          - os: macos-14
-            name: darwin-x64
-            zig-target: x86_64-macos
-          - os: ubuntu-latest
-            name: linux-x64
-          - os: ubuntu-24.04-arm
-            name: linux-arm64
-          - os: windows-latest
-            name: win32-x64
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: goto-bus-stop/setup-zig@v2
-        with:
-          version: 0.15.2
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Fetch Node.js headers (Windows toolcache lacks them)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          NODE_VER=$(node -e "console.log(process.versions.node)")
-          curl -fsSL "https://nodejs.org/dist/v${NODE_VER}/node-v${NODE_VER}-headers.tar.gz" -o node-headers.tar.gz
-          tar -xzf node-headers.tar.gz
-          echo "NODE_INCLUDE=node-v${NODE_VER}/include/node" >> $GITHUB_ENV
-
-      - name: Build native addon
-        shell: bash
-        run: |
-          TARGET="${{ matrix.zig-target }}"
-          EXTRA=""
-          [ -n "$TARGET" ] && EXTRA="-Dtarget=$TARGET"
-          [ -n "$NODE_INCLUDE" ] && EXTRA="$EXTRA \"-Dnode-include=$NODE_INCLUDE\""
-          eval zig build node -Doptimize=ReleaseFast $EXTRA
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.name }}
-          path: zig-out/lib/csvql.node
-
-  # ── Bundle all binaries and publish one package ───────────────────────────────
   publish:
     name: Publish csvql-query
-    needs: build
+    # For workflow_run: only run if the Release workflow succeeded
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     environment: npm
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
+      - name: Resolve source run ID
+        id: src
+        run: |
+          if [ -n "${{ inputs.run-id }}" ]; then
+            echo "id=${{ inputs.run-id }}" >> $GITHUB_OUTPUT
+          else
+            echo "id=${{ github.event.workflow_run.id }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download node addon artifacts
+        uses: actions/download-artifact@v4
         with:
+          pattern: node-*
           path: artifacts/
+          run-id: ${{ steps.src.outputs.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Arrange binaries
         run: |
           mkdir -p nodejs/binaries
           for plat in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
-            cp artifacts/$plat/csvql.node nodejs/binaries/$plat.node
+            cp artifacts/node-$plat/csvql.node nodejs/binaries/$plat.node
           done
 
       - uses: actions/setup-node@v4

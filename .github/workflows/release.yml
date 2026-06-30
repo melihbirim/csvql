@@ -77,6 +77,57 @@ jobs:
           draft: false
           prerelease: false
 
+  build-node-addons:
+    name: Node addon ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            name: darwin-arm64
+          - os: macos-14
+            name: darwin-x64
+            zig-target: x86_64-macos
+          - os: ubuntu-latest
+            name: linux-x64
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
+          - os: windows-latest
+            name: win32-x64
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Fetch Node.js headers (Windows toolcache lacks them)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          NODE_VER=$(node -e "console.log(process.versions.node)")
+          curl -fsSL "https://nodejs.org/dist/v${NODE_VER}/node-v${NODE_VER}-headers.tar.gz" -o node-headers.tar.gz
+          tar -xzf node-headers.tar.gz
+          echo "NODE_INCLUDE=node-v${NODE_VER}/include/node" >> $GITHUB_ENV
+
+      - name: Build native addon
+        shell: bash
+        run: |
+          TARGET="${{ matrix.zig-target }}"
+          EXTRA=""
+          [ -n "$TARGET" ] && EXTRA="-Dtarget=$TARGET"
+          [ -n "$NODE_INCLUDE" ] && EXTRA="$EXTRA \"-Dnode-include=$NODE_INCLUDE\""
+          eval zig build node -Doptimize=ReleaseFast $EXTRA
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-${{ matrix.name }}
+          path: zig-out/lib/csvql.node
+
   update-homebrew:
     name: Update Homebrew Formula
     needs: release
