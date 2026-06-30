@@ -152,7 +152,11 @@ section('3. CUSTOM DELIMITER — TSV (tab-separated)');
 // ══════════════════════════════════════════════════════════════════════════════
 
 lib('csvql');
-na('only comma-delimited CSV is supported');
+code(["csvql.query(\"SELECT * FROM 'data.tsv'\", { delimiter: '\\t' })"]);
+{
+    const rows = csvql.query(`SELECT * FROM '${TSV}'`, { delimiter: '\t' });
+    out('rows[0]', rows[0]);
+}
 
 lib('csv-parse');
 code(["parse(fs.readFileSync('data.tsv'), { columns: true, delimiter: '\\t' })"]);
@@ -174,15 +178,10 @@ section('4. SKIP EMPTY LINES & COMMENT ROWS');
 // ══════════════════════════════════════════════════════════════════════════════
 
 lib('csvql');
-code(["csvql.query(\"SELECT * FROM 'dirty.csv'\")",
-      "// engine skips blank lines automatically; comment rows come through as data"]);
+code(["csvql.query(\"SELECT * FROM 'dirty.csv'\", { comment: '#', skipEmptyLines: true })"]);
 {
-    try {
-        const rows = csvql.query(`SELECT * FROM '${DIRTY}'`);
-        out('rows', rows);
-    } catch (e) {
-        console.log(`    result: ${e.message}`);
-    }
+    const rows = csvql.query(`SELECT * FROM '${DIRTY}'`, { comment: '#', skipEmptyLines: true });
+    out('rows', rows);
 }
 
 lib('csv-parse');
@@ -392,8 +391,8 @@ const rows = [
     [SEP.slice(0,24),           SEP.slice(0,15), SEP.slice(0,19),     SEP.slice(0,19)],
     ['Basic parse',             '✓ SQL',         '✓',                 '✓'],
     ['Type casting',            '✓ via JSON',    '✓ cast:true',       '✓ dynamicTyping'],
-    ['Custom delimiter',        '✗',             '✓',                 '✓ + auto-detect'],
-    ['Skip blank/comment rows', '✗',             '✓',                 '✓'],
+    ['Custom delimiter',        '✓ { delimiter }','✓',                 '✓ + auto-detect'],
+    ['Skip blank/comment rows', '✓ { comment }', '✓',                 '✓'],
     ['Filter (WHERE)',          '✓ SQL 1 line',  '✗ manual .filter','✗ manual .filter'],
     ['Aggregate (GROUP BY)',    '✓ SQL 1 line',  '✗ manual reduce',  '✗ manual reduce'],
     ['Sort (ORDER BY)',         '✓ SQL 1 line',  '✗ manual .sort',   '✗ manual .sort'],

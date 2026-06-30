@@ -60,6 +60,23 @@ try {
     check('missing file throws', true, true);
 }
 
-console.log(`\n${passed}/6 tests passed`);
+// Custom delimiter (TSV)
+const tsv = '/tmp/csvql_test.tsv';
+fs.writeFileSync(tsv, 'id\tname\tscore\n1\tAlice\t95\n2\tBob\t87\n3\tCarol\t92\n');
+const tsv_rows = csvql.query(`SELECT * FROM '${tsv}'`, { delimiter: '\t' });
+check('TSV: row count', tsv_rows.length, 3);
+check('TSV: first name', tsv_rows[0].name, 'Alice');
+check('TSV: WHERE works after conversion', csvql.query(`SELECT name FROM '${tsv}' WHERE score > 90`, { delimiter: '\t' }).length, 2);
+fs.unlinkSync(tsv);
+
+// Comment + skipEmptyLines
+const dirty = '/tmp/csvql_test_dirty.csv';
+fs.writeFileSync(dirty, '# header comment\nid,name\n\n1,Alice\n# mid comment\n2,Bob\n');
+const clean_rows = csvql.query(`SELECT * FROM '${dirty}'`, { comment: '#', skipEmptyLines: true });
+check('comment: # rows stripped', clean_rows.length, 2);
+check('comment: first id', clean_rows[0].id, 1);
+fs.unlinkSync(dirty);
+
+console.log(`\n${passed}/11 tests passed`);
 
 fs.unlinkSync(csv);
