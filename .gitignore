@@ -14,9 +14,11 @@ zig-cache/
 .DS_Store
 Thumbs.db
 
-# Test files
+# Test files (keep test.csv, ignore generated large files)
 test_*.csv
 *.tmp
+large_test.csv
+medium_test.csv
 
 # Binaries
 csvq
