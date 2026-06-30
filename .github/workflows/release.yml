@@ -155,8 +155,8 @@ jobs:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Remove empty auth token so npm uses OIDC
-        run: npm config delete "//registry.npmjs.org/:_authToken"
+      - name: Upgrade npm to 11.5.1+ for OIDC trusted publishing
+        run: npm install -g npm@latest
 
       - name: Set version from tag
         run: |
