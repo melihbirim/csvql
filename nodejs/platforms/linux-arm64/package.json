@@ -1,6 +1,6 @@
 {
   "name": "csvql-query-linux-arm64",
-  "version": "1.5.2",
+  "version": "1.5.3",
   "description": "csvql-query native binary for linux-arm64",
   "main": "index.js",
   "os": [
