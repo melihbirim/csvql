@@ -55,13 +55,10 @@ jobs:
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          npm install -g node-gyp --silent
-          node-gyp install
-          NODE_INC=$(node -e "
-            const path=require('path'),os=require('os'),ver=process.versions.node;
-            process.stdout.write(path.join(os.homedir(),'.node-gyp',ver,'include','node').replace(/\\\\/g,'/'));
-          ")
-          echo "NODE_INCLUDE=$NODE_INC" >> $GITHUB_ENV
+          NODE_VER=$(node -e "console.log(process.versions.node)")
+          curl -fsSL "https://nodejs.org/dist/v${NODE_VER}/node-v${NODE_VER}-headers.tar.gz" -o node-headers.tar.gz
+          tar -xzf node-headers.tar.gz
+          echo "NODE_INCLUDE=node-v${NODE_VER}/include/node" >> $GITHUB_ENV
 
       - name: Build native addon
         shell: bash
@@ -69,8 +66,8 @@ jobs:
           TARGET="${{ matrix.zig-target }}"
           EXTRA=""
           [ -n "$TARGET" ] && EXTRA="-Dtarget=$TARGET"
-          [ -n "$NODE_INCLUDE" ] && EXTRA="$EXTRA -Dnode-include=$NODE_INCLUDE"
-          zig build node -Doptimize=ReleaseFast $EXTRA
+          [ -n "$NODE_INCLUDE" ] && EXTRA="$EXTRA \"-Dnode-include=$NODE_INCLUDE\""
+          eval zig build node -Doptimize=ReleaseFast $EXTRA
 
       - uses: actions/upload-artifact@v4
         with:
