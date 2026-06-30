@@ -1,25 +1,14 @@
-name: Publish npm packages
+name: Publish npm package
 
-# Uses npm trusted publishing (OIDC) — no NPM_TOKEN secret needed.
+# Publishes csvql-query to npm with all platform binaries bundled.
+# Uses npm trusted publishing (OIDC) — no token needed.
 #
-# One-time setup on npmjs.com for EACH package before the first publish:
-#   1. Log into npmjs.com
-#   2. Go to: https://www.npmjs.com/package/<pkg-name> → Settings → Publishing
-#      (for new packages: Packages → Add package → create it first with a dry-run
-#       OR use the Publishing tab after the first manual publish)
-#   3. Under "Trusted Publishers" → Add publisher:
-#        Repository owner : melihbirim
-#        Repository name  : csvql
-#        Workflow filename: npm-publish.yml
-#        Environment name : npm  (must match the `environment:` field below)
-#
-# Do this for all 6 packages:
-#   csvql-query
-#   csvql-query-darwin-arm64
-#   csvql-query-darwin-x64
-#   csvql-query-linux-x64
-#   csvql-query-linux-arm64
-#   csvql-query-win32-x64
+# One-time setup on npmjs.com:
+#   Package: csvql-query → Settings → Publishing → Trusted Publishers → Add
+#     Repository owner : melihbirim
+#     Repository name  : csvql
+#     Workflow filename: npm-publish.yml
+#     Environment name : npm
 
 on:
   push:
@@ -28,82 +17,77 @@ on:
 
 permissions:
   contents: read
-  id-token: write  # required for OIDC trusted publishing
+  id-token: write  # OIDC trusted publishing
 
 jobs:
-  # ── Build + publish one platform package per runner ──────────────────────────
-  publish-platform:
-    name: Publish ${{ matrix.npm-pkg }}
+  # ── Build native addon on each platform ──────────────────────────────────────
+  build:
+    name: Build ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    environment: npm
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14          # Apple Silicon (Sonoma, arm64)
-            npm-pkg: csvql-query-darwin-arm64
-            pkg-dir: darwin-arm64
-
-          - os: macos-14          # cross-compile x64 from arm64 (macos-13 runners are slow)
-            npm-pkg: csvql-query-darwin-x64
-            pkg-dir: darwin-x64
-
-          - os: ubuntu-latest     # Linux x86_64
-            npm-pkg: csvql-query-linux-x64
-            pkg-dir: linux-x64
-
-          - os: ubuntu-24.04-arm  # Linux ARM64
-            npm-pkg: csvql-query-linux-arm64
-            pkg-dir: linux-arm64
+          - os: macos-14
+            name: darwin-arm64
+          - os: macos-14
+            name: darwin-x64
+            zig-target: x86_64-macos
+          - os: ubuntu-latest
+            name: linux-x64
+          - os: ubuntu-24.04-arm
+            name: linux-arm64
+          - os: windows-latest
+            name: win32-x64
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Zig
-        uses: goto-bus-stop/setup-zig@v2
+      - uses: goto-bus-stop/setup-zig@v2
         with:
           version: 0.15.2
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: "22"
-          registry-url: "https://registry.npmjs.org"
 
       - name: Build native addon
-        run: zig build node -Doptimize=ReleaseFast
-
-      - name: Copy binary into platform package
-        run: cp zig-out/lib/csvql.node nodejs/platforms/${{ matrix.pkg-dir }}/csvql.node
-
-      - name: Set version from tag
+        shell: bash
         run: |
-          node -e "
-            const fs = require('fs');
-            const f = 'nodejs/platforms/${{ matrix.pkg-dir }}/package.json';
-            const p = JSON.parse(fs.readFileSync(f, 'utf8'));
-            p.version = process.env.TAG.replace(/^v/, '');
-            fs.writeFileSync(f, JSON.stringify(p, null, 2) + '\n');
-          "
-        env:
-          TAG: ${{ github.ref_name }}
+          TARGET="${{ matrix.zig-target }}"
+          if [ -n "$TARGET" ]; then
+            zig build node -Doptimize=ReleaseFast -Dtarget=$TARGET
+          else
+            zig build node -Doptimize=ReleaseFast
+          fi
 
-      - name: Publish platform package
-        run: npm publish --provenance --access public
-        working-directory: nodejs/platforms/${{ matrix.pkg-dir }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: zig-out/lib/csvql.node
 
-  # ── Publish the main csvql-query package after all platform packages are up ──
-  publish-main:
-    name: Publish csvql-query (main)
-    needs: publish-platform
+  # ── Bundle all binaries and publish one package ───────────────────────────────
+  publish:
+    name: Publish csvql-query
+    needs: build
     runs-on: ubuntu-latest
     environment: npm
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Arrange binaries
+        run: |
+          mkdir -p nodejs/binaries
+          for plat in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
+            cp artifacts/$plat/csvql.node nodejs/binaries/$plat.node
+          done
+
+      - uses: actions/setup-node@v4
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
@@ -113,15 +97,12 @@ jobs:
           node -e "
             const fs = require('fs');
             const p = JSON.parse(fs.readFileSync('nodejs/package.json', 'utf8'));
-            const tag = process.env.TAG.replace(/^v/, '');
-            p.version = tag;
-            for (const k of Object.keys(p.optionalDependencies || {}))
-              p.optionalDependencies[k] = tag;
+            p.version = process.env.TAG.replace(/^v/, '');
             fs.writeFileSync('nodejs/package.json', JSON.stringify(p, null, 2) + '\n');
           "
         env:
           TAG: ${{ github.ref_name }}
 
-      - name: Publish main package
+      - name: Publish
         run: npm publish --provenance --access public
         working-directory: nodejs

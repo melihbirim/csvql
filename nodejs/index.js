@@ -29,19 +29,11 @@ const os     = require('os');
 const crypto = require('crypto');
 
 function findNative() {
-    // 1. Bundled in same dir (npm run build copies it here, or local publish)
-    const bundled = path.join(__dirname, 'csvql.node');
+    // 1. Bundled binary for this platform (npm published package)
+    const bundled = path.join(__dirname, 'binaries', `${process.platform}-${process.arch}.node`);
     if (fs.existsSync(bundled)) return bundled;
 
-    // 2. Platform-specific npm package (installed via optionalDependencies)
-    const pkg = `csvql-query-${process.platform}-${process.arch}`;
-    try {
-        const pkgDir = path.dirname(require.resolve(`${pkg}/package.json`));
-        const bin = path.join(pkgDir, 'csvql.node');
-        if (fs.existsSync(bin)) return bin;
-    } catch (_) {}
-
-    // 3. Dev build output (zig build node from repo root)
+    // 2. Dev build output (zig build node from repo root)
     const dev = path.join(__dirname, '..', 'zig-out', 'lib', 'csvql.node');
     if (fs.existsSync(dev)) return dev;
 

@@ -6,10 +6,11 @@
   "types": "index.d.ts",
   "files": [
     "index.js",
-    "index.d.ts"
+    "index.d.ts",
+    "binaries/"
   ],
   "scripts": {
-    "build": "zig build node -Doptimize=ReleaseFast && cp ../zig-out/lib/csvql.node .",
+    "build": "zig build node -Doptimize=ReleaseFast && mkdir -p binaries && cp ../zig-out/lib/csvql.node binaries/$(node -p \"process.platform + '-' + process.arch\").node",
     "test": "node test.js",
     "bench": "node bench.js"
   },
@@ -29,13 +30,6 @@
   },
   "engines": {
     "node": ">=18"
-  },
-  "optionalDependencies": {
-    "csvql-query-darwin-arm64": "1.5.5",
-    "csvql-query-darwin-x64": "1.5.5",
-    "csvql-query-linux-x64": "1.5.5",
-    "csvql-query-linux-arm64": "1.5.5",
-    "csvql-query-win32-x64": "1.5.5"
   },
   "devDependencies": {
     "csv-parse": "^7.0.0",
