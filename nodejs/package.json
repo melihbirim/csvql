@@ -11,11 +11,22 @@
   ],
   "scripts": {
     "build": "zig build node -Doptimize=ReleaseFast && cp ../zig-out/lib/csvql.node .",
-    "test": "node test.js"
+    "test": "node test.js",
+    "bench": "node bench.js"
   },
-  "keywords": ["csv", "sql", "query", "simd", "fast"],
+  "keywords": [
+    "csv",
+    "sql",
+    "query",
+    "simd",
+    "fast"
+  ],
   "license": "MIT",
   "engines": {
     "node": ">=18"
+  },
+  "devDependencies": {
+    "csv-parse": "^7.0.0",
+    "papaparse": "^5.5.4"
   }
 }
