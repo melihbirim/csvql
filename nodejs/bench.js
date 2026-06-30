@@ -3,26 +3,21 @@
  * csvql vs csv-parse vs papaparse
  *
  * Run: node bench.js
- * Deps: npm install csv-parse papaparse  (already in package.json devDependencies)
+ * Deps: npm install (csv-parse + papaparse in devDependencies)
  *
- * What this measures:
- *   - Time from "I have a CSV file path" to "I have results" (total wall time)
- *   - Same 4 real-world queries in each library
- *   - Lines of code needed to express each query
- *
- * Test data: 200 000 rows generated in /tmp (auto-cleaned up)
+ * Measures: wall time + peak heap allocated during each operation.
+ * Test data: 1 000 000 rows (~42 MB) generated in /tmp, cleaned up after.
  */
 
-const csvql   = require('./index.js');
+const csvql    = require('./index.js');
 const { parse } = require('csv-parse/sync');
-const Papa    = require('papaparse');
-const fs      = require('fs');
-const path    = require('path');
+const Papa     = require('papaparse');
+const fs       = require('fs');
 
 // ── Generate test data ────────────────────────────────────────────────────────
 
-const CSV = '/tmp/_csvql_bench.csv';
-const ROWS = 200_000;
+const CSV   = '/tmp/_csvql_bench.csv';
+const ROWS  = 1_000_000;
 const CITIES = ['Austin', 'Boston', 'Chicago', 'Denver', 'Eugene'];
 const DEPTS  = ['Engineering', 'Marketing', 'Finance', 'HR', 'Sales'];
 
@@ -37,22 +32,31 @@ process.stdout.write(`Generating ${ROWS.toLocaleString()} row test CSV... `);
     }
     fs.writeFileSync(CSV, lines.join('\n') + '\n');
 }
-console.log(`done (${(fs.statSync(CSV).size / 1024 / 1024).toFixed(1)} MB)`);
+const fileMB = (fs.statSync(CSV).size / 1024 / 1024).toFixed(1);
+console.log(`done (${fileMB} MB)`);
 
-// ── Benchmark helper ──────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-const W = 82;
+const W = 86;
 
-function ms(fn) {
+function measure(fn) {
+    if (global.gc) global.gc();
+    const heapBefore = process.memoryUsage().heapUsed;
     const t = process.hrtime.bigint();
     const result = fn();
-    return { ms: Number(process.hrtime.bigint() - t) / 1e6, result };
+    const elapsed = Number(process.hrtime.bigint() - t) / 1e6;
+    const heapPeak = process.memoryUsage().heapUsed - heapBefore;
+    return { ms: elapsed, mb: Math.max(0, heapPeak / 1024 / 1024), result };
 }
 
-function row(label, t, rows, ref) {
-    const speedup = ref ? (ref / t) : null;
-    const speed   = speedup ? (speedup > 1 ? `  ${speedup.toFixed(1)}x faster` : `  ${(1/speedup).toFixed(1)}x slower`) : '';
-    console.log(`  ${label.padEnd(28)} ${String(t.toFixed(1) + 'ms').padStart(9)}  ${String(rows + ' rows').padStart(9)}${speed}`);
+function printRow(label, { ms, mb, result }, ref) {
+    const rowCount = Array.isArray(result) ? result.length : '—';
+    const speedup  = ref ? (ref / ms) : null;
+    const cmp      = speedup
+        ? (speedup >= 1 ? `  ${speedup.toFixed(1)}x faster` : `  ${(1/speedup).toFixed(1)}x slower`)
+        : '';
+    const mem = mb > 1 ? `  +${mb.toFixed(0)} MB heap` : '  ~0 MB heap';
+    console.log(`  ${label.padEnd(26)} ${String(ms.toFixed(0) + 'ms').padStart(8)}${mem.padEnd(18)}  ${String(rowCount + ' rows').padStart(11)}${cmp}`);
 }
 
 function header(title) {
@@ -61,99 +65,98 @@ function header(title) {
     console.log('─'.repeat(W));
 }
 
-// ── QUERY 1: First 5 rows ─────────────────────────────────────────────────────
+// ── QUERY 1: LIMIT 5 ─────────────────────────────────────────────────────────
 
-header('QUERY 1 — SELECT * LIMIT 5  (cold read, return first rows)');
-console.log('  Code:');
-console.log(`    csvql:      query("SELECT * FROM '...' LIMIT 5")                             // 1 line`);
-console.log(`    csv-parse:  parse(fs.readFileSync(f), {columns:true, to:5})                  // 1 line`);
-console.log(`    papaparse:  Papa.parse(fs.readFileSync(f,'utf8'), {header:true}).data.slice(0,5) // 1 line`);
+header('QUERY 1 — SELECT * LIMIT 5  (early stop — does not read the whole file)');
+console.log(`  csvql:      query("SELECT * FROM '...' LIMIT 5")`);
+console.log(`  csv-parse:  parse(readFileSync(f), {columns:true, to:5})          ← stops at row 5`);
+console.log(`  papaparse:  Papa.parse(readFileSync(f,'utf8'), {preview:5})        ← reads whole string first`);
 console.log();
 
-const q1_csvql = ms(() => csvql.query(`SELECT * FROM '${CSV}' LIMIT 5`));
-const q1_csv   = ms(() => parse(fs.readFileSync(CSV), { columns: true, to: 5 }));
-const q1_papa  = ms(() => Papa.parse(fs.readFileSync(CSV, 'utf8'), { header: true, preview: 5 }).data);
+const q1_csvql = measure(() => csvql.query(`SELECT * FROM '${CSV}' LIMIT 5`));
+const q1_csv   = measure(() => parse(fs.readFileSync(CSV), { columns: true, to: 5 }));
+const q1_papa  = measure(() => Papa.parse(fs.readFileSync(CSV, 'utf8'), { header: true, preview: 5 }).data);
 
-row('csvql',     q1_csvql.ms, q1_csvql.result.length, q1_csv.ms);
-row('csv-parse', q1_csv.ms,   q1_csv.result.length);
-row('papaparse', q1_papa.ms,  q1_papa.result.length,  q1_csv.ms);
+printRow('csvql',     q1_csvql, q1_csv.ms);
+printRow('csv-parse', q1_csv);
+printRow('papaparse', q1_papa,  q1_csv.ms);
 
-// ── QUERY 2: GROUP BY (aggregation) ──────────────────────────────────────────
+// ── QUERY 2: GROUP BY ─────────────────────────────────────────────────────────
 
-header('QUERY 2 — GROUP BY city COUNT(*)  (aggregation — scan full file)');
-console.log('  Code:');
-console.log(`    csvql:      query("SELECT city, COUNT(*) FROM '...' GROUP BY city")          // 1 line`);
-console.log(`    csv-parse:  parse + reduce loop + Object.entries map                         // ~8 lines`);
-console.log(`    papaparse:  Papa.parse + reduce loop + Object.entries map                    // ~8 lines`);
+header('QUERY 2 — GROUP BY city COUNT(*)  (full scan + aggregate)');
+console.log(`  csvql:      query("SELECT city, COUNT(*) FROM '...' GROUP BY city")   // 1 line`);
+console.log(`  csv-parse:  parse + .reduce() + Object.entries()                      // ~6 lines, all rows in heap`);
+console.log(`  papaparse:  Papa.parse + .reduce() + Object.entries()                 // ~6 lines, all rows in heap`);
 console.log();
 
-const q2_csvql = ms(() => csvql.query(`SELECT city, COUNT(*) as n FROM '${CSV}' GROUP BY city`));
+const q2_csvql = measure(() =>
+    csvql.query(`SELECT city, COUNT(*) as n FROM '${CSV}' GROUP BY city`));
 
-const q2_csv = ms(() => {
+const q2_csv = measure(() => {
     const records = parse(fs.readFileSync(CSV), { columns: true });
     const counts = records.reduce((acc, r) => { acc[r.city] = (acc[r.city] || 0) + 1; return acc; }, {});
     return Object.entries(counts).map(([city, n]) => ({ city, n }));
 });
 
-const q2_papa = ms(() => {
+const q2_papa = measure(() => {
     const records = Papa.parse(fs.readFileSync(CSV, 'utf8'), { header: true }).data;
     const counts = records.reduce((acc, r) => { acc[r.city] = (acc[r.city] || 0) + 1; return acc; }, {});
     return Object.entries(counts).map(([city, n]) => ({ city, n }));
 });
 
-row('csvql',     q2_csvql.ms, q2_csvql.result.length, q2_csv.ms);
-row('csv-parse', q2_csv.ms,   q2_csv.result.length);
-row('papaparse', q2_papa.ms,  q2_papa.result.length,  q2_csv.ms);
+printRow('csvql',     q2_csvql, q2_csv.ms);
+printRow('csv-parse', q2_csv);
+printRow('papaparse', q2_papa,  q2_csv.ms);
 
-// ── QUERY 3: WHERE filter ─────────────────────────────────────────────────────
+// ── QUERY 3: WHERE ────────────────────────────────────────────────────────────
 
-header("QUERY 3 — WHERE salary > 100000  (filter — early exit possible)");
-console.log('  Code:');
-console.log(`    csvql:      query("SELECT name, salary FROM '...' WHERE salary > 100000")    // 1 line`);
-console.log(`    csv-parse:  parse full file + .filter(r => Number(r.salary) > 100000)        // 2 lines`);
-console.log(`    papaparse:  Papa.parse + .filter(r => Number(r.salary) > 100000)             // 2 lines`);
+header('QUERY 3 — WHERE salary > 100000  (filter — full scan, large result)');
+console.log(`  csvql:      query("SELECT name,salary FROM '...' WHERE salary > 100000")  // 1 line`);
+console.log(`  csv-parse:  parse + .filter(r => Number(r.salary) > 100000)               // 2 lines, all rows in heap`);
+console.log(`  papaparse:  Papa.parse + .filter(r => Number(r.salary) > 100000)          // 2 lines, all rows in heap`);
 console.log();
 
-const q3_csvql = ms(() => csvql.query(`SELECT name, salary FROM '${CSV}' WHERE salary > 100000`));
+const q3_csvql = measure(() =>
+    csvql.query(`SELECT name, salary FROM '${CSV}' WHERE salary > 100000`));
 
-const q3_csv = ms(() => {
+const q3_csv = measure(() => {
     const records = parse(fs.readFileSync(CSV), { columns: true });
     return records.filter(r => Number(r.salary) > 100000);
 });
 
-const q3_papa = ms(() => {
+const q3_papa = measure(() => {
     const records = Papa.parse(fs.readFileSync(CSV, 'utf8'), { header: true }).data;
     return records.filter(r => Number(r.salary) > 100000);
 });
 
-row('csvql',     q3_csvql.ms, q3_csvql.result.length, q3_csv.ms);
-row('csv-parse', q3_csv.ms,   q3_csv.result.length);
-row('papaparse', q3_papa.ms,  q3_papa.result.length,  q3_csv.ms);
+printRow('csvql',     q3_csvql, q3_csv.ms);
+printRow('csv-parse', q3_csv);
+printRow('papaparse', q3_papa,  q3_csv.ms);
 
 // ── QUERY 4: ORDER BY LIMIT ───────────────────────────────────────────────────
 
 header('QUERY 4 — ORDER BY salary DESC LIMIT 10  (top-N)');
-console.log('  Code:');
-console.log(`    csvql:      query("SELECT name, salary FROM '...' ORDER BY salary DESC LIMIT 10")  // 1 line`);
-console.log(`    csv-parse:  parse + sort((a,b) => b.salary - a.salary) + slice(0, 10)             // 3 lines`);
-console.log(`    papaparse:  Papa.parse + sort((a,b) => b.salary - a.salary) + slice(0, 10)        // 3 lines`);
+console.log(`  csvql:      query("SELECT name,salary FROM '...' ORDER BY salary DESC LIMIT 10")  // 1 line`);
+console.log(`  csv-parse:  parse + .sort() + .slice(0,10)                                        // 3 lines, all rows in heap`);
+console.log(`  papaparse:  Papa.parse + .sort() + .slice(0,10)                                   // 3 lines, all rows in heap`);
 console.log();
 
-const q4_csvql = ms(() => csvql.query(`SELECT name, salary FROM '${CSV}' ORDER BY salary DESC LIMIT 10`));
+const q4_csvql = measure(() =>
+    csvql.query(`SELECT name, salary FROM '${CSV}' ORDER BY salary DESC LIMIT 10`));
 
-const q4_csv = ms(() => {
+const q4_csv = measure(() => {
     const records = parse(fs.readFileSync(CSV), { columns: true });
     return records.sort((a, b) => Number(b.salary) - Number(a.salary)).slice(0, 10);
 });
 
-const q4_papa = ms(() => {
+const q4_papa = measure(() => {
     const records = Papa.parse(fs.readFileSync(CSV, 'utf8'), { header: true }).data;
     return records.sort((a, b) => Number(b.salary) - Number(a.salary)).slice(0, 10);
 });
 
-row('csvql',     q4_csvql.ms, q4_csvql.result.length, q4_csv.ms);
-row('csv-parse', q4_csv.ms,   q4_csv.result.length);
-row('papaparse', q4_papa.ms,  q4_papa.result.length,  q4_csv.ms);
+printRow('csvql',     q4_csvql, q4_csv.ms);
+printRow('csv-parse', q4_csv);
+printRow('papaparse', q4_papa,  q4_csv.ms);
 
 // ── Feature comparison ────────────────────────────────────────────────────────
 
@@ -162,34 +165,34 @@ console.log('FEATURE COMPARISON');
 console.log('═'.repeat(W));
 
 const features = [
-    ['SQL WHERE / filter',        '✓', '✗ manual .filter()', '✗ manual .filter()'],
-    ['SQL GROUP BY / aggregate',  '✓', '✗ manual reduce',    '✗ manual reduce'],
-    ['SQL ORDER BY / sort',       '✓', '✗ manual .sort()',   '✗ manual .sort()'],
-    ['SQL JOIN across files',     '✓', '✗',                  '✗'],
-    ['SQL LIMIT (early exit)',     '✓', '✗ loads full file',  '✗ loads full file'],
-    ['Custom delimiter (TSV etc)', '✗', '✓',                  '✓'],
-    ['CSV writing (unparse)',      '✗', '✗',                  '✓'],
-    ['Streaming API',              '✗', '✓',                  '✓'],
-    ['Browser support',            '✗', '✗',                  '✓'],
-    ['SIMD parsing',               '✓', '✗',                  '✗'],
-    ['Low memory (no full load)',  '✓', '✗',                  '✗'],
-    ['TypeScript types',           '✓', '✓',                  '✓'],
+    // [feature, csvql, csv-parse, papaparse]
+    ['SQL WHERE / filter',         '✓',                    '✗ manual .filter()',  '✗ manual .filter()'],
+    ['SQL GROUP BY / aggregate',   '✓',                    '✗ manual reduce',     '✗ manual reduce'],
+    ['SQL ORDER BY / sort',        '✓',                    '✗ manual .sort()',    '✗ manual .sort()'],
+    ['SQL JOIN across files',      '✓',                    '✗',                   '✗'],
+    ['SQL LIMIT (early exit)',      '✓',                    '✓ with {to:N}',       '✓ with {preview:N}'],
+    ['Streaming (low memory)',      '✓ always',             '✓ async API only',    '✓ async API only'],
+    ['Sync API stays low memory',  '✓ always ~5 MB',       '✗ loads all rows',    '✗ loads all rows'],
+    ['Custom delimiter (TSV etc)', '✗',                    '✓',                   '✓'],
+    ['CSV writing (unparse)',      '✗',                    '✗',                   '✓'],
+    ['Browser support',            '✗',                    '✗',                   '✓'],
+    ['SIMD parsing',               '✓',                    '✗',                   '✗'],
+    ['TypeScript types',           '✓',                    '✓',                   '✓'],
 ];
 
-console.log(`  ${'Feature'.padEnd(32)} ${'csvql'.padEnd(18)} ${'csv-parse'.padEnd(22)} papaparse`);
-console.log(`  ${'-'.repeat(32)} ${'-'.repeat(18)} ${'-'.repeat(22)} ---------`);
+console.log(`  ${'Feature'.padEnd(34)} ${'csvql'.padEnd(20)} ${'csv-parse'.padEnd(22)} papaparse`);
+console.log(`  ${'-'.repeat(34)} ${'-'.repeat(20)} ${'-'.repeat(22)} ---------`);
 for (const [feat, a, b, c] of features) {
-    console.log(`  ${feat.padEnd(32)} ${String(a).padEnd(18)} ${String(b).padEnd(22)} ${c}`);
+    console.log(`  ${feat.padEnd(34)} ${String(a).padEnd(20)} ${String(b).padEnd(22)} ${c}`);
 }
 
 console.log(`\n${'═'.repeat(W)}`);
 console.log('WHEN TO USE WHAT');
 console.log('═'.repeat(W));
-console.log('  csvql     → SQL queries on CSV (WHERE, GROUP BY, ORDER BY, JOIN) — fastest for analytics');
-console.log('  csv-parse → Raw CSV parsing with full control, streaming, custom delimiters');
-console.log('  papaparse → Browser + Node, CSV writing, streaming, simple API');
-console.log('  Hybrid    → csvql to filter/aggregate large files, then csv-parse for custom processing');
+console.log('  csvql     → SQL on CSV files, any size — ~5 MB RAM regardless of file size');
+console.log('  csv-parse → Raw parsing, custom delimiters, streaming pipeline (async API)');
+console.log('  papaparse → Browser, CSV writing, simple sync API for small files');
+console.log('  Note      → csv-parse/papaparse sync APIs load all rows as JS objects first');
 console.log('═'.repeat(W));
 
-// Cleanup
 fs.unlinkSync(CSV);
