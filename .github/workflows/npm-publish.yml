@@ -14,6 +14,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -105,7 +106,8 @@ jobs:
           node -e "
             const fs = require('fs');
             const p = JSON.parse(fs.readFileSync('nodejs/package.json', 'utf8'));
-            p.version = process.env.TAG.replace(/^v/, '');
+            const tag = process.env.TAG;
+            if (tag && tag.startsWith('v')) p.version = tag.replace(/^v/, '');
             fs.writeFileSync('nodejs/package.json', JSON.stringify(p, null, 2) + '\n');
           "
         env:
