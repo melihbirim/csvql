@@ -91,8 +91,6 @@ jobs:
       - name: Publish platform package
         run: npm publish --provenance --access public
         working-directory: nodejs/platforms/${{ matrix.pkg-dir }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # ── Publish the main csvql-query package after all platform packages are up ──
   publish-main:
@@ -127,5 +125,3 @@ jobs:
       - name: Publish main package
         run: npm publish --provenance --access public
         working-directory: nodejs
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
