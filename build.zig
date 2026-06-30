@@ -5,7 +5,7 @@ fn detectNodeInclude(allocator: std.mem.Allocator) ?[]const u8 {
     const result = std.process.Child.run(.{
         .allocator = allocator,
         .argv = &.{
-            "node", "-e",
+            "node",                                                                                        "-e",
             "const p=require('path');process.stdout.write(p.join(process.execPath,'../../include/node'))",
         },
     }) catch return null;
