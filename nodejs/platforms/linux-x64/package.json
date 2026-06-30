@@ -1,0 +1,14 @@
+{
+  "name": "csvql-query-linux-x64",
+  "version": "1.0.0",
+  "description": "csvql-query native binary for linux-x64",
+  "main": "index.js",
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "files": ["csvql.node"],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/melihbirim/csvql"
+  }
+}

@@ -29,16 +29,26 @@ const os     = require('os');
 const crypto = require('crypto');
 
 function findNative() {
+    // 1. Bundled in same dir (npm run build copies it here, or local publish)
     const bundled = path.join(__dirname, 'csvql.node');
     if (fs.existsSync(bundled)) return bundled;
 
+    // 2. Platform-specific npm package (installed via optionalDependencies)
+    const pkg = `csvql-query-${process.platform}-${process.arch}`;
+    try {
+        const pkgDir = path.dirname(require.resolve(`${pkg}/package.json`));
+        const bin = path.join(pkgDir, 'csvql.node');
+        if (fs.existsSync(bin)) return bin;
+    } catch (_) {}
+
+    // 3. Dev build output (zig build node from repo root)
     const dev = path.join(__dirname, '..', 'zig-out', 'lib', 'csvql.node');
     if (fs.existsSync(dev)) return dev;
 
     throw new Error(
-        'csvql native module not found.\n' +
-        'Run: zig build node -Doptimize=ReleaseFast\n' +
-        'Or install the npm package: npm install csvql-query'
+        `csvql native module not found for ${process.platform}-${process.arch}.\n` +
+        'Install via npm:  npm install csvql-query\n' +
+        'Build from source: zig build node -Doptimize=ReleaseFast'
     );
 }
 

@@ -6,8 +6,7 @@
   "types": "index.d.ts",
   "files": [
     "index.js",
-    "index.d.ts",
-    "csvql.node"
+    "index.d.ts"
   ],
   "scripts": {
     "build": "zig build node -Doptimize=ReleaseFast && cp ../zig-out/lib/csvql.node .",
@@ -19,11 +18,24 @@
     "sql",
     "query",
     "simd",
-    "fast"
+    "fast",
+    "etl",
+    "parser"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/melihbirim/csvql"
+  },
   "engines": {
     "node": ">=18"
+  },
+  "optionalDependencies": {
+    "csvql-query-darwin-arm64": "1.0.0",
+    "csvql-query-darwin-x64":   "1.0.0",
+    "csvql-query-linux-x64":    "1.0.0",
+    "csvql-query-linux-arm64":  "1.0.0",
+    "csvql-query-win32-x64":    "1.0.0"
   },
   "devDependencies": {
     "csv-parse": "^7.0.0",

@@ -1,0 +1,118 @@
+name: Publish npm packages
+
+# Runs on every release tag (v*), after the main release job.
+# Requires the NPM_TOKEN secret to be set in repo settings.
+#
+# What it does:
+#   1. Builds csvql.node natively on each platform runner
+#   2. Publishes the platform-specific package (e.g. csvql-query-darwin-arm64)
+#   3. After all platform packages are up, publishes the main csvql-query package
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Build + publish one platform package per runner ──────────────────────────
+  publish-platform:
+    name: Publish ${{ matrix.npm-pkg }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest      # Apple Silicon
+            npm-pkg: csvql-query-darwin-arm64
+            zig-target: ""        # native build, no cross-compilation flag needed
+
+          - os: macos-13          # Intel Mac
+            npm-pkg: csvql-query-darwin-x64
+            zig-target: ""
+
+          - os: ubuntu-latest     # Linux x86_64
+            npm-pkg: csvql-query-linux-x64
+            zig-target: ""
+
+          - os: ubuntu-24.04-arm  # Linux ARM64
+            npm-pkg: csvql-query-linux-arm64
+            zig-target: ""
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Build native addon
+        run: zig build node -Doptimize=ReleaseFast
+
+      - name: Copy binary into platform package
+        run: |
+          mkdir -p nodejs/platforms/${{ matrix.npm-pkg }}
+          cp zig-out/lib/csvql.node nodejs/platforms/${{ matrix.npm-pkg }}/csvql.node
+
+      - name: Set version from tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          cd nodejs/platforms/${{ matrix.npm-pkg }}
+          # update version field in package.json
+          node -e "
+            const fs = require('fs');
+            const p = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            p.version = '$TAG';
+            fs.writeFileSync('package.json', JSON.stringify(p, null, 2) + '\n');
+          "
+
+      - name: Publish platform package
+        run: npm publish --access public
+        working-directory: nodejs/platforms/${{ matrix.npm-pkg }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  # ── Publish the main csvql-query package after all platform packages are up ──
+  publish-main:
+    name: Publish csvql-query (main)
+    needs: publish-platform
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Set version from tag
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          cd nodejs
+          node -e "
+            const fs = require('fs');
+            const p = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            p.version = '$TAG';
+            // sync optionalDependencies versions
+            for (const k of Object.keys(p.optionalDependencies || {})) {
+              p.optionalDependencies[k] = '$TAG';
+            }
+            fs.writeFileSync('package.json', JSON.stringify(p, null, 2) + '\n');
+          "
+
+      - name: Publish main package
+        run: npm publish --access public
+        working-directory: nodejs
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
