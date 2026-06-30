@@ -1457,7 +1457,10 @@ fn executeFromStdin(
     output_file: std.fs.File,
     opts: options_mod.Options,
 ) !void {
-    const stdin = std.fs.File{ .handle = std.posix.STDIN_FILENO };
+    const stdin = if (builtin.os.tag == .windows)
+        std.fs.File{ .handle = std.os.windows.GetStdHandle(std.os.windows.STD_INPUT_HANDLE).? }
+    else
+        std.fs.File{ .handle = std.posix.STDIN_FILENO };
     var reader = csv.CsvReader.init(allocator, stdin);
     reader.delimiter = opts.delimiter;
     var writer = csv.RecordWriter.init(output_file, opts);
