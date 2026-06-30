@@ -522,6 +522,88 @@ csvql --mcp
 Once connected, you can ask your AI assistant to query CSV files directly:
 > *"What are the top 5 product categories by revenue this year?"*
 
+## Language Libraries
+
+csvql ships as a native library for Python and Node.js — same SIMD engine, same performance, no subprocess.
+
+### Node.js
+
+```bash
+# 1. Build the native addon
+zig build node -Doptimize=ReleaseFast
+# → zig-out/lib/csvql.node
+
+# 2. Run
+node nodejs/bench.js
+```
+
+```js
+const csvql = require('csvql-query');
+
+// Returns an array of objects (numbers are typed, not strings)
+const rows = csvql.query("SELECT city, COUNT(*) as n, AVG(salary) as avg FROM 'employees.csv' GROUP BY city ORDER BY avg DESC");
+// [{ city: 'Austin', n: 3, avg: 126666.67 }, ...]
+
+// Return raw CSV text instead
+const csv = csvql.queryCsv("SELECT name, salary FROM 'employees.csv' WHERE salary > 100000");
+```
+
+#### Options
+
+Both `query()` and `queryCsv()` accept an optional second argument:
+
+| Option           | Type      | Description                                                         |
+| ---------------- | --------- | ------------------------------------------------------------------- |
+| `delimiter`      | `string`  | Source field separator when not a comma — `'\t'` for TSV, `'\|'` for pipe-delimited, etc. |
+| `comment`        | `string`  | Skip lines that start with this string — e.g. `'#'` for shell-style comments. |
+| `skipEmptyLines` | `boolean` | Strip blank / whitespace-only lines before querying. Default `false`. |
+
+```js
+// TSV file
+csvql.query("SELECT * FROM 'scores.tsv' WHERE score > 90", { delimiter: '\t' })
+
+// File with comment rows and blank lines
+csvql.query("SELECT * FROM 'data.csv'", { comment: '#', skipEmptyLines: true })
+
+// JOIN two TSV files
+csvql.query(
+  "SELECT e.name, d.name as dept FROM 'employees.tsv' e JOIN 'departments.tsv' d ON e.dept_id = d.id",
+  { delimiter: '\t' }
+)
+```
+
+**Memory:** the engine streams through the file internally — RAM stays ~5 MB regardless of file size. Compare with `csv-parse` or `papaparse` sync APIs, which materialise all rows as JS objects (200–650 MB for a 42 MB / 1M row file).
+
+**Benchmarks:** `node --expose-gc nodejs/bench.js` — comparison against `csv-parse` and `papaparse` on 1M rows.  
+**Feature comparison:** `node nodejs/compare.js` — side-by-side code and output for 10 common tasks.
+
+---
+
+### Python
+
+```bash
+pip install csvql
+```
+
+```python
+import csvql
+
+# List of dicts
+rows = csvql.query("SELECT city, COUNT(*) as n FROM 'employees.csv' GROUP BY city")
+# [{'city': 'Austin', 'n': '3'}, ...]
+
+# Raw CSV string
+csv_text = csvql.query_csv("SELECT * FROM 'employees.csv' WHERE salary > 100000")
+
+# pandas DataFrame (requires pandas)
+df = csvql.query_df("SELECT region, SUM(revenue) FROM 'sales.csv' GROUP BY region")
+
+# Plain tuples — lowest overhead
+headers, rows = csvql.query_tuples("SELECT name, age FROM 'employees.csv'")
+```
+
+---
+
 ## Documentation
 
 | Document                                             | Description                                         |
