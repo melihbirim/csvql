@@ -1,6 +1,6 @@
 {
   "name": "csvql-query",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "description": "Fast SQL queries on CSV files — Zig/SIMD engine via N-API",
   "main": "index.js",
   "types": "index.d.ts",
@@ -31,11 +31,11 @@
     "node": ">=18"
   },
   "optionalDependencies": {
-    "csvql-query-darwin-arm64": "1.5.1",
-    "csvql-query-darwin-x64": "1.5.1",
-    "csvql-query-linux-x64": "1.5.1",
-    "csvql-query-linux-arm64": "1.5.1",
-    "csvql-query-win32-x64": "1.5.1"
+    "csvql-query-darwin-arm64": "1.5.2",
+    "csvql-query-darwin-x64": "1.5.2",
+    "csvql-query-linux-x64": "1.5.2",
+    "csvql-query-linux-arm64": "1.5.2",
+    "csvql-query-win32-x64": "1.5.2"
   },
   "devDependencies": {
     "csv-parse": "^7.0.0",
