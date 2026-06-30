@@ -91,8 +91,8 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);
 
-    const stdout_file = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
-    const stderr_file = std.fs.File{ .handle = std.posix.STDERR_FILENO };
+    const stdout_file = stdFile(.out);
+    const stderr_file = stdFile(.err);
 
     // Check for early-exit flags first (before any filtering)
     if (args.len >= 2) {
@@ -176,7 +176,7 @@ pub fn main() !void {
     const use_table = opts.format == .csv and !opts.no_header and switch (opts.table_mode) {
         .on => true,
         .off => false,
-        .auto => std.posix.isatty(std.posix.STDOUT_FILENO),
+        .auto => isTty(stdFile(.out)),
     };
 
     if (use_table) {
@@ -268,6 +268,31 @@ fn renderTableOutput(allocator: Allocator, query: parser.Query, stdout_file: std
     try stdout_file.writeAll(table_buf.items);
 }
 
+/// Cross-platform wrappers for standard file handles.
+fn stdFile(comptime which: enum { in, out, err }) std.fs.File {
+    if (builtin.os.tag == .windows) {
+        const id = switch (which) {
+            .in => std.os.windows.STD_INPUT_HANDLE,
+            .out => std.os.windows.STD_OUTPUT_HANDLE,
+            .err => std.os.windows.STD_ERROR_HANDLE,
+        };
+        return .{ .handle = std.os.windows.GetStdHandle(id) catch @ptrFromInt(0xFFFFFFFF) };
+    }
+    return .{ .handle = switch (which) {
+        .in => std.posix.STDIN_FILENO,
+        .out => std.posix.STDOUT_FILENO,
+        .err => std.posix.STDERR_FILENO,
+    } };
+}
+
+fn isTty(file: std.fs.File) bool {
+    if (builtin.os.tag == .windows) {
+        var mode: std.os.windows.DWORD = 0;
+        return std.os.windows.kernel32.GetConsoleMode(file.handle, &mode) != 0;
+    }
+    return std.posix.isatty(file.handle);
+}
+
 /// Return the current terminal width in columns.
 /// Checks $COLUMNS env var first, then TIOCGWINSZ via libc ioctl, then falls back to 80.
 fn getTerminalWidth() usize {
@@ -277,6 +302,7 @@ fn getTerminalWidth() usize {
             if (n >= 20) return n;
         }
     }
+    if (builtin.os.tag == .windows) return 80;
     // TIOCGWINSZ via libc (works on macOS and Linux; we always link libc).
     const WinSize = extern struct { ws_row: u16, ws_col: u16, ws_xpixel: u16, ws_ypixel: u16 };
     const tiocgwinsz: c_uint = switch (builtin.os.tag) {
@@ -605,12 +631,11 @@ fn getQueryFromArgs(allocator: Allocator, clean_args: []const []const u8) ![]u8 
     }
 
     // Read query from stdin
-    const stdin = std.fs.File{ .handle = std.posix.STDIN_FILENO };
+    const stdin = stdFile(.in);
 
     // If stdin is a TTY (no pipe), nothing will ever come — show help instead.
-    if (std.posix.isatty(std.posix.STDIN_FILENO)) {
-        const stdout_file = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
-        try stdout_file.writeAll(help_text);
+    if (isTty(stdin)) {
+        try stdFile(.out).writeAll(help_text);
         std.process.exit(0);
     }
 
@@ -618,8 +643,7 @@ fn getQueryFromArgs(allocator: Allocator, clean_args: []const []const u8) ![]u8 
     const trimmed = std.mem.trim(u8, query, &std.ascii.whitespace);
 
     if (trimmed.len == 0) {
-        const stderr = std.fs.File{ .handle = std.posix.STDERR_FILENO };
-        try stderr.writeAll("error: no query provided\n\nRun 'csvql --help' for usage information.\n");
+        try stdFile(.err).writeAll("error: no query provided\n\nRun 'csvql --help' for usage information.\n");
         std.process.exit(1);
     }
 

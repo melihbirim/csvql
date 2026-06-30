@@ -13,6 +13,25 @@ const arena_buffer = @import("arena_buffer.zig");
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 
+/// Map a file into memory (POSIX) or read it into an allocated buffer (Windows).
+/// Caller must pass the same allocator to unmapFile.
+fn mapFile(allocator: Allocator, file: std.fs.File, size: u64) ![]const u8 {
+    if (builtin.os.tag == .windows) {
+        return file.readToEndAlloc(allocator, @intCast(size));
+    }
+    const mapped = try std.posix.mmap(null, @intCast(size), std.posix.PROT.READ, .{ .TYPE = .SHARED }, file.handle, 0);
+    std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
+    return mapped;
+}
+
+fn unmapFile(allocator: Allocator, data: []const u8) void {
+    if (builtin.os.tag == .windows) {
+        allocator.free(data);
+    } else {
+        std.posix.munmap(@alignCast(data));
+    }
+}
+
 /// macOS libc sysctl accessor — resolved at link time via linkLibC().
 extern fn sysctlbyname(
     name: [*:0]const u8,
@@ -710,7 +729,7 @@ fn scalarProcessChunk(ctx: *ScalarWorkerCtx) !void {
     var file_pos: usize = ctx.chunk_start;
     while (file_pos < ctx.chunk_end) {
         const to_read = @min(IO_BUF, ctx.chunk_end - file_pos);
-        const n = try std.posix.pread(file.handle, io_buf[0..to_read], @intCast(file_pos));
+        const n = try file.pread(io_buf[0..to_read], @intCast(file_pos));
         if (n == 0) break;
         file_pos += n;
 
@@ -878,17 +897,8 @@ fn executeParallelScalar(
     const file_size = (try input_file.stat()).size;
     if (file_size == 0) return error.EmptyFile;
 
-    const mapped = try std.posix.mmap(
-        null,
-        file_size,
-        std.posix.PROT.READ,
-        .{ .TYPE = .SHARED },
-        input_file.handle,
-        0,
-    );
-    defer std.posix.munmap(mapped);
-    std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
-    const data = mapped[0..file_size];
+    const data = try mapFile(allocator, input_file, file_size);
+    defer unmapFile(allocator, data);
 
     // Parse header
     const header_nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
@@ -2142,17 +2152,8 @@ fn executeDistinct(
     const file_size = (try file.stat()).size;
     if (file_size == 0) return error.EmptyFile;
 
-    const mapped = try std.posix.mmap(
-        null,
-        file_size,
-        std.posix.PROT.READ,
-        .{ .TYPE = .SHARED },
-        file.handle,
-        0,
-    );
-    defer std.posix.munmap(mapped);
-    std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
-    const data = mapped[0..file_size];
+    const data = try mapFile(allocator, file, file_size);
+    defer unmapFile(allocator, data);
 
     var writer = csv.RecordWriter.init(output_file, opts);
     defer writer.deinit();
@@ -2419,17 +2420,8 @@ fn executeScalarAgg(
     const file_size = (try file.stat()).size;
     if (file_size == 0) return error.EmptyFile;
 
-    const mapped = try std.posix.mmap(
-        null,
-        file_size,
-        std.posix.PROT.READ,
-        .{ .TYPE = .SHARED },
-        file.handle,
-        0,
-    );
-    defer std.posix.munmap(mapped);
-    std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
-    const data = mapped[0..file_size];
+    const data = try mapFile(allocator, file, file_size);
+    defer unmapFile(allocator, data);
 
     var writer = csv.RecordWriter.init(output_file, opts);
     defer writer.deinit();
@@ -3021,7 +3013,7 @@ fn gbWorkerScan(ctx: *GbWorkerCtx) !void {
     var file_pos: usize = ctx.chunk_start;
     while (file_pos < ctx.chunk_end) {
         const to_read = @min(IO_BUF, ctx.chunk_end - file_pos);
-        const n = try std.posix.pread(file.handle, io_buf[0..to_read], @intCast(file_pos));
+        const n = try file.pread(io_buf[0..to_read], @intCast(file_pos));
         if (n == 0) break;
         file_pos += n;
 
@@ -3095,7 +3087,7 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
     var file_pos: usize = ctx.chunk_start;
     while (file_pos < ctx.chunk_end) {
         const to_read = @min(IO_BUF, ctx.chunk_end - file_pos);
-        const n = try std.posix.pread(file.handle, io_buf[0..to_read], @intCast(file_pos));
+        const n = try file.pread(io_buf[0..to_read], @intCast(file_pos));
         if (n == 0) break;
         file_pos += n;
 
@@ -3303,17 +3295,8 @@ fn executeGroupBy(
 
     // Memory-map the file: zero-copy sequential scan, better prefetch than
     // buffered I/O for the full-table reads that GROUP BY requires.
-    const mapped = try std.posix.mmap(
-        null,
-        file_size,
-        std.posix.PROT.READ,
-        .{ .TYPE = .SHARED },
-        file.handle,
-        0,
-    );
-    defer std.posix.munmap(mapped);
-    std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
-    const data = mapped[0..file_size];
+    const data = try mapFile(allocator, file, file_size);
+    defer unmapFile(allocator, data);
 
     var writer = csv.RecordWriter.init(output_file, opts);
     defer writer.deinit();

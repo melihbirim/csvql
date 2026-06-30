@@ -1,10 +1,28 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const parser = @import("parser.zig");
 const csv = @import("csv.zig");
 const simd = @import("simd.zig");
 const fast_sort = @import("fast_sort.zig");
 const options_mod = @import("options.zig");
 const Allocator = std.mem.Allocator;
+
+fn mapFile(allocator: Allocator, file: std.fs.File, size: u64) ![]const u8 {
+    if (builtin.os.tag == .windows) {
+        return file.readToEndAlloc(allocator, @intCast(size));
+    }
+    const mapped = try std.posix.mmap(null, @intCast(size), std.posix.PROT.READ, .{ .TYPE = .SHARED }, file.handle, 0);
+    std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
+    return mapped;
+}
+
+fn unmapFile(allocator: Allocator, data: []const u8) void {
+    if (builtin.os.tag == .windows) {
+        allocator.free(data);
+    } else {
+        std.posix.munmap(@alignCast(data));
+    }
+}
 
 const WorkChunk = struct {
     start: usize,
@@ -76,19 +94,8 @@ pub fn executeParallelMapped(
 ) !void {
     const file_size = (try input_file.stat()).size;
 
-    // Memory-map the entire file
-    const mapped = try std.posix.mmap(
-        null,
-        file_size,
-        std.posix.PROT.READ,
-        .{ .TYPE = .SHARED },
-        input_file.handle,
-        0,
-    );
-    defer std.posix.munmap(mapped);
-    std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
-
-    const data = mapped[0..file_size];
+    const data = try mapFile(allocator, input_file, file_size);
+    defer unmapFile(allocator, data);
 
     // Find end of header line
     const header_end = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
