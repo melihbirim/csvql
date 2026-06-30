@@ -1,6 +1,6 @@
 {
   "name": "csvql-query",
-  "version": "1.5.12",
+  "version": "1.5.13",
   "description": "Fast SQL queries on CSV files — Zig/SIMD engine via N-API",
   "main": "index.js",
   "types": "index.d.ts",
