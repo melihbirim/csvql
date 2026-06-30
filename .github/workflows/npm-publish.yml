@@ -42,15 +42,19 @@ jobs:
         include:
           - os: macos-14          # Apple Silicon (Sonoma, arm64)
             npm-pkg: csvql-query-darwin-arm64
+            pkg-dir: darwin-arm64
 
           - os: macos-13          # Intel Mac
             npm-pkg: csvql-query-darwin-x64
+            pkg-dir: darwin-x64
 
           - os: ubuntu-latest     # Linux x86_64
             npm-pkg: csvql-query-linux-x64
+            pkg-dir: linux-x64
 
           - os: ubuntu-24.04-arm  # Linux ARM64
             npm-pkg: csvql-query-linux-arm64
+            pkg-dir: linux-arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -70,16 +74,15 @@ jobs:
         run: zig build node -Doptimize=ReleaseFast
 
       - name: Copy binary into platform package
-        run: cp zig-out/lib/csvql.node nodejs/platforms/${{ matrix.npm-pkg }}/csvql.node
+        run: cp zig-out/lib/csvql.node nodejs/platforms/${{ matrix.pkg-dir }}/csvql.node
 
       - name: Set version from tag
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
           node -e "
             const fs = require('fs');
-            const f = 'nodejs/platforms/${{ matrix.npm-pkg }}/package.json';
+            const f = 'nodejs/platforms/${{ matrix.pkg-dir }}/package.json';
             const p = JSON.parse(fs.readFileSync(f, 'utf8'));
-            p.version = process.env.TAG;
+            p.version = process.env.TAG.replace(/^v/, '');
             fs.writeFileSync(f, JSON.stringify(p, null, 2) + '\n');
           "
         env:
@@ -87,7 +90,7 @@ jobs:
 
       - name: Publish platform package
         run: npm publish --provenance --access public
-        working-directory: nodejs/platforms/${{ matrix.npm-pkg }}
+        working-directory: nodejs/platforms/${{ matrix.pkg-dir }}
 
   # ── Publish the main csvql-query package after all platform packages are up ──
   publish-main:
