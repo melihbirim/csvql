@@ -167,8 +167,10 @@ jobs:
           TAG: ${{ github.ref_name }}
 
       - name: Publish
-        run: npm publish --provenance --access public
+        run: npm publish
         working-directory: nodejs
+        env:
+          NPM_CONFIG_PROVENANCE: true
 
   update-homebrew:
     name: Update Homebrew Formula
