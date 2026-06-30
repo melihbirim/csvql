@@ -91,3 +91,90 @@ export function query(sql: string, opts?: QueryOptions): Record<string, unknown>
  * const csv = queryCsv("SELECT name, score FROM 'results.tsv' ORDER BY score DESC", { delimiter: '\t' })
  */
 export function queryCsv(sql: string, opts?: QueryOptions): string;
+
+/**
+ * Options for {@link find} — no SQL required.
+ */
+export interface FindOptions {
+    /**
+     * Columns to return. Accepts a comma-separated string (`'name, city'`) or an array
+     * (`['name', 'city']`). Defaults to all columns when omitted.
+     */
+    columns?: string | string[];
+
+    /**
+     * Filter rows without writing SQL. Supported operators: `=` `!=` `>` `>=` `<` `<=`
+     * Combine conditions with `AND` / `OR`.
+     * String values are quoted automatically; numbers stay unquoted.
+     *
+     * @example 'salary>100000'
+     * @example 'department=Engineering AND salary>80000'
+     * @example 'city=Austin OR city=Boston'
+     */
+    where?: string;
+
+    /**
+     * Maximum number of rows to return. Omit or set to 0 for all rows.
+     */
+    limit?: number;
+
+    /**
+     * Sort column and direction. Format: `'column'` (asc by default) or `'column:desc'`.
+     *
+     * @example 'salary:desc'
+     * @example 'name:asc'
+     */
+    orderBy?: string;
+
+    /** Source field delimiter when the file is not comma-separated. E.g. `'\t'` for TSV. */
+    delimiter?: string;
+
+    /** Skip lines starting with this string. E.g. `'#'` for comment rows. */
+    comment?: string;
+
+    /** Strip blank / whitespace-only lines before querying. Default `false`. */
+    skipEmptyLines?: boolean;
+}
+
+/**
+ * Query a CSV file without writing SQL.
+ *
+ * Accepts simple filter, column, sort, and limit options. Internally translated
+ * to SQL and executed by the same SIMD engine as {@link query}.
+ *
+ * For aggregates (COUNT, SUM, AVG, GROUP BY, JOIN) use {@link query} instead.
+ *
+ * @param file  Path to the CSV/TSV file.
+ * @param opts  Filter, column, sort, limit, and pre-processing options.
+ * @returns Array of row objects.
+ * @throws {Error} on invalid condition, file not found, or engine error.
+ *
+ * @example
+ * // All rows
+ * find('employees.csv')
+ *
+ * @example
+ * // Pick columns + filter
+ * find('employees.csv', {
+ *     columns: ['name', 'city', 'salary'],
+ *     where:   'salary>100000',
+ * })
+ *
+ * @example
+ * // Filter + sort + limit
+ * find('employees.csv', {
+ *     where:   'department=Engineering AND salary>80000',
+ *     orderBy: 'salary:desc',
+ *     limit:   10,
+ * })
+ *
+ * @example
+ * // TSV file
+ * find('scores.tsv', {
+ *     columns:   ['name', 'score'],
+ *     where:     'score>=90',
+ *     orderBy:   'score:desc',
+ *     delimiter: '\t',
+ * })
+ */
+export function find(file: string, opts?: FindOptions): Record<string, unknown>[];

@@ -539,7 +539,41 @@ node nodejs/bench.js
 
 ```js
 const csvql = require('csvql-query');
+```
 
+#### `find()` — no SQL required
+
+For users who don't want to write SQL. Pass a file path and a plain options object:
+
+```js
+// All rows
+csvql.find('employees.csv')
+
+// Pick columns + filter
+csvql.find('employees.csv', {
+    columns: ['name', 'city', 'salary'],
+    where:   'salary>100000',
+})
+
+// AND / OR conditions, sort, limit
+csvql.find('employees.csv', {
+    where:   'department=Engineering AND salary>80000',
+    orderBy: 'salary:desc',
+    limit:   10,
+})
+
+// OR condition
+csvql.find('employees.csv', {
+    columns: 'name,city',
+    where:   'city=Austin OR city=Boston',
+})
+```
+
+`where` operators: `=` `!=` `>` `>=` `<` `<=` — string values are quoted automatically, numbers stay numeric. Combine with `AND` / `OR`. For aggregates (`COUNT`, `SUM`, `AVG`, `GROUP BY`) use `query()`.
+
+#### `query()` — full SQL
+
+```js
 // Returns an array of objects (numbers are typed, not strings)
 const rows = csvql.query("SELECT city, COUNT(*) as n, AVG(salary) as avg FROM 'employees.csv' GROUP BY city ORDER BY avg DESC");
 // [{ city: 'Austin', n: 3, avg: 126666.67 }, ...]

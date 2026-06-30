@@ -236,4 +236,137 @@ function queryCsv(sql, opts) {
     }
 }
 
-module.exports = { query, queryCsv };
+// ── Simple (no-SQL) API ───────────────────────────────────────────────────────
+
+/**
+ * Translate a simple condition like "salary>100000" or "name=Alice" into SQL.
+ * Numbers stay unquoted; anything that isn't a valid number gets single-quoted.
+ *
+ * @param {string} cond  e.g. "salary>100000" or "city=Austin"
+ * @returns {string}     e.g. "salary > 100000" or "city = 'Austin'"
+ */
+function translateCondition(cond) {
+    // Match: column  operator  value   (operators longest-first to avoid = matching >=)
+    const m = cond.trim().match(/^(\w+)(>=|<=|!=|>|<|=)(.+)$/);
+    if (!m) throw new Error(`Invalid where condition: "${cond}"`);
+    const [, col, op, raw] = m;
+    const val = raw.trim();
+    const quoted = isNaN(Number(val)) ? `'${val}'` : val;
+    return `${col} ${op} ${quoted}`;
+}
+
+/**
+ * Translate a simple where string (may contain AND / OR) into a SQL WHERE clause.
+ * e.g. "salary>100000 AND department=Engineering" → "salary > 100000 AND department = 'Engineering'"
+ *
+ * @param {string} where
+ * @returns {string}
+ */
+function translateWhere(where) {
+    // Split on AND / OR keeping the keyword, translate each leaf condition.
+    return where
+        .split(/\b(AND|OR)\b/)
+        .map(part => {
+            const t = part.trim();
+            if (t === 'AND' || t === 'OR') return t;
+            return translateCondition(t);
+        })
+        .join(' ');
+}
+
+/**
+ * Translate a simple orderBy string into a SQL ORDER BY clause.
+ * e.g. "salary:desc" → "salary DESC"   |   "name" → "name ASC"
+ *
+ * @param {string} orderBy
+ * @returns {string}
+ */
+function translateOrderBy(orderBy) {
+    const [col, dir = 'asc'] = orderBy.split(':');
+    return `${col.trim()} ${dir.trim().toUpperCase()}`;
+}
+
+/**
+ * Build a SQL string from simple find() options.
+ *
+ * @param {string}      file
+ * @param {FindOptions} opts
+ * @returns {string}
+ */
+function buildSql(file, opts) {
+    const cols = opts.columns
+        ? (Array.isArray(opts.columns) ? opts.columns.join(', ') : opts.columns)
+        : '*';
+
+    let sql = `SELECT ${cols} FROM '${file}'`;
+    if (opts.where)   sql += ` WHERE ${translateWhere(opts.where)}`;
+    if (opts.orderBy) sql += ` ORDER BY ${translateOrderBy(opts.orderBy)}`;
+    if (opts.limit)   sql += ` LIMIT ${opts.limit}`;
+    return sql;
+}
+
+/**
+ * @typedef {Object} FindOptions
+ * @property {string|string[]} [columns]      - Columns to return. Comma-separated string or
+ *                                              array. Default: all columns.
+ * @property {string}          [where]        - Filter condition in simple syntax — no SQL needed.
+ *                                              Operators: = != > >= < <=
+ *                                              Combine with AND / OR.
+ *                                              Values are auto-quoted (numbers stay unquoted).
+ *                                              E.g. 'salary>100000 AND department=Engineering'
+ * @property {number}          [limit]        - Maximum rows to return. Default: all rows.
+ * @property {string}          [orderBy]      - Sort column and direction: 'column:asc' or
+ *                                              'column:desc'. Direction defaults to asc.
+ *                                              E.g. 'salary:desc'
+ * @property {string}          [delimiter]    - Source delimiter when not comma. E.g. '\t' for TSV.
+ * @property {string}          [comment]      - Skip lines starting with this string. E.g. '#'.
+ * @property {boolean}         [skipEmptyLines] - Skip blank lines. Default false.
+ */
+
+/**
+ * Query a CSV file without writing SQL.
+ *
+ * Uses the same SIMD engine as `query()` — the simple options are translated
+ * into a SQL string internally. No SQL knowledge required.
+ *
+ * For aggregates (COUNT, SUM, AVG, GROUP BY) use `query()` instead.
+ *
+ * @param {string}      file  Path to the CSV/TSV file.
+ * @param {FindOptions} [opts]
+ * @returns {Record<string, unknown>[]}
+ * @throws {Error} on invalid condition, file not found, or engine error
+ *
+ * @example
+ * // All rows
+ * csvql.find('employees.csv')
+ *
+ * @example
+ * // Pick columns + filter
+ * csvql.find('employees.csv', {
+ *     columns: ['name', 'city', 'salary'],
+ *     where:   'salary>100000',
+ * })
+ *
+ * @example
+ * // Filter + sort + limit
+ * csvql.find('employees.csv', {
+ *     where:   'department=Engineering AND salary>80000',
+ *     orderBy: 'salary:desc',
+ *     limit:   10,
+ * })
+ *
+ * @example
+ * // TSV file, no SQL needed
+ * csvql.find('scores.tsv', {
+ *     columns: ['name', 'score'],
+ *     where:   'score>=90',
+ *     orderBy: 'score:desc',
+ *     delimiter: '\t',
+ * })
+ */
+function find(file, opts = {}) {
+    const sql = buildSql(file, opts);
+    return query(sql, opts);
+}
+
+module.exports = { query, queryCsv, find };

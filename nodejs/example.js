@@ -63,6 +63,28 @@ function log(title, result) {
     }
 }
 
+// ── find() — no SQL required ──────────────────────────────────────────────────
+
+log('find: all rows (no options)', csvql.find(CSV));
+
+log('find: pick columns + filter', csvql.find(CSV, {
+    columns: ['name', 'city', 'salary'],
+    where:   'salary>100000',
+}));
+
+log('find: AND filter + sort + limit', csvql.find(CSV, {
+    where:   'department=Engineering AND salary>80000',
+    orderBy: 'salary:desc',
+    limit:   3,
+}));
+
+log('find: OR filter', csvql.find(CSV, {
+    columns: 'name,city',
+    where:   'city=Austin OR city=Boston',
+}));
+
+// ── query() — SQL ─────────────────────────────────────────────────────────────
+
 // ── 1. Basic SELECT ───────────────────────────────────────────────────────────
 
 log(

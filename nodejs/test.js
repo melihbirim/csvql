@@ -77,6 +77,20 @@ check('comment: # rows stripped', clean_rows.length, 2);
 check('comment: first id', clean_rows[0].id, 1);
 fs.unlinkSync(dirty);
 
-console.log(`\n${passed}/11 tests passed`);
+// find() — no SQL
+const find_all = csvql.find(csv);
+check('find: all rows', find_all.length, 5);
+
+const find_cols = csvql.find(csv, { columns: ['name', 'salary'], where: 'salary>100000' });
+check('find: columns + where', find_cols.length, 3);
+check('find: only requested columns', Object.keys(find_cols[0]).join(','), 'name,salary');
+
+const find_and = csvql.find(csv, { where: 'department=Engineering AND salary>100000', orderBy: 'salary:desc', limit: 1 });
+check('find: AND + orderBy + limit', find_and[0].name, 'Carol');
+
+const find_or = csvql.find(csv, { columns: 'name,city', where: 'city=Austin OR city=Boston' });
+check('find: OR condition', find_or.length, 4);
+
+console.log(`\n${passed}/15 tests passed`);
 
 fs.unlinkSync(csv);
