@@ -19,7 +19,7 @@ jobs:
             artifact: csvql-linux-x86_64
             ext: ""
             pkg: tar.gz
-          - os: macos-latest
+          - os: macos-14
             zig-target: aarch64-macos
             artifact: csvql-macos-aarch64
             ext: ""
@@ -178,10 +178,10 @@ jobs:
         include:
           - os: ubuntu-latest
             plat: manylinux_2_17_x86_64
-          - os: macos-latest
+          - os: macos-13
             arch: x86_64
             plat: macosx_12_0_x86_64
-          - os: macos-latest
+          - os: macos-14
             arch: arm64
             plat: macosx_12_0_arm64
 
