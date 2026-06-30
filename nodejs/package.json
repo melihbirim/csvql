@@ -1,0 +1,21 @@
+{
+  "name": "csvql-query",
+  "version": "1.0.0",
+  "description": "Fast SQL queries on CSV files — Zig/SIMD engine via N-API",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "csvql.node"
+  ],
+  "scripts": {
+    "build": "zig build node -Doptimize=ReleaseFast && cp ../zig-out/lib/csvql.node .",
+    "test": "node test.js"
+  },
+  "keywords": ["csv", "sql", "query", "simd", "fast"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}

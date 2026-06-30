@@ -1,5 +1,22 @@
 const std = @import("std");
 
+/// Auto-detect the Node.js include directory by running `node` at build time.
+fn detectNodeInclude(allocator: std.mem.Allocator) ?[]const u8 {
+    const result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &.{
+            "node", "-e",
+            "const p=require('path');process.stdout.write(p.join(process.execPath,'../../include/node'))",
+        },
+    }) catch return null;
+    allocator.free(result.stderr);
+    if (result.term != .Exited or result.term.Exited != 0) {
+        allocator.free(result.stdout);
+        return null;
+    }
+    return result.stdout; // allocator owns; lives for the duration of build()
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -126,6 +143,42 @@ pub fn build(b: *std.Build) void {
     });
     mmap_example.linkLibC();
     b.installArtifact(mmap_example);
+
+    // Node.js N-API addon — zig build node -Doptimize=ReleaseFast
+    // Output: zig-out/lib/csvql.node  (loaded by nodejs/index.js)
+    const node_include = b.option(
+        []const u8,
+        "node-include",
+        "Path to Node.js include dir containing node_api.h (auto-detected if omitted)",
+    ) orelse detectNodeInclude(b.allocator);
+
+    if (node_include) |inc| {
+        const node_addon = b.addLibrary(.{
+            .name = "csvql_node",
+            .linkage = .dynamic,
+            .root_module = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+                .root_source_file = b.path("src/node_binding.zig"),
+            }),
+        });
+        node_addon.linkLibC();
+        node_addon.addIncludePath(.{ .cwd_relative = inc });
+        // N-API symbols are resolved by Node.js at dlopen() time, not at link time.
+        node_addon.linker_allow_shlib_undefined = true;
+
+        const install_node = b.addInstallFileWithDir(
+            node_addon.getEmittedBin(),
+            .lib,
+            "csvql.node",
+        );
+
+        const node_step = b.step("node", "Build Node.js N-API addon (zig-out/lib/csvql.node)");
+        node_step.dependOn(&install_node.step);
+    } else {
+        const node_step = b.step("node", "Build Node.js N-API addon (requires node in PATH)");
+        _ = node_step;
+    }
 
     // Tests
     const test_step = b.step("test", "Run unit tests");

@@ -1,0 +1,65 @@
+'use strict';
+
+const csvql = require('./index.js');
+const path = require('path');
+const fs = require('fs');
+
+// Generate a tiny test CSV in /tmp
+const csv = '/tmp/csvql_test.csv';
+fs.writeFileSync(csv, [
+    'id,name,age,city,salary,department',
+    '1,Alice,30,Austin,120000,Engineering',
+    '2,Bob,25,Boston,80000,Marketing',
+    '3,Carol,35,Austin,150000,Engineering',
+    '4,Dave,28,Denver,90000,Marketing',
+    '5,Eve,32,Austin,110000,Engineering',
+].join('\n') + '\n');
+
+let passed = 0;
+
+function check(label, actual, expected) {
+    const ok = JSON.stringify(actual) === JSON.stringify(expected);
+    console.log(`${ok ? '✓' : '✗'} ${label}`);
+    if (!ok) {
+        console.log('  expected:', JSON.stringify(expected));
+        console.log('  actual:  ', JSON.stringify(actual));
+        process.exitCode = 1;
+    } else {
+        passed++;
+    }
+}
+
+// LIMIT
+const rows = csvql.query(`SELECT * FROM '${csv}' LIMIT 2`);
+check('LIMIT 2 returns 2 rows', rows.length, 2);
+check('first row name', rows[0].name, 'Alice');
+
+// WHERE
+const filtered = csvql.query(`SELECT name, salary FROM '${csv}' WHERE salary > 100000`);
+check('WHERE salary > 100000 → 3 rows', filtered.length, 3);
+
+// GROUP BY
+const groups = csvql.query(`SELECT city, COUNT(*) as n FROM '${csv}' GROUP BY city`);
+check('GROUP BY city → 3 groups', groups.length, 3);
+const austin = groups.find(r => r.city === 'Austin');
+check('Austin has 3 rows', austin && Number(austin.n), 3);
+
+// ORDER BY
+const sorted = csvql.query(`SELECT name, salary FROM '${csv}' ORDER BY salary DESC LIMIT 1`);
+check('top earner is Carol', sorted[0].name, 'Carol');
+
+// queryCsv
+const csv_out = csvql.queryCsv(`SELECT name FROM '${csv}' LIMIT 1`);
+check('queryCsv returns string with header', csv_out.startsWith('name'), true);
+
+// Error handling
+try {
+    csvql.query('SELECT * FROM \'/tmp/no_such_file.csv\'');
+    check('missing file throws', false, true);
+} catch (e) {
+    check('missing file throws', true, true);
+}
+
+console.log(`\n${passed}/6 tests passed`);
+
+fs.unlinkSync(csv);
