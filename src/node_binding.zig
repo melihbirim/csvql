@@ -5,6 +5,7 @@
 ///   queryJson(sql: string) -> string   — JSON array string; JS caller does JSON.parse()
 ///   queryCsv(sql: string)  -> string   — CSV text (header + rows)
 const std = @import("std");
+const builtin = @import("builtin");
 const parser = @import("parser.zig");
 const engine = @import("engine.zig");
 const options_mod = @import("options.zig");
@@ -20,22 +21,35 @@ fn runQuery(sql: []const u8, format: options_mod.OutputFormat) ![]u8 {
     var q = try parser.parse(allocator, sql);
     defer q.deinit();
 
+    const opts = options_mod.Options{ .format = format, .table_mode = .off };
+
+    if (builtin.os.tag == .windows) {
+        const tmp_dir = std.process.getEnvVarOwned(allocator, "TEMP") catch
+            try allocator.dupe(u8, "C:\\Windows\\Temp");
+        defer allocator.free(tmp_dir);
+        const tmp_path = try std.fmt.allocPrint(allocator, "{s}\\csvql_{d}.tmp", .{ tmp_dir, std.time.nanoTimestamp() });
+        defer allocator.free(tmp_path);
+        const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{ .read = true });
+        defer {
+            tmp_file.close();
+            std.fs.deleteFileAbsolute(tmp_path) catch {};
+        }
+        try engine.execute(allocator, q, tmp_file, opts);
+        try tmp_file.seekTo(0);
+        return tmp_file.readToEndAlloc(allocator, 256 * 1024 * 1024);
+    }
+
     var buf = std.ArrayList(u8){};
     errdefer buf.deinit(allocator);
-
     var pipe_fds: [2]std.posix.fd_t = undefined;
     pipe_fds = try std.posix.pipe();
     const read_fd = pipe_fds[0];
     const write_fd = pipe_fds[1];
-
-    const opts = options_mod.Options{ .format = format, .table_mode = .off };
-
     const DrainCtx = struct {
         rfd: std.posix.fd_t,
         out: *std.ArrayList(u8),
         alloc: std.mem.Allocator,
         err: ?anyerror = null,
-
         fn run(ctx: *@This()) void {
             var tmp: [4096]u8 = undefined;
             while (true) {
@@ -51,18 +65,14 @@ fn runQuery(sql: []const u8, format: options_mod.OutputFormat) ![]u8 {
             }
         }
     };
-
     var drain_ctx = DrainCtx{ .rfd = read_fd, .out = &buf, .alloc = allocator };
     const drain_thread = try std.Thread.spawn(.{}, DrainCtx.run, .{&drain_ctx});
-
     const eng_result = engine.execute(allocator, q, std.fs.File{ .handle = write_fd }, opts);
     std.posix.close(write_fd);
     drain_thread.join();
     std.posix.close(read_fd);
-
     try eng_result;
     if (drain_ctx.err) |e| return e;
-
     return buf.toOwnedSlice(allocator);
 }
 

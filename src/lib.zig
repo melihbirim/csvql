@@ -10,6 +10,7 @@
 ///   - Always call csvql_free() on a non-null result, even after an error.
 ///   - Return code 0 = success, non-zero = error (message in *out_ptr).
 const std = @import("std");
+const builtin = @import("builtin");
 const parser = @import("parser.zig");
 const engine = @import("engine.zig");
 const options_mod = @import("options.zig");
@@ -28,71 +29,69 @@ fn runQuery(sql: []const u8, format: options_mod.OutputFormat) ![*:0]u8 {
     var query = try parser.parse(allocator, sql);
     defer query.deinit();
 
-    // Capture engine output into a buffer instead of a real file.
-    var buf = std.ArrayList(u8){};
-    defer buf.deinit(allocator);
-
-    // The engine writes to a std.fs.File. We create a pipe: engine writes to
-    // the write end; we read from the read end into buf.
-    // Simpler alternative: write to a temp file. Simplest: use a pipe fd pair.
-    //
-    // Actually the cleanest approach for our engine is to give it a writable
-    // file descriptor backed by an in-memory pipe.
-    var pipe_fds: [2]std.posix.fd_t = undefined;
-    pipe_fds = try std.posix.pipe();
-
-    const read_fd = pipe_fds[0];
-    const write_fd = pipe_fds[1];
-
-    const write_file = std.fs.File{ .handle = write_fd };
-
     const opts = options_mod.Options{
         .format = format,
-        .table_mode = .off, // never table-format in lib mode
+        .table_mode = .off,
     };
 
-    // Spawn a thread to drain the pipe while the engine writes, to avoid
-    // deadlock on large outputs that exceed the pipe buffer (typically 64 KB).
-    const DrainCtx = struct {
-        rfd: std.posix.fd_t,
-        out: *std.ArrayList(u8),
-        alloc: std.mem.Allocator,
-        err: ?anyerror = null,
-
-        fn run(ctx: *@This()) void {
-            var tmp: [4096]u8 = undefined;
-            while (true) {
-                const n = std.posix.read(ctx.rfd, &tmp) catch |e| {
-                    ctx.err = e;
-                    return;
-                };
-                if (n == 0) return; // EOF
-                ctx.out.appendSlice(ctx.alloc, tmp[0..n]) catch |e| {
-                    ctx.err = e;
-                    return;
-                };
-            }
+    const output: []u8 = if (builtin.os.tag == .windows) blk: {
+        // Windows: write to temp file (no std.posix.pipe)
+        const tmp_dir = std.process.getEnvVarOwned(allocator, "TEMP") catch
+            try allocator.dupe(u8, "C:\\Windows\\Temp");
+        defer allocator.free(tmp_dir);
+        const tmp_path = try std.fmt.allocPrint(allocator, "{s}\\csvql_{d}.tmp", .{ tmp_dir, std.time.nanoTimestamp() });
+        defer allocator.free(tmp_path);
+        const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{ .read = true });
+        defer {
+            tmp_file.close();
+            std.fs.deleteFileAbsolute(tmp_path) catch {};
         }
+        try engine.execute(allocator, query, tmp_file, opts);
+        try tmp_file.seekTo(0);
+        break :blk try tmp_file.readToEndAlloc(allocator, 256 * 1024 * 1024);
+    } else blk: {
+        // POSIX: pipe + drain thread to avoid deadlock on large outputs
+        var pipe_fds: [2]std.posix.fd_t = undefined;
+        pipe_fds = try std.posix.pipe();
+        const read_fd = pipe_fds[0];
+        const write_fd = pipe_fds[1];
+        var buf = std.ArrayList(u8){};
+        errdefer buf.deinit(allocator);
+        const DrainCtx = struct {
+            rfd: std.posix.fd_t,
+            out: *std.ArrayList(u8),
+            alloc: std.mem.Allocator,
+            err: ?anyerror = null,
+            fn run(ctx: *@This()) void {
+                var tmp: [4096]u8 = undefined;
+                while (true) {
+                    const n = std.posix.read(ctx.rfd, &tmp) catch |e| {
+                        ctx.err = e;
+                        return;
+                    };
+                    if (n == 0) return;
+                    ctx.out.appendSlice(ctx.alloc, tmp[0..n]) catch |e| {
+                        ctx.err = e;
+                        return;
+                    };
+                }
+            }
+        };
+        var drain_ctx = DrainCtx{ .rfd = read_fd, .out = &buf, .alloc = allocator };
+        const drain_thread = try std.Thread.spawn(.{}, DrainCtx.run, .{&drain_ctx});
+        const engine_result = engine.execute(allocator, query, std.fs.File{ .handle = write_fd }, opts);
+        std.posix.close(write_fd);
+        drain_thread.join();
+        std.posix.close(read_fd);
+        try engine_result;
+        if (drain_ctx.err) |e| return e;
+        break :blk try buf.toOwnedSlice(allocator);
     };
-
-    var drain_ctx = DrainCtx{ .rfd = read_fd, .out = &buf, .alloc = allocator };
-    const drain_thread = try std.Thread.spawn(.{}, DrainCtx.run, .{&drain_ctx});
-
-    // Run the engine — writes to write_file (the pipe write end).
-    const engine_result = engine.execute(allocator, query, write_file, opts);
-
-    // Close the write end first so the drain thread sees EOF.
-    std.posix.close(write_fd);
-    drain_thread.join();
-    std.posix.close(read_fd);
-
-    // Propagate errors after cleanup.
-    try engine_result;
-    if (drain_ctx.err) |e| return e;
+    defer allocator.free(output);
 
     // Return a heap-allocated null-terminated copy.
-    const result = try allocator.allocSentinel(u8, buf.items.len, 0);
-    @memcpy(result, buf.items);
+    const result = try allocator.allocSentinel(u8, output.len, 0);
+    @memcpy(result, output);
     return result;
 }
 

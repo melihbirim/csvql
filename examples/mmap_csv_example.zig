@@ -1,4 +1,19 @@
 const std = @import("std");
+const builtin = @import("builtin");
+
+fn mapFile(allocator: std.mem.Allocator, file: std.fs.File, size: u64) ![]const u8 {
+    if (builtin.os.tag == .windows) return file.readToEndAlloc(allocator, @intCast(size));
+    const mapped = try std.posix.mmap(null, @intCast(size), std.posix.PROT.READ, .{ .TYPE = .SHARED }, file.handle, 0);
+    return mapped;
+}
+
+fn unmapFile(allocator: std.mem.Allocator, data: []const u8) void {
+    if (builtin.os.tag == .windows) {
+        allocator.free(data);
+        return;
+    }
+    std.posix.munmap(@alignCast(data));
+}
 
 /// Example: High-performance CSV parsing with memory-mapped I/O
 /// This is the fastest way to parse CSV files - used in csvq's parallel engine
@@ -22,18 +37,8 @@ pub fn main() !void {
     const file_size = (try file.stat()).size;
     std.debug.print("File size: {d} bytes\n", .{file_size});
 
-    // Memory-map the entire file for zero-copy reading
-    const mapped = try std.posix.mmap(
-        null,
-        file_size,
-        std.posix.PROT.READ,
-        .{ .TYPE = .SHARED },
-        file.handle,
-        0,
-    );
-    defer std.posix.munmap(mapped);
-
-    const data = mapped[0..file_size];
+    const data = try mapFile(allocator, file, file_size);
+    defer unmapFile(allocator, data);
 
     // Parse header
     const header_end = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;

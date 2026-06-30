@@ -12,6 +12,7 @@
 //!   { "mcpServers": { "csvql": { "command": "/path/to/csvql", "args": ["--mcp"] } } }
 
 const std = @import("std");
+const builtin = @import("builtin");
 const parser = @import("parser.zig");
 const engine = @import("engine.zig");
 const options_mod = @import("options.zig");
@@ -42,8 +43,14 @@ const TOOLS_JSON =
 // ---------------------------------------------------------------------------
 
 pub fn run(allocator: Allocator) !void {
-    const stdin = std.fs.File{ .handle = std.posix.STDIN_FILENO };
-    const stdout = std.fs.File{ .handle = std.posix.STDOUT_FILENO };
+    const stdin = if (builtin.os.tag == .windows)
+        std.fs.File{ .handle = std.os.windows.GetStdHandle(std.os.windows.STD_INPUT_HANDLE) catch return error.NoStdin }
+    else
+        std.fs.File{ .handle = std.posix.STDIN_FILENO };
+    const stdout = if (builtin.os.tag == .windows)
+        std.fs.File{ .handle = std.os.windows.GetStdHandle(std.os.windows.STD_OUTPUT_HANDLE) catch return error.NoStdout }
+    else
+        std.fs.File{ .handle = std.posix.STDOUT_FILENO };
 
     const r = stdin.deprecatedReader();
 
