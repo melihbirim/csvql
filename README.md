@@ -173,6 +173,19 @@ Run the benchmark yourself: [`bench/bench_all.sh --section like`](bench/bench_al
 
 Run the benchmark yourself: [`bench/bench_all.sh --section join`](bench/bench_all.sh)
 
+**NYC Taxi benchmark — 20M rows, 8 GB CSV, Apple M-series** — the canonical [Billion-Taxi-Rides](https://github.com/pdet/taxi-benchmark) queries on [DuckDB's own dataset](https://duckdb.org/2024/10/16/driving-csv-performance-benchmarking-duckdb-with-the-nyc-taxi-dataset). Both engines query the raw uncompressed CSV **directly** (no preload into a native store), cold per run, best-of-5, warm OS cache:
+
+| Query                                                       | csvql     | DuckDB | Speedup  |
+| ----------------------------------------------------------- | --------- | ------ | -------- |
+| Q01 `COUNT(*) GROUP BY cab_type`                            | **1.29s** | 3.55s  | **2.8x** |
+| Q02 `AVG(total_amount) GROUP BY passenger_count`            | **1.41s** | 3.81s  | **2.7x** |
+| Q03 `COUNT(*) GROUP BY passenger_count, year`               | **1.36s** | 4.01s  | **2.9x** |
+| Q04 `GROUP BY passenger_count, year, ROUND(distance) ...`   | **1.38s** | 3.99s  | **2.9x** |
+
+Results verified identical to DuckDB. The gap **widens on smaller files** — ~10x on the 417 MB / 1M-row sample, where DuckDB's process and CSV-reader startup dominate; on 8 GB the actual parse+aggregate work dominates and csvql holds a clean ~2.8x.
+
+Reproduce: [`bench/bench_taxi.sh`](bench/bench_taxi.sh) — `./bench/bench_taxi.sh --sample` (417 MB, quick) or `./bench/bench_taxi.sh 1` (full 20M rows, ~8 GB download).
+
 Run the full suite (all sections): [`bench/bench_all.sh`](bench/bench_all.sh)
 
 <details>
