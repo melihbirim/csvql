@@ -4212,8 +4212,7 @@ test "GROUP BY: ORDER BY aggregate result is applied (issue #46)" {
 
     // green:2 rows, yellow:3 rows → ORDER BY count DESC must put yellow first.
     const data = "cab,x\ngreen,1\nyellow,1\ngreen,1\nyellow,1\nyellow,1\n";
-    const out = try runQueryForTest(allocator, &tmp, data,
-        "SELECT cab, COUNT(*) AS c FROM '{s}' GROUP BY cab ORDER BY c DESC");
+    const out = try runQueryForTest(allocator, &tmp, data, "SELECT cab, COUNT(*) AS c FROM '{s}' GROUP BY cab ORDER BY c DESC");
     defer allocator.free(out);
 
     const body = std.mem.trim(u8, out, "\n");
@@ -4230,8 +4229,7 @@ test "GROUP BY ROUND(col) forms a numeric key (issue #47)" {
 
     // 1.2 and 0.9 both round to 1; 2.4 rounds to 2 → groups {1:2, 2:1}.
     const data = "d\n1.2\n0.9\n2.4\n";
-    const out = try runQueryForTest(allocator, &tmp, data,
-        "SELECT ROUND(d) AS r, COUNT(*) AS c FROM '{s}' GROUP BY r ORDER BY r ASC");
+    const out = try runQueryForTest(allocator, &tmp, data, "SELECT ROUND(d) AS r, COUNT(*) AS c FROM '{s}' GROUP BY r ORDER BY r ASC");
     defer allocator.free(out);
 
     const body = std.mem.trim(u8, out, "\n");
