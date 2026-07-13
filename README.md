@@ -254,6 +254,7 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 | **MIN / MAX** | `MIN(col)`, `MAX(col)` — with or without `GROUP BY`                     |
 | **HAVING**    | `HAVING expr` — filter groups after aggregation (e.g. `HAVING COUNT(*) > 5`) |
 | **STRFTIME**  | `STRFTIME('%Y-%m', col)` — date bucketing in `SELECT` and `GROUP BY`    |
+| **DATE_PART** | `DATE_PART('year', col)` — extract `year`/`month`/`day`/`hour`/`minute`/`second`; alias for `STRFTIME` in `SELECT` and `GROUP BY` |
 | **UPPER / LOWER** | `SELECT UPPER(col), LOWER(col)` — case conversion                  |
 | **TRIM**      | `SELECT TRIM(col)` — strip leading and trailing whitespace              |
 | **LENGTH**    | `SELECT LENGTH(col)` — byte length of the value                         |
@@ -486,6 +487,19 @@ csvql ships as a [Model Context Protocol](https://modelcontextprotocol.io/) serv
 csvql --mcp
 ```
 
+### Why query instead of paste?
+
+A 1 MB CSV costs **~560,000 tokens** to paste into an LLM — it doesn't even fit a 200K-token context window. Pasting a real dataset is impossible past a few hundred KB, and expensive long before that. With `csvql --mcp` the agent *queries* the file instead and gets back only the rows it asked for:
+
+| CSV size | Paste into context | Query via `csvql --mcp` | Savings |
+| -------- | ------------------ | ----------------------- | ------- |
+| 1 MB     | 559K tokens ❌ *(overflows)* | ~440 tokens | **1,280x** |
+| 10 MB    | 5.6M tokens ❌      | ~450 tokens | **12,000x** |
+| 100 MB   | 55M tokens ❌       | ~470 tokens | **118,000x** |
+| 417 MB   | 230M tokens ❌      | ~460 tokens | **~500,000x** |
+
+The query cost is **flat** — it's the SQL plus a few result rows, independent of file size — so a 417 MB file costs the same ~460 tokens as a 1 MB one. Five real questions, answered against DuckDB's NYC-taxi data; token counts via `tiktoken` (a proxy for the model's tokenizer, within ~10–15%). Your data never leaves your machine.
+
 ### Exposed Tools
 
 | Tool | Description |
@@ -514,7 +528,7 @@ csvql --mcp
 
 **Full WHERE clause support:** `=`, `!=`, `>`, `>=`, `<`, `<=`, `LIKE`, `BETWEEN`, `IN`, `IS NULL`, `IS NOT NULL`, `NOT`, `AND`, `OR`
 
-**Full SELECT support:** column projections, `AS` aliases, `DISTINCT`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING`, `ORDER BY` (by name, alias, or position), `LIMIT`, `STRFTIME()`, `JOIN`, `UPPER`/`LOWER`/`TRIM`/`LENGTH`/`SUBSTR`, `ABS`/`CEIL`/`FLOOR`/`MOD`/`ROUND`, `COALESCE`, `CAST`, `DATEDIFF`, `DATEADD`, `EXTRACT`
+**Full SELECT support:** column projections, `AS` aliases, `DISTINCT`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING`, `ORDER BY` (by name, alias, or position), `LIMIT`, `STRFTIME()`, `DATE_PART()`, `JOIN`, `UPPER`/`LOWER`/`TRIM`/`LENGTH`/`SUBSTR`, `ABS`/`CEIL`/`FLOOR`/`MOD`/`ROUND`, `COALESCE`, `CAST`, `DATEDIFF`, `DATEADD`, `EXTRACT`
 
 ### Setup
 

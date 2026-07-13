@@ -276,6 +276,13 @@ fn hasScalarSelectFunctions(query: parser.Query) bool {
 
 /// Execute a SQL query on a CSV file
 pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.File, opts: options_mod.Options) !void {
+    // Normalize DATE_PART(...) → STRFTIME(...) up front so every downstream path
+    // (SELECT, GROUP BY, stdin, JOIN) handles it via the existing STRFTIME machinery.
+    // Slice backing is shared with the caller; freed entries are replaced with new
+    // allocations from the same allocator, so query.deinit() still frees correctly.
+    try rewriteDateParts(allocator, query.columns);
+    try rewriteDateParts(allocator, query.group_by);
+
     // Check if reading from stdin
     const is_stdin = std.mem.eql(u8, query.file_path, "-") or std.mem.eql(u8, query.file_path, "stdin");
 
@@ -1896,6 +1903,48 @@ fn applyStrftime(fmt: []const u8, date_str: []const u8, buf: *[64]u8) []const u8
         }
     }
     return buf[0..pos];
+}
+
+/// Map a DATE_PART unit to the equivalent strftime specifier.
+fn datePartFmt(unit: []const u8) ?[]const u8 {
+    const u = std.mem.trim(u8, unit, &std.ascii.whitespace);
+    if (std.ascii.eqlIgnoreCase(u, "year")) return "%Y";
+    if (std.ascii.eqlIgnoreCase(u, "month")) return "%m";
+    if (std.ascii.eqlIgnoreCase(u, "day")) return "%d";
+    if (std.ascii.eqlIgnoreCase(u, "hour")) return "%H";
+    if (std.ascii.eqlIgnoreCase(u, "minute")) return "%M";
+    if (std.ascii.eqlIgnoreCase(u, "second")) return "%S";
+    return null;
+}
+
+/// Rewrite one `DATE_PART('unit', col)` occurrence in `e` to `STRFTIME('%x', col)`,
+/// returning an allocator-owned string, or null if there is no (recognized) DATE_PART.
+/// ponytail: textual alias only, one occurrence per expr. Numeric parts come back
+/// zero-padded like STRFTIME (month "03" not 3); 'year' — the common case — is exact.
+/// Full integer semantics: give DATE_PART its own scalar op (see datePartFmt callers).
+fn rewriteOneDatePart(allocator: Allocator, e: []const u8) !?[]u8 {
+    const at = std.ascii.indexOfIgnoreCase(e, "DATE_PART(") orelse return null;
+    const inner_start = at + "DATE_PART(".len;
+    const close = std.mem.indexOfScalarPos(u8, e, inner_start, ')') orelse return null;
+    const inner = e[inner_start..close];
+    const q1 = std.mem.indexOfScalar(u8, inner, '\'') orelse return null;
+    const q2 = std.mem.indexOfScalarPos(u8, inner, q1 + 1, '\'') orelse return null;
+    const unit = inner[q1 + 1 .. q2];
+    const comma = std.mem.indexOfScalarPos(u8, inner, q2 + 1, ',') orelse return null;
+    const col = std.mem.trim(u8, inner[comma + 1 ..], &std.ascii.whitespace);
+    const fmt = datePartFmt(unit) orelse return null;
+    return try std.fmt.allocPrint(allocator, "{s}STRFTIME('{s}', {s}){s}", .{ e[0..at], fmt, col, e[close + 1 ..] });
+}
+
+/// Rewrite DATE_PART(...) to STRFTIME(...) in place across a set of expressions,
+/// so the existing STRFTIME code paths (SELECT and GROUP BY) handle it for free.
+fn rewriteDateParts(allocator: Allocator, exprs: [][]u8) !void {
+    for (exprs, 0..) |e, i| {
+        if (try rewriteOneDatePart(allocator, e)) |rewritten| {
+            allocator.free(exprs[i]);
+            exprs[i] = rewritten;
+        }
+    }
 }
 
 /// Pre-resolved aggregate function spec — no per-row allocations in hot loop.
@@ -4237,6 +4286,22 @@ test "GROUP BY ROUND(col) forms a numeric key (issue #47)" {
     _ = lines.next(); // header
     try std.testing.expectEqualStrings("1,2", lines.next().?);
     try std.testing.expectEqualStrings("2,1", lines.next().?);
+}
+
+test "DATE_PART('year', col) rewrites to STRFTIME and groups by year" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const data = "d\n2008-01-15 10:00:00\n2009-06-01 12:00:00\n2008-12-31 23:59:59\n";
+    const out = try runQueryForTest(allocator, &tmp, data, "SELECT DATE_PART('year', d) AS y, COUNT(*) AS c FROM '{s}' GROUP BY y ORDER BY y ASC");
+    defer allocator.free(out);
+
+    const body = std.mem.trim(u8, out, "\n");
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    _ = lines.next(); // header
+    try std.testing.expectEqualStrings("2008,2", lines.next().?);
+    try std.testing.expectEqualStrings("2009,1", lines.next().?);
 }
 
 test "GROUP BY basic: unique values per group" {
