@@ -174,6 +174,47 @@ const MultiKeyCtx = struct {
     }
 };
 
+/// Row comparator for GROUP BY output ORDER BY. Sorts materialized output rows
+/// by resolved output-column indices — numeric-aware, primary then secondary keys.
+const RowSortCtx = struct {
+    keys: []const ResolvedOrderKey,
+
+    pub fn lessThan(ctx: RowSortCtx, a: []const []const u8, b: []const []const u8) bool {
+        for (ctx.keys) |k| {
+            const a_val = if (k.col_idx < a.len) a[k.col_idx] else "";
+            const b_val = if (k.col_idx < b.len) b[k.col_idx] else "";
+            const a_num = std.fmt.parseFloat(f64, a_val) catch std.math.nan(f64);
+            const b_num = std.fmt.parseFloat(f64, b_val) catch std.math.nan(f64);
+            if (!std.math.isNan(a_num) and !std.math.isNan(b_num)) {
+                if (a_num < b_num) return k.order != .desc;
+                if (a_num > b_num) return k.order == .desc;
+            } else {
+                const cmp = std.mem.order(u8, a_val, b_val);
+                if (cmp == .lt) return k.order != .desc;
+                if (cmp == .gt) return k.order == .desc;
+            }
+        }
+        return false; // fully equal
+    }
+};
+
+/// Resolve a GROUP BY ORDER BY column (name/alias/positional) to a 0-based
+/// output-column index. Returns null when not found.
+fn resolveGroupOrderIdx(col: []const u8, out_hdr: []const []const u8, alloc: std.mem.Allocator) !?usize {
+    const pos_num = std.fmt.parseInt(usize, col, 10) catch 0;
+    if (pos_num >= 1 and pos_num <= out_hdr.len) return pos_num - 1;
+    const lcol = try alloc.alloc(u8, col.len);
+    defer alloc.free(lcol);
+    _ = std.ascii.lowerString(lcol, col);
+    for (out_hdr, 0..) |hdr, pos| {
+        const lh = try alloc.alloc(u8, hdr.len);
+        defer alloc.free(lh);
+        _ = std.ascii.lowerString(lh, hdr);
+        if (std.mem.eql(u8, lh, lcol)) return pos;
+    }
+    return null;
+}
+
 /// Append a CSV-escaped field to an ArenaBuffer.
 /// Fields containing the delimiter, `"`, `\r`, or `\n` are wrapped in
 /// double-quotes with any internal `"` doubled (RFC 4180).
@@ -235,6 +276,13 @@ fn hasScalarSelectFunctions(query: parser.Query) bool {
 
 /// Execute a SQL query on a CSV file
 pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.File, opts: options_mod.Options) !void {
+    // Normalize DATE_PART(...) → STRFTIME(...) up front so every downstream path
+    // (SELECT, GROUP BY, stdin, JOIN) handles it via the existing STRFTIME machinery.
+    // Slice backing is shared with the caller; freed entries are replaced with new
+    // allocations from the same allocator, so query.deinit() still frees correctly.
+    try rewriteDateParts(allocator, query.columns);
+    try rewriteDateParts(allocator, query.group_by);
+
     // Check if reading from stdin
     const is_stdin = std.mem.eql(u8, query.file_path, "-") or std.mem.eql(u8, query.file_path, "stdin");
 
@@ -1687,7 +1735,60 @@ const GroupSpec = union(enum) {
     column: usize, // plain CSV column index
     strftime: StrftimeSpec, // STRFTIME transform applied to a column value
     substr: SubstrSpec, // SUBSTR(col, start[, length]) extraction
+    round: RoundGroupSpec, // ROUND(col[, digits]) applied to a numeric column value
 };
+
+/// GROUP BY ROUND(col[, digits]) — rounds a numeric column value to form the key.
+const RoundGroupSpec = struct {
+    col_idx: usize,
+    digits: ?u8, // null => round to nearest integer
+    header: []const u8,
+};
+
+/// Parse a GROUP BY `ROUND(col[, digits])` expression. Returns an allocator-owned
+/// RoundGroupSpec (caller frees `.header`), or null if `raw` is not a ROUND call.
+fn parseRoundGroupRaw(allocator: Allocator, raw: []const u8, column_map: std.StringHashMap(usize)) !?RoundGroupSpec {
+    const t = std.mem.trim(u8, raw, &std.ascii.whitespace);
+    if (t.len < 8 or !std.ascii.startsWithIgnoreCase(t, "ROUND(")) return null;
+    const close = std.mem.lastIndexOfScalar(u8, t, ')') orelse return error.InvalidQuery;
+    if (close != t.len - 1) return null;
+    const inner = t[6..close]; // between ROUND( and )
+    var col_part = inner;
+    var digits: ?u8 = null;
+    if (std.mem.lastIndexOfScalar(u8, inner, ',')) |comma| {
+        col_part = inner[0..comma];
+        const digits_str = std.mem.trim(u8, inner[comma + 1 ..], &std.ascii.whitespace);
+        digits = std.fmt.parseInt(u8, digits_str, 10) catch return error.InvalidQuery;
+    }
+    const col_raw = std.mem.trim(u8, col_part, &std.ascii.whitespace);
+    const col_lower = try allocator.alloc(u8, col_raw.len);
+    defer allocator.free(col_lower);
+    _ = std.ascii.lowerString(col_lower, col_raw);
+    const col_idx = column_map.get(col_lower) orelse return error.ColumnNotFound;
+    return RoundGroupSpec{
+        .col_idx = col_idx,
+        .digits = digits,
+        .header = try allocator.dupe(u8, raw),
+    };
+}
+
+/// Round a numeric field value to form a group key. Writes into `buf` (64 bytes).
+/// Non-numeric input falls through as-is so it still groups deterministically.
+fn applyRoundKey(spec: RoundGroupSpec, s: []const u8, buf: *[64]u8) []const u8 {
+    const val = std.fmt.parseFloat(f64, std.mem.trim(u8, s, &std.ascii.whitespace)) catch return s;
+    const d = spec.digits orelse 0;
+    if (d == 0) {
+        return std.fmt.bufPrint(buf, "{d}", .{@as(i64, @intFromFloat(@round(val)))}) catch s;
+    }
+    return switch (d) {
+        1 => std.fmt.bufPrint(buf, "{d:.1}", .{val}),
+        2 => std.fmt.bufPrint(buf, "{d:.2}", .{val}),
+        3 => std.fmt.bufPrint(buf, "{d:.3}", .{val}),
+        4 => std.fmt.bufPrint(buf, "{d:.4}", .{val}),
+        5 => std.fmt.bufPrint(buf, "{d:.5}", .{val}),
+        else => std.fmt.bufPrint(buf, "{d:.6}", .{val}),
+    } catch s;
+}
 
 /// Parse a SUBSTR(col, start[, length]) expression. Returns an allocator-owned SubstrSpec
 /// on success, or null if `raw` is not a SUBSTR call.
@@ -1802,6 +1903,48 @@ fn applyStrftime(fmt: []const u8, date_str: []const u8, buf: *[64]u8) []const u8
         }
     }
     return buf[0..pos];
+}
+
+/// Map a DATE_PART unit to the equivalent strftime specifier.
+fn datePartFmt(unit: []const u8) ?[]const u8 {
+    const u = std.mem.trim(u8, unit, &std.ascii.whitespace);
+    if (std.ascii.eqlIgnoreCase(u, "year")) return "%Y";
+    if (std.ascii.eqlIgnoreCase(u, "month")) return "%m";
+    if (std.ascii.eqlIgnoreCase(u, "day")) return "%d";
+    if (std.ascii.eqlIgnoreCase(u, "hour")) return "%H";
+    if (std.ascii.eqlIgnoreCase(u, "minute")) return "%M";
+    if (std.ascii.eqlIgnoreCase(u, "second")) return "%S";
+    return null;
+}
+
+/// Rewrite one `DATE_PART('unit', col)` occurrence in `e` to `STRFTIME('%x', col)`,
+/// returning an allocator-owned string, or null if there is no (recognized) DATE_PART.
+/// ponytail: textual alias only, one occurrence per expr. Numeric parts come back
+/// zero-padded like STRFTIME (month "03" not 3); 'year' — the common case — is exact.
+/// Full integer semantics: give DATE_PART its own scalar op (see datePartFmt callers).
+fn rewriteOneDatePart(allocator: Allocator, e: []const u8) !?[]u8 {
+    const at = std.ascii.indexOfIgnoreCase(e, "DATE_PART(") orelse return null;
+    const inner_start = at + "DATE_PART(".len;
+    const close = std.mem.indexOfScalarPos(u8, e, inner_start, ')') orelse return null;
+    const inner = e[inner_start..close];
+    const q1 = std.mem.indexOfScalar(u8, inner, '\'') orelse return null;
+    const q2 = std.mem.indexOfScalarPos(u8, inner, q1 + 1, '\'') orelse return null;
+    const unit = inner[q1 + 1 .. q2];
+    const comma = std.mem.indexOfScalarPos(u8, inner, q2 + 1, ',') orelse return null;
+    const col = std.mem.trim(u8, inner[comma + 1 ..], &std.ascii.whitespace);
+    const fmt = datePartFmt(unit) orelse return null;
+    return try std.fmt.allocPrint(allocator, "{s}STRFTIME('{s}', {s}){s}", .{ e[0..at], fmt, col, e[close + 1 ..] });
+}
+
+/// Rewrite DATE_PART(...) to STRFTIME(...) in place across a set of expressions,
+/// so the existing STRFTIME code paths (SELECT and GROUP BY) handle it for free.
+fn rewriteDateParts(allocator: Allocator, exprs: [][]u8) !void {
+    for (exprs, 0..) |e, i| {
+        if (try rewriteOneDatePart(allocator, e)) |rewritten| {
+            allocator.free(exprs[i]);
+            exprs[i] = rewritten;
+        }
+    }
 }
 
 /// Pre-resolved aggregate function spec — no per-row allocations in hot loop.
@@ -2897,6 +3040,10 @@ fn gbProcessRecord(
                 applySubstr(ss, record[ss.col_idx])
             else
                 "",
+            .round => |rg| if (rg.col_idx < record.len)
+                applyRoundKey(rg, record[rg.col_idx], &date_buf)
+            else
+                "",
         };
         try key_buf.appendSlice(aa, val);
     }
@@ -2915,6 +3062,10 @@ fn gbProcessRecord(
                     "",
                 .substr => |ss| if (ss.col_idx < record.len)
                     applySubstr(ss, record[ss.col_idx])
+                else
+                    "",
+                .round => |rg| if (rg.col_idx < record.len)
+                    applyRoundKey(rg, record[rg.col_idx], &date_buf_kv)
                 else
                     "",
             };
@@ -3341,6 +3492,7 @@ fn executeGroupBy(
                     allocator.free(sf.header);
                 },
                 .substr => |ss| allocator.free(ss.header),
+                .round => |rg| allocator.free(rg.header),
             }
         }
         allocator.free(group_specs);
@@ -3350,6 +3502,8 @@ fn executeGroupBy(
             group_specs[i] = .{ .strftime = sf };
         } else if (try parseSubstrRaw(allocator, col, column_map)) |ss| {
             group_specs[i] = .{ .substr = ss };
+        } else if (try parseRoundGroupRaw(allocator, col, column_map)) |rg| {
+            group_specs[i] = .{ .round = rg };
         } else {
             const lower = try allocator.alloc(u8, col.len);
             defer allocator.free(lower);
@@ -3379,6 +3533,8 @@ fn executeGroupBy(
                         group_specs[i] = .{ .strftime = sf };
                     } else if (try parseSubstrRaw(allocator, expr, column_map)) |ss| {
                         group_specs[i] = .{ .substr = ss };
+                    } else if (try parseRoundGroupRaw(allocator, expr, column_map)) |rg| {
+                        group_specs[i] = .{ .round = rg };
                     } else {
                         const lower2 = try allocator.alloc(u8, expr.len);
                         defer allocator.free(lower2);
@@ -3421,14 +3577,23 @@ fn executeGroupBy(
                     try col_kinds.append(allocator, .{ .group_key = gi });
                     try out_header_list.append(allocator, ss.header);
                 },
+                .round => |rg| {
+                    try col_kinds.append(allocator, .{ .group_key = gi });
+                    try out_header_list.append(allocator, rg.header);
+                },
             }
         }
     } else {
         for (query.columns) |col| {
             const sa = splitAlias(col);
             const col_base = sa.expr;
-            // Detect ROUND(inner_agg, n) wrapper
-            const rw = parseRoundWrapper(col_base);
+            // Detect ROUND(inner_agg, n) wrapper — only when rounding an aggregate
+            // (e.g. ROUND(AVG(x), 2)). ROUND(plain_col, n) is a GROUP BY key, not
+            // a wrapper, and is resolved via the group-key match below.
+            const rw = blk: {
+                const r = parseRoundWrapper(col_base) orelse break :blk null;
+                break :blk if (isAggregateExpr(r.inner)) r else null;
+            };
             const effective_col: []const u8 = if (rw) |r| r.inner else col_base;
             const round_digits: ?u8 = if (rw) |r| r.digits else null;
 
@@ -3505,6 +3670,11 @@ fn executeGroupBy(
                             .substr => |ss| if (std.ascii.eqlIgnoreCase(col_base, ss.header)) {
                                 gi_found = gi;
                                 fn_hdr = ss.header;
+                                break;
+                            },
+                            .round => |rg| if (std.ascii.eqlIgnoreCase(col_base, rg.header)) {
+                                gi_found = gi;
+                                fn_hdr = rg.header;
                                 break;
                             },
                             else => {},
@@ -3742,6 +3912,10 @@ fn executeGroupBy(
                         applySubstr(ss, record[ss.col_idx])
                     else
                         "",
+                    .round => |rg| if (rg.col_idx < record.len)
+                        applyRoundKey(rg, record[rg.col_idx], &date_buf)
+                    else
+                        "",
                 };
                 try key_buf.appendSlice(allocator, val);
             }
@@ -3762,6 +3936,10 @@ fn executeGroupBy(
                             "",
                         .substr => |ss| if (ss.col_idx < record.len)
                             applySubstr(ss, record[ss.col_idx])
+                        else
+                            "",
+                        .round => |rg| if (rg.col_idx < record.len)
+                            applyRoundKey(rg, record[rg.col_idx], &date_buf_kv)
                         else
                             "",
                     };
@@ -3861,9 +4039,27 @@ fn executeGroupBy(
     var distinct_seen_gb = std.StringHashMap(void).init(allocator);
     defer distinct_seen_gb.deinit();
 
+    // ORDER BY on GROUP BY output: resolve keys against the output columns, then
+    // materialize surviving rows and sort before applying LIMIT. Without ORDER BY
+    // we stream in group-key order (fast path) and short-circuit on LIMIT.
+    var order_keys = std.ArrayListUnmanaged(ResolvedOrderKey){};
+    defer order_keys.deinit(allocator);
+    var row_arena = std.heap.ArenaAllocator.init(allocator);
+    defer row_arena.deinit();
+    var collected = std.ArrayListUnmanaged([]const []const u8){};
+    defer collected.deinit(allocator);
+    if (query.order_by) |ob| {
+        const idx = (try resolveGroupOrderIdx(ob.column, out_header_list.items, allocator)) orelse return error.OrderByColumnNotFound;
+        try order_keys.append(allocator, .{ .col_idx = idx, .order = ob.order });
+        for (ob.secondary) |sk| {
+            const sidx = (try resolveGroupOrderIdx(sk.column, out_header_list.items, allocator)) orelse return error.OrderByColumnNotFound;
+            try order_keys.append(allocator, .{ .col_idx = sidx, .order = sk.order });
+        }
+    }
+
     var rows_output: i32 = 0;
     for (sorted_keys) |key| {
-        if (query.limit >= 0 and rows_output >= query.limit) break;
+        if (query.order_by == null and query.limit >= 0 and rows_output >= query.limit) break;
         const accum = group_map.getPtr(key).?;
 
         // Format aggregate results (handful of groups, negligible cost)
@@ -3921,7 +4117,7 @@ fn executeGroupBy(
                     for (group_specs, 0..) |spec, gi| {
                         switch (spec) {
                             .column => |gcidx| if (gcidx == cidx) break :blk accum.key_values[gi],
-                            .strftime, .substr => {},
+                            .strftime, .substr, .round => {},
                         }
                     }
                     break :blk "";
@@ -4008,8 +4204,26 @@ fn executeGroupBy(
             try distinct_seen_gb.put(try distinct_arena_gb.allocator().dupe(u8, row_key), {});
         }
 
-        try writer.writeRecord(output_row);
-        rows_output += 1;
+        if (query.order_by == null) {
+            try writer.writeRecord(output_row);
+            rows_output += 1;
+        } else {
+            // Defer output: copy the row (its fields point into per-iteration
+            // scratch that is freed/reset) and sort the full set below.
+            const ra = row_arena.allocator();
+            const row_copy = try ra.alloc([]const u8, output_row.len);
+            for (output_row, 0..) |f, fi| row_copy[fi] = try ra.dupe(u8, f);
+            try collected.append(allocator, row_copy);
+        }
+    }
+
+    if (query.order_by != null) {
+        std.mem.sort([]const []const u8, collected.items, RowSortCtx{ .keys = order_keys.items }, RowSortCtx.lessThan);
+        for (collected.items) |row| {
+            if (query.limit >= 0 and rows_output >= query.limit) break;
+            try writer.writeRecord(row);
+            rows_output += 1;
+        }
     }
 
     try writer.finish();
@@ -4019,6 +4233,76 @@ fn executeGroupBy(
 // --- Tests ---
 // Note: tests use std.testing.tmpDir so that parallel test runs don't race
 // on shared temp-file names.
+
+// Run `sql` against `csv_content` and return the output (caller frees).
+fn runQueryForTest(allocator: Allocator, tmp: *std.testing.TmpDir, csv_content: []const u8, sql_tmpl: []const u8) ![]u8 {
+    {
+        const f = try tmp.dir.createFile("input.csv", .{});
+        defer f.close();
+        try f.writeAll(csv_content);
+    }
+    var in_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const in_path = try tmp.dir.realpath("input.csv", &in_path_buf);
+    const sql = try std.mem.replaceOwned(u8, allocator, sql_tmpl, "{s}", in_path);
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+    const out_file = try tmp.dir.createFile("output.csv", .{ .read = true });
+    defer out_file.close();
+    try execute(allocator, query, out_file, .{});
+    try out_file.seekTo(0);
+    return out_file.readToEndAlloc(allocator, 64 * 1024);
+}
+
+test "GROUP BY: ORDER BY aggregate result is applied (issue #46)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // green:2 rows, yellow:3 rows → ORDER BY count DESC must put yellow first.
+    const data = "cab,x\ngreen,1\nyellow,1\ngreen,1\nyellow,1\nyellow,1\n";
+    const out = try runQueryForTest(allocator, &tmp, data, "SELECT cab, COUNT(*) AS c FROM '{s}' GROUP BY cab ORDER BY c DESC");
+    defer allocator.free(out);
+
+    const body = std.mem.trim(u8, out, "\n");
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    _ = lines.next(); // header
+    try std.testing.expectEqualStrings("yellow,3", lines.next().?);
+    try std.testing.expectEqualStrings("green,2", lines.next().?);
+}
+
+test "GROUP BY ROUND(col) forms a numeric key (issue #47)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // 1.2 and 0.9 both round to 1; 2.4 rounds to 2 → groups {1:2, 2:1}.
+    const data = "d\n1.2\n0.9\n2.4\n";
+    const out = try runQueryForTest(allocator, &tmp, data, "SELECT ROUND(d) AS r, COUNT(*) AS c FROM '{s}' GROUP BY r ORDER BY r ASC");
+    defer allocator.free(out);
+
+    const body = std.mem.trim(u8, out, "\n");
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    _ = lines.next(); // header
+    try std.testing.expectEqualStrings("1,2", lines.next().?);
+    try std.testing.expectEqualStrings("2,1", lines.next().?);
+}
+
+test "DATE_PART('year', col) rewrites to STRFTIME and groups by year" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const data = "d\n2008-01-15 10:00:00\n2009-06-01 12:00:00\n2008-12-31 23:59:59\n";
+    const out = try runQueryForTest(allocator, &tmp, data, "SELECT DATE_PART('year', d) AS y, COUNT(*) AS c FROM '{s}' GROUP BY y ORDER BY y ASC");
+    defer allocator.free(out);
+
+    const body = std.mem.trim(u8, out, "\n");
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    _ = lines.next(); // header
+    try std.testing.expectEqualStrings("2008,2", lines.next().?);
+    try std.testing.expectEqualStrings("2009,1", lines.next().?);
+}
 
 test "GROUP BY basic: unique values per group" {
     const allocator = std.testing.allocator;

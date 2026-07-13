@@ -173,6 +173,32 @@ Run the benchmark yourself: [`bench/bench_all.sh --section like`](bench/bench_al
 
 Run the benchmark yourself: [`bench/bench_all.sh --section join`](bench/bench_all.sh)
 
+**NYC Taxi benchmark — 20M rows, 8 GB CSV, Apple M-series** — the canonical [Billion-Taxi-Rides](https://github.com/pdet/taxi-benchmark) queries on [DuckDB's own dataset](https://duckdb.org/2024/10/16/driving-csv-performance-benchmarking-duckdb-with-the-nyc-taxi-dataset). Both engines query the raw uncompressed CSV **directly** (no preload into a native store), cold per run, best-of-5, warm OS cache:
+
+| Query                                                       | csvql     | DuckDB | Speedup  |
+| ----------------------------------------------------------- | --------- | ------ | -------- |
+| Q01 `COUNT(*) GROUP BY cab_type`                            | **1.29s** | 3.55s  | **2.8x** |
+| Q02 `AVG(total_amount) GROUP BY passenger_count`            | **1.41s** | 3.81s  | **2.7x** |
+| Q03 `COUNT(*) GROUP BY passenger_count, year`               | **1.36s** | 4.01s  | **2.9x** |
+| Q04 `GROUP BY passenger_count, year, ROUND(distance) ...`   | **1.38s** | 3.99s  | **2.9x** |
+
+Results verified identical to DuckDB. The gap **widens on smaller files** — ~10x on the 417 MB / 1M-row sample, where DuckDB's process and CSV-reader startup dominate; on 8 GB the actual parse+aggregate work dominates and csvql holds a clean ~2.8x.
+
+Reproduce: [`bench/bench_taxi.sh`](bench/bench_taxi.sh) — `./bench/bench_taxi.sh --sample` (417 MB, quick) or `./bench/bench_taxi.sh 1` (full 20M rows, ~8 GB download).
+
+**Memory & storage — same 8 GB / 20M-row file** (peak memory footprint, single cold run):
+
+| Query | csvql peak | DuckDB peak |
+| ----- | ---------- | ----------- |
+| Q01   | **29 MB**  | 178 MB      |
+| Q02   | **30 MB**  | 210 MB      |
+| Q03   | **34 MB**  | 208 MB      |
+| Q04   | **38 MB**  | 219 MB      |
+
+**~6x less memory** — and csvql needs **0 bytes of extra storage**: it queries the CSV in place via mmap, no ingest. DuckDB's fast "with storage" path first materializes a **2.1 GB native store (21.7 s one-time ingest)** before it can reach comparable query times; querying the raw CSV directly (as csvql does), it uses ~6x the memory and stays ~2.8x slower.
+
+Reproduce: `./bench/bench_taxi.sh --resources 1` (or `--resources --sample`).
+
 Run the full suite (all sections): [`bench/bench_all.sh`](bench/bench_all.sh)
 
 <details>
@@ -228,6 +254,7 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 | **MIN / MAX** | `MIN(col)`, `MAX(col)` — with or without `GROUP BY`                     |
 | **HAVING**    | `HAVING expr` — filter groups after aggregation (e.g. `HAVING COUNT(*) > 5`) |
 | **STRFTIME**  | `STRFTIME('%Y-%m', col)` — date bucketing in `SELECT` and `GROUP BY`    |
+| **DATE_PART** | `DATE_PART('year', col)` — extract `year`/`month`/`day`/`hour`/`minute`/`second`; alias for `STRFTIME` in `SELECT` and `GROUP BY` |
 | **UPPER / LOWER** | `SELECT UPPER(col), LOWER(col)` — case conversion                  |
 | **TRIM**      | `SELECT TRIM(col)` — strip leading and trailing whitespace              |
 | **LENGTH**    | `SELECT LENGTH(col)` — byte length of the value                         |
@@ -460,6 +487,19 @@ csvql ships as a [Model Context Protocol](https://modelcontextprotocol.io/) serv
 csvql --mcp
 ```
 
+### Why query instead of paste?
+
+A 1 MB CSV costs **~560,000 tokens** to paste into an LLM — it doesn't even fit a 200K-token context window. Pasting a real dataset is impossible past a few hundred KB, and expensive long before that. With `csvql --mcp` the agent *queries* the file instead and gets back only the rows it asked for:
+
+| CSV size | Paste into context | Query via `csvql --mcp` | Savings |
+| -------- | ------------------ | ----------------------- | ------- |
+| 1 MB     | 559K tokens ❌ *(overflows)* | ~540 tokens | **1,000x** |
+| 10 MB    | 5.6M tokens ❌      | ~550 tokens | **10,000x** |
+| 100 MB   | 55M tokens ❌       | ~565 tokens | **98,000x** |
+| 417 MB   | 230M tokens ❌      | ~560 tokens | **~410,000x** |
+
+The query cost is **flat** — it's the SQL plus a few result rows, independent of file size — so a 417 MB file costs the same ~560 tokens as a 1 MB one. Five real questions, answered against DuckDB's NYC-taxi data; token counts via `tiktoken` (exact `cl100k`). Reproduce: [`bench/bench_tokens.py`](bench/bench_tokens.py). Your data never leaves your machine.
+
 ### Exposed Tools
 
 | Tool | Description |
@@ -488,7 +528,7 @@ csvql --mcp
 
 **Full WHERE clause support:** `=`, `!=`, `>`, `>=`, `<`, `<=`, `LIKE`, `BETWEEN`, `IN`, `IS NULL`, `IS NOT NULL`, `NOT`, `AND`, `OR`
 
-**Full SELECT support:** column projections, `AS` aliases, `DISTINCT`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING`, `ORDER BY` (by name, alias, or position), `LIMIT`, `STRFTIME()`, `JOIN`, `UPPER`/`LOWER`/`TRIM`/`LENGTH`/`SUBSTR`, `ABS`/`CEIL`/`FLOOR`/`MOD`/`ROUND`, `COALESCE`, `CAST`, `DATEDIFF`, `DATEADD`, `EXTRACT`
+**Full SELECT support:** column projections, `AS` aliases, `DISTINCT`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING`, `ORDER BY` (by name, alias, or position), `LIMIT`, `STRFTIME()`, `DATE_PART()`, `JOIN`, `UPPER`/`LOWER`/`TRIM`/`LENGTH`/`SUBSTR`, `ABS`/`CEIL`/`FLOOR`/`MOD`/`ROUND`, `COALESCE`, `CAST`, `DATEDIFF`, `DATEADD`, `EXTRACT`
 
 ### Setup
 

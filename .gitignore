@@ -34,3 +34,6 @@ release.sh
 
 DATETIME_PLAN.md
 __pycache__/
+
+# Benchmark data downloads
+bench/.taxi-data/
