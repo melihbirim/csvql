@@ -186,6 +186,19 @@ Results verified identical to DuckDB. The gap **widens on smaller files** — ~1
 
 Reproduce: [`bench/bench_taxi.sh`](bench/bench_taxi.sh) — `./bench/bench_taxi.sh --sample` (417 MB, quick) or `./bench/bench_taxi.sh 1` (full 20M rows, ~8 GB download).
 
+**Memory & storage — same 8 GB / 20M-row file** (peak memory footprint, single cold run):
+
+| Query | csvql peak | DuckDB peak |
+| ----- | ---------- | ----------- |
+| Q01   | **29 MB**  | 178 MB      |
+| Q02   | **30 MB**  | 210 MB      |
+| Q03   | **34 MB**  | 208 MB      |
+| Q04   | **38 MB**  | 219 MB      |
+
+**~6x less memory** — and csvql needs **0 bytes of extra storage**: it queries the CSV in place via mmap, no ingest. DuckDB's fast "with storage" path first materializes a **2.1 GB native store (21.7 s one-time ingest)** before it can reach comparable query times; querying the raw CSV directly (as csvql does), it uses ~6x the memory and stays ~2.8x slower.
+
+Reproduce: `./bench/bench_taxi.sh --resources 1` (or `--resources --sample`).
+
 Run the full suite (all sections): [`bench/bench_all.sh`](bench/bench_all.sh)
 
 <details>

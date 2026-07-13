@@ -35,6 +35,10 @@ CYAN='\033[0;36m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BOLD='\033[1m'; NC='
 header() { echo; echo -e "${BOLD}${CYAN}━━━ $* ━━━${NC}"; }
 info()   { echo -e "  ${YELLOW}→${NC} $*"; }
 
+# --resources: measure peak memory / CPU / storage instead of query speed (macOS `time -l`).
+RESOURCES=0
+if [ "${1:-}" = "--resources" ]; then RESOURCES=1; shift; fi
+
 command -v duckdb >/dev/null || { echo "duckdb not found on PATH"; exit 1; }
 [ -x "$CSVQL" ] || { echo "csvql not found (build with: zig build -Doptimize=ReleaseFast)"; exit 1; }
 
@@ -87,6 +91,20 @@ print(f"{b:.3f}")
 PY
 }
 
+# measure CMD... -> "real_s peak_mb cpu_pct" for a single cold run (macOS `time -l`).
+measure() {
+    local tf; tf=$(mktemp)
+    /usr/bin/time -l "$@" >/dev/null 2>"$tf" || true
+    local real user sys peak
+    real=$(awk '/ real /{print $1; exit}' "$tf")
+    user=$(awk '{for (i=1;i<=NF;i++) if ($i=="user") print $(i-1)}' "$tf" | head -1)
+    sys=$(awk '{for (i=1;i<=NF;i++) if ($i=="sys") print $(i-1)}' "$tf" | head -1)
+    peak=$(awk '/peak memory footprint/{print $1; exit}' "$tf")            # macOS (bytes)
+    [ -z "$peak" ] && peak=$(awk '/maximum resident set size/{print $1; exit}' "$tf")
+    rm -f "$tf"
+    echo "$real $(echo "scale=1; $peak/1048576" | bc) $(echo "scale=0; ($user+$sys)/$real*100" | bc)"
+}
+
 # Canonical Billion-Taxi-Rides queries (csvql uses STRFTIME where DuckDB uses DATE_PART).
 declare -a NAMES=(Q01 Q02 Q03 Q04)
 declare -a CQ=(
@@ -102,12 +120,33 @@ declare -a DQ=(
   "SELECT passenger_count, DATE_PART('year',pickup_datetime) AS y, ROUND(trip_distance) AS d, COUNT(*) AS c FROM $DK GROUP BY passenger_count, y, d ORDER BY y, c DESC"
 )
 
-printf "\n  %-5s %10s %10s %8s\n" q csvql duckdb ratio
-for i in "${!NAMES[@]}"; do
-    c=$(best "$CSVQL" "${CQ[$i]}")
-    d=$(best duckdb -csv -c "${DQ[$i]}")
-    r=$(echo "scale=2; $d/$c" | bc)
-    printf "  ${BOLD}%-5s${NC} %9ss %9ss ${GREEN}%6sx${NC}\n" "${NAMES[$i]}" "$c" "$d" "$r"
-done
-echo
-info "Note: OS page-cache is warm on best-of-N (both engines equally). First cold run is slower."
+if [ "$RESOURCES" = 1 ]; then
+    printf "\n  %-5s %-8s %9s %9s %6s\n" q engine real peakMB CPU
+    for i in "${!NAMES[@]}"; do
+        read -r cr cm cc < <(measure "$CSVQL" "${CQ[$i]}")
+        read -r dr dm dc < <(measure duckdb -csv -c "${DQ[$i]}")
+        printf "  ${BOLD}%-5s${NC} %-8s %8ss %8sM %5s%%\n" "${NAMES[$i]}" csvql "$cr" "$cm" "$cc"
+        printf "  %-5s %-8s %8ss %8sM %5s%%\n" "" duckdb "$dr" "$dm" "$dc"
+    done
+
+    header "Storage — extra disk required to answer these queries"
+    info "csvql:  0 bytes — queries the raw CSV in place (mmap), no ingest"
+    DB="$DATA_DIR/taxi.duckdb"; rm -f "$DB"
+    t0=$(python3 -c 'import time;print(time.time())')
+    duckdb "$DB" -c "CREATE TABLE trips AS SELECT * FROM read_csv_auto('$CSV');" >/dev/null 2>&1
+    t1=$(python3 -c 'import time;print(time.time())')
+    info "DuckDB: $(du -h "$DB" | cut -f1) native store, built in $(printf '%.1f' "$(echo "$t1-$t0" | bc)")s (the one-time cost of its fast 'with storage' path)"
+    rm -f "$DB"
+    echo
+    info "Note: single cold run per query; peak = macOS 'peak memory footprint'. CPU>100% = multi-core."
+else
+    printf "\n  %-5s %10s %10s %8s\n" q csvql duckdb ratio
+    for i in "${!NAMES[@]}"; do
+        c=$(best "$CSVQL" "${CQ[$i]}")
+        d=$(best duckdb -csv -c "${DQ[$i]}")
+        r=$(echo "scale=2; $d/$c" | bc)
+        printf "  ${BOLD}%-5s${NC} %9ss %9ss ${GREEN}%6sx${NC}\n" "${NAMES[$i]}" "$c" "$d" "$r"
+    done
+    echo
+    info "Note: OS page-cache is warm on best-of-N (both engines equally). First cold run is slower."
+fi
