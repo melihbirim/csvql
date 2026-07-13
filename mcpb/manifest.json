@@ -1,0 +1,18 @@
+{
+  "manifest_version": "0.1",
+  "name": "csvql",
+  "version": "0.0.0",
+  "description": "Query CSV files with SQL via MCP — fast, local, zero-config. Answers questions about CSV data without pasting the file into context.",
+  "author": { "name": "Melih Birim" },
+  "license": "MIT",
+  "homepage": "https://github.com/melihbirim/csvql",
+  "server": {
+    "type": "stdio",
+    "command": "server/csvql"
+  },
+  "tools": [
+    { "name": "csv_query", "description": "Run SQL against a CSV file; results are capped so large files never flood the context." },
+    { "name": "csv_schema", "description": "Column names, types, and row count for a CSV file." },
+    { "name": "csv_list", "description": "List CSV files in a directory." }
+  ]
+}

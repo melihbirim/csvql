@@ -532,6 +532,19 @@ The query cost is **flat** — it's the SQL plus a few result rows, independent 
 
 ### Setup
 
+**One command (recommended)** — registers csvql in Claude Code and Claude Desktop, no manual config:
+
+```bash
+csvql install          # add --print to dry-run first
+```
+
+It runs `claude mcp add` for Claude Code (if the CLI is present) and merges an `mcpServers.csvql` entry into the Claude Desktop config, preserving your other servers. Restart Claude afterward.
+
+**Claude Desktop (one-click)** — grab `csvql.mcpb` from [Releases](https://github.com/melihbirim/csvql/releases) and open it in Claude Desktop (Settings → Extensions). No terminal. Build it yourself with [`scripts/build-mcpb.sh`](scripts/build-mcpb.sh).
+
+<details>
+<summary>Manual config (if you prefer)</summary>
+
 **VS Code (Copilot)** — create `.vscode/mcp.json` in your workspace:
 
 ```json
@@ -558,6 +571,8 @@ The query cost is **flat** — it's the SQL plus a few result rows, independent 
   }
 }
 ```
+
+</details>
 
 Once connected, you can ask your AI assistant to query CSV files directly:
 > *"What are the top 5 product categories by revenue this year?"*

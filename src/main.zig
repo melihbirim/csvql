@@ -5,6 +5,7 @@ const simple_parser = @import("simple_parser.zig");
 const engine = @import("engine.zig");
 const options_mod = @import("options.zig");
 const mcp = @import("mcp.zig");
+const install = @import("install.zig");
 const zigtable = @import("zigtable");
 const Allocator = std.mem.Allocator;
 
@@ -74,6 +75,8 @@ const help_text =
     \\  --schema <file>         Show column names, inferred types, row count, and file size
     \\  --mcp                   Start as an MCP (Model Context Protocol) server
     \\                          Exposes csv_query, csv_schema, csv_list tools
+    \\  install                 Register csvql as an MCP server in Claude (Code + Desktop),
+    \\                          no manual config. Add --print to dry-run.
     \\
     \\EXAMPLES:
     \\  csvql "SELECT * FROM 'users.csv' WHERE age >= 18 LIMIT 100"
@@ -106,6 +109,11 @@ pub fn main() !void {
         }
         if (std.mem.eql(u8, args[1], "--mcp")) {
             try mcp.run(allocator);
+            return;
+        }
+        if (std.mem.eql(u8, args[1], "install")) {
+            const print_only = args.len > 2 and std.mem.eql(u8, args[2], "--print");
+            try install.run(allocator, print_only);
             return;
         }
         if (std.mem.eql(u8, args[1], "--schema") or std.mem.eql(u8, args[1], "-schema") or std.mem.eql(u8, args[1], "-s")) {

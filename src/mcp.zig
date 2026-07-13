@@ -32,7 +32,7 @@ const INIT_RESULT =
 // Multiline for readability; flattened to single line before sending.
 const TOOLS_JSON =
     \\{"tools":[
-    \\{"name":"csv_query","description":"Execute a SQL query against CSV files and return results as JSON. Supports SELECT, WHERE, GROUP BY, ORDER BY, LIMIT, JOIN, COUNT/SUM/AVG/MIN/MAX, DISTINCT, LIKE. File paths must be single-quoted in FROM. Use LIMIT to keep results compact. Example: SELECT dept, COUNT(*) FROM 'data.csv' GROUP BY dept","inputSchema":{"type":"object","properties":{"sql":{"type":"string","description":"SQL query with single-quoted file paths in FROM clause"}},"required":["sql"]}},
+    \\{"name":"csv_query","description":"Execute a SQL query against CSV files and return results as JSON. Supports SELECT, WHERE, GROUP BY, ORDER BY, LIMIT, JOIN, COUNT/SUM/AVG/MIN/MAX, DISTINCT, LIKE. File paths must be single-quoted in FROM. Results are capped (~100 rows / 12KB): do NOT SELECT * on large files — aggregate (COUNT/SUM/AVG with GROUP BY) or add WHERE/LIMIT to answer questions without pulling raw rows. Example: SELECT dept, COUNT(*) FROM 'data.csv' GROUP BY dept","inputSchema":{"type":"object","properties":{"sql":{"type":"string","description":"SQL query with single-quoted file paths in FROM clause"}},"required":["sql"]}},
     \\{"name":"csv_schema","description":"Show column names and a few sample rows from a CSV file. Call this before csv_query to understand column names and data types.","inputSchema":{"type":"object","properties":{"file":{"type":"string","description":"Path to the CSV file"}},"required":["file"]}},
     \\{"name":"csv_list","description":"List CSV files in a directory.","inputSchema":{"type":"object","properties":{"directory":{"type":"string","description":"Directory to search (defaults to current working directory)"}}}}
     \\]}
@@ -177,15 +177,34 @@ fn toolCsvQuery(
         return;
     };
 
-    const output = runQuery(allocator, sql, .json) catch |err| {
+    const res = runQuery(allocator, sql, .json) catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "Query error: {s}", .{@errorName(err)});
         defer allocator.free(msg);
         try sendToolError(allocator, id, msg, resp);
         return;
     };
-    defer allocator.free(output);
+    defer allocator.free(res.output);
 
-    try sendToolResult(allocator, id, std.mem.trim(u8, output, "\r\n "), resp);
+    const trimmed = std.mem.trim(u8, res.output, "\r\n ");
+
+    // Hard byte cap: even 100 rows of wide columns must not flood the context.
+    if (trimmed.len > MAX_RESULT_BYTES) {
+        const msg = try std.fmt.allocPrint(allocator, "Result is {d} bytes — too large to return. Narrow it: select fewer columns, add a WHERE filter, or aggregate (COUNT/SUM/AVG with GROUP BY) instead of selecting raw rows.", .{trimmed.len});
+        defer allocator.free(msg);
+        try sendToolError(allocator, id, msg, resp);
+        return;
+    }
+
+    // Note partial results only when the row cap was actually hit (each JSON row
+    // object starts with '{'); a complete result under the cap needs no note.
+    const rows = std.mem.count(u8, trimmed, "{");
+    if (res.row_capped and rows >= DEFAULT_ROW_CAP) {
+        const withNote = try std.fmt.allocPrint(allocator, "{s}\n\n[Showing first {d} rows — no LIMIT was given. Add LIMIT/WHERE or aggregate for complete or narrower results.]", .{ trimmed, DEFAULT_ROW_CAP });
+        defer allocator.free(withNote);
+        try sendToolResult(allocator, id, withNote, resp);
+    } else {
+        try sendToolResult(allocator, id, trimmed, resp);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -206,7 +225,7 @@ fn toolCsvSchema(
     const sql = try std.fmt.allocPrint(allocator, "SELECT * FROM '{s}' LIMIT 5", .{file});
     defer allocator.free(sql);
 
-    const output = runQuery(allocator, sql, .json) catch |err| {
+    const res = runQuery(allocator, sql, .json) catch |err| {
         const msg = try std.fmt.allocPrint(
             allocator,
             "Error reading '{s}': {s}",
@@ -216,9 +235,9 @@ fn toolCsvSchema(
         try sendToolError(allocator, id, msg, resp);
         return;
     };
-    defer allocator.free(output);
+    defer allocator.free(res.output);
 
-    try sendToolResult(allocator, id, std.mem.trim(u8, output, "\r\n "), resp);
+    try sendToolResult(allocator, id, std.mem.trim(u8, res.output, "\r\n "), resp);
 }
 
 // ---------------------------------------------------------------------------
@@ -289,24 +308,60 @@ fn toolCsvList(
 // Core query execution
 // ---------------------------------------------------------------------------
 
-fn runQuery(allocator: Allocator, sql: []const u8, format: options_mod.OutputFormat) ![]u8 {
+// Token guardrails: an agent that does `SELECT * FROM huge.csv` would otherwise
+// dump millions of tokens back into context and defeat the whole point of querying
+// instead of pasting. We cap rows (when the query gives no LIMIT) and hard-cap the
+// response bytes, so the result stays a few hundred tokens regardless of file size.
+const DEFAULT_ROW_CAP: i32 = 100;
+const MAX_RESULT_BYTES: usize = 12 * 1024;
+
+const QueryResult = struct {
+    output: []u8, // caller frees
+    row_capped: bool, // true when we injected DEFAULT_ROW_CAP (result may be partial)
+};
+
+fn runQuery(allocator: Allocator, sql: []const u8, format: options_mod.OutputFormat) !QueryResult {
     var q = try parser.parse(allocator, sql);
     defer q.deinit();
 
+    // No LIMIT given → bound the row count so a bare SELECT can't dump the table.
+    var row_capped = false;
+    if (q.limit < 0) {
+        q.limit = DEFAULT_ROW_CAP;
+        row_capped = true;
+    }
+
     // Capture engine output via a temp file (engine.execute writes to std.fs.File).
-    // MCP is sequential over stdio so a single path is safe per process.
-    const tmp_path = "/tmp/.csvql_mcp.tmp";
-    const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{ .read = true });
+    // Use the OS temp dir (TMPDIR/TEMP) with a unique name so it works on Windows
+    // too and parallel test processes don't collide.
+    const tmp_base = if (builtin.os.tag == .windows)
+        (std.process.getEnvVarOwned(allocator, "TEMP") catch null)
+    else
+        (std.process.getEnvVarOwned(allocator, "TMPDIR") catch null);
+    defer if (tmp_base) |b| allocator.free(b);
+    const base = tmp_base orelse (if (builtin.os.tag == .windows) "." else "/tmp");
+
+    const name = try std.fmt.allocPrint(allocator, ".csvql_mcp_{d}.tmp", .{std.time.nanoTimestamp()});
+    defer allocator.free(name);
+    const tmp_path = try std.fs.path.join(allocator, &.{ base, name });
+    defer allocator.free(tmp_path);
+    const absolute = std.fs.path.isAbsolute(tmp_path);
+
+    const tmp_file = if (absolute)
+        try std.fs.createFileAbsolute(tmp_path, .{ .read = true })
+    else
+        try std.fs.cwd().createFile(tmp_path, .{ .read = true });
     defer {
         tmp_file.close();
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        if (absolute) std.fs.deleteFileAbsolute(tmp_path) catch {} else std.fs.cwd().deleteFile(tmp_path) catch {};
     }
 
     const opts = options_mod.Options{ .format = format };
     try engine.execute(allocator, q, tmp_file, opts);
 
     try tmp_file.seekTo(0);
-    return tmp_file.readToEndAlloc(allocator, 100 * 1024 * 1024);
+    const output = try tmp_file.readToEndAlloc(allocator, 100 * 1024 * 1024);
+    return .{ .output = output, .row_capped = row_capped };
 }
 
 // ---------------------------------------------------------------------------
@@ -424,4 +479,40 @@ fn writeJsonValue(v: std.json.Value, buf: *ManagedList) !void {
         .string => |s| try writeJsonString(s, buf),
         .array, .object => try buf.appendSlice("null"),
     }
+}
+
+// --- Tests ---
+
+test "runQuery injects DEFAULT_ROW_CAP when the query has no LIMIT" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // 150 rows > DEFAULT_ROW_CAP (100)
+    var csv = std.array_list.Managed(u8).init(allocator);
+    defer csv.deinit();
+    try csv.appendSlice("id\n");
+    var i: usize = 0;
+    while (i < 150) : (i += 1) try csv.writer().print("{d}\n", .{i});
+    {
+        const f = try tmp.dir.createFile("t.csv", .{});
+        defer f.close();
+        try f.writeAll(csv.items);
+    }
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath("t.csv", &path_buf);
+
+    const sql_no_limit = try std.fmt.allocPrint(allocator, "SELECT id FROM '{s}'", .{path});
+    defer allocator.free(sql_no_limit);
+    const capped = try runQuery(allocator, sql_no_limit, .json);
+    defer allocator.free(capped.output);
+    try std.testing.expect(capped.row_capped);
+    try std.testing.expectEqual(@as(usize, DEFAULT_ROW_CAP), std.mem.count(u8, capped.output, "{"));
+
+    const sql_limit = try std.fmt.allocPrint(allocator, "SELECT id FROM '{s}' LIMIT 5", .{path});
+    defer allocator.free(sql_limit);
+    const limited = try runQuery(allocator, sql_limit, .json);
+    defer allocator.free(limited.output);
+    try std.testing.expect(!limited.row_capped);
+    try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, limited.output, "{"));
 }

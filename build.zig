@@ -242,6 +242,30 @@ pub fn build(b: *std.Build) void {
     const run_engine_tests = b.addRunArtifact(engine_tests);
     test_step.dependOn(&run_engine_tests.step);
 
+    // MCP tests (token guardrails: default row cap)
+    const mcp_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/mcp.zig"),
+        }),
+    });
+    mcp_tests.linkLibC();
+    const run_mcp_tests = b.addRunArtifact(mcp_tests);
+    test_step.dependOn(&run_mcp_tests.step);
+
+    // Install tests (Claude Desktop config merge preserves other keys)
+    const install_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/install.zig"),
+        }),
+    });
+    install_tests.linkLibC();
+    const run_install_tests = b.addRunArtifact(install_tests);
+    test_step.dependOn(&run_install_tests.step);
+
     // Scalar tests (COALESCE multi-arg, etc.)
     const scalar_tests = b.addTest(.{
         .root_module = b.createModule(.{
