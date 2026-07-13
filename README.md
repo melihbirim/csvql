@@ -493,12 +493,12 @@ A 1 MB CSV costs **~560,000 tokens** to paste into an LLM — it doesn't even fi
 
 | CSV size | Paste into context | Query via `csvql --mcp` | Savings |
 | -------- | ------------------ | ----------------------- | ------- |
-| 1 MB     | 559K tokens ❌ *(overflows)* | ~440 tokens | **1,280x** |
-| 10 MB    | 5.6M tokens ❌      | ~450 tokens | **12,000x** |
-| 100 MB   | 55M tokens ❌       | ~470 tokens | **118,000x** |
-| 417 MB   | 230M tokens ❌      | ~460 tokens | **~500,000x** |
+| 1 MB     | 559K tokens ❌ *(overflows)* | ~540 tokens | **1,000x** |
+| 10 MB    | 5.6M tokens ❌      | ~550 tokens | **10,000x** |
+| 100 MB   | 55M tokens ❌       | ~565 tokens | **98,000x** |
+| 417 MB   | 230M tokens ❌      | ~560 tokens | **~410,000x** |
 
-The query cost is **flat** — it's the SQL plus a few result rows, independent of file size — so a 417 MB file costs the same ~460 tokens as a 1 MB one. Five real questions, answered against DuckDB's NYC-taxi data; token counts via `tiktoken` (a proxy for the model's tokenizer, within ~10–15%). Your data never leaves your machine.
+The query cost is **flat** — it's the SQL plus a few result rows, independent of file size — so a 417 MB file costs the same ~560 tokens as a 1 MB one. Five real questions, answered against DuckDB's NYC-taxi data; token counts via `tiktoken` (exact `cl100k`). Reproduce: [`bench/bench_tokens.py`](bench/bench_tokens.py). Your data never leaves your machine.
 
 ### Exposed Tools
 
