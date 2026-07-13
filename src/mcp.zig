@@ -332,12 +332,28 @@ fn runQuery(allocator: Allocator, sql: []const u8, format: options_mod.OutputFor
     }
 
     // Capture engine output via a temp file (engine.execute writes to std.fs.File).
-    // MCP is sequential over stdio so a single path is safe per process.
-    const tmp_path = "/tmp/.csvql_mcp.tmp";
-    const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{ .read = true });
+    // Use the OS temp dir (TMPDIR/TEMP) with a unique name so it works on Windows
+    // too and parallel test processes don't collide.
+    const tmp_base = if (builtin.os.tag == .windows)
+        (std.process.getEnvVarOwned(allocator, "TEMP") catch null)
+    else
+        (std.process.getEnvVarOwned(allocator, "TMPDIR") catch null);
+    defer if (tmp_base) |b| allocator.free(b);
+    const base = tmp_base orelse (if (builtin.os.tag == .windows) "." else "/tmp");
+
+    const name = try std.fmt.allocPrint(allocator, ".csvql_mcp_{d}.tmp", .{std.time.nanoTimestamp()});
+    defer allocator.free(name);
+    const tmp_path = try std.fs.path.join(allocator, &.{ base, name });
+    defer allocator.free(tmp_path);
+    const absolute = std.fs.path.isAbsolute(tmp_path);
+
+    const tmp_file = if (absolute)
+        try std.fs.createFileAbsolute(tmp_path, .{ .read = true })
+    else
+        try std.fs.cwd().createFile(tmp_path, .{ .read = true });
     defer {
         tmp_file.close();
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        if (absolute) std.fs.deleteFileAbsolute(tmp_path) catch {} else std.fs.cwd().deleteFile(tmp_path) catch {};
     }
 
     const opts = options_mod.Options{ .format = format };
