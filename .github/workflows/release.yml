@@ -64,6 +64,17 @@ jobs:
           cp zig-out/bin/csvql${{ matrix.ext }} release/${{ matrix.artifact }}.exe
           cd release && zip ${{ matrix.artifact }}.zip ${{ matrix.artifact }}.exe
 
+      - name: Package .mcpb bundle (one-click Claude Desktop install)
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p bundle/server release
+          cp zig-out/bin/csvql${{ matrix.ext }} bundle/server/csvql${{ matrix.ext }}
+          sed -e "s|\"version\": \"0.0.0\"|\"version\": \"$VERSION\"|" \
+              -e "s|\"command\": \"server/csvql\"|\"command\": \"server/csvql${{ matrix.ext }}\"|" \
+              mcpb/manifest.json > bundle/manifest.json
+          ( cd bundle && zip -qr "../release/${{ matrix.artifact }}.mcpb" manifest.json server )
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -74,7 +85,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: release/${{ matrix.artifact }}.${{ matrix.pkg }}
+          files: |
+            release/${{ matrix.artifact }}.${{ matrix.pkg }}
+            release/${{ matrix.artifact }}.mcpb
           draft: false
           prerelease: false
 

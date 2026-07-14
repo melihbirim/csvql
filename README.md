@@ -553,7 +553,7 @@ csvql install          # add --print to dry-run first
 
 It runs `claude mcp add` for Claude Code (if the CLI is present) and merges an `mcpServers.csvql` entry into the Claude Desktop config, preserving your other servers. Restart Claude afterward.
 
-**Claude Desktop (one-click)** — grab `csvql.mcpb` from [Releases](https://github.com/melihbirim/csvql/releases) and open it in Claude Desktop (Settings → Extensions). No terminal. Build it yourself with [`scripts/build-mcpb.sh`](scripts/build-mcpb.sh).
+**Claude Desktop (one-click)** — grab the `csvql-<platform>.mcpb` for your OS from [Releases](https://github.com/melihbirim/csvql/releases) and open it in Claude Desktop (Settings → Extensions). No terminal. Build it yourself with [`scripts/build-mcpb.sh`](scripts/build-mcpb.sh).
 
 <details>
 <summary>Manual config (if you prefer)</summary>
