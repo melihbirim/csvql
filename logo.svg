@@ -50,27 +50,27 @@
 
   <!-- Tagline -->
   <text x="28" y="83" font-family="'SF Mono', 'Fira Code', 'Consolas', monospace"
-        font-size="10.5" font-weight="400" fill="#8394a8" letter-spacing="2">SQL on CSV files</text>
+        font-size="10.5" font-weight="400" fill="#8394a8" letter-spacing="1.6">SQL analytics on CSV</text>
 
-  <!-- Proof chips (right column) -->
-  <!-- 1. speed vs DuckDB -->
+  <!-- Proof chips (right column) — identity: tokens, agent/MCP, zero-setup -->
+  <!-- 1. token economics (the moat) -->
   <g transform="translate(286, 13)">
-    <rect width="124" height="22" rx="11" fill="url(#accentGrad)" opacity="0.13"/>
-    <rect width="124" height="22" rx="11" fill="none" stroke="url(#accentGrad)" stroke-width="1.1" opacity="0.55"/>
-    <text x="62" y="15" font-family="'SF Mono', 'Fira Code', 'Consolas', monospace"
-          font-size="10" font-weight="600" fill="#f7a41d" text-anchor="middle" letter-spacing="0.2">⚡ up to 10× DuckDB</text>
-  </g>
-  <!-- 2. token savings (MCP) -->
-  <g transform="translate(286, 39)">
     <rect width="124" height="22" rx="11" fill="url(#accentGrad)" opacity="0.13"/>
     <rect width="124" height="22" rx="11" fill="none" stroke="url(#accentGrad)" stroke-width="1.1" opacity="0.55"/>
     <text x="62" y="15" font-family="'SF Mono', 'Fira Code', 'Consolas', monospace"
           font-size="10" font-weight="600" fill="#f7a41d" text-anchor="middle" letter-spacing="0.2">1000× fewer tokens</text>
   </g>
-  <!-- 3. Zig / zero deps -->
+  <!-- 2. agent-native / MCP -->
+  <g transform="translate(286, 39)">
+    <rect width="124" height="22" rx="11" fill="url(#accentGrad)" opacity="0.13"/>
+    <rect width="124" height="22" rx="11" fill="none" stroke="url(#accentGrad)" stroke-width="1.1" opacity="0.55"/>
+    <text x="62" y="15" font-family="'SF Mono', 'Fira Code', 'Consolas', monospace"
+          font-size="10" font-weight="600" fill="#f7a41d" text-anchor="middle" letter-spacing="0.2">agent-native · MCP</text>
+  </g>
+  <!-- 3. zero-setup -->
   <g transform="translate(286, 65)">
     <rect width="124" height="22" rx="11" fill="#ffffff" opacity="0.05"/>
     <text x="62" y="15" font-family="'SF Mono', 'Fira Code', 'Consolas', monospace"
-          font-size="10" font-weight="400" fill="#9fb0c4" text-anchor="middle" letter-spacing="0.4">Zig · single binary · 0 deps</text>
+          font-size="10" font-weight="400" fill="#9fb0c4" text-anchor="middle" letter-spacing="0.4">Zig · 0 deps · no ingest</text>
   </g>
 </svg>
