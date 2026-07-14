@@ -213,6 +213,8 @@ Reproduce: [`bench/bench_taxi.sh`](bench/bench_taxi.sh) — `./bench/bench_taxi.
 
 Reproduce: `./bench/bench_taxi.sh --resources 1` (or `--resources --sample`).
 
+**At scale, csvql reads raw CSV about as fast as your OS can hand it the bytes.** On the 8 GB file, `SELECT COUNT(*)`, `GROUP BY cab_type`, and `GROUP BY + AVG` all run in **~1.31 s** — the same time as `cat file > /dev/null` (~1.30 s) on the same machine. The parsing, grouping, and aggregation are effectively free; the whole query is bounded by the file read itself. There is no meaningful parsing overhead left to remove — csvql is already at the read ceiling, which is why the raw-CSV gap over DuckDB (which does more work per byte) holds at ~2.8x.
+
 Run the full suite (all sections): [`bench/bench_all.sh`](bench/bench_all.sh)
 
 <details>
