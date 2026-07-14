@@ -25,6 +25,20 @@ Eve,Boston,142000
 
 ---
 
+### Built for AI agents: query files instead of pasting them
+
+Pasting a 417 MB CSV into an LLM costs **230 million tokens** — it fits no context window. With `csvql --mcp`, the agent queries the file in place and gets back only the answer:
+
+| Question an agent asks | Tokens used |
+| ---------------------- | ----------- |
+| *"How many trips per cab type?"* | **43** |
+| *"Which year was busiest?"* | **49** |
+| *"Average fare by passenger count?"* | **123** |
+
+Same answers, **~1,000–500,000× fewer tokens** — and your data never leaves your machine. One command wires it into Claude: [`csvql install`](#setup). Measure it yourself: [`bench/bench_tokens.py`](bench/bench_tokens.py).
+
+---
+
 ## Quick Start
 
 csvql auto-detects SQL or simple mode from your input:
