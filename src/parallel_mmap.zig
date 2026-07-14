@@ -196,9 +196,8 @@ pub fn executeParallelMapped(
     const data_start = header_end + 1;
     const data_len = data.len - data_start;
 
-    // Get number of threads
-    const num_cores = try std.Thread.getCpuCount();
-    const num_threads = num_cores;
+    // Resolve the requested worker count; 0 preserves automatic CPU detection.
+    const num_threads = options_mod.effectiveThreadCount(opts);
 
     // Split into chunks aligned to line boundaries
     const chunk_size = data_len / num_threads;
