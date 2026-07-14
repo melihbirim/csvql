@@ -8,6 +8,8 @@
 
 **Query CSV files with SQL. Faster than DuckDB.**
 
+> DuckDB is a database you load your data *into*. csvql is a query you run on the data where it already lives — instantly, with zero setup, zero ingest, and few enough tokens that an AI agent can ask it questions.
+
 ```bash
 $ csvql "SELECT name, city, salary FROM 'employees.csv' WHERE salary > 100000 ORDER BY salary DESC LIMIT 5"
 
