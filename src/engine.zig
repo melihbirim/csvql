@@ -275,7 +275,32 @@ fn hasScalarSelectFunctions(query: parser.Query) bool {
 }
 
 /// Execute a SQL query on a CSV file
+/// Confine file access to `roots` when `--root` is set. `path` must resolve
+/// (via realpath, which collapses `..` and follows symlinks) to a location inside
+/// one of the allowed root trees. Empty `roots` = unrestricted. `-`/stdin allowed.
+/// Returns error.PathOutsideAllowedRoot on violation (or if the path can't resolve).
+pub fn ensurePathAllowed(allocator: Allocator, path: []const u8, roots: []const []const u8) !void {
+    if (roots.len == 0) return;
+    if (std.mem.eql(u8, path, "-") or std.mem.eql(u8, path, "stdin")) return;
+    const real = std.fs.realpathAlloc(allocator, path) catch return error.PathOutsideAllowedRoot;
+    defer allocator.free(real);
+    for (roots) |root| {
+        const rroot = std.fs.realpathAlloc(allocator, root) catch continue;
+        defer allocator.free(rroot);
+        // Inside root iff real == rroot, or real starts with "rroot/" (the separator
+        // check stops "/data-secret" from matching root "/data").
+        if (std.mem.startsWith(u8, real, rroot) and
+            (real.len == rroot.len or real[rroot.len] == std.fs.path.sep))
+            return;
+    }
+    return error.PathOutsideAllowedRoot;
+}
+
 pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.File, opts: options_mod.Options) !void {
+    // --root sandbox: reject any file outside the allowed trees before opening.
+    try ensurePathAllowed(allocator, query.file_path, opts.roots);
+    for (query.joins) |j| try ensurePathAllowed(allocator, j.right_file, opts.roots);
+
     // Normalize DATE_PART(...) → STRFTIME(...) up front so every downstream path
     // (SELECT, GROUP BY, stdin, JOIN) handles it via the existing STRFTIME machinery.
     // Slice backing is shared with the caller; freed entries are replaced with new
@@ -4286,6 +4311,33 @@ test "GROUP BY ROUND(col) forms a numeric key (issue #47)" {
     _ = lines.next(); // header
     try std.testing.expectEqualStrings("1,2", lines.next().?);
     try std.testing.expectEqualStrings("2,1", lines.next().?);
+}
+
+test "ensurePathAllowed confines file access to --root trees" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile("data.csv", .{});
+        f.close();
+    }
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &root_buf);
+    const roots = [_][]const u8{root};
+
+    var in_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const inside = try tmp.dir.realpath("data.csv", &in_buf);
+
+    // Inside the root: allowed.
+    try ensurePathAllowed(allocator, inside, &roots);
+    // Empty roots: unrestricted (backwards compatible).
+    try ensurePathAllowed(allocator, "/etc/hosts", &.{});
+    // Outside the root: rejected.
+    try std.testing.expectError(error.PathOutsideAllowedRoot, ensurePathAllowed(allocator, "/etc/hosts", &roots));
+    // Traversal escape (realpath collapses `..`): rejected.
+    const escape = try std.fmt.allocPrint(allocator, "{s}/../../../etc/hosts", .{root});
+    defer allocator.free(escape);
+    try std.testing.expectError(error.PathOutsideAllowedRoot, ensurePathAllowed(allocator, escape, &roots));
 }
 
 test "DATE_PART('year', col) rewrites to STRFTIME and groups by year" {

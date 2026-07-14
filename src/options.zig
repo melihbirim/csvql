@@ -30,4 +30,7 @@ pub const Options = struct {
     table_mode: TableMode = .auto,
     /// Wrap cell content to multiple lines instead of truncating with '…'.
     wrap_cells: bool = false,
+    /// Allowed root directories (`--root`). Empty = unrestricted (current behavior).
+    /// When set, file access is confined to these trees (see engine.ensurePathAllowed).
+    roots: []const []const u8 = &.{},
 };
