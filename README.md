@@ -592,6 +592,19 @@ It runs `claude mcp add` for Claude Code (if the CLI is present) and merges an `
 Once connected, you can ask your AI assistant to query CSV files directly:
 > *"What are the top 5 product categories by revenue this year?"*
 
+### Remote & on-prem: query data where it lives
+
+Big files are hard to download — so run csvql **on the server next to the data** and connect over SSH. Only the SQL query and the small result cross the wire; the data never leaves the box. No open port, no reverse proxy — it rides your existing SSH keys and audit trail:
+
+```jsonc
+// client MCP config — csvql runs on the remote server
+{ "command": "ssh", "args": ["analyst@dataserver", "csvql", "--mcp", "--root", "/data"] }
+```
+
+**`--root` sandboxes file access.** With `--root /data`, queries can only read files under `/data` — `SELECT * FROM '/etc/passwd'` and `../` traversal are rejected. Always set `--root` when exposing csvql to an agent or another user. Pair it with a restricted OS user and a read-only mount for defense in depth.
+
+**Read-only by construction:** csvql only runs `SELECT` — it has no `INSERT`/`UPDATE`/`DELETE`/`DROP` and cannot modify your data. It makes zero outbound network calls and runs fully air-gapped.
+
 ## Language Libraries
 
 csvql ships as a native library for Python and Node.js — same SIMD engine, same performance, no subprocess.

@@ -42,7 +42,13 @@ const TOOLS_JSON =
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub fn run(allocator: Allocator) !void {
+// Server-wide --root sandbox, set once at startup. Empty = unrestricted.
+// ponytail: global — the MCP server is a single sequential process, so one
+// server-wide config is correct; no per-request roots needed.
+var g_roots: []const []const u8 = &.{};
+
+pub fn run(allocator: Allocator, roots: []const []const u8) !void {
+    g_roots = roots;
     const stdin = if (builtin.os.tag == .windows)
         std.fs.File{ .handle = std.os.windows.GetStdHandle(std.os.windows.STD_INPUT_HANDLE) catch return error.NoStdin }
     else
@@ -252,6 +258,12 @@ fn toolCsvList(
 ) !void {
     const dir_path = getStringArg(args, "directory") orelse ".";
 
+    // --root sandbox: refuse to list directories outside the allowed trees.
+    engine.ensurePathAllowed(allocator, dir_path, g_roots) catch {
+        try sendToolError(allocator, id, "directory outside allowed --root", resp);
+        return;
+    };
+
     var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |err| {
         const msg = try std.fmt.allocPrint(
             allocator,
@@ -356,7 +368,7 @@ fn runQuery(allocator: Allocator, sql: []const u8, format: options_mod.OutputFor
         if (absolute) std.fs.deleteFileAbsolute(tmp_path) catch {} else std.fs.cwd().deleteFile(tmp_path) catch {};
     }
 
-    const opts = options_mod.Options{ .format = format };
+    const opts = options_mod.Options{ .format = format, .roots = g_roots };
     try engine.execute(allocator, q, tmp_file, opts);
 
     try tmp_file.seekTo(0);

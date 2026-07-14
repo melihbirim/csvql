@@ -75,6 +75,8 @@ const help_text =
     \\  --schema <file>         Show column names, inferred types, row count, and file size
     \\  --mcp                   Start as an MCP (Model Context Protocol) server
     \\                          Exposes csv_query, csv_schema, csv_list tools
+    \\  --root <dir>[,<dir>]    Confine all file access to these directories (blocks
+    \\                          traversal/symlink escape). Use for remote/on-prem servers.
     \\  install                 Register csvql as an MCP server in Claude (Code + Desktop),
     \\                          no manual config. Add --print to dry-run.
     \\
@@ -97,6 +99,23 @@ pub fn main() !void {
     const stdout_file = stdFile(.out);
     const stderr_file = stdFile(.err);
 
+    // --root <dir>[,<dir>...] — parse from anywhere (may precede --mcp). Empty = unrestricted.
+    var roots_list = std.ArrayList([]const u8){};
+    defer roots_list.deinit(allocator);
+    {
+        var i: usize = 1;
+        while (i < args.len) : (i += 1) {
+            if (std.mem.eql(u8, args[i], "--root")) {
+                i += 1;
+                if (i < args.len) {
+                    var it = std.mem.splitScalar(u8, args[i], ',');
+                    while (it.next()) |r| if (r.len > 0) try roots_list.append(allocator, r);
+                }
+            }
+        }
+    }
+    const roots = roots_list.items;
+
     // Check for early-exit flags first (before any filtering)
     if (args.len >= 2) {
         if (std.mem.eql(u8, args[1], "--version") or std.mem.eql(u8, args[1], "-v")) {
@@ -107,8 +126,8 @@ pub fn main() !void {
             try stdout_file.writeAll(help_text);
             return;
         }
-        if (std.mem.eql(u8, args[1], "--mcp")) {
-            try mcp.run(allocator);
+        if (argHas(args, "--mcp")) {
+            try mcp.run(allocator, roots);
             return;
         }
         if (std.mem.eql(u8, args[1], "install")) {
@@ -121,13 +140,17 @@ pub fn main() !void {
                 try stderr_file.writeAll("error: --schema requires a file path argument\n");
                 std.process.exit(1);
             }
+            engine.ensurePathAllowed(allocator, args[2], roots) catch {
+                try stderr_file.writeAll("error: path outside allowed --root\n");
+                std.process.exit(1);
+            };
             try runSchema(allocator, args[2], stdout_file, stderr_file);
             return;
         }
     }
 
     // Strip --no-header / -d / --delimiter flags; collect remainder for query parsing.
-    var opts = options_mod.Options{};
+    var opts = options_mod.Options{ .roots = roots };
     var clean_args = try std.ArrayList([]const u8).initCapacity(allocator, args.len);
     defer clean_args.deinit(allocator);
     try clean_args.append(allocator, args[0]); // keep program name at [0]
@@ -154,6 +177,8 @@ pub fn main() !void {
                 std.process.exit(1);
             }
             opts.delimiter = parseDelimiter(args[i]);
+        } else if (std.mem.eql(u8, arg, "--root")) {
+            i += 1; // value already parsed into opts.roots above; skip it here
         } else {
             try clean_args.append(allocator, arg);
         }
@@ -325,6 +350,12 @@ fn getTerminalWidth() usize {
 
 /// Analyse a CSV file and print a schema table: column index, name, inferred type,
 /// non-empty count, and empty count.  Also prints a summary header line.
+/// True if `tok` appears anywhere in args[1..].
+fn argHas(args: []const [:0]u8, tok: []const u8) bool {
+    for (args[1..]) |a| if (std.mem.eql(u8, a, tok)) return true;
+    return false;
+}
+
 fn runSchema(allocator: Allocator, raw_path: []const u8, stdout_file: std.fs.File, stderr_file: std.fs.File) !void {
     // Strip surrounding quotes that users sometimes include in shell invocations.
     const file_path = blk: {
