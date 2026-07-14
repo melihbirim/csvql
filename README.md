@@ -6,30 +6,15 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.md)
 [![Release](https://img.shields.io/github/v/release/melihbirim/csvql)](https://github.com/melihbirim/csvql/releases)
 
-**Query CSV files with SQL. Faster than DuckDB.**
+**The analytical CSV query engine for AI agents.**
 
-> DuckDB is a database you load your data *into*. csvql is a query you run on the data where it already lives — instantly, with zero setup, zero ingest, and few enough tokens that an AI agent can ask it questions.
+Run SQL analytics — `GROUP BY`, aggregates, joins, time-series — on CSV files **in place**: no database, no import, no ingest. csvql ships as an [MCP](https://modelcontextprotocol.io/) server, so an LLM can query a gigabyte file for a few hundred tokens instead of pasting it (impossible) into context. A single static binary written in Zig. Your data never leaves your machine.
 
-```bash
-$ csvql "SELECT name, city, salary FROM 'employees.csv' WHERE salary > 100000 ORDER BY salary DESC LIMIT 5"
+> A database is something you load your data *into*. csvql is a query you run on the data where it already lives.
 
-name,city,salary
-Alice,San Francisco,185000
-Bob,New York,172000
-Carol,Seattle,168000
-Dave,Austin,155000
-Eve,Boston,142000
+### Token economics: query files instead of pasting them
 
-  0.020s — 9x faster than DuckDB on 1M rows
-```
-
-[Quick Start](#quick-start) · [Installation](#installation) · [Performance](#performance) · [SQL Reference](#sql-reference) · [Docs](#documentation)
-
----
-
-### Built for AI agents: query files instead of pasting them
-
-Pasting a 417 MB CSV into an LLM costs **230 million tokens** — it fits no context window. With `csvql --mcp`, the agent queries the file in place and gets back only the answer:
+Pasting a 417 MB CSV into an LLM costs **230 million tokens** — it fits no context window. Over MCP, the agent queries the file in place and gets back only the answer:
 
 | Question an agent asks | Tokens used |
 | ---------------------- | ----------- |
@@ -37,7 +22,17 @@ Pasting a 417 MB CSV into an LLM costs **230 million tokens** — it fits no con
 | *"Which year was busiest?"* | **49** |
 | *"Average fare by passenger count?"* | **123** |
 
-Same answers, **~1,000–500,000× fewer tokens** — and your data never leaves your machine. One command wires it into Claude: [`csvql install`](#setup). Measure it yourself: [`bench/bench_tokens.py`](bench/bench_tokens.py).
+Same answers, **~1,000–500,000× fewer tokens** — flat, regardless of file size. One command wires it into Claude: [`csvql install`](#setup). Measure it yourself: [`bench/bench_tokens.py`](bench/bench_tokens.py).
+
+```bash
+$ csvql "SELECT cab_type, COUNT(*) FROM 'trips.csv' GROUP BY cab_type"
+cab_type,COUNT(*)
+green,32447
+yellow,967553
+  0.05s — no import, queried straight off the file
+```
+
+[Quick Start](#quick-start) · [Installation](#installation) · [Performance](#performance) · [SQL Reference](#sql-reference) · [Docs](#documentation)
 
 ---
 
