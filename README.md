@@ -12,6 +12,8 @@ Run SQL analytics — `GROUP BY`, aggregates, joins, time-series — on CSV file
 
 > A database is something you load your data *into*. csvql is a query you run on the data where it already lives.
 
+**Read-only and on-prem by design.** csvql only runs `SELECT` — it has no `INSERT`/`UPDATE`/`DELETE`/`DROP` and physically cannot modify your data. It makes zero network calls, needs no cloud, and runs fully air-gapped. **Our next north star:** the safe way to give AI agents query access to corporate data — run csvql *next to the data* on your own servers (read-only, nothing leaves the box) instead of shipping files out to an LLM.
+
 ### Token economics: query files instead of pasting them
 
 Pasting a 417 MB CSV into an LLM costs **230 million tokens** — it fits no context window. Over MCP, the agent queries the file in place and gets back only the answer:
