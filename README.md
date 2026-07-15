@@ -803,6 +803,8 @@ headers, rows = csvql.query_tuples("SELECT name, age FROM 'employees.csv'")
 
 Contributions welcome — bug reports, performance improvements, features, docs. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
+New here? The [**good first issues**](https://github.com/melihbirim/csvql/labels/good%20first%20issue) are scoped with file pointers and clear done-when criteria — a great place to start (new SQL functions, output formats, and more).
+
 ## License
 
 MIT — see [LICENSE.md](LICENSE.md).
