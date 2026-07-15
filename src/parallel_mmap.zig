@@ -197,7 +197,11 @@ pub fn executeParallelMapped(
     const data_len = data.len - data_start;
 
     // Resolve the requested worker count; 0 preserves automatic CPU detection.
-    const num_threads = options_mod.effectiveThreadCount(opts);
+    // Never use more workers than there are data bytes, otherwise chunk_size can become 0.
+    const num_threads = @min(
+        options_mod.effectiveThreadCount(opts),
+        @max(@as(usize, 1), data_len),
+    );
 
     // Split into chunks aligned to line boundaries
     const chunk_size = data_len / num_threads;

@@ -41,9 +41,14 @@ pub const Options = struct {
 
 /// Resolve the configured worker count.
 /// A value of 0 preserves the current automatic CPU-count behavior.
+/// The effective value is clamped to the range 1...1024.
 pub fn effectiveThreadCount(opts: Options) usize {
-    if (opts.threads != 0) return opts.threads;
-    return std.Thread.getCpuCount() catch 1;
+    const n = if (opts.threads != 0)
+        opts.threads
+    else
+        (std.Thread.getCpuCount() catch 1);
+
+    return @max(1, @min(n, 1024));
 }
 
 test "effectiveThreadCount uses configured value" {
@@ -54,4 +59,9 @@ test "effectiveThreadCount uses configured value" {
 test "effectiveThreadCount auto-detects when threads is zero" {
     const opts = Options{};
     try std.testing.expect(effectiveThreadCount(opts) >= 1);
+}
+
+test "effectiveThreadCount caps configured value" {
+    const opts = Options{ .threads = 2_000_000 };
+    try std.testing.expectEqual(@as(usize, 1024), effectiveThreadCount(opts));
 }

@@ -242,6 +242,17 @@ pub fn build(b: *std.Build) void {
     const run_engine_tests = b.addRunArtifact(engine_tests);
     test_step.dependOn(&run_engine_tests.step);
 
+    // Options tests (thread count configuration)
+    const options_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/options.zig"),
+        }),
+    });
+    const run_options_tests = b.addRunArtifact(options_tests);
+    test_step.dependOn(&run_options_tests.step);
+
     // MCP tests (token guardrails: default row cap)
     const mcp_tests = b.addTest(.{
         .root_module = b.createModule(.{
