@@ -72,6 +72,7 @@ const help_text =
     \\  --table                 Always render output as a table (default: auto on TTY)
     \\  --no-table              Never render output as a table
     \\  --wrap                  Wrap long cell text across lines instead of dropping columns
+    \\  --threads <N>           Worker threads for parallel execution (0 = auto)
     \\  --schema <file>         Show column names, inferred types, row count, and file size
     \\  --mcp                   Start as an MCP (Model Context Protocol) server
     \\                          Exposes csv_query, csv_schema, csv_list tools
@@ -170,6 +171,16 @@ pub fn main() !void {
             opts.wrap_cells = true;
         } else if (std.mem.eql(u8, arg, "--no-table")) {
             opts.table_mode = .off;
+        } else if (std.mem.eql(u8, arg, "--threads")) {
+            i += 1;
+            if (i >= args.len) {
+                try stderr_file.writeAll("error: --threads requires a non-negative integer argument\n");
+                std.process.exit(1);
+            }
+            opts.threads = std.fmt.parseInt(usize, args[i], 10) catch {
+                try stderr_file.writeAll("error: --threads requires a non-negative integer argument\n");
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, arg, "-d") or std.mem.eql(u8, arg, "--delimiter")) {
             i += 1;
             if (i >= args.len) {

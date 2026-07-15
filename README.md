@@ -69,6 +69,7 @@ csvql "SELECT email FROM 'users.csv'" | wc -l
 | `--delimiter <char>` | `-d`  | Field delimiter (default `,`). Use `\t` for TSV     |
 | `--json`             |       | Output as a JSON array (`[{...}, ...]`)             |
 | `--jsonl`            |       | Output as JSONL / NDJSON (one JSON object per line) |
+| `--threads <N>`      |       | Worker threads for parallel execution; `0` uses automatic detection |
 | `--version`          | `-v`  | Show version                                        |
 | `--help`             | `-h`  | Show help                                           |
 | `--mcp`              |       | Start as an MCP server (stdio JSON-RPC transport)   |

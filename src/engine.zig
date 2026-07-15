@@ -46,12 +46,6 @@ extern fn sysctlbyname(
 /// No-op on non-macOS (conditional compile).
 extern fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) c_int;
 
-/// Returns the thread count for parallel scans.
-/// Uses all logical CPUs — worker threads set QOS_CLASS_USER_INTERACTIVE to
-/// preference P-cores on Apple Silicon where that improves scheduling.
-fn getEffectiveThreadCount() usize {
-    return std.Thread.getCpuCount() catch 1;
-}
 const ArenaBuffer = arena_buffer.ArenaBuffer;
 const appendJsonStringToArena = arena_buffer.appendJsonStringToArena;
 
@@ -364,7 +358,7 @@ pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.Fi
             !query.distinct and
             query.limit < 0)
         {
-            const nc = getEffectiveThreadCount();
+            const nc = options_mod.effectiveThreadCount(opts);
             if (nc > 1) {
                 try executeParallelScalar(allocator, query, file_s, output_file, opts);
                 return;
@@ -383,8 +377,8 @@ pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.Fi
 
     // Use parallel memory-mapped I/O for large files (2+ cores, no LIMIT unless ORDER BY)
     if (file_stat.size > 10 * 1024 * 1024 and (query.limit < 0 or query.limit > 100000 or query.order_by != null)) {
-        const num_cores = try std.Thread.getCpuCount();
-        if (num_cores > 1) {
+        const num_threads = options_mod.effectiveThreadCount(opts);
+        if (num_threads > 1) {
             try parallel_mmap.executeParallelMapped(allocator, query, file, output_file, opts);
             return;
         }
@@ -1053,7 +1047,7 @@ fn executeParallelScalar(
     try writer.flush();
 
     // Split into N worker chunks aligned to line boundaries
-    const num_cores = getEffectiveThreadCount();
+    const num_cores = options_mod.effectiveThreadCount(opts);
     const n_threads = num_cores;
     const data_start = header_nl + 1;
     const data_len = data.len - data_start;
@@ -2729,7 +2723,7 @@ fn executeScalarAgg(
     var field_stk: [256][]const u8 = undefined;
 
     // -- Scan (parallel on large files, sequential on small) --
-    const num_cores_sa = getEffectiveThreadCount();
+    const num_cores_sa = options_mod.effectiveThreadCount(opts);
     if (num_cores_sa > 1 and file_size > 10 * 1024 * 1024) {
         const n_threads = num_cores_sa;
         const chunks = try splitLineChunks(data, header_nl + 1, n_threads, allocator);
@@ -3782,7 +3776,7 @@ fn executeGroupBy(
     // Each thread independently scans its chunk into its own partial_map;
     // main thread merges arithmetic results after join (O(num_groups), negligible).
     // Single-threaded fallback for small files or single-core environments.
-    const num_cores = getEffectiveThreadCount();
+    const num_cores = options_mod.effectiveThreadCount(opts);
     if (num_cores > 1 and file_size > 10 * 1024 * 1024) {
         const n_threads = num_cores;
         const chunks = try splitLineChunks(data, header_nl + 1, n_threads, allocator);
