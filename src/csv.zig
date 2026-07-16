@@ -5,6 +5,40 @@ const options_mod = @import("options.zig");
 /// Re-export options so callers that only import csv can access Options/OutputFormat.
 pub const options = options_mod;
 
+/// Header names + where the data begins, for the mmap-based scan paths.
+/// With `--no-input-header` the first row is data and names are synthesized c1..cN;
+/// otherwise the first line is the header and data starts after it.
+pub const MmapHeader = struct {
+    names: [][]const u8, // slices into `data` (real header) or allocated "cN" (synth)
+    data_start: usize,
+    synth: bool,
+
+    pub fn deinit(self: MmapHeader, a: Allocator) void {
+        if (self.synth) for (self.names) |n| a.free(n);
+        a.free(self.names);
+    }
+};
+
+pub fn resolveMmapHeader(a: Allocator, data: []const u8, opts: options_mod.Options) !MmapHeader {
+    const nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
+    var line = data[0..nl];
+    if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+    var n: usize = 1;
+    for (line) |c| if (c == opts.delimiter) {
+        n += 1;
+    };
+    const names = try a.alloc([]const u8, n);
+    errdefer a.free(names);
+    if (opts.no_input_header) {
+        for (names, 0..) |*nm, i| nm.* = try std.fmt.allocPrint(a, "c{d}", .{i + 1});
+        return .{ .names = names, .data_start = 0, .synth = true };
+    }
+    var it = std.mem.splitScalar(u8, line, opts.delimiter);
+    var i: usize = 0;
+    while (it.next()) |col| : (i += 1) names[i] = col;
+    return .{ .names = names, .data_start = nl + 1, .synth = false };
+}
+
 /// RFC 4180 compliant CSV reader
 pub const CsvReader = struct {
     file: std.fs.File,

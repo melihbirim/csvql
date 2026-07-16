@@ -66,6 +66,7 @@ const help_text =
     \\  -h, --help              Show this help
     \\  -v, --version           Show version
     \\  --no-header             Suppress header row in output
+    \\  --no-input-header       Treat the first row as data; name columns c1..cN
     \\  -d, --delimiter <char>  Field delimiter (default: ',')  e.g. -d '\t' for TSV
     \\  --json                  Output results as a JSON array of objects
     \\  --jsonl                 Output results as newline-delimited JSON (NDJSON)
@@ -169,6 +170,8 @@ pub fn main() !void {
             opts.table_mode = .on;
         } else if (std.mem.eql(u8, arg, "--wrap")) {
             opts.wrap_cells = true;
+        } else if (std.mem.eql(u8, arg, "--no-input-header")) {
+            opts.no_input_header = true;
         } else if (std.mem.eql(u8, arg, "--no-table")) {
             opts.table_mode = .off;
         } else if (std.mem.eql(u8, arg, "--threads")) {

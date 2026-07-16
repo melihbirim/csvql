@@ -410,9 +410,25 @@ fn executeSequential(
     var writer = csv.RecordWriter.init(output_file, opts);
     defer writer.deinit();
 
-    // Read header
-    const header = try reader.readRecord() orelse return error.EmptyFile;
-    defer reader.freeRecord(header);
+    // Read row 0. Normally it's the header; with --no-input-header we synthesize
+    // c1..cN names and keep this (owned) record as the first data row.
+    const first_owned = try reader.readRecord() orelse return error.EmptyFile;
+    var synth_names: ?[][]const u8 = null;
+    var first_data: ?[]const []const u8 = null;
+    defer {
+        if (synth_names) |sn| {
+            for (sn) |s| allocator.free(s);
+            allocator.free(sn);
+        }
+        reader.freeRecord(first_owned);
+    }
+    const header: []const []const u8 = if (opts.no_input_header) blk: {
+        const names = try allocator.alloc([]const u8, first_owned.len);
+        for (names, 0..) |*nm, i| nm.* = try std.fmt.allocPrint(allocator, "c{d}", .{i + 1});
+        synth_names = names;
+        first_data = first_owned;
+        break :blk names;
+    } else first_owned;
 
     // Build column index map (case-insensitive)
     var column_map = std.StringHashMap(usize).init(allocator);
@@ -538,7 +554,13 @@ fn executeSequential(
     var scalar_arena = std.heap.ArenaAllocator.init(allocator);
     defer scalar_arena.deinit();
 
-    while (try reader.readRecordSlices()) |record| {
+    // Process the retained first data row (headerless), then stream the rest.
+    var pending_first = first_data;
+    while (true) {
+        const record = if (pending_first) |p| blk: {
+            pending_first = null;
+            break :blk p;
+        } else (try reader.readRecordSlices()) orelse break;
         // Zero-copy: record slices point into reader buffer, no freeRecord needed
         row_count += 1;
 
@@ -968,18 +990,9 @@ fn executeParallelScalar(
     defer unmapFile(allocator, data);
 
     // Parse header
-    const header_nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
-    var header_line = data[0..header_nl];
-    if (header_line.len > 0 and header_line[header_line.len - 1] == '\r')
-        header_line = header_line[0 .. header_line.len - 1];
-
-    var header_list = std.ArrayListUnmanaged([]const u8){};
-    defer header_list.deinit(allocator);
-    {
-        var hi = std.mem.splitScalar(u8, header_line, opts.delimiter);
-        while (hi.next()) |col| try header_list.append(allocator, col);
-    }
-    const header = header_list.items;
+    const hinfo = try csv.resolveMmapHeader(allocator, data, opts);
+    defer hinfo.deinit(allocator);
+    const header = hinfo.names;
 
     // Build lowercase column map
     var lower_header_buf = try allocator.alloc([]u8, header.len);
@@ -1049,7 +1062,7 @@ fn executeParallelScalar(
     // Split into N worker chunks aligned to line boundaries
     const num_cores = options_mod.effectiveThreadCount(opts);
     const n_threads = num_cores;
-    const data_start = header_nl + 1;
+    const data_start = hinfo.data_start;
     const data_len = data.len - data_start;
     const chunk_size = data_len / n_threads;
 
@@ -1543,9 +1556,25 @@ fn executeFromStdin(
     var writer = csv.RecordWriter.init(output_file, opts);
     defer writer.deinit();
 
-    // Read header
-    const header = try reader.readRecord() orelse return error.EmptyFile;
-    defer reader.freeRecord(header);
+    // Read row 0. Normally it's the header; with --no-input-header we synthesize
+    // c1..cN names and keep this (owned) record as the first data row.
+    const first_owned = try reader.readRecord() orelse return error.EmptyFile;
+    var synth_names: ?[][]const u8 = null;
+    var first_data: ?[]const []const u8 = null;
+    defer {
+        if (synth_names) |sn| {
+            for (sn) |s| allocator.free(s);
+            allocator.free(sn);
+        }
+        reader.freeRecord(first_owned);
+    }
+    const header: []const []const u8 = if (opts.no_input_header) blk: {
+        const names = try allocator.alloc([]const u8, first_owned.len);
+        for (names, 0..) |*nm, i| nm.* = try std.fmt.allocPrint(allocator, "c{d}", .{i + 1});
+        synth_names = names;
+        first_data = first_owned;
+        break :blk names;
+    } else first_owned;
 
     // Build column index map (case-insensitive)
     var column_map = std.StringHashMap(usize).init(allocator);
@@ -1633,8 +1662,20 @@ fn executeFromStdin(
     // Process rows
     var rows_written: i32 = 0;
 
-    while (try reader.readRecord()) |record| {
-        defer reader.freeRecord(record);
+    // Process the retained first data row (headerless), then stream the rest.
+    // The injected first row is freed by the outer defer, not here.
+    var pending_first = first_data;
+    while (true) {
+        var owned_rec: ?[][]u8 = null;
+        const record: []const []const u8 = if (pending_first) |p| blk: {
+            pending_first = null;
+            break :blk p;
+        } else blk: {
+            const r = (try reader.readRecord()) orelse break;
+            owned_rec = r;
+            break :blk r;
+        };
+        defer if (owned_rec) |r| reader.freeRecord(r);
 
         // OPTIMIZATION: Fast WHERE evaluation using direct index lookup
         if (query.where_expr) |expr| {
@@ -2321,18 +2362,9 @@ fn executeDistinct(
     defer writer.deinit();
 
     // Header
-    const header_nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
-    var header_line = data[0..header_nl];
-    if (header_line.len > 0 and header_line[header_line.len - 1] == '\r')
-        header_line = header_line[0 .. header_line.len - 1];
-
-    var header_list = std.ArrayListUnmanaged([]const u8){};
-    defer header_list.deinit(allocator);
-    {
-        var it = std.mem.splitScalar(u8, header_line, opts.delimiter);
-        while (it.next()) |col| try header_list.append(allocator, col);
-    }
-    const header = header_list.items;
+    const hinfo = try csv.resolveMmapHeader(allocator, data, opts);
+    defer hinfo.deinit(allocator);
+    const header = hinfo.names;
 
     // Build lowercase column map
     var lower_header = try allocator.alloc([]u8, header.len);
@@ -2439,7 +2471,7 @@ fn executeDistinct(
     defer key_buf.deinit(allocator);
 
     var rows_written: i32 = 0;
-    var pos: usize = header_nl + 1;
+    var pos: usize = hinfo.data_start;
 
     while (pos < data.len) {
         const line_start = pos;
@@ -2589,18 +2621,9 @@ fn executeScalarAgg(
     defer writer.deinit();
 
     // -- Header --
-    const header_nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
-    var header_line = data[0..header_nl];
-    if (header_line.len > 0 and header_line[header_line.len - 1] == '\r')
-        header_line = header_line[0 .. header_line.len - 1];
-
-    var header_list = std.ArrayListUnmanaged([]const u8){};
-    defer header_list.deinit(allocator);
-    {
-        var it = std.mem.splitScalar(u8, header_line, opts.delimiter);
-        while (it.next()) |col| try header_list.append(allocator, col);
-    }
-    const header = header_list.items;
+    const hinfo = try csv.resolveMmapHeader(allocator, data, opts);
+    defer hinfo.deinit(allocator);
+    const header = hinfo.names;
 
     var lower_header = try allocator.alloc([]u8, header.len);
     defer {
@@ -2726,7 +2749,7 @@ fn executeScalarAgg(
     const num_cores_sa = options_mod.effectiveThreadCount(opts);
     if (num_cores_sa > 1 and file_size > 10 * 1024 * 1024) {
         const n_threads = num_cores_sa;
-        const chunks = try splitLineChunks(data, header_nl + 1, n_threads, allocator);
+        const chunks = try splitLineChunks(data, hinfo.data_start, n_threads, allocator);
         defer allocator.free(chunks);
 
         var thread_ctxs = try allocator.alloc(ScalarAggWorkerCtx, n_threads);
@@ -2783,7 +2806,7 @@ fn executeScalarAgg(
         }
     } else {
         // -- Sequential scan --
-        var scan_pos: usize = header_nl + 1;
+        var scan_pos: usize = hinfo.data_start;
         while (scan_pos < data.len) {
             const line_start = scan_pos;
             const nl = std.mem.indexOfScalarPos(u8, data, scan_pos, '\n');
@@ -3472,18 +3495,9 @@ fn executeGroupBy(
     defer writer.deinit();
 
     // -- Header parsing -----------------------------------------------------
-    const header_nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
-    var header_line = data[0..header_nl];
-    if (header_line.len > 0 and header_line[header_line.len - 1] == '\r')
-        header_line = header_line[0 .. header_line.len - 1];
-
-    var header_list = std.ArrayListUnmanaged([]const u8){};
-    defer header_list.deinit(allocator);
-    {
-        var it = std.mem.splitScalar(u8, header_line, opts.delimiter);
-        while (it.next()) |col| try header_list.append(allocator, col);
-    }
-    const header = header_list.items;
+    const hinfo = try csv.resolveMmapHeader(allocator, data, opts);
+    defer hinfo.deinit(allocator);
+    const header = hinfo.names;
 
     var lower_header = try allocator.alloc([]u8, header.len);
     defer {
@@ -3779,7 +3793,7 @@ fn executeGroupBy(
     const num_cores = options_mod.effectiveThreadCount(opts);
     if (num_cores > 1 and file_size > 10 * 1024 * 1024) {
         const n_threads = num_cores;
-        const chunks = try splitLineChunks(data, header_nl + 1, n_threads, allocator);
+        const chunks = try splitLineChunks(data, hinfo.data_start, n_threads, allocator);
         defer allocator.free(chunks);
 
         var thread_ctxs = try allocator.alloc(GbWorkerCtx, n_threads);
@@ -3875,7 +3889,7 @@ fn executeGroupBy(
         }
     } else {
         // -- Sequential mmap scan (single-core or small file) --
-        var pos: usize = header_nl + 1;
+        var pos: usize = hinfo.data_start;
         while (pos < data.len) {
             const line_start = pos;
             const nl = std.mem.indexOfScalarPos(u8, data, pos, '\n');
@@ -4305,6 +4319,40 @@ test "GROUP BY ROUND(col) forms a numeric key (issue #47)" {
     _ = lines.next(); // header
     try std.testing.expectEqualStrings("1,2", lines.next().?);
     try std.testing.expectEqualStrings("2,1", lines.next().?);
+}
+
+test "--no-input-header: first row is data, columns named c1..cN" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // No header row. 3 data rows.
+    const data = "1,green,10\n2,yellow,20\n3,green,30\n";
+    {
+        const f = try tmp.dir.createFile("h.csv", .{});
+        defer f.close();
+        try f.writeAll(data);
+    }
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath("h.csv", &path_buf);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT c2, COUNT(*) FROM '{s}' GROUP BY c2", .{path});
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out_file.close();
+    try execute(allocator, query, out_file, .{ .no_input_header = true });
+
+    try out_file.seekTo(0);
+    const out = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(out);
+
+    // Header uses synthesized name c2; row 0 counted (green=2, not 1).
+    try std.testing.expect(std.mem.indexOf(u8, out, "c2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "green,2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "yellow,1") != null);
 }
 
 test "ensurePathAllowed confines file access to --root trees" {
