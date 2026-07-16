@@ -605,7 +605,7 @@ Big files are hard to download — so run csvql **on the server next to the data
 
 **`--root` sandboxes file access.** With `--root /data`, queries can only read files under `/data` — `SELECT * FROM '/etc/passwd'` and `../` traversal are rejected. Always set `--root` when exposing csvql to an agent or another user. Pair it with a restricted OS user and a read-only mount for defense in depth.
 
-**Read-only by construction:** csvql only runs `SELECT` — it has no `INSERT`/`UPDATE`/`DELETE`/`DROP` and cannot modify your data. It makes zero outbound network calls and runs fully air-gapped.
+**Read-only by construction:** csvql only runs `SELECT` — it has no `INSERT`/`UPDATE`/`DELETE`/`DROP` and cannot modify your data. It makes zero outbound network calls and runs fully air-gapped. Full posture and hardening guidance in [SECURITY.md](SECURITY.md).
 
 ## Language Libraries
 
