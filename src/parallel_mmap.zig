@@ -97,26 +97,16 @@ pub fn executeParallelMapped(
     const data = try mapFile(allocator, input_file, file_size);
     defer unmapFile(allocator, data);
 
-    // Find end of header line
-    const header_end = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
-    const header_line_raw = data[0..header_end];
-    // Strip trailing \r for CRLF files
-    const header_line = if (header_line_raw.len > 0 and header_line_raw[header_line_raw.len - 1] == '\r') header_line_raw[0 .. header_line_raw.len - 1] else header_line_raw;
-
-    // Parse header
-    var header = std.ArrayList([]const u8){};
-    defer header.deinit(allocator);
-
-    var header_iter = std.mem.splitScalar(u8, header_line, opts.delimiter);
-    while (header_iter.next()) |col| {
-        try header.append(allocator, col);
-    }
+    // Resolve header (or synthesize c1..cN with --no-input-header) and data start.
+    const hinfo = try csv.resolveMmapHeader(allocator, data, opts);
+    defer hinfo.deinit(allocator);
+    const header = hinfo.names;
 
     // Build column map
     var column_map = std.StringHashMap(usize).init(allocator);
     defer column_map.deinit();
 
-    var lower_header = try allocator.alloc([]u8, header.items.len);
+    var lower_header = try allocator.alloc([]u8, header.len);
     defer {
         for (lower_header) |lower_name| {
             allocator.free(lower_name);
@@ -124,7 +114,7 @@ pub fn executeParallelMapped(
         allocator.free(lower_header);
     }
 
-    for (header.items, 0..) |col_name, idx| {
+    for (header, 0..) |col_name, idx| {
         const lower_name = try allocator.alloc(u8, col_name.len);
         _ = std.ascii.lowerString(lower_name, col_name);
         lower_header[idx] = lower_name;
@@ -136,7 +126,7 @@ pub fn executeParallelMapped(
     defer output_indices.deinit(allocator);
 
     if (query.all_columns) {
-        for (0..header.items.len) |idx| {
+        for (0..header.len) |idx| {
             try output_indices.append(allocator, idx);
         }
     } else {
@@ -163,7 +153,7 @@ pub fn executeParallelMapped(
 
     if (query.all_columns) {
         for (output_indices.items) |idx| {
-            try output_header.append(allocator, header.items[idx]);
+            try output_header.append(allocator, header[idx]);
         }
     } else {
         for (query.columns) |col| {
@@ -193,7 +183,7 @@ pub fn executeParallelMapped(
     }
 
     // Process data in parallel
-    const data_start = header_end + 1;
+    const data_start = hinfo.data_start;
     const data_len = data.len - data_start;
 
     // Resolve the requested worker count; 0 preserves automatic CPU detection.

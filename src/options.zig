@@ -34,6 +34,8 @@ pub const Options = struct {
     wrap_cells: bool = false,
     /// Number of worker threads. 0 = auto-detect logical CPU count.
     threads: usize = 0,
+    /// Treat the first row as data (not a header) and auto-name columns c1..cN.
+    no_input_header: bool = false,
     /// Allowed root directories (`--root`). Empty = unrestricted (current behavior).
     /// When set, file access is confined to these trees (see engine.ensurePathAllowed).
     roots: []const []const u8 = &.{},
