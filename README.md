@@ -802,6 +802,15 @@ headers, rows = csvql.query_tuples("SELECT name, age FROM 'employees.csv'")
 | `ROUND(col)` / `ROUND(col, n)` in SELECT |                                               | ✅ shipped          |
 | `COALESCE` in SELECT                |                                                      | ✅ shipped          |
 | `CAST` in SELECT                    |                                                      | ✅ shipped          |
+| `DATE_PART()`, `DATEDIFF`, `DATEADD`, `EXTRACT` |                                          | ✅ shipped          |
+| `JOIN` (inner, hash join)           |                                                      | ✅ shipped          |
+| `--threads` parallelism control     | [#51](https://github.com/melihbirim/csvql/issues/51) | ✅ shipped (v1.7.0) |
+| `--no-input-header` (headerless CSVs, `c1..cN`) | [#49](https://github.com/melihbirim/csvql/issues/49) | ✅ shipped (v1.7.0) |
+| MCP token guardrails + `csvql install` + `.mcpb` bundle | [#54](https://github.com/melihbirim/csvql/issues/54) | ✅ shipped (v1.7.0) |
+| `--root` file-access sandbox        | [#58](https://github.com/melihbirim/csvql/issues/58) | ✅ shipped (v1.7.0) |
+| `--audit` query log                 | [#62](https://github.com/melihbirim/csvql/issues/62) | ✅ shipped (v1.7.0) |
+| HTTP/SSE MCP transport (shared service) | [#60](https://github.com/melihbirim/csvql/issues/60) | planned             |
+| More SQL functions (`GROUP_CONCAT`, `VARIANCE`, `SPLIT_PART`, `OFFSET`, …) | [good first issues](https://github.com/melihbirim/csvql/labels/good%20first%20issue) | help wanted |
 
 ## Contributing
 
