@@ -6,6 +6,7 @@ const engine = @import("engine.zig");
 const options_mod = @import("options.zig");
 const mcp = @import("mcp.zig");
 const install = @import("install.zig");
+const audit = @import("audit.zig");
 const zigtable = @import("zigtable");
 const Allocator = std.mem.Allocator;
 
@@ -79,6 +80,7 @@ const help_text =
     \\                          Exposes csv_query, csv_schema, csv_list tools
     \\  --root <dir>[,<dir>]    Confine all file access to these directories (blocks
     \\                          traversal/symlink escape). Use for remote/on-prem servers.
+    \\  --audit <file>          Append a JSONL record per query (timestamp, SQL) for compliance
     \\  install                 Register csvql as an MCP server in Claude (Code + Desktop),
     \\                          no manual config. Add --print to dry-run.
     \\
@@ -101,9 +103,11 @@ pub fn main() !void {
     const stdout_file = stdFile(.out);
     const stderr_file = stdFile(.err);
 
-    // --root <dir>[,<dir>...] — parse from anywhere (may precede --mcp). Empty = unrestricted.
+    // --root <dir>[,<dir>...] and --audit <file> — parse from anywhere (may precede
+    // --mcp). Empty roots = unrestricted; null audit = off.
     var roots_list = std.ArrayList([]const u8){};
     defer roots_list.deinit(allocator);
+    var audit_path: ?[]const u8 = null;
     {
         var i: usize = 1;
         while (i < args.len) : (i += 1) {
@@ -113,6 +117,9 @@ pub fn main() !void {
                     var it = std.mem.splitScalar(u8, args[i], ',');
                     while (it.next()) |r| if (r.len > 0) try roots_list.append(allocator, r);
                 }
+            } else if (std.mem.eql(u8, args[i], "--audit")) {
+                i += 1;
+                if (i < args.len) audit_path = args[i];
             }
         }
     }
@@ -129,7 +136,7 @@ pub fn main() !void {
             return;
         }
         if (argHas(args, "--mcp")) {
-            try mcp.run(allocator, roots);
+            try mcp.run(allocator, roots, audit_path);
             return;
         }
         if (std.mem.eql(u8, args[1], "install")) {
@@ -152,7 +159,7 @@ pub fn main() !void {
     }
 
     // Strip --no-header / -d / --delimiter flags; collect remainder for query parsing.
-    var opts = options_mod.Options{ .roots = roots };
+    var opts = options_mod.Options{ .roots = roots, .audit_path = audit_path };
     var clean_args = try std.ArrayList([]const u8).initCapacity(allocator, args.len);
     defer clean_args.deinit(allocator);
     try clean_args.append(allocator, args[0]); // keep program name at [0]
@@ -193,6 +200,8 @@ pub fn main() !void {
             opts.delimiter = parseDelimiter(args[i]);
         } else if (std.mem.eql(u8, arg, "--root")) {
             i += 1; // value already parsed into opts.roots above; skip it here
+        } else if (std.mem.eql(u8, arg, "--audit")) {
+            i += 1; // value already parsed into opts.audit_path above; skip it here
         } else {
             try clean_args.append(allocator, arg);
         }
@@ -236,6 +245,13 @@ pub fn main() !void {
             std.debug.print("execution error: {}\n", .{err});
             std.process.exit(1);
         };
+    }
+
+    // Audit the query after it ran (best-effort). Descriptor = the query text/args.
+    if (audit_path) |ap| {
+        const desc = try std.mem.join(allocator, " ", clean_args.items[1..]);
+        defer allocator.free(desc);
+        audit.record(allocator, ap, desc, null, null);
     }
 }
 

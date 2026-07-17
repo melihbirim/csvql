@@ -36,6 +36,8 @@ pub const Options = struct {
     threads: usize = 0,
     /// Treat the first row as data (not a header) and auto-name columns c1..cN.
     no_input_header: bool = false,
+    /// Append a JSONL audit record per query to this file (`--audit`). null = off.
+    audit_path: ?[]const u8 = null,
     /// Allowed root directories (`--root`). Empty = unrestricted (current behavior).
     /// When set, file access is confined to these trees (see engine.ensurePathAllowed).
     roots: []const []const u8 = &.{},

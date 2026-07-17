@@ -277,6 +277,18 @@ pub fn build(b: *std.Build) void {
     const run_install_tests = b.addRunArtifact(install_tests);
     test_step.dependOn(&run_install_tests.step);
 
+    // Audit-log tests
+    const audit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/audit.zig"),
+        }),
+    });
+    audit_tests.linkLibC();
+    const run_audit_tests = b.addRunArtifact(audit_tests);
+    test_step.dependOn(&run_audit_tests.step);
+
     // Scalar tests (COALESCE multi-arg, etc.)
     const scalar_tests = b.addTest(.{
         .root_module = b.createModule(.{
