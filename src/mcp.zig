@@ -16,6 +16,7 @@ const builtin = @import("builtin");
 const parser = @import("parser.zig");
 const engine = @import("engine.zig");
 const options_mod = @import("options.zig");
+const audit = @import("audit.zig");
 const Allocator = std.mem.Allocator;
 
 // Zig 0.15: std.ArrayList is unmanaged (allocator per-call).
@@ -46,9 +47,12 @@ const TOOLS_JSON =
 // ponytail: global — the MCP server is a single sequential process, so one
 // server-wide config is correct; no per-request roots needed.
 var g_roots: []const []const u8 = &.{};
+// Optional audit-log path, set once at startup. null = off.
+var g_audit: ?[]const u8 = null;
 
-pub fn run(allocator: Allocator, roots: []const []const u8) !void {
+pub fn run(allocator: Allocator, roots: []const []const u8, audit_path: ?[]const u8) !void {
     g_roots = roots;
+    g_audit = audit_path;
     const stdin = if (builtin.os.tag == .windows)
         std.fs.File{ .handle = std.os.windows.GetStdHandle(std.os.windows.STD_INPUT_HANDLE) catch return error.NoStdin }
     else
@@ -192,6 +196,10 @@ fn toolCsvQuery(
     defer allocator.free(res.output);
 
     const trimmed = std.mem.trim(u8, res.output, "\r\n ");
+
+    // Audit the executed query (best-effort). Records even when the result is
+    // then refused below, because the query still read the data.
+    if (g_audit) |ap| audit.record(allocator, ap, sql, std.mem.count(u8, trimmed, "{"), trimmed.len);
 
     // Hard byte cap: even 100 rows of wide columns must not flood the context.
     if (trimmed.len > MAX_RESULT_BYTES) {

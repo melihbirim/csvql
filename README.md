@@ -74,6 +74,8 @@ csvql "SELECT email FROM 'users.csv'" | wc -l
 | `--version`          | `-v`  | Show version                                        |
 | `--help`             | `-h`  | Show help                                           |
 | `--mcp`              |       | Start as an MCP server (stdio JSON-RPC transport)   |
+| `--root <dir>`       |       | Confine file access to a directory (repeatable via commas) |
+| `--audit <file>`     |       | Append a JSONL audit record per query (timestamp, SQL)     |
 
 ```bash
 # TSV file
