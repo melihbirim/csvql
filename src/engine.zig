@@ -1330,10 +1330,15 @@ fn executeJoin(
     defer base_reader.freeRecord(base_hdr_raw);
     const base_w = base_hdr_raw.len;
     var base_headers = try aa.alloc([]const u8, base_w);
-    for (base_hdr_raw, 0..) |col, i| {
-        const lower = try aa.alloc(u8, col.len);
-        _ = std.ascii.lowerString(lower, col);
-        base_headers[i] = lower;
+    if (opts.no_input_header) {
+        // Headerless: synthesize c1..cN; base_hdr_raw is the first data row (Step 4).
+        for (base_headers, 0..) |*h, i| h.* = try std.fmt.allocPrint(aa, "c{d}", .{i + 1});
+    } else {
+        for (base_hdr_raw, 0..) |col, i| {
+            const lower = try aa.alloc(u8, col.len);
+            _ = std.ascii.lowerString(lower, col);
+            base_headers[i] = lower;
+        }
     }
 
     // ── Step 2: Load all right hash maps; pre-resolve join key indices ────────
@@ -1394,18 +1399,32 @@ fn executeJoin(
         var right_lh = try aa.alloc([]const u8, rw);
         var right_col_map = std.StringHashMap(usize).init(aa);
         for (rh_raw, 0..) |col, i| {
-            const lower = try aa.alloc(u8, col.len);
-            _ = std.ascii.lowerString(lower, col);
-            right_lh[i] = lower;
-            try right_col_map.put(lower, i);
+            const name = if (opts.no_input_header)
+                try std.fmt.allocPrint(aa, "c{d}", .{i + 1})
+            else name_blk: {
+                const lower = try aa.alloc(u8, col.len);
+                _ = std.ascii.lowerString(lower, col);
+                break :name_blk lower;
+            };
+            right_lh[i] = name;
+            try right_col_map.put(name, i);
             if (join.right_alias.len > 0) {
-                const qname = try std.fmt.allocPrint(aa, "{s}.{s}", .{ join.right_alias, lower });
+                const qname = try std.fmt.allocPrint(aa, "{s}.{s}", .{ join.right_alias, name });
                 try right_col_map.put(qname, i);
             }
         }
         const rjidx = right_col_map.get(join.right_col) orelse return error.JoinColumnNotFound;
 
         var rmap = std.StringHashMap(std.ArrayList([][]const u8)).init(allocator);
+        // Headerless: row 0 (rh_raw) is data, not a header — add it to the map.
+        if (opts.no_input_header and rjidx < rh_raw.len) {
+            const key = try aa.dupe(u8, rh_raw[rjidx]);
+            const gop = try rmap.getOrPut(key);
+            if (!gop.found_existing) gop.value_ptr.* = std.ArrayList([][]const u8){};
+            const rcopy = try aa.alloc([]const u8, rh_raw.len);
+            for (rh_raw, 0..) |f, fi| rcopy[fi] = try aa.dupe(u8, f);
+            try gop.value_ptr.append(allocator, rcopy);
+        }
         while (try rr.readRecordSlices()) |rrow| {
             if (rjidx >= rrow.len) continue;
             const key = try aa.dupe(u8, rrow[rjidx]);
@@ -1528,7 +1547,13 @@ fn executeJoin(
         .allocator = allocator,
     };
 
-    while (try base_reader.readRecordSlices()) |base_row| {
+    // Headerless: base_hdr_raw is the first data row; stream the rest after it.
+    var pending_base: ?[]const []const u8 = if (opts.no_input_header) base_hdr_raw else null;
+    while (true) {
+        const base_row = if (pending_base) |p| blk: {
+            pending_base = null;
+            break :blk p;
+        } else (try base_reader.readRecordSlices()) orelse break;
         for (0..base_w) |ci| merged_row[ci] = if (ci < base_row.len) base_row[ci] else "";
         expandAndEmit(merged_row, base_w, 0, &ctx) catch |err| switch (err) {
             error.LimitReached => break,
@@ -4353,6 +4378,41 @@ test "--no-input-header: first row is data, columns named c1..cN" {
     try std.testing.expect(std.mem.indexOf(u8, out, "c2") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "green,2") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "yellow,1") != null);
+}
+
+test "--no-input-header works with JOIN (c1..cN on both tables)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const a = try tmp.dir.createFile("a.csv", .{});
+        try a.writeAll("1,alice\n2,bob\n3,carol\n");
+        a.close();
+        const b = try tmp.dir.createFile("b.csv", .{});
+        try b.writeAll("1,NYC\n2,LA\n");
+        b.close();
+    }
+    var ab: [std.fs.max_path_bytes]u8 = undefined;
+    var bb: [std.fs.max_path_bytes]u8 = undefined;
+    const ap = try tmp.dir.realpath("a.csv", &ab);
+    const bp = try tmp.dir.realpath("b.csv", &bb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT a.c2, b.c2 FROM '{s}' a JOIN '{s}' b ON a.c1 = b.c1", .{ ap, bp });
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out_file.close();
+    try execute(allocator, query, out_file, .{ .no_input_header = true });
+
+    try out_file.seekTo(0);
+    const out = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(out);
+    // row 0 counted as data on both sides; inner join keeps matches only
+    try std.testing.expect(std.mem.indexOf(u8, out, "alice,NYC") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "bob,LA") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "carol") == null);
 }
 
 test "ensurePathAllowed confines file access to --root trees" {
