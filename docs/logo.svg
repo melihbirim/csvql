@@ -1,0 +1,76 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 100" width="420" height="100">
+  <defs>
+    <!-- Background gradient: dark charcoal -->
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#181826"/>
+      <stop offset="100%" style="stop-color:#141d38"/>
+    </linearGradient>
+
+    <!-- Zig orange accent gradient -->
+    <linearGradient id="accentGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#f7a41d"/>
+      <stop offset="100%" style="stop-color:#ff6f3c"/>
+    </linearGradient>
+
+    <!-- Text gradient: warm white -->
+    <linearGradient id="textGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#ffffff"/>
+      <stop offset="100%" style="stop-color:#dfe4ee"/>
+    </linearGradient>
+
+    <clipPath id="clip">
+      <rect width="420" height="100" rx="14"/>
+    </clipPath>
+  </defs>
+
+  <!-- Background -->
+  <rect width="420" height="100" rx="14" fill="url(#bg)"/>
+
+  <!-- Subtle grid lines (CSV feel) -->
+  <g clip-path="url(#clip)" opacity="0.04">
+    <line x1="0" y1="25" x2="420" y2="25" stroke="#ffffff" stroke-width="1"/>
+    <line x1="0" y1="50" x2="420" y2="50" stroke="#ffffff" stroke-width="1"/>
+    <line x1="0" y1="75" x2="420" y2="75" stroke="#ffffff" stroke-width="1"/>
+    <line x1="105" y1="0" x2="105" y2="100" stroke="#ffffff" stroke-width="1"/>
+    <line x1="210" y1="0" x2="210" y2="100" stroke="#ffffff" stroke-width="1"/>
+    <line x1="315" y1="0" x2="315" y2="100" stroke="#ffffff" stroke-width="1"/>
+  </g>
+
+  <!-- Left accent rail -->
+  <rect x="0" y="0" width="4" height="100" fill="url(#accentGrad)" opacity="0.9" clip-path="url(#clip)"/>
+
+  <!-- Wordmark: csvql — csv=white, ql=orange -->
+  <text font-family="'SF Mono', 'Fira Code', 'Consolas', monospace"
+        font-size="50" font-weight="700" letter-spacing="-2" x="26" y="58">
+    <tspan fill="url(#textGrad)" opacity="0.96">csv</tspan><tspan fill="url(#accentGrad)">ql</tspan>
+  </text>
+
+  <!-- Accent underline -->
+  <rect x="27" y="65" width="176" height="2.5" rx="1.25" fill="url(#accentGrad)" opacity="0.55"/>
+
+  <!-- Tagline -->
+  <text x="28" y="83" font-family="'SF Mono', 'Fira Code', 'Consolas', monospace"
+        font-size="10.5" font-weight="400" fill="#8394a8" letter-spacing="1.6">SQL analytics on CSV</text>
+
+  <!-- Proof chips (right column) — identity: tokens, agent/MCP, zero-setup -->
+  <!-- 1. token economics (the moat) -->
+  <g transform="translate(286, 13)">
+    <rect width="124" height="22" rx="11" fill="url(#accentGrad)" opacity="0.13"/>
+    <rect width="124" height="22" rx="11" fill="none" stroke="url(#accentGrad)" stroke-width="1.1" opacity="0.55"/>
+    <text x="62" y="15" font-family="'SF Mono', 'Fira Code', 'Consolas', monospace"
+          font-size="10" font-weight="600" fill="#f7a41d" text-anchor="middle" letter-spacing="0.2">1000× fewer tokens</text>
+  </g>
+  <!-- 2. agent-native / MCP -->
+  <g transform="translate(286, 39)">
+    <rect width="124" height="22" rx="11" fill="url(#accentGrad)" opacity="0.13"/>
+    <rect width="124" height="22" rx="11" fill="none" stroke="url(#accentGrad)" stroke-width="1.1" opacity="0.55"/>
+    <text x="62" y="15" font-family="'SF Mono', 'Fira Code', 'Consolas', monospace"
+          font-size="10" font-weight="600" fill="#f7a41d" text-anchor="middle" letter-spacing="0.2">agent-native · MCP</text>
+  </g>
+  <!-- 3. zero-setup -->
+  <g transform="translate(286, 65)">
+    <rect width="124" height="22" rx="11" fill="#ffffff" opacity="0.05"/>
+    <text x="62" y="15" font-family="'SF Mono', 'Fira Code', 'Consolas', monospace"
+          font-size="10" font-weight="400" fill="#9fb0c4" text-anchor="middle" letter-spacing="0.4">Zig · 0 deps · no ingest</text>
+  </g>
+</svg>
