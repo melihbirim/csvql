@@ -1,7 +1,7 @@
 /// scalar.zig — Scalar function evaluation for SELECT columns.
 ///
 /// Supports: UPPER, LOWER, TRIM, LENGTH, SUBSTR/SUBSTRING,
-///           ABS, CEIL, FLOOR, MOD, COALESCE, CAST(col AS type)
+///           ABS, CEIL, FLOOR, MOD, COALESCE, CAST(col AS type), REPLACE
 ///
 /// Usage:
 ///   1. Call tryParseScalar(expr, column_map, allocator) at query setup time to
@@ -36,6 +36,13 @@ pub const ScalarSpec = union(enum) {
     dateadd: DateaddArgs, // DATEADD(unit, amount, date_col)
     extract: ExtractArgs, // EXTRACT(part FROM date_col)
     round_op: RoundArgs, // ROUND(col[, digits])
+    replace: ReplaceArgs, // REPLACE(col, 'from', 'to') — replace all occurrences
+
+    pub const ReplaceArgs = struct {
+        col_idx: usize,
+        from: []const u8, // slice into the query expr (query-lifetime)
+        to: []const u8,
+    };
 
     pub const SubstrArgs = struct {
         col_idx: usize,
@@ -96,6 +103,7 @@ pub const ScalarSpec = union(enum) {
             .dateadd => |a| a.date_col,
             .extract => |a| a.date_col,
             .round_op => |a| a.col_idx,
+            .replace => |a| a.col_idx,
         };
     }
 };
@@ -179,6 +187,31 @@ pub fn tryParseScalar(
             -1;
 
         return .{ .substr = .{ .col_idx = cidx, .start = start, .len = len } };
+    }
+
+    // ── REPLACE(col, 'from', 'to') ─────────────────────────────────────────
+    if (std.mem.eql(u8, fn_lower, "replace")) {
+        // col is up to the first comma (column names have no commas); the two
+        // string literals may themselves contain commas, so scan by quotes.
+        const comma1 = std.mem.indexOfScalar(u8, args_str, ',') orelse return null;
+        const col_str = std.mem.trim(u8, args_str[0..comma1], &std.ascii.whitespace);
+        const cidx = try resolveCol(col_str, column_map, allocator) orelse
+            return error.ColumnNotFound;
+
+        const rest = args_str[comma1 + 1 ..];
+        const q1 = std.mem.indexOfScalar(u8, rest, '\'') orelse return null;
+        const q2 = std.mem.indexOfScalarPos(u8, rest, q1 + 1, '\'') orelse return null;
+        const from = rest[q1 + 1 .. q2];
+        if (from.len == 0) return null; // empty search would be a no-op / infinite
+
+        const after = rest[q2 + 1 ..];
+        const sep = std.mem.indexOfScalar(u8, after, ',') orelse return null;
+        const tail = after[sep + 1 ..];
+        const q3 = std.mem.indexOfScalar(u8, tail, '\'') orelse return null;
+        const q4 = std.mem.indexOfScalarPos(u8, tail, q3 + 1, '\'') orelse return null;
+        const to = tail[q3 + 1 .. q4];
+
+        return .{ .replace = .{ .col_idx = cidx, .from = from, .to = to } };
     }
 
     // ── MOD ────────────────────────────────────────────────────────────────
@@ -356,6 +389,14 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
         },
         .trim => |cidx| {
             return std.mem.trim(u8, field(record, cidx), &std.ascii.whitespace);
+        },
+        .replace => |args| {
+            const v = field(record, args.col_idx);
+            if (args.from.len == 0 or std.mem.indexOf(u8, v, args.from) == null) return v;
+            const size = std.mem.replacementSize(u8, v, args.from, args.to);
+            const buf = arena.alloc(u8, size) catch return v;
+            _ = std.mem.replace(u8, v, args.from, args.to, buf);
+            return buf;
         },
         .length => |cidx| {
             const v = field(record, cidx);
@@ -677,4 +718,29 @@ test "ROUND: digits > 6 produces correct decimal places" {
     try std.testing.expectEqualStrings("1.0000000", eval(spec7, &.{"1.0"}, fba.allocator()));
     fba.reset();
     try std.testing.expectEqualStrings("1.000000000", eval(spec9, &.{"1.0"}, fba.allocator()));
+}
+
+test "REPLACE: replaces all occurrences, handles comma literals and no-match" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var column_map = std.StringHashMap(usize).init(allocator);
+    try column_map.put("s", 0);
+
+    const dash = (try tryParseScalar("REPLACE(s, '-', '')", column_map, allocator)).?;
+    const comma = (try tryParseScalar("REPLACE(s, ',', ';')", column_map, allocator)).?;
+
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    try std.testing.expectEqualStrings("5551234567", eval(dash, &.{"555-123-4567"}, fba.allocator()));
+    fba.reset();
+    // from-literal contains a comma; field contains commas
+    try std.testing.expectEqualStrings("a;b;c", eval(comma, &.{"a,b,c"}, fba.allocator()));
+    fba.reset();
+    // no match: passthrough
+    try std.testing.expectEqualStrings("hello", eval(dash, &.{"hello"}, fba.allocator()));
+
+    // empty search literal is rejected (would be a no-op / infinite)
+    try std.testing.expect((try tryParseScalar("REPLACE(s, '', 'x')", column_map, allocator)) == null);
 }
