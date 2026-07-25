@@ -4213,6 +4213,10 @@ fn executeGroupBy(
                         .extract => |*a| a.date_col = 0,
                         .round_op => |*a| a.col_idx = 0,
                         .replace => |*a| a.col_idx = 0,
+                        .split_part => |*a| a.col_idx = 0,
+                        .greatest, .least => |*a| for (a.colsMut()) |*ci| {
+                            ci.* = 0;
+                        },
                     }
                     break :blk scalar.eval(adj_spec, &rec, gb_scalar_arena.allocator());
                 },
