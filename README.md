@@ -278,6 +278,7 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 | **TRIM**      | `SELECT TRIM(col)` — strip leading and trailing whitespace              |
 | **LENGTH**    | `SELECT LENGTH(col)` — byte length of the value                         |
 | **SUBSTR**    | `SELECT SUBSTR(col, start, len)` — substring (1-based, `len` optional)  |
+| **REPLACE**   | `SELECT REPLACE(col, 'from', 'to')` — replace all occurrences of a substring |
 | **ABS / CEIL / FLOOR** | `SELECT ABS(col), CEIL(col), FLOOR(col)` — numeric functions  |
 | **MOD**       | `SELECT MOD(col, n)` — modulo by a numeric literal                      |
 | **ROUND**     | `SELECT ROUND(col)` — round to integer; `ROUND(col, n)` — round to `n` decimal places |
@@ -547,7 +548,7 @@ The query cost is **flat** — it's the SQL plus a few result rows, independent 
 
 **Full WHERE clause support:** `=`, `!=`, `>`, `>=`, `<`, `<=`, `LIKE`, `BETWEEN`, `IN`, `IS NULL`, `IS NOT NULL`, `NOT`, `AND`, `OR`
 
-**Full SELECT support:** column projections, `AS` aliases, `DISTINCT`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING`, `ORDER BY` (by name, alias, or position), `LIMIT`, `STRFTIME()`, `DATE_PART()`, `JOIN`, `UPPER`/`LOWER`/`TRIM`/`LENGTH`/`SUBSTR`, `ABS`/`CEIL`/`FLOOR`/`MOD`/`ROUND`, `COALESCE`, `CAST`, `DATEDIFF`, `DATEADD`, `EXTRACT`
+**Full SELECT support:** column projections, `AS` aliases, `DISTINCT`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, `GROUP BY`, `HAVING`, `ORDER BY` (by name, alias, or position), `LIMIT`, `STRFTIME()`, `DATE_PART()`, `JOIN`, `UPPER`/`LOWER`/`TRIM`/`LENGTH`/`SUBSTR`/`REPLACE`, `ABS`/`CEIL`/`FLOOR`/`MOD`/`ROUND`, `COALESCE`, `CAST`, `DATEDIFF`, `DATEADD`, `EXTRACT`
 
 ### Setup
 
