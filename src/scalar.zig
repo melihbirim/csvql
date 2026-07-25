@@ -1,7 +1,8 @@
 /// scalar.zig — Scalar function evaluation for SELECT columns.
 ///
 /// Supports: UPPER, LOWER, TRIM, LENGTH, SUBSTR/SUBSTRING,
-///           ABS, CEIL, FLOOR, MOD, COALESCE, CAST(col AS type), REPLACE
+///           ABS, CEIL, FLOOR, MOD, COALESCE, CAST(col AS type), REPLACE,
+///           SPLIT_PART, GREATEST, LEAST
 ///
 /// Usage:
 ///   1. Call tryParseScalar(expr, column_map, allocator) at query setup time to
@@ -37,11 +38,33 @@ pub const ScalarSpec = union(enum) {
     extract: ExtractArgs, // EXTRACT(part FROM date_col)
     round_op: RoundArgs, // ROUND(col[, digits])
     replace: ReplaceArgs, // REPLACE(col, 'from', 'to') — replace all occurrences
+    split_part: SplitPartArgs, // SPLIT_PART(col, 'delim', n) — n-th field (1-based)
+    greatest: VariadicArgs, // GREATEST(a, b, ...) — row-wise max
+    least: VariadicArgs, // LEAST(a, b, ...) — row-wise min
 
     pub const ReplaceArgs = struct {
         col_idx: usize,
         from: []const u8, // slice into the query expr (query-lifetime)
         to: []const u8,
+    };
+
+    pub const SplitPartArgs = struct {
+        col_idx: usize,
+        delim: []const u8, // slice into the query expr
+        n: usize, // 1-based field index
+    };
+
+    /// Up to 8 column args for GREATEST/LEAST.
+    pub const VariadicArgs = struct {
+        cols_buf: [8]usize = undefined,
+        cols_len: usize,
+
+        pub fn cols(self: *const VariadicArgs) []const usize {
+            return self.cols_buf[0..self.cols_len];
+        }
+        pub fn colsMut(self: *VariadicArgs) []usize {
+            return self.cols_buf[0..self.cols_len];
+        }
     };
 
     pub const SubstrArgs = struct {
@@ -104,6 +127,8 @@ pub const ScalarSpec = union(enum) {
             .extract => |a| a.date_col,
             .round_op => |a| a.col_idx,
             .replace => |a| a.col_idx,
+            .split_part => |a| a.col_idx,
+            .greatest, .least => |a| a.cols()[0],
         };
     }
 };
@@ -212,6 +237,42 @@ pub fn tryParseScalar(
         const to = tail[q3 + 1 .. q4];
 
         return .{ .replace = .{ .col_idx = cidx, .from = from, .to = to } };
+    }
+
+    // ── SPLIT_PART(col, 'delim', n) ────────────────────────────────────────
+    if (std.mem.eql(u8, fn_lower, "split_part")) {
+        const comma1 = std.mem.indexOfScalar(u8, args_str, ',') orelse return null;
+        const col_str = std.mem.trim(u8, args_str[0..comma1], &std.ascii.whitespace);
+        const cidx = try resolveCol(col_str, column_map, allocator) orelse
+            return error.ColumnNotFound;
+        const rest = args_str[comma1 + 1 ..];
+        const q1 = std.mem.indexOfScalar(u8, rest, '\'') orelse return null;
+        const q2 = std.mem.indexOfScalarPos(u8, rest, q1 + 1, '\'') orelse return null;
+        const delim = rest[q1 + 1 .. q2];
+        if (delim.len == 0) return null;
+        const after = rest[q2 + 1 ..];
+        const sep = std.mem.indexOfScalar(u8, after, ',') orelse return null;
+        const n_str = std.mem.trim(u8, after[sep + 1 ..], &std.ascii.whitespace);
+        const n = std.fmt.parseInt(usize, n_str, 10) catch return null;
+        if (n == 0) return null; // SPLIT_PART is 1-based
+        return .{ .split_part = .{ .col_idx = cidx, .delim = delim, .n = n } };
+    }
+
+    // ── GREATEST / LEAST(a, b, ...) ────────────────────────────────────────
+    if (std.mem.eql(u8, fn_lower, "greatest") or std.mem.eql(u8, fn_lower, "least")) {
+        var v = ScalarSpec.VariadicArgs{ .cols_len = 0 };
+        var it = std.mem.splitScalar(u8, args_str, ',');
+        while (it.next()) |token| {
+            const arg = std.mem.trim(u8, token, &std.ascii.whitespace);
+            if (arg.len == 0) continue;
+            if (v.cols_len >= v.cols_buf.len) return error.TooManyArgs;
+            const cidx = try resolveCol(arg, column_map, allocator) orelse
+                return error.ColumnNotFound;
+            v.cols_buf[v.cols_len] = cidx;
+            v.cols_len += 1;
+        }
+        if (v.cols_len < 2) return null;
+        return if (std.mem.eql(u8, fn_lower, "greatest")) .{ .greatest = v } else .{ .least = v };
     }
 
     // ── MOD ────────────────────────────────────────────────────────────────
@@ -398,6 +459,17 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
             _ = std.mem.replace(u8, v, args.from, args.to, buf);
             return buf;
         },
+        .split_part => |args| {
+            const v = field(record, args.col_idx);
+            var it = std.mem.splitSequence(u8, v, args.delim);
+            var i: usize = 1;
+            while (it.next()) |part| : (i += 1) {
+                if (i == args.n) return part;
+            }
+            return "";
+        },
+        .greatest => |args| return pickExtreme(record, args.cols(), true),
+        .least => |args| return pickExtreme(record, args.cols(), false),
         .length => |cidx| {
             const v = field(record, cidx);
             const buf = arena.alloc(u8, 20) catch return "0";
@@ -579,6 +651,35 @@ pub fn evalOutputCol(spec: OutputColSpec, record: []const []const u8, arena: All
 // ──────────────────────────────────────────────────────────────────────────────
 
 /// Safe indexed field access (returns "" when index is out of range).
+/// Row-wise max/min across columns. Numeric compare when every value parses as a
+/// number, otherwise lexicographic. Returns the winning field slice (no alloc).
+fn pickExtreme(record: []const []const u8, cols: []const usize, want_max: bool) []const u8 {
+    var all_num = true;
+    for (cols) |c| {
+        _ = std.fmt.parseFloat(f64, field(record, c)) catch {
+            all_num = false;
+            break;
+        };
+    }
+    var best_idx = cols[0];
+    if (all_num) {
+        var best = std.fmt.parseFloat(f64, field(record, cols[0])) catch 0;
+        for (cols[1..]) |c| {
+            const v = std.fmt.parseFloat(f64, field(record, c)) catch 0;
+            if ((want_max and v > best) or (!want_max and v < best)) {
+                best = v;
+                best_idx = c;
+            }
+        }
+    } else {
+        for (cols[1..]) |c| {
+            const cmp = std.mem.order(u8, field(record, c), field(record, best_idx));
+            if ((want_max and cmp == .gt) or (!want_max and cmp == .lt)) best_idx = c;
+        }
+    }
+    return field(record, best_idx);
+}
+
 inline fn field(record: []const []const u8, idx: usize) []const u8 {
     return if (idx < record.len) record[idx] else "";
 }
@@ -743,4 +844,41 @@ test "REPLACE: replaces all occurrences, handles comma literals and no-match" {
 
     // empty search literal is rejected (would be a no-op / infinite)
     try std.testing.expect((try tryParseScalar("REPLACE(s, '', 'x')", column_map, allocator)) == null);
+}
+
+test "SPLIT_PART: n-th field, 1-based, out of range empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cm = std.StringHashMap(usize).init(allocator);
+    try cm.put("s", 0);
+    const sp2 = (try tryParseScalar("SPLIT_PART(s, '@', 2)", cm, allocator)).?;
+    const sp5 = (try tryParseScalar("SPLIT_PART(s, '@', 5)", cm, allocator)).?;
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    try std.testing.expectEqualStrings("example.com", eval(sp2, &.{"alice@example.com"}, fba.allocator()));
+    fba.reset();
+    try std.testing.expectEqualStrings("", eval(sp5, &.{"alice@example.com"}, fba.allocator()));
+    try std.testing.expect((try tryParseScalar("SPLIT_PART(s, '@', 0)", cm, allocator)) == null);
+}
+
+test "GREATEST/LEAST: numeric and lexicographic" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cm = std.StringHashMap(usize).init(allocator);
+    try cm.put("a", 0);
+    try cm.put("b", 1);
+    const g = (try tryParseScalar("GREATEST(a, b)", cm, allocator)).?;
+    const l = (try tryParseScalar("LEAST(a, b)", cm, allocator)).?;
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    try std.testing.expectEqualStrings("7", eval(g, &.{ "3", "7" }, fba.allocator()));
+    fba.reset();
+    try std.testing.expectEqualStrings("3", eval(l, &.{ "3", "7" }, fba.allocator()));
+    fba.reset();
+    // non-numeric → lexicographic
+    try std.testing.expectEqualStrings("pear", eval(g, &.{ "apple", "pear" }, fba.allocator()));
+    // single arg rejected
+    try std.testing.expect((try tryParseScalar("GREATEST(a)", cm, allocator)) == null);
 }
