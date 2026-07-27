@@ -67,6 +67,7 @@ csvql "SELECT email FROM 'users.csv'" | wc -l
 | -------------------- | ----- | --------------------------------------------------- |
 | `--no-header`        |       | Suppress header row in output                       |
 | `--no-input-header`  |       | Treat the first row as data; auto-name columns `c1`..`cN` |
+| `-o`, `--output <file>` |    | Write results to a file instead of stdout           |
 | `--delimiter <char>` | `-d`  | Field delimiter (default `,`). Use `\t` for TSV     |
 | `--json`             |       | Output as a JSON array (`[{...}, ...]`)             |
 | `--jsonl`            |       | Output as JSONL / NDJSON (one JSON object per line) |
