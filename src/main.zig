@@ -68,6 +68,7 @@ const help_text =
     \\  -v, --version           Show version
     \\  --no-header             Suppress header row in output
     \\  --no-input-header       Treat the first row as data; name columns c1..cN
+    \\  -o, --output <file>     Write results to a file instead of stdout
     \\  -d, --delimiter <char>  Field delimiter (default: ',')  e.g. -d '\t' for TSV
     \\  --json                  Output results as a JSON array of objects
     \\  --jsonl                 Output results as newline-delimited JSON (NDJSON)
@@ -160,6 +161,7 @@ pub fn main() !void {
 
     // Strip --no-header / -d / --delimiter flags; collect remainder for query parsing.
     var opts = options_mod.Options{ .roots = roots, .audit_path = audit_path };
+    var output_path: ?[]const u8 = null;
     var clean_args = try std.ArrayList([]const u8).initCapacity(allocator, args.len);
     defer clean_args.deinit(allocator);
     try clean_args.append(allocator, args[0]); // keep program name at [0]
@@ -202,6 +204,13 @@ pub fn main() !void {
             i += 1; // value already parsed into opts.roots above; skip it here
         } else if (std.mem.eql(u8, arg, "--audit")) {
             i += 1; // value already parsed into opts.audit_path above; skip it here
+        } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
+            i += 1;
+            if (i >= args.len) {
+                try stderr_file.writeAll("error: --output requires a file path argument\n");
+                std.process.exit(1);
+            }
+            output_path = args[i];
         } else {
             try clean_args.append(allocator, arg);
         }
@@ -235,7 +244,18 @@ pub fn main() !void {
         .auto => isTty(stdFile(.out)),
     };
 
-    if (use_table) {
+    if (output_path) |p| {
+        // Write results straight to a file (no table rendering).
+        const out = std.fs.cwd().createFile(p, .{ .truncate = true }) catch {
+            try stderr_file.writeAll("error: cannot open --output file for writing\n");
+            std.process.exit(1);
+        };
+        defer out.close();
+        engine.execute(allocator, query, out, opts) catch |err| {
+            std.debug.print("execution error: {}\n", .{err});
+            std.process.exit(1);
+        };
+    } else if (use_table) {
         renderTableOutput(allocator, query, stdout_file, opts) catch |err| {
             std.debug.print("execution error: {}\n", .{err});
             std.process.exit(1);
