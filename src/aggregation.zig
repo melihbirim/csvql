@@ -12,6 +12,7 @@ pub const AggregateType = enum {
     median,
     variance, // population variance (VAR_POP)
     stddev, // population standard deviation (STDDEV_POP)
+    group_concat, // GROUP_CONCAT(col [, 'sep']) — concatenate group values
 };
 
 /// Represents an aggregate function in SELECT
@@ -19,11 +20,13 @@ pub const AggregateFunc = struct {
     func_type: AggregateType,
     column: ?[]const u8, // null for COUNT(*)
     alias: []const u8, // Original expression
+    sep: ?[]const u8 = null, // GROUP_CONCAT separator (allocator-owned); null otherwise
 
     pub fn deinit(self: AggregateFunc, allocator: Allocator) void {
         if (self.column) |col| {
             allocator.free(col);
         }
+        if (self.sep) |s| allocator.free(s);
         allocator.free(self.alias);
     }
 };
@@ -223,6 +226,8 @@ pub fn parseAggregateFunc(allocator: Allocator, expr: []const u8) !?AggregateFun
         func_type = .variance;
     } else if (std.mem.eql(u8, func_lower, "stddev") or std.mem.eql(u8, func_lower, "stddev_pop") or std.mem.eql(u8, func_lower, "std")) {
         func_type = .stddev;
+    } else if (std.mem.eql(u8, func_lower, "group_concat") or std.mem.eql(u8, func_lower, "string_agg")) {
+        func_type = .group_concat;
     } else {
         return null;
     }
@@ -233,6 +238,25 @@ pub fn parseAggregateFunc(allocator: Allocator, expr: []const u8) !?AggregateFun
         // Strip "DISTINCT " prefix (9 chars) already verified above
         actual_column_part = std.mem.trim(u8, column_part[9..], &std.ascii.whitespace);
     }
+
+    // GROUP_CONCAT(col [, 'sep']): the column is the first arg; the optional second
+    // arg is the separator literal (default ",").
+    var gc_sep: ?[]const u8 = null;
+    if (func_type == .group_concat) {
+        if (std.mem.indexOfScalar(u8, column_part, ',')) |c| {
+            actual_column_part = std.mem.trim(u8, column_part[0..c], &std.ascii.whitespace);
+            const sep_raw = std.mem.trim(u8, column_part[c + 1 ..], &std.ascii.whitespace);
+            const sep_str = if (sep_raw.len >= 2 and sep_raw[0] == '\'' and sep_raw[sep_raw.len - 1] == '\'')
+                sep_raw[1 .. sep_raw.len - 1]
+            else
+                sep_raw;
+            gc_sep = try allocator.dupe(u8, sep_str);
+        } else {
+            gc_sep = try allocator.dupe(u8, ",");
+        }
+    }
+    errdefer if (gc_sep) |s| allocator.free(s);
+
     const column = if (std.mem.eql(u8, actual_column_part, "*"))
         null
     else
@@ -242,6 +266,7 @@ pub fn parseAggregateFunc(allocator: Allocator, expr: []const u8) !?AggregateFun
         .func_type = func_type,
         .column = column,
         .alias = try allocator.dupe(u8, trimmed),
+        .sep = gc_sep,
     };
 }
 

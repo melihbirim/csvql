@@ -56,7 +56,7 @@ const help_text =
     \\  LIMIT    number of rows
     \\  AS       column aliases: SELECT name AS n
     \\  DISTINCT deduplicate output rows
-    \\  SELECT   aggregate functions: COUNT, SUM, AVG, MIN, MAX, VARIANCE, STDDEV, MEDIAN, COUNT(DISTINCT)
+    \\  SELECT   aggregate functions: COUNT, SUM, AVG, MIN, MAX, VARIANCE, STDDEV, MEDIAN, GROUP_CONCAT, COUNT(DISTINCT)
     \\  JOIN     inner join: SELECT ... FROM 'a.csv' JOIN 'b.csv' ON a.id = b.id
     \\
     \\NOT SUPPORTED:
