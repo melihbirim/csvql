@@ -2339,13 +2339,51 @@ fn fmtAggrF64(allocator: Allocator, val: f64, round_digits: ?u8) ![]u8 {
 /// Format the MEDIAN of a per-group value list. Sorts the list in place (called
 /// once at output time), takes the middle element (mean of the two middles for an
 /// even count). Empty/absent list → "".
+/// In-place quickselect: return the k-th smallest (0-based), partitioning `a` so
+/// that everything before index k is <= a[k]. O(n) average; median-of-three pivot
+/// keeps sorted/adversarial inputs off the O(n^2) path. Faster than a full sort
+/// when we only need the middle element(s).
+fn quickselectF64(a: []f64, k: usize) f64 {
+    var lo: usize = 0;
+    var hi: usize = a.len - 1;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        // Order a[lo] <= a[mid] <= a[hi], then move the median to a[hi] as pivot.
+        if (a[mid] < a[lo]) std.mem.swap(f64, &a[mid], &a[lo]);
+        if (a[hi] < a[lo]) std.mem.swap(f64, &a[hi], &a[lo]);
+        if (a[hi] < a[mid]) std.mem.swap(f64, &a[hi], &a[mid]);
+        std.mem.swap(f64, &a[mid], &a[hi]);
+        const pivot = a[hi];
+        var i = lo;
+        var j = lo;
+        while (j < hi) : (j += 1) {
+            if (a[j] < pivot) {
+                std.mem.swap(f64, &a[i], &a[j]);
+                i += 1;
+            }
+        }
+        std.mem.swap(f64, &a[i], &a[hi]);
+        if (i == k) return a[i];
+        if (i < k) lo = i + 1 else hi = i - 1;
+    }
+    return a[k];
+}
+
 fn fmtMedian(allocator: Allocator, vl: ?std.ArrayList(f64), round_digits: ?u8) ![]u8 {
     const list = vl orelse return allocator.dupe(u8, "");
     const items = list.items;
     if (items.len == 0) return allocator.dupe(u8, "");
-    std.mem.sort(f64, items, {}, comptime std.sort.asc(f64));
     const n = items.len;
-    const med = if (n % 2 == 1) items[n / 2] else (items[n / 2 - 1] + items[n / 2]) / 2.0;
+    const med = if (n % 2 == 1)
+        quickselectF64(items, n / 2)
+    else blk: {
+        const upper = quickselectF64(items, n / 2); // items[0..n/2] are all <= upper
+        var lower = items[0];
+        for (items[0 .. n / 2]) |v| {
+            if (v > lower) lower = v; // (n/2 - 1)-th smallest = max of the lower partition
+        }
+        break :blk (lower + upper) / 2.0;
+    };
     return fmtAggrF64(allocator, med, round_digits);
 }
 
@@ -4592,6 +4630,18 @@ test "GROUP_CONCAT: default and custom separator" {
     defer allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "a,x|y") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "b,p|q") != null);
+}
+
+test "quickselectF64 returns the k-th smallest (sorted, reverse, single)" {
+    var a = [_]f64{ 5, 3, 8, 1, 9, 2, 7 }; // sorted: 1,2,3,5,7,8,9
+    try std.testing.expectEqual(@as(f64, 5), quickselectF64(&a, 3));
+    var b = [_]f64{ 1, 2, 3, 4, 5 }; // already sorted (pivot stress)
+    try std.testing.expectEqual(@as(f64, 3), quickselectF64(&b, 2));
+    var c = [_]f64{ 5, 4, 3, 2, 1 }; // reverse sorted
+    try std.testing.expectEqual(@as(f64, 1), quickselectF64(&c, 0));
+    try std.testing.expectEqual(@as(f64, 5), quickselectF64(&c, 4));
+    var d = [_]f64{42};
+    try std.testing.expectEqual(@as(f64, 42), quickselectF64(&d, 0));
 }
 
 test "MEDIAN: odd and even counts, scalar and GROUP BY" {
