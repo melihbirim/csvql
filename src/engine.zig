@@ -260,6 +260,7 @@ fn hasScalarSelectFunctions(query: parser.Query) bool {
             std.ascii.eqlIgnoreCase(fn_raw, "min") or
             std.ascii.eqlIgnoreCase(fn_raw, "max") or
             std.ascii.eqlIgnoreCase(fn_raw, "count_distinct") or
+            std.ascii.eqlIgnoreCase(fn_raw, "median") or
             std.ascii.eqlIgnoreCase(fn_raw, "variance") or
             std.ascii.eqlIgnoreCase(fn_raw, "var_pop") or
             std.ascii.eqlIgnoreCase(fn_raw, "stddev") or
@@ -2083,6 +2084,7 @@ const CompactAccum = struct {
     mins: []f64, // min[i], arena-alloc, init to +inf
     maxs: []f64, // max[i], arena-alloc, init to -inf
     distinct_sets: []?std.StringHashMap(void), // per-slot distinct-value set for COUNT(DISTINCT)
+    value_lists: []?std.ArrayList(f64), // per-slot numeric values for MEDIAN (buffers all values)
 
     fn init(ka: Allocator, key_vals: [][]const u8, n_aggs: usize) !CompactAccum {
         const sums = try ka.alloc(f64, n_aggs);
@@ -2091,6 +2093,7 @@ const CompactAccum = struct {
         const mins = try ka.alloc(f64, n_aggs);
         const maxs = try ka.alloc(f64, n_aggs);
         const distinct_sets = try ka.alloc(?std.StringHashMap(void), n_aggs);
+        const value_lists = try ka.alloc(?std.ArrayList(f64), n_aggs);
         @memset(sums, 0.0);
         @memset(sum_sqs, 0.0);
         @memset(sum_counts, 0);
@@ -2099,6 +2102,7 @@ const CompactAccum = struct {
             mx.* = -std.math.inf(f64);
         }
         for (distinct_sets) |*ds| ds.* = null;
+        for (value_lists) |*vl| vl.* = null;
         return CompactAccum{
             .key_values = key_vals,
             .count = 0,
@@ -2108,6 +2112,7 @@ const CompactAccum = struct {
             .mins = mins,
             .maxs = maxs,
             .distinct_sets = distinct_sets,
+            .value_lists = value_lists,
         };
     }
 };
@@ -2324,6 +2329,19 @@ fn fmtAggrF64(allocator: Allocator, val: f64, round_digits: ?u8) ![]u8 {
     return formatF64(allocator, val);
 }
 
+/// Format the MEDIAN of a per-group value list. Sorts the list in place (called
+/// once at output time), takes the middle element (mean of the two middles for an
+/// even count). Empty/absent list → "".
+fn fmtMedian(allocator: Allocator, vl: ?std.ArrayList(f64), round_digits: ?u8) ![]u8 {
+    const list = vl orelse return allocator.dupe(u8, "");
+    const items = list.items;
+    if (items.len == 0) return allocator.dupe(u8, "");
+    std.mem.sort(f64, items, {}, comptime std.sort.asc(f64));
+    const n = items.len;
+    const med = if (n % 2 == 1) items[n / 2] else (items[n / 2 - 1] + items[n / 2]) / 2.0;
+    return fmtAggrF64(allocator, med, round_digits);
+}
+
 /// Format population VARIANCE (sum_sq/n - mean^2) or STDDEV (its sqrt) from the
 /// running sum, sum-of-squares, and count. Empty group → "0".
 fn fmtVarStd(allocator: Allocator, sum_sq: f64, sum: f64, n: i64, is_stddev: bool, round_digits: ?u8) ![]u8 {
@@ -2352,6 +2370,7 @@ fn isAggregateExpr(col: []const u8) bool {
         std.mem.eql(u8, lower, "avg") or
         std.mem.eql(u8, lower, "min") or
         std.mem.eql(u8, lower, "max") or
+        std.mem.eql(u8, lower, "median") or
         std.mem.eql(u8, lower, "variance") or
         std.mem.eql(u8, lower, "var_pop") or
         std.mem.eql(u8, lower, "stddev") or
@@ -2854,6 +2873,11 @@ fn executeScalarAgg(
                             gop_e.key_ptr.* = try ka.allocator().dupe(u8, entry.key_ptr.*);
                     }
                 }
+                // Concatenate MEDIAN value lists
+                if (partial.value_lists[i]) |pl| {
+                    if (accum.value_lists[i] == null) accum.value_lists[i] = std.ArrayList(f64){};
+                    try accum.value_lists[i].?.appendSlice(ka.allocator(), pl.items);
+                }
             }
         }
     } else {
@@ -2919,6 +2943,17 @@ fn executeScalarAgg(
                                 if (ds_ptr.* == null) ds_ptr.* = std.StringHashMap(void).init(ka.allocator());
                                 const gop_e = try ds_ptr.*.?.getOrPut(record[cidx]);
                                 if (!gop_e.found_existing) gop_e.key_ptr.* = try ka.allocator().dupe(u8, record[cidx]);
+                            }
+                        }
+                    },
+                    .median => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len) {
+                                if (parseNumericFast(record[cidx])) |val| {
+                                    const vl_ptr = &accum.value_lists[i];
+                                    if (vl_ptr.* == null) vl_ptr.* = std.ArrayList(f64){};
+                                    try vl_ptr.*.?.append(ka.allocator(), val);
+                                } else |_| {}
                             }
                         }
                     },
@@ -3007,6 +3042,7 @@ fn executeScalarAgg(
             },
             .variance => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], false, spec.round_digits),
             .stddev => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], true, spec.round_digits),
+            .median => try fmtMedian(allocator, accum.value_lists[i], spec.round_digits),
         };
         try agg_allocs.append(allocator, s);
         agg_results[i] = s;
@@ -3184,6 +3220,17 @@ fn gbProcessRecord(
                         if (ds_ptr.* == null) ds_ptr.* = std.StringHashMap(void).init(aa);
                         const gop_e = try ds_ptr.*.?.getOrPut(record[cidx]);
                         if (!gop_e.found_existing) gop_e.key_ptr.* = try aa.dupe(u8, record[cidx]);
+                    }
+                }
+            },
+            .median => {
+                if (spec.col_idx) |cidx| {
+                    if (cidx < record.len) {
+                        if (parseNumericFast(record[cidx])) |val| {
+                            const vl_ptr = &accum.value_lists[i];
+                            if (vl_ptr.* == null) vl_ptr.* = std.ArrayList(f64){};
+                            try vl_ptr.*.?.append(aa, val);
+                        } else |_| {}
                     }
                 }
             },
@@ -3405,6 +3452,17 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                             }
                         }
                     },
+                    .median => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len) {
+                                if (parseNumericFast(record[cidx])) |val| {
+                                    const vl_ptr = &ctx.partial_accum.value_lists[i];
+                                    if (vl_ptr.* == null) vl_ptr.* = std.ArrayList(f64){};
+                                    try vl_ptr.*.?.append(aa, val);
+                                } else |_| {}
+                            }
+                        }
+                    },
                     .sum, .avg, .variance, .stddev => {
                         if (spec.case_when) |cw| {
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
@@ -3488,6 +3546,17 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                                 if (ds_ptr.* == null) ds_ptr.* = std.StringHashMap(void).init(aa);
                                 const gop_e = try ds_ptr.*.?.getOrPut(record[cidx]);
                                 if (!gop_e.found_existing) gop_e.key_ptr.* = try aa.dupe(u8, record[cidx]);
+                            }
+                        }
+                    },
+                    .median => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len) {
+                                if (parseNumericFast(record[cidx])) |val| {
+                                    const vl_ptr = &ctx.partial_accum.value_lists[i];
+                                    if (vl_ptr.* == null) vl_ptr.* = std.ArrayList(f64){};
+                                    try vl_ptr.*.?.append(aa, val);
+                                } else |_| {}
                             }
                         }
                     },
@@ -3915,6 +3984,15 @@ fn executeGroupBy(
                             nd.* = new_set;
                         }
                     }
+                    const new_vl = try ka.alloc(?std.ArrayList(f64), n_aggs);
+                    for (new_vl) |*v| v.* = null;
+                    for (new_vl, 0..) |*nv, i| {
+                        if (partial.value_lists[i]) |pl| {
+                            var lst = std.ArrayList(f64){};
+                            try lst.appendSlice(ka, pl.items);
+                            nv.* = lst;
+                        }
+                    }
                     gop.value_ptr.* = CompactAccum{
                         .key_values = key_vals,
                         .count = partial.count,
@@ -3924,6 +4002,7 @@ fn executeGroupBy(
                         .mins = try ka.dupe(f64, partial.mins),
                         .maxs = try ka.dupe(f64, partial.maxs),
                         .distinct_sets = new_ds,
+                        .value_lists = new_vl,
                     };
                 } else {
                     // Existing group: fold arithmetic values
@@ -3946,6 +4025,10 @@ fn executeGroupBy(
                                 if (!gop_e.found_existing)
                                     gop_e.key_ptr.* = try ka.dupe(u8, e.key_ptr.*);
                             }
+                        }
+                        if (partial.value_lists[i]) |pl| {
+                            if (accum.value_lists[i] == null) accum.value_lists[i] = std.ArrayList(f64){};
+                            try accum.value_lists[i].?.appendSlice(ka, pl.items);
                         }
                     }
                 }
@@ -4066,6 +4149,17 @@ fn executeGroupBy(
                                 if (ds_ptr.* == null) ds_ptr.* = std.StringHashMap(void).init(ka);
                                 const gop_e = try ds_ptr.*.?.getOrPut(record[cidx]);
                                 if (!gop_e.found_existing) gop_e.key_ptr.* = try ka.dupe(u8, record[cidx]);
+                            }
+                        }
+                    },
+                    .median => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len) {
+                                if (parseNumericFast(record[cidx])) |val| {
+                                    const vl_ptr = &accum.value_lists[i];
+                                    if (vl_ptr.* == null) vl_ptr.* = std.ArrayList(f64){};
+                                    try vl_ptr.*.?.append(ka, val);
+                                } else |_| {}
                             }
                         }
                     },
@@ -4206,6 +4300,7 @@ fn executeGroupBy(
                 },
                 .variance => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], false, spec.round_digits),
                 .stddev => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], true, spec.round_digits),
+                .median => try fmtMedian(allocator, accum.value_lists[i], spec.round_digits),
             };
             try agg_allocs.append(allocator, s);
             agg_results[i] = s;
@@ -4392,6 +4487,18 @@ test "GROUP BY ROUND(col) forms a numeric key (issue #47)" {
     _ = lines.next(); // header
     try std.testing.expectEqualStrings("1,2", lines.next().?);
     try std.testing.expectEqualStrings("2,1", lines.next().?);
+}
+
+test "MEDIAN: odd and even counts, scalar and GROUP BY" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // a: 1,3,5,7 (even -> 4);  b: 2,4,6,8,100 (odd -> 6)
+    const data = "g,x\na,1\na,3\na,5\na,7\nb,2\nb,4\nb,6\nb,8\nb,100\n";
+    const out = try runQueryForTest(allocator, &tmp, data, "SELECT g, MEDIAN(x) AS m FROM '{s}' GROUP BY g");
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a,4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "b,6") != null);
 }
 
 test "VARIANCE / STDDEV: population, scalar and GROUP BY" {
