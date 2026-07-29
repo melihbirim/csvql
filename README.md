@@ -149,7 +149,7 @@ sudo cp zig-out/bin/csvql /usr/local/bin/
 | `COUNT(*) GROUP BY` (6 groups)    | **0.060s** | 0.110s | **1.8x** |
 | `SUM + AVG GROUP BY` (6 groups)   | **0.070s** | 0.110s | **1.6x** |
 | `VARIANCE + STDDEV GROUP BY`      | **0.012s** | 0.152s | **12.7x** |
-| `MEDIAN GROUP BY`                 | **0.132s** | 0.150s | **1.1x** |
+| `MEDIAN GROUP BY`                 | **0.031s** | 0.150s | **4.9x** |
 | `GROUP_CONCAT`                    | **0.010s** | 0.136s | **13.6x** |
 | `SUM(CASE WHEN) GROUP BY`         | **0.016s** | 0.114s | **7.1x** |
 | `SELECT DISTINCT city` (8 values) | **0.060s** | 0.110s | **1.8x** |
