@@ -137,38 +137,32 @@ sudo cp zig-out/bin/csvql /usr/local/bin/
 
 ## Performance
 
-**1M rows, 35MB CSV, Apple M2** — all tools forced to output all rows (no display tricks):
+**2M rows, 56 MB CSV, Apple M2 Pro** — aggregates, GROUP BY, DISTINCT, both engines on the raw CSV (best-of-5 via [`bench/bench_all.sh --section queries`](bench/bench_all.sh)):
 
 | Query                             | csvql      | DuckDB | Speedup  |
 | --------------------------------- | ---------- | ------ | -------- |
-| WHERE + ORDER BY LIMIT 10         | **0.020s** | 0.179s | **9x**   |
-| ORDER BY LIMIT 10                 | **0.041s** | 0.165s | **4x**   |
-| ORDER BY (all 1M rows)            | **0.156s** | 1.221s | **7.8x** |
-| WHERE (full output)               | **0.141s** | 0.739s | **5.2x** |
-| Full scan (all 1M rows)           | **0.196s** | 1.163s | **5.9x** |
-| `COUNT(*) GROUP BY` (6 groups)    | **0.060s** | 0.110s | **1.8x** |
-| `SUM + AVG GROUP BY` (6 groups)   | **0.070s** | 0.110s | **1.6x** |
-| `VARIANCE + STDDEV GROUP BY`      | **0.012s** | 0.152s | **12.7x** |
-| `MEDIAN GROUP BY`                 | **0.031s** | 0.150s | **4.9x** |
-| `GROUP_CONCAT`                    | **0.010s** | 0.136s | **13.6x** |
-| `SUM(CASE WHEN) GROUP BY`         | **0.016s** | 0.114s | **7.1x** |
-| `SELECT DISTINCT city` (8 values) | **0.060s** | 0.110s | **1.8x** |
-| `SELECT COUNT(*)` scalar          | **0.050s** | 0.100s | **2x**   |
-| `SELECT SUM(salary)` scalar       | **0.050s** | 0.110s | **2.2x** |
+| `SELECT COUNT(*)` scalar          | **0.012s** | 0.136s | **11.3x** |
+| `MIN(age), MAX(age)`              | **0.016s** | 0.132s | **8.2x** |
+| `SELECT AVG(salary)` scalar       | **0.016s** | 0.130s | **8.1x** |
+| `SELECT SUM(salary)` scalar       | **0.018s** | 0.138s | **7.7x** |
+| `VARIANCE + STDDEV GROUP BY`      | **0.020s** | 0.152s | **7.6x** |
+| `COUNT(*) GROUP BY`               | **0.020s** | 0.146s | **7.3x** |
+| `SELECT DISTINCT city`            | **0.020s** | 0.142s | **7.1x** |
+| `GROUP_CONCAT`                    | **0.020s** | 0.140s | **7.0x** |
+| `SUM + AVG GROUP BY`              | **0.022s** | 0.150s | **6.8x** |
+| `MEDIAN GROUP BY`                 | **0.056s** | 0.160s | **2.9x** |
 
 **35x less memory** than DuckDB (1.8MB vs 63.5MB).
 
-**5M rows, 173MB CSV, Apple M2** — output-format benchmark (full output, all rows matched, `> /dev/null`):
+**2M rows, 56 MB CSV, Apple M2 Pro** — output-format throughput (full output, all rows, via [`bench/bench_all.sh --section formats`](bench/bench_all.sh)):
 
 | Output format              | csvql      | DuckDB | Speedup  |
 | -------------------------- | ---------- | ------ | -------- |
-| CSV                        | **0.100s** | 0.354s | **3.5x** |
-| JSON array (`--json`)      | **0.164s** | 0.434s | **2.6x** |
-| JSONL / NDJSON (`--jsonl`) | **0.172s** | 0.422s | **2.5x** |
+| CSV                        | **0.030s** | 0.258s | **8.6x** |
+| JSON array (`--json`)      | **0.054s** | 0.328s | **6.1x** |
+| JSONL / NDJSON (`--jsonl`) | **0.058s** | 0.328s | **5.7x** |
 
-Outputs are semantically/byte-identical to DuckDB (verified: CSV byte-for-byte diff; JSONL byte-for-byte diff; JSON array Python-parsed row comparison).
-
-Run the benchmark yourself: [`bench/bench_all.sh --section formats`](bench/bench_all.sh)
+Outputs are semantically/byte-identical to DuckDB (verified via [`bench/verify_correctness.sh`](bench/verify_correctness.sh)). Reproduce any of these with [`bench/bench_all.sh`](bench/bench_all.sh).
 
 **5M rows, 173MB CSV, Apple M2** — LIKE operator benchmark (CSV output, `> /dev/null`):
 
