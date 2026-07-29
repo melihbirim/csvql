@@ -9,6 +9,7 @@ pub const AggregateType = enum {
     avg,
     min,
     max,
+    median,
     variance, // population variance (VAR_POP)
     stddev, // population standard deviation (STDDEV_POP)
 };
@@ -216,6 +217,8 @@ pub fn parseAggregateFunc(allocator: Allocator, expr: []const u8) !?AggregateFun
         func_type = .min;
     } else if (std.mem.eql(u8, func_lower, "max")) {
         func_type = .max;
+    } else if (std.mem.eql(u8, func_lower, "median")) {
+        func_type = .median;
     } else if (std.mem.eql(u8, func_lower, "variance") or std.mem.eql(u8, func_lower, "var_pop")) {
         func_type = .variance;
     } else if (std.mem.eql(u8, func_lower, "stddev") or std.mem.eql(u8, func_lower, "stddev_pop") or std.mem.eql(u8, func_lower, "std")) {
