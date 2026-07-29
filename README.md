@@ -221,6 +221,8 @@ Reproduce: `./bench/bench_taxi.sh --resources 1` (or `--resources --sample`).
 
 Run the full suite (all sections): [`bench/bench_all.sh`](bench/bench_all.sh)
 
+Speed **and** correctness vs DuckDB across query types: [`bench/bench_compare.py`](bench/bench_compare.py) — times each query best-of-5 and diffs the output against DuckDB (numeric-tolerant).
+
 <details>
 <summary><b>How is csvql so fast?</b></summary>
 

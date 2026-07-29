@@ -40,3 +40,4 @@ bench/.taxi-data/
 
 # MCP bundle build artifact
 csvql.mcpb
+bench/.compare-data/
