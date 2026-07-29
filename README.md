@@ -148,6 +148,9 @@ sudo cp zig-out/bin/csvql /usr/local/bin/
 | Full scan (all 1M rows)           | **0.196s** | 1.163s | **5.9x** |
 | `COUNT(*) GROUP BY` (6 groups)    | **0.060s** | 0.110s | **1.8x** |
 | `SUM + AVG GROUP BY` (6 groups)   | **0.070s** | 0.110s | **1.6x** |
+| `VARIANCE + STDDEV GROUP BY`      | **0.012s** | 0.152s | **12.7x** |
+| `MEDIAN GROUP BY`                 | **0.132s** | 0.150s | **1.1x** |
+| `GROUP_CONCAT`                    | **0.010s** | 0.136s | **13.6x** |
 | `SUM(CASE WHEN) GROUP BY`         | **0.016s** | 0.114s | **7.1x** |
 | `SELECT DISTINCT city` (8 values) | **0.060s** | 0.110s | **1.8x** |
 | `SELECT COUNT(*)` scalar          | **0.050s** | 0.100s | **2x**   |
@@ -220,8 +223,6 @@ Reproduce: `./bench/bench_taxi.sh --resources 1` (or `--resources --sample`).
 **At scale, csvql reads raw CSV about as fast as your OS can hand it the bytes.** On the 8 GB file, `SELECT COUNT(*)`, `GROUP BY cab_type`, and `GROUP BY + AVG` all run in **~1.31 s** — the same time as `cat file > /dev/null` (~1.30 s) on the same machine. The parsing, grouping, and aggregation are effectively free; the whole query is bounded by the file read itself. There is no meaningful parsing overhead left to remove — csvql is already at the read ceiling, which is why the raw-CSV gap over DuckDB (which does more work per byte) holds at ~2.8x.
 
 Run the full suite (all sections): [`bench/bench_all.sh`](bench/bench_all.sh)
-
-Speed **and** correctness vs DuckDB across query types: [`bench/bench_compare.py`](bench/bench_compare.py) — times each query best-of-5 and diffs the output against DuckDB (numeric-tolerant).
 
 <details>
 <summary><b>How is csvql so fast?</b></summary>

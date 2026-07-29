@@ -201,6 +201,21 @@ run_section_queries() {
     "SELECT department, SUM(salary), AVG(salary) FROM read_csv_auto('${CSV}') GROUP BY department ORDER BY department"
 
   run_query \
+    "VARIANCE STDDEV GROUP BY department" \
+    "SELECT department, VARIANCE(salary), STDDEV(salary) FROM '${CSV}' GROUP BY department ORDER BY department" \
+    "SELECT department, VAR_POP(salary), STDDEV_POP(salary) FROM read_csv_auto('${CSV}') GROUP BY department ORDER BY department"
+
+  run_query \
+    "MEDIAN(salary) GROUP BY department" \
+    "SELECT department, MEDIAN(salary) FROM '${CSV}' GROUP BY department ORDER BY department" \
+    "SELECT department, median(salary) FROM read_csv_auto('${CSV}') GROUP BY department ORDER BY department"
+
+  run_query \
+    "GROUP_CONCAT(city) WHERE age = 21" \
+    "SELECT GROUP_CONCAT(city) FROM '${CSV}' WHERE age = 21" \
+    "SELECT string_agg(city, ',') FROM read_csv_auto('${CSV}') WHERE age = 21"
+
+  run_query \
     "COUNT(*) GROUP BY city ORDER BY city" \
     "SELECT city, COUNT(*) FROM '${CSV}' GROUP BY city ORDER BY city" \
     "SELECT city, COUNT(*) FROM read_csv_auto('${CSV}') GROUP BY city ORDER BY city"
