@@ -813,8 +813,13 @@ headers, rows = csvql.query_tuples("SELECT name, age FROM 'employees.csv'")
 | MCP token guardrails + `csvql install` + `.mcpb` bundle | [#54](https://github.com/melihbirim/csvql/issues/54) | ✅ shipped (v1.7.0) |
 | `--root` file-access sandbox        | [#58](https://github.com/melihbirim/csvql/issues/58) | ✅ shipped (v1.7.0) |
 | `--audit` query log                 | [#62](https://github.com/melihbirim/csvql/issues/62) | ✅ shipped (v1.7.0) |
+| `-o`/`--output <file>`               | [#71](https://github.com/melihbirim/csvql/issues/71) | ✅ shipped (v1.8.0) |
+| `REPLACE`, `SPLIT_PART`, `GREATEST`, `LEAST` | [#67](https://github.com/melihbirim/csvql/issues/67) | ✅ shipped (v1.8.0) |
+| `VARIANCE`, `STDDEV`, `MEDIAN`, `GROUP_CONCAT` | [#50](https://github.com/melihbirim/csvql/issues/50) | ✅ shipped (v1.9.0) |
 | HTTP/SSE MCP transport (shared service) | [#60](https://github.com/melihbirim/csvql/issues/60) | planned             |
-| More SQL functions (`GROUP_CONCAT`, `VARIANCE`, `SPLIT_PART`, `OFFSET`, …) | [good first issues](https://github.com/melihbirim/csvql/labels/good%20first%20issue) | help wanted |
+| `OFFSET` clause | [#70](https://github.com/melihbirim/csvql/issues/70) | help wanted |
+| `--markdown` output | [#72](https://github.com/melihbirim/csvql/issues/72) | help wanted |
+| Shell completions (bash/zsh) | [#73](https://github.com/melihbirim/csvql/issues/73) | help wanted |
 
 ## Contributing
 
