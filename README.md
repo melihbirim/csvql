@@ -148,6 +148,9 @@ sudo cp zig-out/bin/csvql /usr/local/bin/
 | Full scan (all 1M rows)           | **0.196s** | 1.163s | **5.9x** |
 | `COUNT(*) GROUP BY` (6 groups)    | **0.060s** | 0.110s | **1.8x** |
 | `SUM + AVG GROUP BY` (6 groups)   | **0.070s** | 0.110s | **1.6x** |
+| `VARIANCE + STDDEV GROUP BY`      | **0.012s** | 0.152s | **12.7x** |
+| `MEDIAN GROUP BY`                 | **0.132s** | 0.150s | **1.1x** |
+| `GROUP_CONCAT`                    | **0.010s** | 0.136s | **13.6x** |
 | `SUM(CASE WHEN) GROUP BY`         | **0.016s** | 0.114s | **7.1x** |
 | `SELECT DISTINCT city` (8 values) | **0.060s** | 0.110s | **1.8x** |
 | `SELECT COUNT(*)` scalar          | **0.050s** | 0.100s | **2x**   |
@@ -221,8 +224,6 @@ Reproduce: `./bench/bench_taxi.sh --resources 1` (or `--resources --sample`).
 
 Run the full suite (all sections): [`bench/bench_all.sh`](bench/bench_all.sh)
 
-Speed **and** correctness vs DuckDB across query types: [`bench/bench_compare.py`](bench/bench_compare.py) — times each query best-of-5 and diffs the output against DuckDB (numeric-tolerant).
-
 <details>
 <summary><b>How is csvql so fast?</b></summary>
 
@@ -274,6 +275,7 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 | **AVG**       | `AVG(col)` — full precision; with or without `GROUP BY`                 |
 | **VARIANCE / STDDEV** | `VARIANCE(col)`, `STDDEV(col)` — population variance / std deviation (aliases `VAR_POP`, `STDDEV_POP`) |
 | **MEDIAN** | `MEDIAN(col)` — median of numeric values (mean of the two middles for an even count) |
+| **GROUP_CONCAT** | `GROUP_CONCAT(col [, 'sep'])` — concatenate group values (default separator `,`; alias `STRING_AGG`) |
 | **CASE WHEN** | `CASE WHEN col OP val THEN n ELSE m END` inside any aggregate function  |
 | **MIN / MAX** | `MIN(col)`, `MAX(col)` — with or without `GROUP BY`                     |
 | **HAVING**    | `HAVING expr` — filter groups after aggregation (e.g. `HAVING COUNT(*) > 5`) |
@@ -555,7 +557,7 @@ The query cost is **flat** — it's the SQL plus a few result rows, independent 
 
 **Full WHERE clause support:** `=`, `!=`, `>`, `>=`, `<`, `<=`, `LIKE`, `BETWEEN`, `IN`, `IS NULL`, `IS NOT NULL`, `NOT`, `AND`, `OR`
 
-**Full SELECT support:** column projections, `AS` aliases, `DISTINCT`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`VARIANCE`/`STDDEV`/`MEDIAN`, `GROUP BY`, `HAVING`, `ORDER BY` (by name, alias, or position), `LIMIT`, `STRFTIME()`, `DATE_PART()`, `JOIN`, `UPPER`/`LOWER`/`TRIM`/`LENGTH`/`SUBSTR`/`REPLACE`/`SPLIT_PART`/`GREATEST`/`LEAST`, `ABS`/`CEIL`/`FLOOR`/`MOD`/`ROUND`, `COALESCE`, `CAST`, `DATEDIFF`, `DATEADD`, `EXTRACT`
+**Full SELECT support:** column projections, `AS` aliases, `DISTINCT`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`VARIANCE`/`STDDEV`/`MEDIAN`/`GROUP_CONCAT`, `GROUP BY`, `HAVING`, `ORDER BY` (by name, alias, or position), `LIMIT`, `STRFTIME()`, `DATE_PART()`, `JOIN`, `UPPER`/`LOWER`/`TRIM`/`LENGTH`/`SUBSTR`/`REPLACE`/`SPLIT_PART`/`GREATEST`/`LEAST`, `ABS`/`CEIL`/`FLOOR`/`MOD`/`ROUND`, `COALESCE`, `CAST`, `DATEDIFF`, `DATEADD`, `EXTRACT`
 
 ### Setup
 

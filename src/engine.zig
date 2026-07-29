@@ -260,6 +260,8 @@ fn hasScalarSelectFunctions(query: parser.Query) bool {
             std.ascii.eqlIgnoreCase(fn_raw, "min") or
             std.ascii.eqlIgnoreCase(fn_raw, "max") or
             std.ascii.eqlIgnoreCase(fn_raw, "count_distinct") or
+            std.ascii.eqlIgnoreCase(fn_raw, "group_concat") or
+            std.ascii.eqlIgnoreCase(fn_raw, "string_agg") or
             std.ascii.eqlIgnoreCase(fn_raw, "median") or
             std.ascii.eqlIgnoreCase(fn_raw, "variance") or
             std.ascii.eqlIgnoreCase(fn_raw, "var_pop") or
@@ -2045,6 +2047,7 @@ const AggSpec = struct {
     alias: []const u8, // output header name (allocator-owned)
     round_digits: ?u8 = null, // non-null for ROUND(expr, n)
     case_when: ?CaseWhenSpec = null, // non-null for CASE WHEN conditional aggregates
+    sep: []const u8 = ",", // GROUP_CONCAT separator
 };
 
 /// THEN/ELSE value in a CASE WHEN — either a numeric literal or a column reference.
@@ -2085,6 +2088,7 @@ const CompactAccum = struct {
     maxs: []f64, // max[i], arena-alloc, init to -inf
     distinct_sets: []?std.StringHashMap(void), // per-slot distinct-value set for COUNT(DISTINCT)
     value_lists: []?std.ArrayList(f64), // per-slot numeric values for MEDIAN (buffers all values)
+    concat_lists: []?std.ArrayList([]const u8), // per-slot string values for GROUP_CONCAT
 
     fn init(ka: Allocator, key_vals: [][]const u8, n_aggs: usize) !CompactAccum {
         const sums = try ka.alloc(f64, n_aggs);
@@ -2094,6 +2098,7 @@ const CompactAccum = struct {
         const maxs = try ka.alloc(f64, n_aggs);
         const distinct_sets = try ka.alloc(?std.StringHashMap(void), n_aggs);
         const value_lists = try ka.alloc(?std.ArrayList(f64), n_aggs);
+        const concat_lists = try ka.alloc(?std.ArrayList([]const u8), n_aggs);
         @memset(sums, 0.0);
         @memset(sum_sqs, 0.0);
         @memset(sum_counts, 0);
@@ -2103,6 +2108,7 @@ const CompactAccum = struct {
         }
         for (distinct_sets) |*ds| ds.* = null;
         for (value_lists) |*vl| vl.* = null;
+        for (concat_lists) |*cl| cl.* = null;
         return CompactAccum{
             .key_values = key_vals,
             .count = 0,
@@ -2113,6 +2119,7 @@ const CompactAccum = struct {
             .maxs = maxs,
             .distinct_sets = distinct_sets,
             .value_lists = value_lists,
+            .concat_lists = concat_lists,
         };
     }
 };
@@ -2342,6 +2349,13 @@ fn fmtMedian(allocator: Allocator, vl: ?std.ArrayList(f64), round_digits: ?u8) !
     return fmtAggrF64(allocator, med, round_digits);
 }
 
+/// Join a per-group string list with `sep` for GROUP_CONCAT. Empty/absent → "".
+fn fmtGroupConcat(allocator: Allocator, cl: ?std.ArrayList([]const u8), sep: []const u8) ![]u8 {
+    const list = cl orelse return allocator.dupe(u8, "");
+    if (list.items.len == 0) return allocator.dupe(u8, "");
+    return std.mem.join(allocator, sep, list.items);
+}
+
 /// Format population VARIANCE (sum_sq/n - mean^2) or STDDEV (its sqrt) from the
 /// running sum, sum-of-squares, and count. Empty group → "0".
 fn fmtVarStd(allocator: Allocator, sum_sq: f64, sum: f64, n: i64, is_stddev: bool, round_digits: ?u8) ![]u8 {
@@ -2362,14 +2376,16 @@ fn isAggregateExpr(col: []const u8) bool {
     }
     const paren = std.mem.indexOf(u8, col, "(") orelse return false;
     const name_part = std.mem.trim(u8, col[0..paren], &std.ascii.whitespace);
-    if (name_part.len == 0 or name_part.len > 10) return false;
-    var buf: [10]u8 = undefined;
+    if (name_part.len == 0 or name_part.len > 12) return false;
+    var buf: [12]u8 = undefined;
     const lower = std.ascii.lowerString(buf[0..name_part.len], name_part);
     return std.mem.eql(u8, lower, "count") or
         std.mem.eql(u8, lower, "sum") or
         std.mem.eql(u8, lower, "avg") or
         std.mem.eql(u8, lower, "min") or
         std.mem.eql(u8, lower, "max") or
+        std.mem.eql(u8, lower, "group_concat") or
+        std.mem.eql(u8, lower, "string_agg") or
         std.mem.eql(u8, lower, "median") or
         std.mem.eql(u8, lower, "variance") or
         std.mem.eql(u8, lower, "var_pop") or
@@ -2717,6 +2733,7 @@ fn executeScalarAgg(
         for (agg_specs.items) |spec| {
             allocator.free(spec.alias);
             if (spec.case_when) |cw| cw.comp.deinit(allocator);
+            if (spec.func_type == .group_concat) allocator.free(spec.sep);
         }
         agg_specs.deinit(allocator);
     }
@@ -2776,11 +2793,14 @@ fn executeScalarAgg(
             }
             try col_kinds.append(allocator, .{ .aggregate = agg_idx });
             try out_header_list.append(allocator, agg_func.alias);
+            const gc_sep: []const u8 = agg_func.sep orelse ",";
+            agg_func.sep = null; // ownership transfers to AggSpec
             try agg_specs.append(allocator, AggSpec{
                 .func_type = agg_func.func_type,
                 .col_idx = col_idx,
                 .alias = agg_func.alias,
                 .round_digits = round_digits,
+                .sep = gc_sep,
             });
         } else {
             const lower = try allocator.alloc(u8, effective_col.len);
@@ -2878,6 +2898,11 @@ fn executeScalarAgg(
                     if (accum.value_lists[i] == null) accum.value_lists[i] = std.ArrayList(f64){};
                     try accum.value_lists[i].?.appendSlice(ka.allocator(), pl.items);
                 }
+                // GROUP_CONCAT string lists — re-dupe (partial arena is freed after merge)
+                if (partial.concat_lists[i]) |pl| {
+                    if (accum.concat_lists[i] == null) accum.concat_lists[i] = std.ArrayList([]const u8){};
+                    for (pl.items) |s| try accum.concat_lists[i].?.append(ka.allocator(), try ka.allocator().dupe(u8, s));
+                }
             }
         }
     } else {
@@ -2954,6 +2979,15 @@ fn executeScalarAgg(
                                     if (vl_ptr.* == null) vl_ptr.* = std.ArrayList(f64){};
                                     try vl_ptr.*.?.append(ka.allocator(), val);
                                 } else |_| {}
+                            }
+                        }
+                    },
+                    .group_concat => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len) {
+                                const cl_ptr = &accum.concat_lists[i];
+                                if (cl_ptr.* == null) cl_ptr.* = std.ArrayList([]const u8){};
+                                try cl_ptr.*.?.append(ka.allocator(), try ka.allocator().dupe(u8, record[cidx]));
                             }
                         }
                     },
@@ -3043,6 +3077,8 @@ fn executeScalarAgg(
             .variance => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], false, spec.round_digits),
             .stddev => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], true, spec.round_digits),
             .median => try fmtMedian(allocator, accum.value_lists[i], spec.round_digits),
+
+            .group_concat => try fmtGroupConcat(allocator, accum.concat_lists[i], spec.sep),
         };
         try agg_allocs.append(allocator, s);
         agg_results[i] = s;
@@ -3231,6 +3267,15 @@ fn gbProcessRecord(
                             if (vl_ptr.* == null) vl_ptr.* = std.ArrayList(f64){};
                             try vl_ptr.*.?.append(aa, val);
                         } else |_| {}
+                    }
+                }
+            },
+            .group_concat => {
+                if (spec.col_idx) |cidx| {
+                    if (cidx < record.len) {
+                        const cl_ptr = &accum.concat_lists[i];
+                        if (cl_ptr.* == null) cl_ptr.* = std.ArrayList([]const u8){};
+                        try cl_ptr.*.?.append(aa, try aa.dupe(u8, record[cidx]));
                     }
                 }
             },
@@ -3463,6 +3508,15 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                             }
                         }
                     },
+                    .group_concat => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len) {
+                                const cl_ptr = &ctx.partial_accum.concat_lists[i];
+                                if (cl_ptr.* == null) cl_ptr.* = std.ArrayList([]const u8){};
+                                try cl_ptr.*.?.append(aa, try aa.dupe(u8, record[cidx]));
+                            }
+                        }
+                    },
                     .sum, .avg, .variance, .stddev => {
                         if (spec.case_when) |cw| {
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
@@ -3557,6 +3611,15 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                                     if (vl_ptr.* == null) vl_ptr.* = std.ArrayList(f64){};
                                     try vl_ptr.*.?.append(aa, val);
                                 } else |_| {}
+                            }
+                        }
+                    },
+                    .group_concat => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len) {
+                                const cl_ptr = &ctx.partial_accum.concat_lists[i];
+                                if (cl_ptr.* == null) cl_ptr.* = std.ArrayList([]const u8){};
+                                try cl_ptr.*.?.append(aa, try aa.dupe(u8, record[cidx]));
                             }
                         }
                     },
@@ -3719,7 +3782,10 @@ fn executeGroupBy(
 
     var agg_specs = std.ArrayListUnmanaged(AggSpec){};
     defer {
-        for (agg_specs.items) |spec| allocator.free(spec.alias);
+        for (agg_specs.items) |spec| {
+            allocator.free(spec.alias);
+            if (spec.func_type == .group_concat) allocator.free(spec.sep);
+        }
         agg_specs.deinit(allocator);
     }
 
@@ -3806,12 +3872,15 @@ fn executeGroupBy(
                 }
                 try col_kinds.append(allocator, .{ .aggregate = agg_idx });
                 try out_header_list.append(allocator, agg_func.alias);
-                // alias ownership transfers to AggSpec
+                // alias + sep ownership transfers to AggSpec
+                const gc_sep: []const u8 = agg_func.sep orelse ",";
+                agg_func.sep = null;
                 try agg_specs.append(allocator, AggSpec{
                     .func_type = agg_func.func_type,
                     .col_idx = col_idx,
                     .alias = agg_func.alias,
                     .round_digits = round_digits,
+                    .sep = gc_sep,
                 });
             } else {
                 const lower = try allocator.alloc(u8, effective_col.len);
@@ -3993,6 +4062,15 @@ fn executeGroupBy(
                             nv.* = lst;
                         }
                     }
+                    const new_cl = try ka.alloc(?std.ArrayList([]const u8), n_aggs);
+                    for (new_cl) |*c| c.* = null;
+                    for (new_cl, 0..) |*nc, i| {
+                        if (partial.concat_lists[i]) |pl| {
+                            var lst = std.ArrayList([]const u8){};
+                            for (pl.items) |s| try lst.append(ka, try ka.dupe(u8, s));
+                            nc.* = lst;
+                        }
+                    }
                     gop.value_ptr.* = CompactAccum{
                         .key_values = key_vals,
                         .count = partial.count,
@@ -4003,6 +4081,7 @@ fn executeGroupBy(
                         .maxs = try ka.dupe(f64, partial.maxs),
                         .distinct_sets = new_ds,
                         .value_lists = new_vl,
+                        .concat_lists = new_cl,
                     };
                 } else {
                     // Existing group: fold arithmetic values
@@ -4029,6 +4108,10 @@ fn executeGroupBy(
                         if (partial.value_lists[i]) |pl| {
                             if (accum.value_lists[i] == null) accum.value_lists[i] = std.ArrayList(f64){};
                             try accum.value_lists[i].?.appendSlice(ka, pl.items);
+                        }
+                        if (partial.concat_lists[i]) |pl| {
+                            if (accum.concat_lists[i] == null) accum.concat_lists[i] = std.ArrayList([]const u8){};
+                            for (pl.items) |s| try accum.concat_lists[i].?.append(ka, try ka.dupe(u8, s));
                         }
                     }
                 }
@@ -4160,6 +4243,15 @@ fn executeGroupBy(
                                     if (vl_ptr.* == null) vl_ptr.* = std.ArrayList(f64){};
                                     try vl_ptr.*.?.append(ka, val);
                                 } else |_| {}
+                            }
+                        }
+                    },
+                    .group_concat => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len) {
+                                const cl_ptr = &accum.concat_lists[i];
+                                if (cl_ptr.* == null) cl_ptr.* = std.ArrayList([]const u8){};
+                                try cl_ptr.*.?.append(ka, try ka.dupe(u8, record[cidx]));
                             }
                         }
                     },
@@ -4301,6 +4393,8 @@ fn executeGroupBy(
                 .variance => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], false, spec.round_digits),
                 .stddev => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], true, spec.round_digits),
                 .median => try fmtMedian(allocator, accum.value_lists[i], spec.round_digits),
+
+                .group_concat => try fmtGroupConcat(allocator, accum.concat_lists[i], spec.sep),
             };
             try agg_allocs.append(allocator, s);
             agg_results[i] = s;
@@ -4487,6 +4581,17 @@ test "GROUP BY ROUND(col) forms a numeric key (issue #47)" {
     _ = lines.next(); // header
     try std.testing.expectEqualStrings("1,2", lines.next().?);
     try std.testing.expectEqualStrings("2,1", lines.next().?);
+}
+
+test "GROUP_CONCAT: default and custom separator" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = "g,c\na,x\na,y\nb,p\nb,q\n";
+    const out = try runQueryForTest(allocator, &tmp, data, "SELECT g, GROUP_CONCAT(c, '|') AS gc FROM '{s}' GROUP BY g");
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "a,x|y") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "b,p|q") != null);
 }
 
 test "MEDIAN: odd and even counts, scalar and GROUP BY" {
