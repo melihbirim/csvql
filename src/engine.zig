@@ -2927,13 +2927,13 @@ fn executeScalarAgg(
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
                             const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
                             accum.sums[i] += val;
-                            accum.sum_sqs[i] += val * val;
+                            if (spec.func_type == .variance or spec.func_type == .stddev) accum.sum_sqs[i] += val * val;
                             accum.sum_counts[i] += 1;
                         } else if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
                                 if (parseNumericFast(record[cidx])) |val| {
                                     accum.sums[i] += val;
-                                    accum.sum_sqs[i] += val * val;
+                                    if (spec.func_type == .variance or spec.func_type == .stddev) accum.sum_sqs[i] += val * val;
                                     accum.sum_counts[i] += 1;
                                 } else |_| {}
                             }
@@ -3192,13 +3192,13 @@ fn gbProcessRecord(
                     const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
                     const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
                     accum.sums[i] += val;
-                    accum.sum_sqs[i] += val * val;
+                    if (spec.func_type == .variance or spec.func_type == .stddev) accum.sum_sqs[i] += val * val;
                     accum.sum_counts[i] += 1;
                 } else if (spec.col_idx) |cidx| {
                     if (cidx < record.len) {
                         if (parseNumericFast(record[cidx])) |val| {
                             accum.sums[i] += val;
-                            accum.sum_sqs[i] += val * val;
+                            if (spec.func_type == .variance or spec.func_type == .stddev) accum.sum_sqs[i] += val * val;
                             accum.sum_counts[i] += 1;
                         } else |_| {}
                     }
@@ -3410,13 +3410,13 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
                             const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
                             ctx.partial_accum.sums[i] += val;
-                            ctx.partial_accum.sum_sqs[i] += val * val;
+                            if (spec.func_type == .variance or spec.func_type == .stddev) ctx.partial_accum.sum_sqs[i] += val * val;
                             ctx.partial_accum.sum_counts[i] += 1;
                         } else if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
                                 if (parseNumericFast(record[cidx])) |val| {
                                     ctx.partial_accum.sums[i] += val;
-                                    ctx.partial_accum.sum_sqs[i] += val * val;
+                                    if (spec.func_type == .variance or spec.func_type == .stddev) ctx.partial_accum.sum_sqs[i] += val * val;
                                     ctx.partial_accum.sum_counts[i] += 1;
                                 } else |_| {}
                             }
@@ -3496,13 +3496,13 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
                             const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
                             ctx.partial_accum.sums[i] += val;
-                            ctx.partial_accum.sum_sqs[i] += val * val;
+                            if (spec.func_type == .variance or spec.func_type == .stddev) ctx.partial_accum.sum_sqs[i] += val * val;
                             ctx.partial_accum.sum_counts[i] += 1;
                         } else if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
                                 if (parseNumericFast(record[cidx])) |val| {
                                     ctx.partial_accum.sums[i] += val;
-                                    ctx.partial_accum.sum_sqs[i] += val * val;
+                                    if (spec.func_type == .variance or spec.func_type == .stddev) ctx.partial_accum.sum_sqs[i] += val * val;
                                     ctx.partial_accum.sum_counts[i] += 1;
                                 } else |_| {}
                             }
@@ -4074,13 +4074,13 @@ fn executeGroupBy(
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
                             const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
                             accum.sums[i] += val;
-                            accum.sum_sqs[i] += val * val;
+                            if (spec.func_type == .variance or spec.func_type == .stddev) accum.sum_sqs[i] += val * val;
                             accum.sum_counts[i] += 1;
                         } else if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
                                 if (parseNumericFast(record[cidx])) |val| {
                                     accum.sums[i] += val;
-                                    accum.sum_sqs[i] += val * val;
+                                    if (spec.func_type == .variance or spec.func_type == .stddev) accum.sum_sqs[i] += val * val;
                                     accum.sum_counts[i] += 1;
                                 } else |_| {}
                             }
