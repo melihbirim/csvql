@@ -86,14 +86,18 @@ def same(a, b, tol=1e-6):
     return True
 
 
-# (label, csvql_sql, duckdb_sql). ORDER BY LIMIT compares the sort key only,
-# since ties on non-key columns are an undefined (but valid) ordering in both.
+# (label, csvql_sql, duckdb_sql[, kind]). kind="concat" compares GROUP_CONCAT
+# output as an order-insensitive multiset (neither engine orders the values).
+# ORDER BY LIMIT compares the sort key only, since ties on non-key columns are an
+# undefined (but valid) ordering in both.
 QUERIES = [
     ("COUNT(*)", f"SELECT COUNT(*) FROM '{F}'", f"SELECT COUNT(*) FROM {DK}"),
     ("SUM + AVG GROUP BY", f"SELECT dept, SUM(salary), AVG(salary) FROM '{F}' GROUP BY dept",
      f"SELECT dept, SUM(salary), AVG(salary) FROM {DK} GROUP BY dept"),
     ("VARIANCE + STDDEV GROUP BY", f"SELECT dept, VARIANCE(salary), STDDEV(salary) FROM '{F}' GROUP BY dept",
      f"SELECT dept, VAR_POP(salary), STDDEV_POP(salary) FROM {DK} GROUP BY dept"),
+    ("MEDIAN GROUP BY", f"SELECT dept, MEDIAN(salary) FROM '{F}' GROUP BY dept",
+     f"SELECT dept, median(salary) FROM {DK} GROUP BY dept"),
     ("MIN + MAX GROUP BY", f"SELECT city, MIN(salary), MAX(salary) FROM '{F}' GROUP BY city",
      f"SELECT city, MIN(salary), MAX(salary) FROM {DK} GROUP BY city"),
     ("WHERE filter count", f"SELECT COUNT(*) FROM '{F}' WHERE salary > 150000",
@@ -103,6 +107,8 @@ QUERIES = [
     ("DISTINCT", f"SELECT DISTINCT city FROM '{F}'", f"SELECT DISTINCT city FROM {DK}"),
     ("ORDER BY DESC LIMIT 10", f"SELECT salary FROM '{F}' ORDER BY salary DESC LIMIT 10",
      f"SELECT salary FROM {DK} ORDER BY salary DESC LIMIT 10"),
+    ("GROUP_CONCAT (city per dept)", f"SELECT GROUP_CONCAT(city) FROM '{F}' WHERE age = 21",
+     f"SELECT string_agg(city, ',') FROM {DK} WHERE age = 21", "concat"),
 ]
 
 
@@ -119,9 +125,19 @@ def main():
     print(f"  {'query':30} {'csvql':>8} {'duckdb':>8} {'speedup':>8}  correct")
     print("  " + "-" * 66)
     all_ok = True
-    for label, cq, dq in QUERIES:
+    for q in QUERIES:
+        label, cq, dq = q[0], q[1], q[2]
+        kind = q[3] if len(q) > 3 else None
         ct, dt = best([BIN, cq]), best(["duckdb", "-csv", "-c", dq])
-        ok = same(rows_of(run([BIN, cq])), rows_of(run(["duckdb", "-csv", "-c", dq])))
+        c_out, d_out = run([BIN, cq]), run(["duckdb", "-csv", "-c", dq])
+        if kind == "concat":
+            # single-cell concatenated list — compare as an order-insensitive multiset
+            def multiset(txt):
+                cell = rows_of(txt)[0][0] if rows_of(txt) else ""
+                return sorted(cell.strip('"').split(","))
+            ok = multiset(c_out) == multiset(d_out)
+        else:
+            ok = same(rows_of(c_out), rows_of(d_out))
         all_ok = all_ok and ok
         print(f"  {label:30} {ct:7.3f}s {dt:7.3f}s {dt / ct:7.2f}x  {'MATCH' if ok else 'DIFF'}")
     print(f"\n  correctness: {'all queries match DuckDB' if all_ok else 'MISMATCH — investigate'}")
