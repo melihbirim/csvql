@@ -2760,7 +2760,7 @@ fn executeDistinct(
 
     while (pos < data.len) {
         const line_start = pos;
-        const nl = csv.findRecordEnd(data, pos);
+        const nl = csv.findRecordEnd(data, pos, opts.delimiter);
         var line_end = nl orelse data.len;
         pos = if (nl) |n| n + 1 else data.len;
         if (line_end > line_start and data[line_end - 1] == '\r') line_end -= 1;
@@ -3109,7 +3109,7 @@ fn executeScalarAgg(
         var scan_pos: usize = hinfo.data_start;
         while (scan_pos < data.len) {
             const line_start = scan_pos;
-            const nl = csv.findRecordEnd(data, scan_pos);
+            const nl = csv.findRecordEnd(data, scan_pos, opts.delimiter);
             var line_end = nl orelse data.len;
             scan_pos = if (nl) |n| n + 1 else data.len;
             if (line_end > line_start and data[line_end - 1] == '\r') line_end -= 1;
@@ -4321,7 +4321,7 @@ fn executeGroupBy(
         var pos: usize = hinfo.data_start;
         while (pos < data.len) {
             const line_start = pos;
-            const nl = csv.findRecordEnd(data, pos);
+            const nl = csv.findRecordEnd(data, pos, opts.delimiter);
             var line_end = nl orelse data.len;
             pos = if (nl) |n| n + 1 else data.len;
             if (line_end > line_start and data[line_end - 1] == '\r') line_end -= 1;

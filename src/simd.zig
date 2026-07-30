@@ -23,7 +23,9 @@ pub inline fn parseIntFast(str: []const u8) !i64 {
     while (i < str.len) : (i += 1) {
         const c = str[i];
         if (c < '0' or c > '9') break;
-        result = result * 10 + (c - '0');
+        const digit: i64 = c - '0';
+        if (result > @divTrunc(std.math.maxInt(i64) - digit, 10)) return error.InvalidInput;
+        result = result * 10 + digit;
     }
 
     // Reject strings with non-whitespace chars after the digits.
@@ -251,6 +253,12 @@ test "parseIntFast: float string returns error" {
 
 test "parseIntFast: empty string returns error" {
     try std.testing.expectError(error.InvalidInput, parseIntFast(""));
+}
+
+test "parseIntFast: overflowing 20-digit literal returns error instead of wrapping (issue #98)" {
+    // Larger than i64 max (9223372036854775807) — must error so callers fall
+    // back to parseFloat rather than silently wrapping to a garbage integer.
+    try std.testing.expectError(error.InvalidInput, parseIntFast("99999999999999999999"));
 }
 
 test "stringsEqualFast: equal strings" {

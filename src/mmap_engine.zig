@@ -50,6 +50,67 @@ const appendJsonStringToArena = arena_buffer.appendJsonStringToArena;
 /// Sort entry for ORDER BY — uses fast_sort SortKey
 const MmapSortEntry = fast_sort.SortKey;
 
+/// A row's sort key + output line recorded as (start, len) offsets into the
+/// ORDER BY arena, rather than live slices.
+///
+/// `ArenaBuffer.append` may realloc its backing buffer (see arena_buffer.zig),
+/// which invalidates any slice returned by an earlier `append` call — not just
+/// within the current row, but for every row appended before it, since later
+/// rows keep appending to and potentially reallocating the same shared arena.
+/// Offsets stay valid across reallocation; convert to slices only once all
+/// rows have been appended and the arena is done growing (issue #99).
+const PendingSortEntry = struct {
+    numeric_key: f64,
+    sort_key_start: usize,
+    sort_key_len: usize,
+    line_start: usize,
+    line_len: usize,
+};
+
+/// Append one row's sort key + rendered output line to the ORDER BY arena,
+/// and push the corresponding offsets onto `entries`.
+fn appendSortEntry(
+    a: *ArenaBuffer,
+    entries: *std.ArrayList(PendingSortEntry),
+    allocator: Allocator,
+    format: options_mod.OutputFormat,
+    output_row: []const []const u8,
+    output_header: []const []const u8,
+    order_by_col_idx: usize,
+) !void {
+    const sort_key_start = a.pos;
+    _ = try a.append(output_row[order_by_col_idx]);
+    const sort_key_end = a.pos;
+    const numeric_key = std.fmt.parseFloat(f64, a.data[sort_key_start..sort_key_end]) catch std.math.nan(f64);
+
+    const line_buf_start = a.pos;
+    switch (format) {
+        .csv => {
+            for (output_row, 0..) |field, i| {
+                if (i > 0) _ = try a.append(",");
+                _ = try a.append(field);
+            }
+        },
+        .json, .jsonl => {
+            _ = try a.append("{");
+            for (output_row, 0..) |field, i| {
+                if (i > 0) _ = try a.append(",");
+                try appendJsonStringToArena(a, output_header[i]);
+                _ = try a.append(":");
+                try appendJsonStringToArena(a, field);
+            }
+            _ = try a.append("}");
+        },
+    }
+    try entries.append(allocator, .{
+        .numeric_key = numeric_key,
+        .sort_key_start = sort_key_start,
+        .sort_key_len = sort_key_end - sort_key_start,
+        .line_start = line_buf_start,
+        .line_len = a.pos - line_buf_start,
+    });
+}
+
 pub fn executeMapped(
     allocator: Allocator,
     query: parser.Query,
@@ -163,7 +224,7 @@ pub fn executeMapped(
     }
 
     // ORDER BY support
-    var sort_entries: ?std.ArrayList(MmapSortEntry) = null;
+    var sort_entries: ?std.ArrayList(PendingSortEntry) = null;
     var arena: ?ArenaBuffer = null;
     var order_by_col_idx: ?usize = null;
     defer {
@@ -172,7 +233,7 @@ pub fn executeMapped(
     }
 
     if (query.order_by) |order_by| {
-        sort_entries = std.ArrayList(MmapSortEntry){};
+        sort_entries = std.ArrayList(PendingSortEntry){};
         arena = try ArenaBuffer.init(allocator, 16 * 1024 * 1024); // 16MB initial for large result sets
 
         // Positional ORDER BY: "ORDER BY 1" → position 0 in output
@@ -215,6 +276,8 @@ pub fn executeMapped(
     defer distinct_arena.deinit();
     var distinct_seen = std.StringHashMap(void).init(allocator);
     defer distinct_seen.deinit();
+    var distinct_key_buf = std.ArrayListUnmanaged(u8){};
+    defer distinct_key_buf.deinit(allocator);
 
     // Pre-allocate output row buffer (reused across all rows)
     var output_row = try allocator.alloc([]const u8, output_indices.items.len);
@@ -228,7 +291,7 @@ pub fn executeMapped(
     var line_start: usize = data_start;
     while (line_start < data.len) {
         const remaining = data[line_start..];
-        const line_end = (csv.findRecordEnd(data, line_start) orelse data.len) - line_start;
+        const line_end = (csv.findRecordEnd(data, line_start, opts.delimiter) orelse data.len) - line_start;
 
         var line = remaining[0..line_end];
         // Trim \r if present
@@ -304,18 +367,12 @@ pub fn executeMapped(
 
             // DISTINCT: skip duplicate rows
             if (query.distinct) {
-                var key_buf: [8192]u8 = undefined;
-                var klen: usize = 0;
+                distinct_key_buf.clearRetainingCapacity();
                 for (output_row, 0..) |field, fi| {
-                    if (fi > 0 and klen < key_buf.len) {
-                        key_buf[klen] = 0;
-                        klen += 1;
-                    }
-                    const n = @min(field.len, key_buf.len - klen);
-                    if (n > 0) @memcpy(key_buf[klen..][0..n], field[0..n]);
-                    klen += n;
+                    if (fi > 0) try distinct_key_buf.append(allocator, 0);
+                    try distinct_key_buf.appendSlice(allocator, field);
                 }
-                const row_key = key_buf[0..klen];
+                const row_key = distinct_key_buf.items;
                 if (distinct_seen.contains(row_key)) {
                     line_start += line_end + 1;
                     continue;
@@ -324,35 +381,7 @@ pub fn executeMapped(
             }
 
             if (sort_entries) |*entries| {
-                // Buffer for ORDER BY: store sort key + output line in arena
-                const a = &(arena.?);
-                const sort_key = try a.append(output_row[order_by_col_idx.?]);
-                const numeric_key = std.fmt.parseFloat(f64, sort_key) catch std.math.nan(f64);
-                const line_buf_start = a.pos;
-                switch (opts.format) {
-                    .csv => {
-                        for (output_row, 0..) |field, i| {
-                            if (i > 0) _ = try a.append(",");
-                            _ = try a.append(field);
-                        }
-                    },
-                    .json, .jsonl => {
-                        _ = try a.append("{");
-                        for (output_row, 0..) |field, i| {
-                            if (i > 0) _ = try a.append(",");
-                            try appendJsonStringToArena(a, output_header.items[i]);
-                            _ = try a.append(":");
-                            try appendJsonStringToArena(a, field);
-                        }
-                        _ = try a.append("}");
-                    },
-                }
-                const output_line = a.data[line_buf_start..a.pos];
-                try entries.append(allocator, fast_sort.makeSortKey(
-                    numeric_key,
-                    sort_key,
-                    output_line,
-                ));
+                try appendSortEntry(&(arena.?), entries, allocator, opts.format, output_row, output_header.items, order_by_col_idx.?);
                 rows_written += 1;
             } else {
                 try writer.writeRecord(output_row);
@@ -373,10 +402,23 @@ pub fn executeMapped(
     // Sort and write buffered rows if ORDER BY
     if (sort_entries) |*entries| {
         if (query.order_by) |order_by| {
+            // The arena is done growing now that every row has been appended —
+            // safe to materialize final slices from the recorded offsets (issue #99).
+            const a = &(arena.?);
+            const materialized = try allocator.alloc(MmapSortEntry, entries.items.len);
+            defer allocator.free(materialized);
+            for (entries.items, 0..) |pending, i| {
+                materialized[i] = fast_sort.makeSortKey(
+                    pending.numeric_key,
+                    a.data[pending.sort_key_start..][0..pending.sort_key_len],
+                    a.data[pending.line_start..][0..pending.line_len],
+                );
+            }
+
             const limit: ?usize = if (query.limit >= 0) @intCast(query.limit) else null;
             const sorted = try fast_sort.sortEntries(
                 allocator,
-                entries.items,
+                materialized,
                 order_by.order == .desc,
                 limit,
             );
@@ -398,4 +440,76 @@ pub fn executeMapped(
 
     try writer.finish();
     try writer.flush();
+}
+
+// TDD Test: DISTINCT dedup key must not silently truncate long rows — two
+// rows that share the same first 8192 bytes but differ after that must NOT
+// be collapsed into one (issue #97).
+test "DISTINCT does not falsely collapse rows longer than the dedup key buffer" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const prefix = "A" ** 9000;
+    const data = try std.fmt.allocPrint(allocator, "val\n{s}X\n{s}Y\n", .{ prefix, prefix });
+    defer allocator.free(data);
+
+    const in_file = try tmp.dir.createFile("in.csv", .{ .read = true });
+    defer in_file.close();
+    try in_file.writeAll(data);
+    try in_file.seekTo(0);
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath("in.csv", &path_buf);
+    const sql = try std.fmt.allocPrint(allocator, "SELECT DISTINCT val FROM '{s}'", .{path});
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out_file.close();
+    try executeMapped(allocator, query, in_file, out_file, .{});
+
+    try out_file.seekTo(0);
+    const out = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(out);
+
+    var row_count: usize = 0;
+    for (out) |c| if (c == '\n') {
+        row_count += 1;
+    };
+    // header + 2 distinct rows
+    try std.testing.expectEqual(@as(usize, 3), row_count);
+}
+
+// TDD Test: sort-key/line offsets recorded by appendSortEntry must still
+// resolve to the correct bytes after a LATER row's append forces ArenaBuffer
+// to realloc the shared backing buffer — a raw slice captured at append time
+// would dangle once any subsequent row triggers growth (issue #99).
+test "appendSortEntry offsets survive arena realloc from a later row" {
+    const allocator = std.testing.allocator;
+
+    // Tiny initial size guarantees appending row2 forces a realloc that would
+    // invalidate any slice captured while appending row1.
+    var a = try ArenaBuffer.init(allocator, 4);
+    defer a.deinit();
+    var entries = std.ArrayList(PendingSortEntry){};
+    defer entries.deinit(allocator);
+
+    const header = &[_][]const u8{ "id", "val" };
+
+    var row1 = [_][]const u8{ "1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
+    try appendSortEntry(&a, &entries, allocator, .csv, &row1, header, 1);
+
+    var row2 = [_][]const u8{ "2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" };
+    try appendSortEntry(&a, &entries, allocator, .csv, &row2, header, 1);
+
+    // Materialize only after all rows are appended, per the documented
+    // ArenaBuffer offset pattern.
+    const e1 = entries.items[0];
+    const e2 = entries.items[1];
+    try std.testing.expectEqualStrings(row1[1], a.data[e1.sort_key_start..][0..e1.sort_key_len]);
+    try std.testing.expectEqualStrings("1,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", a.data[e1.line_start..][0..e1.line_len]);
+    try std.testing.expectEqualStrings(row2[1], a.data[e2.sort_key_start..][0..e2.sort_key_len]);
+    try std.testing.expectEqualStrings("2,bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", a.data[e2.line_start..][0..e2.line_len]);
 }

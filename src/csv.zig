@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const options_mod = @import("options.zig");
+const simd = @import("simd.zig");
 
 /// Re-export options so callers that only import csv can access Options/OutputFormat.
 pub const options = options_mod;
@@ -27,23 +28,33 @@ pub const MmapHeader = struct {
 /// Mirrors BulkCsvReader.findRecordEnd in bulk_csv.zig, but works on a plain
 /// slice with an explicit start offset so mmap-based scan loops that don't
 /// go through BulkCsvReader can stay quote-aware too.
-pub fn findRecordEnd(data: []const u8, start: usize) ?usize {
+pub fn findRecordEnd(data: []const u8, start: usize, delimiter: u8) ?usize {
     var i = start;
     var in_quote = false;
+    var at_field_start = true;
     while (i < data.len) {
         const c = data[i];
-        if (c == '"') {
-            if (in_quote) {
+        if (in_quote) {
+            if (c == '"') {
                 if (i + 1 < data.len and data[i + 1] == '"') {
                     i += 2;
                     continue;
                 }
                 in_quote = false;
-            } else {
-                in_quote = true;
+                at_field_start = false;
             }
-        } else if (c == '\n' and !in_quote) {
+            i += 1;
+            continue;
+        }
+        if (c == '"' and at_field_start) {
+            in_quote = true;
+            at_field_start = false;
+        } else if (c == delimiter) {
+            at_field_start = true;
+        } else if (c == '\n') {
             return i;
+        } else {
+            at_field_start = false;
         }
         i += 1;
     }
@@ -54,19 +65,17 @@ pub fn resolveMmapHeader(a: Allocator, data: []const u8, opts: options_mod.Optio
     const nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
     var line = data[0..nl];
     if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-    var n: usize = 1;
-    for (line) |c| if (c == opts.delimiter) {
-        n += 1;
-    };
+
+    var field_buf: [4096][]const u8 = undefined;
+    const n = try simd.parseCSVFieldsStatic(line, &field_buf, opts.delimiter);
+
     const names = try a.alloc([]const u8, n);
     errdefer a.free(names);
     if (opts.no_input_header) {
         for (names, 0..) |*nm, i| nm.* = try std.fmt.allocPrint(a, "c{d}", .{i + 1});
         return .{ .names = names, .data_start = 0, .synth = true };
     }
-    var it = std.mem.splitScalar(u8, line, opts.delimiter);
-    var i: usize = 0;
-    while (it.next()) |col| : (i += 1) names[i] = col;
+    for (names, field_buf[0..n]) |*nm, col| nm.* = col;
     return .{ .names = names, .data_start = nl + 1, .synth = false };
 }
 

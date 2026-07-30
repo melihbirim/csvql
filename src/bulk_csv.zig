@@ -72,21 +72,31 @@ pub const BulkCsvReader = struct {
     fn findRecordEnd(self: *BulkCsvReader) ?usize {
         var i = self.line_start;
         var in_quote = false;
+        var at_field_start = true;
         while (i < self.buffer_len) {
             const c = self.buffer[i];
-            if (c == '"') {
-                if (in_quote) {
+            if (in_quote) {
+                if (c == '"') {
                     // "" inside a quoted field — escaped quote, stay in quoted mode
                     if (i + 1 < self.buffer_len and self.buffer[i + 1] == '"') {
                         i += 2;
                         continue;
                     }
                     in_quote = false;
-                } else {
-                    in_quote = true;
+                    at_field_start = false;
                 }
-            } else if (c == '\n' and !in_quote) {
+                i += 1;
+                continue;
+            }
+            if (c == '"' and at_field_start) {
+                in_quote = true;
+                at_field_start = false;
+            } else if (c == self.delimiter) {
+                at_field_start = true;
+            } else if (c == '\n') {
                 return i;
+            } else {
+                at_field_start = false;
             }
             i += 1;
         }

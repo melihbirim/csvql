@@ -1,6 +1,36 @@
 const std = @import("std");
 const csv = @import("csv");
 
+// TDD Test: findRecordEnd only treats a quote as opening a quoted field
+// when it is the first byte of the field (mirrors CsvReader.readRecord's
+// field_buffer.items.len == 0 check). A stray quote inside an already-started
+// unquoted field must not suppress the record-ending newline (issue #94).
+test "findRecordEnd ignores stray quote inside unquoted field" {
+    const data = "id,note\n1,it's \"cool\n2,fine\n";
+    const header_nl = std.mem.indexOfScalar(u8, data, '\n').?;
+    const record_start = header_nl + 1;
+
+    const end = csv.findRecordEnd(data, record_start, ',');
+    try std.testing.expect(end != null);
+    try std.testing.expectEqualStrings("1,it's \"cool", data[record_start..end.?]);
+}
+
+// TDD Test: resolveMmapHeader must be quote-aware when counting/splitting
+// header columns — a delimiter inside a quoted header field is not a real
+// column separator (issue #95).
+test "resolveMmapHeader handles quoted header field containing delimiter" {
+    const allocator = std.testing.allocator;
+    const data = "\"last,first\",age\nSmith,42\n";
+    const opts = csv.options.Options{};
+
+    var hinfo = try csv.resolveMmapHeader(allocator, data, opts);
+    defer hinfo.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), hinfo.names.len);
+    try std.testing.expectEqualStrings("last,first", hinfo.names[0]);
+    try std.testing.expectEqualStrings("age", hinfo.names[1]);
+}
+
 // TDD Test 6: CsvWriter properly handles all data (no short writes)
 test "CsvWriter writeRecord outputs complete data" {
     const allocator = std.testing.allocator;

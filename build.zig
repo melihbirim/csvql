@@ -313,6 +313,18 @@ pub fn build(b: *std.Build) void {
     const run_bulk_csv_tests = b.addRunArtifact(bulk_csv_tests);
     test_step.dependOn(&run_bulk_csv_tests.step);
 
+    // Mmap engine tests (DISTINCT, ORDER BY, scan paths)
+    const mmap_engine_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/mmap_engine.zig"),
+        }),
+    });
+    mmap_engine_tests.linkLibC();
+    const run_mmap_engine_tests = b.addRunArtifact(mmap_engine_tests);
+    test_step.dependOn(&run_mmap_engine_tests.step);
+
     // Simd utility tests (parseIntFast, stringsEqualFast, parseCSVFields)
     const simd_tests = b.addTest(.{
         .root_module = b.createModule(.{

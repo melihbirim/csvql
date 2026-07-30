@@ -995,11 +995,25 @@ fn parseInComparison(allocator: Allocator, input: []const u8, in_idx: usize) !Ex
         for (values.items) |v| allocator.free(v);
         values.deinit(allocator);
     }
-    var it = std.mem.splitScalar(u8, inner, ',');
-    while (it.next()) |tok| {
-        const t = std.mem.trim(u8, tok, &std.ascii.whitespace);
-        try values.append(allocator, try allocator.dupe(u8, trimQuotes(t)));
+    var in_quote = false;
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < inner.len) : (i += 1) {
+        const c = inner[i];
+        if (in_quote) {
+            if (c == '\'') in_quote = false;
+            continue;
+        }
+        if (c == '\'') {
+            in_quote = true;
+        } else if (c == ',') {
+            const t = std.mem.trim(u8, inner[start..i], &std.ascii.whitespace);
+            try values.append(allocator, try allocator.dupe(u8, trimQuotes(t)));
+            start = i + 1;
+        }
     }
+    const last = std.mem.trim(u8, inner[start..], &std.ascii.whitespace);
+    try values.append(allocator, try allocator.dupe(u8, trimQuotes(last)));
 
     const column_lower = try allocator.alloc(u8, column_part.len);
     errdefer allocator.free(column_lower);

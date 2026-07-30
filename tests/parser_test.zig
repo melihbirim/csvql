@@ -11,6 +11,21 @@ test "Query deinit with SELECT *" {
     try std.testing.expectEqual(@as(usize, 0), query.columns.len);
 }
 
+// TDD Test: IN (...) list splitting must be quote-aware — a comma inside a
+// quoted value is part of the value, not a list separator (issue #96).
+test "IN comparison handles quoted value containing a comma" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(allocator, "SELECT * FROM 'test.csv' WHERE note IN ('a,b', 'c')");
+    defer query.deinit();
+
+    const expr = query.where_expr.?;
+    const in_values = expr.comparison.in_values.?;
+    try std.testing.expectEqual(@as(usize, 2), in_values.len);
+    try std.testing.expectEqualStrings("a,b", in_values[0]);
+    try std.testing.expectEqualStrings("c", in_values[1]);
+}
+
 // TDD Test 2: Query.deinit should not crash when no GROUP BY clause
 test "Query deinit without GROUP BY" {
     const allocator = std.testing.allocator;
