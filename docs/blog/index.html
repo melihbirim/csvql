@@ -1,0 +1,68 @@
+---
+title: "Blog — csvql"
+description: "Notes on building csvql, an analytical CSV query engine for AI agents."
+---
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{% seo %}
+{% feed_meta %}
+<style>
+  :root { --bg:#12121f; --bg2:#16213e; --fg:#e8ecf4; --muted:#8b9bb4; --accent:#f7a41d; --accent2:#ff6f3c; --card:#1a1a2e; --line:#262a44; }
+  * { box-sizing:border-box; }
+  html { scroll-behavior:smooth; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  .wrap { max-width:760px; margin:0 auto; padding:0 20px; }
+  .accent { background:linear-gradient(90deg,var(--accent),var(--accent2)); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  header { text-align:center; padding:56px 20px 32px; background:radial-gradient(ellipse at top,rgba(247,164,29,0.10),transparent 60%); }
+  h1 { font-size:clamp(26px,5vw,38px); margin:0 0 8px; letter-spacing:-0.5px; }
+  .sub { color:var(--muted); font-size:16px; }
+  main { padding:20px 0 60px; }
+  .post { display:block; padding:22px 0; border-top:1px solid var(--line); }
+  .post:hover { text-decoration:none; }
+  .post h2 { margin:0 0 6px; font-size:20px; color:var(--fg); }
+  .post:hover h2 { color:var(--accent); }
+  .post .date { color:var(--muted); font-size:13px; font-family:"SF Mono","Fira Code",monospace; }
+  .post p { margin:8px 0 0; color:var(--muted); font-size:15px; }
+  footer { text-align:center; color:var(--muted); padding:40px 20px; border-top:1px solid var(--line); font-size:14px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <h1>The <span class="accent">csvql</span> blog</h1>
+    <p class="sub">Notes on building an analytical CSV query engine for AI agents.</p>
+  </div>
+</header>
+
+<main class="wrap">
+  <a class="post" href="token-economics-of-querying-a-csv.html">
+    <div class="date">2026-07-30</div>
+    <h2>The Token Economics of Querying a CSV Instead of Pasting It</h2>
+    <p>Pasting an 8 GB CSV into an LLM costs 230 million tokens and still doesn't fit. Querying it costs about 560 tokens, flat, regardless of file size.</p>
+  </a>
+  <a class="post" href="join-performance-vs-duckdb.html">
+    <div class="date">2026-07-30</div>
+    <h2>Why csvql joins beat DuckDB by 50x while aggregates only beat it by 8x</h2>
+    <p>Two query types, two different bottlenecks. What the parallel join probe actually changed, and why the same trick doesn't move the needle on a plain COUNT(*).</p>
+  </a>
+  <a class="post" href="csvql-vs-duckdb-nyc-taxi.html">
+    <div class="date">2026-07-13</div>
+    <h2>I Benchmarked My CSV Engine Against DuckDB on Its Own Dataset. It Found Two Bugs in Mine.</h2>
+    <p>csvql queries raw CSV about 2.8x faster than DuckDB on an 8 GB file, using about 6x less memory and zero extra disk. The benchmark that proved it also surfaced two real bugs.</p>
+  </a>
+</main>
+
+<footer>
+  <div class="wrap">
+    <a href="../index.html">csvql</a> &middot; <a href="https://github.com/melihbirim/csvql">GitHub</a>
+  </div>
+</footer>
+
+</body>
+</html>

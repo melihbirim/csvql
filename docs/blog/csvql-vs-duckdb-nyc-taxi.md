@@ -1,4 +1,9 @@
-# I Benchmarked My CSV Engine Against DuckDB on Its Own Dataset. It Found Two Bugs in Mine.
+---
+layout: post
+title: "I Benchmarked My CSV Engine Against DuckDB on Its Own Dataset. It Found Two Bugs in Mine."
+description: "csvql queries raw CSV about 2.8x faster than DuckDB on an 8 GB file, using about 6x less memory and zero extra disk. The benchmark that proved it also surfaced two real bugs."
+date: 2026-07-13
+---
 
 *csvql queries raw CSV ~2.8x faster than DuckDB on an 8 GB file, using ~6x less memory and zero extra disk — and the benchmark that proved it also surfaced two real bugs I'd never have found otherwise.*
 

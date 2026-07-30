@@ -1,0 +1,14 @@
+markdown: kramdown
+url: "https://melihbirim.github.io"
+baseurl: "/csvql"
+title: "csvql"
+description: "The analytical CSV query engine for AI agents. Run SQL on CSV files in place, no database, no import, MCP-native."
+logo: "/logo.svg"
+social:
+  name: csvql
+  links:
+    - https://github.com/melihbirim/csvql
+plugins:
+  - jekyll-seo-tag
+  - jekyll-sitemap
+  - jekyll-feed
