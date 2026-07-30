@@ -178,14 +178,17 @@ Run the benchmark yourself: [`bench/bench_all.sh --section like`](bench/bench_al
 
 **2M rows, 56 MB CSV, Apple M2 Pro** — INNER JOIN (hash join), via [`bench/bench_all.sh --section join`](bench/bench_all.sh):
 
-| Query                                          | csvql      | DuckDB  | Speedup  |
-| ---------------------------------------------- | ---------- | ------- | -------- |
-| `JOIN departments` (2M × 6)                    | 0.182s     | 0.150s  | 0.8x     |
-| `JOIN SELECT *` (2M × 6, all cols)             | 0.186s     | 0.174s  | 0.9x     |
-| `JOIN bonus` (2M × 50K, numeric key)           | 0.186s     | 0.152s  | 0.9x     |
-| `JOIN cities` (2M × 8)                         | **0.242s** | 1.524s  | **6.3x** |
+| Query                                          | csvql      | DuckDB  | Speedup   |
+| ---------------------------------------------- | ---------- | ------- | --------- |
+| `JOIN departments` (2M × 6)                    | 0.044s     | 2.650s  | **60x**   |
+| `JOIN + WHERE` (2M × 6)                        | 0.034s     | 0.988s  | **29x**   |
+| `JOIN SELECT *` (2M × 6, all cols)             | 0.088s     | 7.832s  | **89x**   |
+| `JOIN cities` (2M × 8)                         | 0.046s     | 2.508s  | **55x**   |
+| `JOIN bonus` (2M × 50K, numeric key)           | 0.032s     | 0.286s  | **9x**    |
+| `3-table JOIN` (2M × 6 × 3)                    | 0.058s     | 3.294s  | **57x**   |
+| `4-table JOIN` (2M × 6 × 3 × 6)               | 0.076s     | 3.948s  | **52x**   |
 
-Joins are the one area where csvql is roughly **on par** with DuckDB rather than ahead — DuckDB's join engine is excellent, and csvql uses a straightforward in-memory hash join. csvql's clear advantage is single-table scans, aggregates, and token-cheap MCP access, not joins.
+The base table is memory-mapped, split into line-aligned chunks, and probed against the right-side hash maps across all cores in parallel — output order in a join is undefined, so each worker streams its matches straight out with no merge step. Combined with cat-speed CSV reading (DuckDB spends most of a join parsing the CSV), joins that used to be roughly on par are now a clear win. Byte-for-byte verified against DuckDB in [`bench/verify_correctness.sh`](bench/verify_correctness.sh).
 
 **NYC Taxi benchmark — 20M rows, 8 GB CSV, Apple M-series** — the canonical [Billion-Taxi-Rides](https://github.com/pdet/taxi-benchmark) queries on [DuckDB's own dataset](https://duckdb.org/2024/10/16/driving-csv-performance-benchmarking-duckdb-with-the-nyc-taxi-dataset). Both engines query the raw uncompressed CSV **directly** (no preload into a native store), cold per run, best-of-5, warm OS cache:
 

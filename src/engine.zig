@@ -1305,6 +1305,85 @@ fn expandAndEmit(merged: [][]const u8, filled_w: usize, step_idx: usize, ctx: *J
     }
 }
 
+/// Per-thread context for a parallel JOIN probe. All the join-shape fields are
+/// shared read-only (the right hash maps are only read during probing, which is
+/// thread-safe); each worker owns its own temp-file writer + row workspaces.
+const JoinWorkerCtx = struct {
+    data: []const u8,
+    chunk_start: usize,
+    chunk_end: usize,
+    delimiter: u8,
+    base_w: usize,
+    total_w: usize,
+    right_maps: []const std.StringHashMap(std.ArrayList([][]const u8)),
+    left_key_idxs: []const usize,
+    right_ws: []const usize,
+    n_steps: usize,
+    final_headers: []const []const u8,
+    output_indices: []const usize,
+    where_merged_idx: ?usize,
+    where_expr: ?parser.Expression,
+    tmp_path: []const u8,
+    opts: options_mod.Options,
+    parent_allocator: Allocator,
+    err: ?anyerror = null,
+};
+
+fn joinWorker(w: *JoinWorkerCtx) void {
+    joinWorkerRun(w) catch |e| {
+        w.err = e;
+    };
+}
+
+fn joinWorkerRun(w: *JoinWorkerCtx) !void {
+    const out = try std.fs.cwd().createFile(w.tmp_path, .{ .truncate = true });
+    defer out.close();
+    var writer = csv.RecordWriter.init(out, w.opts);
+    defer writer.deinit();
+
+    // Thread-local arena: only used for the complex-WHERE row map per leaf; keeps
+    // allocation off the shared allocator (which is not thread-safe).
+    var arena = std.heap.ArenaAllocator.init(w.parent_allocator);
+    defer arena.deinit();
+    const wa = arena.allocator();
+    const merged = try wa.alloc([]const u8, w.total_w);
+    const output_row = try wa.alloc([]const u8, w.output_indices.len);
+
+    var ctx = JoinCtx{
+        .right_maps = w.right_maps,
+        .left_key_idxs = w.left_key_idxs,
+        .right_ws = w.right_ws,
+        .n_steps = w.n_steps,
+        .final_headers = w.final_headers,
+        .output_indices = w.output_indices,
+        .output_row = output_row,
+        .where_merged_idx = w.where_merged_idx,
+        .where_expr = w.where_expr,
+        .writer = &writer,
+        .rows_written = 0,
+        .limit = -1, // parallel path is gated to no-LIMIT queries
+        .allocator = wa,
+    };
+
+    // ponytail: 512-column ceiling matches the other parallel scan paths; a wider
+    // table would fall back to the sequential reader, not corrupt.
+    var field_buf: [512][]const u8 = undefined;
+    var pos = w.chunk_start;
+    while (pos < w.chunk_end) {
+        const nl = std.mem.indexOfScalarPos(u8, w.data, pos, '\n') orelse w.data.len;
+        var end = nl;
+        if (end > pos and w.data[end - 1] == '\r') end -= 1;
+        const line = w.data[pos..end];
+        pos = nl + 1;
+        if (line.len == 0) continue;
+        const rec = splitLine(line, &field_buf, w.delimiter);
+        for (0..w.base_w) |ci| merged[ci] = if (ci < rec.len) rec[ci] else "";
+        try expandAndEmit(merged, w.base_w, 0, &ctx);
+    }
+    try writer.finish();
+    try writer.flush();
+}
+
 /// Execute an INNER JOIN between two or more CSV files using a pipelined hash-join.
 ///
 /// All right-side tables are loaded into hash maps upfront (they are typically small
@@ -1535,6 +1614,78 @@ fn executeJoin(
     var writer = csv.RecordWriter.init(output_file, opts);
     defer writer.deinit();
     try writer.writeHeader(output_header_names.items, opts.no_header);
+
+    // ── Parallel probe ───────────────────────────────────────────────────────
+    // For a large base table with no LIMIT, split it into line-aligned chunks and
+    // run expandAndEmit on worker threads, each writing rows to its own temp CSV,
+    // then concatenate. JOIN output order is undefined, so no ordering is needed.
+    // Gated to CSV output (JSON/JSONL need a single wrapping writer) and to a real
+    // header (headerless base row 0 is handled by the sequential path).
+    parallel: {
+        if (opts.format != .csv) break :parallel;
+        if (opts.no_input_header) break :parallel;
+        if (query.limit >= 0) break :parallel;
+        const nthreads = options_mod.effectiveThreadCount(opts);
+        if (nthreads <= 1) break :parallel;
+        const base_size = (base_file.stat() catch break :parallel).size;
+        if (base_size < 8 * 1024 * 1024) break :parallel; // small base: sequential is fine
+
+        const base_data = mapFile(allocator, base_file, base_size) catch break :parallel;
+        defer unmapFile(allocator, base_data);
+        const header_nl = std.mem.indexOfScalar(u8, base_data, '\n') orelse break :parallel;
+        const chunks = try splitLineChunks(base_data, header_nl + 1, nthreads, aa);
+
+        const tmp_dir: []const u8 = (if (builtin.os.tag == .windows)
+            std.process.getEnvVarOwned(aa, "TEMP")
+        else
+            std.process.getEnvVarOwned(aa, "TMPDIR")) catch (if (builtin.os.tag == .windows) "." else "/tmp");
+        const stamp = std.time.nanoTimestamp();
+
+        const workers = try aa.alloc(JoinWorkerCtx, nthreads);
+        const threads = try aa.alloc(std.Thread, nthreads);
+        for (0..nthreads) |i| {
+            const tmp_path = try std.fmt.allocPrint(aa, "{s}{c}csvql_join_{d}_{d}.tmp", .{ tmp_dir, std.fs.path.sep, stamp, i });
+            workers[i] = .{
+                .data = base_data,
+                .chunk_start = chunks[i][0],
+                .chunk_end = chunks[i][1],
+                .delimiter = opts.delimiter,
+                .base_w = base_w,
+                .total_w = total_w,
+                .right_maps = right_maps,
+                .left_key_idxs = left_key_idxs,
+                .right_ws = right_ws,
+                .n_steps = joins.len,
+                .final_headers = final_headers,
+                .output_indices = output_indices.items,
+                .where_merged_idx = where_merged_idx,
+                .where_expr = query.where_expr,
+                .tmp_path = tmp_path,
+                .opts = opts,
+                .parent_allocator = allocator,
+            };
+        }
+        for (0..nthreads) |i| threads[i] = try std.Thread.spawn(.{}, joinWorker, .{&workers[i]});
+        for (threads) |t| t.join();
+        for (workers) |wk| if (wk.err) |e| return e;
+
+        // Header is already buffered above; flush it, then append each worker's rows.
+        try writer.flush();
+        var copy_buf: [64 * 1024]u8 = undefined;
+        for (workers) |wk| {
+            const tf = try std.fs.cwd().openFile(wk.tmp_path, .{});
+            defer {
+                tf.close();
+                std.fs.cwd().deleteFile(wk.tmp_path) catch {};
+            }
+            while (true) {
+                const n = try tf.read(&copy_buf);
+                if (n == 0) break;
+                try output_file.writeAll(copy_buf[0..n]);
+            }
+        }
+        return;
+    }
 
     var merged_row = try aa.alloc([]const u8, total_w);
     const output_row = try aa.alloc([]const u8, output_indices.items.len);
