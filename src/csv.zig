@@ -19,6 +19,37 @@ pub const MmapHeader = struct {
     }
 };
 
+/// Find the absolute index of the `\n` that ends the CSV record starting at
+/// `start`, skipping `\n` bytes that appear inside a quoted field (RFC 4180
+/// allows literal newlines inside `"..."`). Returns null when the record runs
+/// to the end of `data` with no terminating newline.
+///
+/// Mirrors BulkCsvReader.findRecordEnd in bulk_csv.zig, but works on a plain
+/// slice with an explicit start offset so mmap-based scan loops that don't
+/// go through BulkCsvReader can stay quote-aware too.
+pub fn findRecordEnd(data: []const u8, start: usize) ?usize {
+    var i = start;
+    var in_quote = false;
+    while (i < data.len) {
+        const c = data[i];
+        if (c == '"') {
+            if (in_quote) {
+                if (i + 1 < data.len and data[i + 1] == '"') {
+                    i += 2;
+                    continue;
+                }
+                in_quote = false;
+            } else {
+                in_quote = true;
+            }
+        } else if (c == '\n' and !in_quote) {
+            return i;
+        }
+        i += 1;
+    }
+    return null;
+}
+
 pub fn resolveMmapHeader(a: Allocator, data: []const u8, opts: options_mod.Options) !MmapHeader {
     const nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
     var line = data[0..nl];

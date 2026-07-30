@@ -488,7 +488,7 @@ fn executeSequential(
             defer allocator.free(lower_col);
             _ = std.ascii.lowerString(lower_col, expr);
 
-            const idx = column_map.get(lower_col) orelse return error.ColumnNotFound;
+            const idx = column_map.get(lower_col) orelse return columnLookupError(expr);
             try output_specs.append(allocator, .{ .column = idx });
             try output_header.append(allocator, if (sa.alias) |a| a else header[idx]);
         }
@@ -1041,7 +1041,7 @@ fn executeParallelScalar(
             const lower_col = try allocator.alloc(u8, expr.len);
             defer allocator.free(lower_col);
             _ = std.ascii.lowerString(lower_col, expr);
-            const idx = column_map.get(lower_col) orelse return error.ColumnNotFound;
+            const idx = column_map.get(lower_col) orelse return columnLookupError(expr);
             try output_specs_list.append(allocator, .{ .column = idx });
             try output_header.append(allocator, if (sa.alias) |a| a else header[idx]);
         }
@@ -1809,7 +1809,7 @@ fn executeFromStdin(
             defer allocator.free(lower_col);
             _ = std.ascii.lowerString(lower_col, expr);
 
-            const idx = column_map.get(lower_col) orelse return error.ColumnNotFound;
+            const idx = column_map.get(lower_col) orelse return columnLookupError(expr);
             try output_specs.append(allocator, .{ .column = idx });
             try output_header.append(allocator, if (sa.alias) |a| a else header[idx]);
         }
@@ -2278,6 +2278,17 @@ const CompactAccum = struct {
 /// Fast numeric parser: try fast integer path first (most CSV numbers are
 /// integers), fall back to float.  ~3-4x faster than parseFloat on integer
 /// strings (salary, age, count columns).
+/// A bare column lookup failed. If `expr` looks like an arithmetic expression
+/// (`amt*2`, `price/100`) rather than a real column name, say so instead of
+/// the misleading ColumnNotFound — csvql doesn't evaluate SELECT-list
+/// arithmetic today, and "column not found" reads like a typo in the schema.
+fn columnLookupError(expr: []const u8) anyerror {
+    for (expr) |c| {
+        if (c == '*' or c == '/') return error.ArithmeticExpressionsNotSupported;
+    }
+    return error.ColumnNotFound;
+}
+
 inline fn parseNumericFast(s: []const u8) !f64 {
     if (simd.parseIntFast(s)) |iv| {
         return @as(f64, @floatFromInt(iv));
@@ -2287,14 +2298,13 @@ inline fn parseNumericFast(s: []const u8) !f64 {
 
 /// Split a CSV line into fields using a pre-allocated stack buffer.
 /// Zero-copy: returned slices point into `line`.  Max 256 fields.
+/// Quote-aware via simd.parseCSVFieldsStatic: commas and newlines inside a
+/// quoted field don't split it, and surrounding quotes are stripped. Note:
+/// a doubled `""` escape inside a quoted field is not collapsed to `"` by
+/// that helper (see github.com/melihbirim/csvql/issues/89) — same known gap
+/// as the rest of the zero-copy scan path.
 inline fn splitLine(line: []const u8, buf: [][]const u8, delim: u8) []const []const u8 {
-    var n: usize = 0;
-    var it = std.mem.splitScalar(u8, line, delim);
-    while (it.next()) |f| {
-        if (n >= buf.len) break;
-        buf[n] = f;
-        n += 1;
-    }
+    const n = simd.parseCSVFieldsStatic(line, buf, delim) catch buf.len;
     return buf[0..n];
 }
 
@@ -2750,7 +2760,7 @@ fn executeDistinct(
 
     while (pos < data.len) {
         const line_start = pos;
-        const nl = std.mem.indexOfScalarPos(u8, data, pos, '\n');
+        const nl = csv.findRecordEnd(data, pos);
         var line_end = nl orelse data.len;
         pos = if (nl) |n| n + 1 else data.len;
         if (line_end > line_start and data[line_end - 1] == '\r') line_end -= 1;
@@ -3099,7 +3109,7 @@ fn executeScalarAgg(
         var scan_pos: usize = hinfo.data_start;
         while (scan_pos < data.len) {
             const line_start = scan_pos;
-            const nl = std.mem.indexOfScalarPos(u8, data, scan_pos, '\n');
+            const nl = csv.findRecordEnd(data, scan_pos);
             var line_end = nl orelse data.len;
             scan_pos = if (nl) |n| n + 1 else data.len;
             if (line_end > line_start and data[line_end - 1] == '\r') line_end -= 1;
@@ -4311,7 +4321,7 @@ fn executeGroupBy(
         var pos: usize = hinfo.data_start;
         while (pos < data.len) {
             const line_start = pos;
-            const nl = std.mem.indexOfScalarPos(u8, data, pos, '\n');
+            const nl = csv.findRecordEnd(data, pos);
             var line_end = nl orelse data.len;
             pos = if (nl) |n| n + 1 else data.len;
             if (line_end > line_start and data[line_end - 1] == '\r') line_end -= 1;

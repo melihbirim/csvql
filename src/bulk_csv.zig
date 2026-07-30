@@ -18,6 +18,11 @@ pub const BulkCsvReader = struct {
     // Hard limit: CSVs with more than 256 columns are not supported by this reader.
     // Use csv.CsvReader instead for wide files.
     field_buf: [256][]const u8 = undefined,
+    // Scratch arena for the rare field that contains an escaped "" quote pair
+    // and needs unescaping (parseCSVFieldsStatic returns those unescaped —
+    // see issue #89). Reset every call instead of freed per-field, since the
+    // common case allocates nothing at all.
+    unescape_arena: std.heap.ArenaAllocator,
 
     pub fn init(allocator: Allocator, file: std.fs.File) !BulkCsvReader {
         // Allocate 2MB buffer for bulk reading - fewer syscalls
@@ -31,11 +36,34 @@ pub const BulkCsvReader = struct {
             .buffer_len = 0,
             .eof = false,
             .line_start = 0,
+            .unescape_arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
 
     pub fn deinit(self: *BulkCsvReader) void {
         self.allocator.free(self.buffer);
+        self.unescape_arena.deinit();
+    }
+
+    /// Collapse `""` escape pairs to `"` within an already quote-stripped field.
+    /// Only called when the field is known to contain `""`, so it always
+    /// allocates a (shorter-or-equal) replacement from the reader's scratch arena.
+    fn unescapeQuotes(self: *BulkCsvReader, field: []const u8) ![]const u8 {
+        var out = try self.unescape_arena.allocator().alloc(u8, field.len);
+        var w: usize = 0;
+        var i: usize = 0;
+        while (i < field.len) {
+            if (field[i] == '"' and i + 1 < field.len and field[i + 1] == '"') {
+                out[w] = '"';
+                w += 1;
+                i += 2;
+            } else {
+                out[w] = field[i];
+                w += 1;
+                i += 1;
+            }
+        }
+        return out[0..w];
     }
 
     /// Find the absolute buffer index of the '\n' that ends the current CSV record,
@@ -158,10 +186,18 @@ pub const BulkCsvReader = struct {
         }
     }
 
-    /// Parse a line into field_buf without any allocation.
+    /// Parse a line into field_buf. Zero-copy for the common case; a field
+    /// containing an escaped `""` pair gets unescaped into the reader's
+    /// scratch arena (reset here, so no per-field free is needed).
     /// Quote-aware: quoted fields have their surrounding `"` stripped.
     fn parseLineSlices(self: *BulkCsvReader, line: []const u8) ![]const []const u8 {
+        _ = self.unescape_arena.reset(.retain_capacity);
         const count = try simd.parseCSVFieldsStatic(line, &self.field_buf, self.delimiter);
+        for (self.field_buf[0..count]) |*field| {
+            if (std.mem.indexOf(u8, field.*, "\"\"") != null) {
+                field.* = try self.unescapeQuotes(field.*);
+            }
+        }
         return self.field_buf[0..count];
     }
 
@@ -237,6 +273,8 @@ test "parseLineSlices returns TooManyColumns when row exceeds 256 fields" {
     }
 
     var reader: BulkCsvReader = undefined;
+    reader.unescape_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer reader.unescape_arena.deinit();
     reader.delimiter = ',';
     try std.testing.expectError(error.TooManyColumns, reader.parseLineSlices(line_buf[0..pos]));
 }
@@ -255,6 +293,8 @@ test "parseLineSlices returns exactly 256 fields for a 256-column row" {
     }
 
     var reader: BulkCsvReader = undefined;
+    reader.unescape_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer reader.unescape_arena.deinit();
     reader.delimiter = ',';
     const fields = try reader.parseLineSlices(line_buf[0..pos]);
     try std.testing.expectEqual(@as(usize, 256), fields.len);
@@ -262,6 +302,8 @@ test "parseLineSlices returns exactly 256 fields for a 256-column row" {
 
 test "parseLineSlices: single field with no delimiter" {
     var reader: BulkCsvReader = undefined;
+    reader.unescape_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer reader.unescape_arena.deinit();
     reader.delimiter = ',';
     const fields = try reader.parseLineSlices("onlyvalue");
     try std.testing.expectEqual(@as(usize, 1), fields.len);
@@ -270,6 +312,8 @@ test "parseLineSlices: single field with no delimiter" {
 
 test "parseLineSlices: empty line returns one empty field" {
     var reader: BulkCsvReader = undefined;
+    reader.unescape_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer reader.unescape_arena.deinit();
     reader.delimiter = ',';
     const fields = try reader.parseLineSlices("");
     try std.testing.expectEqual(@as(usize, 1), fields.len);
@@ -278,6 +322,8 @@ test "parseLineSlices: empty line returns one empty field" {
 
 test "parseLineSlices: custom tab delimiter" {
     var reader: BulkCsvReader = undefined;
+    reader.unescape_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer reader.unescape_arena.deinit();
     reader.delimiter = '\t';
     const fields = try reader.parseLineSlices("col1\tcol2\tcol3");
     try std.testing.expectEqual(@as(usize, 3), fields.len);

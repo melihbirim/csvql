@@ -24,6 +24,26 @@ fn unmapFile(allocator: Allocator, data: []const u8) void {
         std.posix.munmap(@alignCast(data));
     }
 }
+/// Collapse `""` escape pairs to `"` within an already quote-stripped field.
+/// Only called when the field is known to contain `""` — see issue #89.
+fn unescapeQuotesArena(arena: *std.heap.ArenaAllocator, field: []const u8) ![]const u8 {
+    const out = try arena.allocator().alloc(u8, field.len);
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < field.len) {
+        if (field[i] == '"' and i + 1 < field.len and field[i + 1] == '"') {
+            out[w] = '"';
+            w += 1;
+            i += 2;
+        } else {
+            out[w] = field[i];
+            w += 1;
+            i += 1;
+        }
+    }
+    return out[0..w];
+}
+
 const ArenaBuffer = arena_buffer.ArenaBuffer;
 const appendJsonStringToArena = arena_buffer.appendJsonStringToArena;
 
@@ -41,6 +61,12 @@ pub fn executeMapped(
 
     const data = try mapFile(allocator, input_file, file_size);
     defer unmapFile(allocator, data);
+
+    // Scratch arena for the rare field containing an escaped "" quote pair,
+    // which simd.parseCSVFieldsStatic returns unescaped (issue #89). Reset
+    // every row; the common case allocates nothing.
+    var unescape_arena = std.heap.ArenaAllocator.init(allocator);
+    defer unescape_arena.deinit();
 
     // Find end of header line
     const header_end = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
@@ -202,7 +228,7 @@ pub fn executeMapped(
     var line_start: usize = data_start;
     while (line_start < data.len) {
         const remaining = data[line_start..];
-        const line_end = std.mem.indexOfScalar(u8, remaining, '\n') orelse data.len - line_start;
+        const line_end = (csv.findRecordEnd(data, line_start) orelse data.len) - line_start;
 
         var line = remaining[0..line_end];
         // Trim \r if present
@@ -215,6 +241,12 @@ pub fn executeMapped(
             var field_buf: [256][]const u8 = undefined;
             const field_count = simd.parseCSVFieldsStatic(line, &field_buf, opts.delimiter) catch break;
             const fields = field_buf[0..field_count];
+            _ = unescape_arena.reset(.retain_capacity);
+            for (fields) |*field| {
+                if (std.mem.indexOf(u8, field.*, "\"\"") != null) {
+                    field.* = unescapeQuotesArena(&unescape_arena, field.*) catch field.*;
+                }
+            }
 
             // Fast WHERE evaluation
             if (query.where_expr) |expr| {
