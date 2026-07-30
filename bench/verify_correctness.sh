@@ -317,6 +317,82 @@ check \
 
 # ════════════════════════════════════════════════════════════════
 echo ""
+echo "── JOIN (hash-join, exercises parallel probe on large base) ─"
+
+# Lookup tables (small right side)
+DEPTS="$TMP/depts.csv"
+cat > "$DEPTS" <<'EOF'
+dept_name,region,budget_code
+Engineering,West,ENG-001
+Finance,East,FIN-002
+HR,Central,HR-003
+Marketing,East,MKT-004
+Operations,West,OPS-005
+Sales,Central,SAL-006
+EOF
+
+CITIES="$TMP/cities.csv"
+cat > "$CITIES" <<'EOF'
+city,state,timezone
+Austin,TX,CDT
+Boston,MA,EDT
+Chicago,IL,CDT
+Denver,CO,MDT
+LA,CA,PDT
+NYC,NY,EDT
+SF,CA,PDT
+Seattle,WA,PDT
+EOF
+
+BONUS="$TMP/bonus_50k.csv"
+awk -F, 'NR==1{print "emp_id,bonus_pct"} NR>1&&NR<=50001{printf "%s,%.2f\n",$1,($5*0.1)}' "$CSV" > "$BONUS"
+
+REGIONS="$TMP/regions.csv"
+cat > "$REGIONS" <<'EOF'
+region_name,continent
+West,North America
+East,North America
+Central,North America
+EOF
+
+# Join output order is undefined; pass "" to sort whole lines before diff.
+check \
+  "JOIN departments" \
+  "SELECT e.name, e.salary, d.region FROM '$CSV' e INNER JOIN '$DEPTS' d ON e.department = d.dept_name" \
+  "SELECT e.name, e.salary, d.region FROM read_csv_auto('$CSV') AS e JOIN read_csv_auto('$DEPTS') AS d ON e.department = d.dept_name" \
+  ""
+
+check \
+  "JOIN departments + WHERE region" \
+  "SELECT e.name, e.salary, d.region FROM '$CSV' e INNER JOIN '$DEPTS' d ON e.department = d.dept_name WHERE d.region = 'West'" \
+  "SELECT e.name, e.salary, d.region FROM read_csv_auto('$CSV') AS e JOIN read_csv_auto('$DEPTS') AS d ON e.department = d.dept_name WHERE d.region = 'West'" \
+  ""
+
+check \
+  "JOIN SELECT *" \
+  "SELECT * FROM '$CSV' e INNER JOIN '$DEPTS' d ON e.department = d.dept_name" \
+  "SELECT * FROM read_csv_auto('$CSV') AS e JOIN read_csv_auto('$DEPTS') AS d ON e.department = d.dept_name" \
+  ""
+
+check \
+  "JOIN cities" \
+  "SELECT e.name, e.city, c.state, c.timezone FROM '$CSV' e INNER JOIN '$CITIES' c ON e.city = c.city" \
+  "SELECT e.name, e.city, c.state, c.timezone FROM read_csv_auto('$CSV') AS e JOIN read_csv_auto('$CITIES') AS c ON e.city = c.city" \
+  ""
+
+check_approx \
+  "JOIN 50K right on numeric id" \
+  "SELECT e.name, e.salary, b.bonus_pct FROM '$CSV' e INNER JOIN '$BONUS' b ON e.id = b.emp_id" \
+  "SELECT e.name, e.salary, b.bonus_pct FROM read_csv_auto('$CSV') AS e JOIN read_csv_auto('$BONUS') AS b ON e.id::TEXT = b.emp_id::TEXT"
+
+check \
+  "3-table JOIN departments then regions" \
+  "SELECT e.name, e.salary, d.region, r.continent FROM '$CSV' e INNER JOIN '$DEPTS' d ON e.department = d.dept_name INNER JOIN '$REGIONS' r ON d.region = r.region_name" \
+  "SELECT e.name, e.salary, d.region, r.continent FROM read_csv_auto('$CSV') AS e JOIN read_csv_auto('$DEPTS') AS d ON e.department = d.dept_name JOIN read_csv_auto('$REGIONS') AS r ON d.region = r.region_name" \
+  ""
+
+# ════════════════════════════════════════════════════════════════
+echo ""
 echo "── Summary ─────────────────────────────────────────────────"
 echo "  Total:  $TOTAL"
 printf "  Pass:   ${GREEN}%d${RESET}\n" $PASS
