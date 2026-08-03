@@ -129,9 +129,11 @@ pub fn executeMapped(
     var unescape_arena = std.heap.ArenaAllocator.init(allocator);
     defer unescape_arena.deinit();
 
-    // Find end of header line
+    // Find end of header line. Strip a leading UTF-8 BOM (Excel's "CSV UTF-8"
+    // export writes one) so it doesn't glue onto the first column name (#103).
+    const bom_len: usize = if (std.mem.startsWith(u8, data, "\xEF\xBB\xBF")) 3 else 0;
     const header_end = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
-    const header_line_raw = data[0..header_end];
+    const header_line_raw = data[bom_len..header_end];
     // Strip trailing \r for CRLF files
     const header_line = if (header_line_raw.len > 0 and header_line_raw[header_line_raw.len - 1] == '\r') header_line_raw[0 .. header_line_raw.len - 1] else header_line_raw;
 

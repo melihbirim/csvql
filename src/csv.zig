@@ -61,9 +61,15 @@ pub fn findRecordEnd(data: []const u8, start: usize, delimiter: u8) ?usize {
     return null;
 }
 
+/// UTF-8 byte order mark. Excel's "CSV UTF-8" export writes one at the very
+/// start of the file; left in place it glues onto the first header name and
+/// breaks every lookup for that column (issue #103).
+const bom = "\xEF\xBB\xBF";
+
 pub fn resolveMmapHeader(a: Allocator, data: []const u8, opts: options_mod.Options) !MmapHeader {
+    const bom_len: usize = if (std.mem.startsWith(u8, data, bom)) bom.len else 0;
     const nl = std.mem.indexOfScalar(u8, data, '\n') orelse return error.NoHeader;
-    var line = data[0..nl];
+    var line = data[bom_len..nl];
     if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
 
     var field_buf: [4096][]const u8 = undefined;

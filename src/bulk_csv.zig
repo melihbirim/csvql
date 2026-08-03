@@ -25,6 +25,17 @@ pub const BulkCsvReader = struct {
     unescape_arena: std.heap.ArenaAllocator,
 
     pub fn init(allocator: Allocator, file: std.fs.File) !BulkCsvReader {
+        // Skip a leading UTF-8 BOM (Excel's "CSV UTF-8" export writes one) so
+        // it doesn't glue onto the first header name and break column lookup
+        // for that column (issue #103).
+        var bom_probe: [3]u8 = undefined;
+        const probe_n = file.pread(&bom_probe, 0) catch 0;
+        if (probe_n == 3 and std.mem.eql(u8, &bom_probe, "\xEF\xBB\xBF")) {
+            try file.seekTo(3);
+        } else {
+            try file.seekTo(0);
+        }
+
         // Allocate 2MB buffer for bulk reading - fewer syscalls
         const buffer = try allocator.alloc(u8, 2 * 1024 * 1024);
         return BulkCsvReader{
