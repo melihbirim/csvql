@@ -160,7 +160,7 @@ pub fn executeMapped(
         const lower_name = try allocator.alloc(u8, col_name.len);
         _ = std.ascii.lowerString(lower_name, col_name);
         lower_header[idx] = lower_name;
-        try column_map.put(lower_name, idx);
+        _ = try column_map.getOrPutValue(lower_name, idx); // first occurrence of a duplicate header name wins (#102)
     }
 
     // Determine output columns

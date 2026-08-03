@@ -456,7 +456,7 @@ fn executeSequential(
         const lower_name = try allocator.alloc(u8, col_name.len);
         _ = std.ascii.lowerString(lower_name, col_name);
         lower_header[idx] = lower_name;
-        try column_map.put(lower_name, idx);
+        _ = try column_map.getOrPutValue(lower_name, idx); // first occurrence of a duplicate header name wins (#102)
     }
 
     // Determine output columns
@@ -1014,7 +1014,7 @@ fn executeParallelScalar(
         const lower = try allocator.alloc(u8, col.len);
         _ = std.ascii.lowerString(lower, col);
         lower_header_buf[idx] = lower;
-        try column_map.put(lower, idx);
+        _ = try column_map.getOrPutValue(lower, idx); // first occurrence of a duplicate header name wins (#102)
     }
     const lower_header: []const []const u8 = lower_header_buf;
 
@@ -1777,7 +1777,7 @@ fn executeFromStdin(
         const lower_name = try allocator.alloc(u8, col_name.len);
         _ = std.ascii.lowerString(lower_name, col_name);
         lower_header[idx] = lower_name;
-        try column_map.put(lower_name, idx);
+        _ = try column_map.getOrPutValue(lower_name, idx); // first occurrence of a duplicate header name wins (#102)
     }
 
     // Determine output columns
@@ -2663,7 +2663,7 @@ fn executeDistinct(
         const lower = try allocator.alloc(u8, col_name.len);
         _ = std.ascii.lowerString(lower, col_name);
         lower_header[idx] = lower;
-        try column_map.put(lower, idx);
+        _ = try column_map.getOrPutValue(lower, idx); // first occurrence of a duplicate header name wins (#102)
     }
 
     // Resolve output column indices
@@ -2921,7 +2921,7 @@ fn executeScalarAgg(
         const lower = try allocator.alloc(u8, col_name.len);
         _ = std.ascii.lowerString(lower, col_name);
         lower_header[idx] = lower;
-        try column_map.put(lower, idx);
+        _ = try column_map.getOrPutValue(lower, idx); // first occurrence of a duplicate header name wins (#102)
     }
 
     // -- Resolve SELECT into ColKind + AggSpec lists --
@@ -3903,7 +3903,7 @@ fn executeGroupBy(
         const lower = try allocator.alloc(u8, col_name.len);
         _ = std.ascii.lowerString(lower, col_name);
         lower_header[idx] = lower;
-        try column_map.put(lower, idx);
+        _ = try column_map.getOrPutValue(lower, idx); // first occurrence of a duplicate header name wins (#102)
     }
 
     // -- Resolve GROUP BY columns -------------------------------------------
