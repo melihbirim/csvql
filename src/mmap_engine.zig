@@ -158,7 +158,8 @@ pub fn executeMapped(
         allocator.free(lower_header);
     }
 
-    for (header.items, 0..) |col_name, idx| {
+    for (header.items, 0..) |col_name_raw, idx| {
+        const col_name = std.mem.trim(u8, col_name_raw, " \t\r\n"); // trim header whitespace (#101)
         const lower_name = try allocator.alloc(u8, col_name.len);
         _ = std.ascii.lowerString(lower_name, col_name);
         lower_header[idx] = lower_name;
@@ -197,7 +198,7 @@ pub fn executeMapped(
 
     if (query.all_columns) {
         for (output_indices.items) |idx| {
-            try output_header.append(allocator, header.items[idx]);
+            try output_header.append(allocator, std.mem.trim(u8, header.items[idx], " \t\r\n")); // trim header whitespace (#101)
         }
     } else {
         for (query.columns) |col| {

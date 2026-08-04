@@ -451,7 +451,8 @@ fn executeSequential(
         allocator.free(lower_header);
     }
 
-    for (header, 0..) |col_name, idx| {
+    for (header, 0..) |col_name_raw, idx| {
+        const col_name = std.mem.trim(u8, col_name_raw, " \t\r\n"); // trim header whitespace (#101)
         // Store lowercase version for case-insensitive lookup
         const lower_name = try allocator.alloc(u8, col_name.len);
         _ = std.ascii.lowerString(lower_name, col_name);
@@ -469,7 +470,7 @@ fn executeSequential(
     if (query.all_columns) {
         for (header, 0..) |col_name, idx| {
             try output_specs.append(allocator, .{ .column = idx });
-            try output_header.append(allocator, col_name);
+            try output_header.append(allocator, std.mem.trim(u8, col_name, " \t\r\n")); // trim header whitespace (#101)
         }
     } else {
         for (query.columns) |col| {
@@ -490,7 +491,7 @@ fn executeSequential(
 
             const idx = column_map.get(lower_col) orelse return columnLookupError(expr);
             try output_specs.append(allocator, .{ .column = idx });
-            try output_header.append(allocator, if (sa.alias) |a| a else header[idx]);
+            try output_header.append(allocator, if (sa.alias) |a| a else std.mem.trim(u8, header[idx], " \t\r\n")); // trim header whitespace (#101)
         }
     }
 
@@ -1010,7 +1011,8 @@ fn executeParallelScalar(
     }
     var column_map = std.StringHashMap(usize).init(allocator);
     defer column_map.deinit();
-    for (header, 0..) |col, idx| {
+    for (header, 0..) |col_raw, idx| {
+        const col = std.mem.trim(u8, col_raw, " \t\r\n"); // trim header whitespace (#101)
         const lower = try allocator.alloc(u8, col.len);
         _ = std.ascii.lowerString(lower, col);
         lower_header_buf[idx] = lower;
@@ -1027,7 +1029,7 @@ fn executeParallelScalar(
     if (query.all_columns) {
         for (header, 0..) |col_name, idx| {
             try output_specs_list.append(allocator, .{ .column = idx });
-            try output_header.append(allocator, col_name);
+            try output_header.append(allocator, std.mem.trim(u8, col_name, " \t\r\n")); // trim header whitespace (#101)
         }
     } else {
         for (query.columns) |col| {
@@ -1043,7 +1045,7 @@ fn executeParallelScalar(
             _ = std.ascii.lowerString(lower_col, expr);
             const idx = column_map.get(lower_col) orelse return columnLookupError(expr);
             try output_specs_list.append(allocator, .{ .column = idx });
-            try output_header.append(allocator, if (sa.alias) |a| a else header[idx]);
+            try output_header.append(allocator, if (sa.alias) |a| a else std.mem.trim(u8, header[idx], " \t\r\n")); // trim header whitespace (#101)
         }
     }
     const output_specs = output_specs_list.items;
@@ -1773,7 +1775,8 @@ fn executeFromStdin(
         allocator.free(lower_header);
     }
 
-    for (header, 0..) |col_name, idx| {
+    for (header, 0..) |col_name_raw, idx| {
+        const col_name = std.mem.trim(u8, col_name_raw, " \t\r\n"); // trim header whitespace (#101)
         const lower_name = try allocator.alloc(u8, col_name.len);
         _ = std.ascii.lowerString(lower_name, col_name);
         lower_header[idx] = lower_name;
@@ -1790,7 +1793,7 @@ fn executeFromStdin(
     if (query.all_columns) {
         for (header, 0..) |col_name, idx| {
             try output_specs.append(allocator, .{ .column = idx });
-            try output_header.append(allocator, col_name);
+            try output_header.append(allocator, std.mem.trim(u8, col_name, " \t\r\n")); // trim header whitespace (#101)
         }
     } else {
         for (query.columns) |col| {
@@ -1811,7 +1814,7 @@ fn executeFromStdin(
 
             const idx = column_map.get(lower_col) orelse return columnLookupError(expr);
             try output_specs.append(allocator, .{ .column = idx });
-            try output_header.append(allocator, if (sa.alias) |a| a else header[idx]);
+            try output_header.append(allocator, if (sa.alias) |a| a else std.mem.trim(u8, header[idx], " \t\r\n")); // trim header whitespace (#101)
         }
     }
 
@@ -2659,7 +2662,8 @@ fn executeDistinct(
     }
     var column_map = std.StringHashMap(usize).init(allocator);
     defer column_map.deinit();
-    for (header, 0..) |col_name, idx| {
+    for (header, 0..) |col_name_raw, idx| {
+        const col_name = std.mem.trim(u8, col_name_raw, " \t\r\n"); // trim header whitespace (#101)
         const lower = try allocator.alloc(u8, col_name.len);
         _ = std.ascii.lowerString(lower, col_name);
         lower_header[idx] = lower;
@@ -2917,7 +2921,8 @@ fn executeScalarAgg(
     }
     var column_map = std.StringHashMap(usize).init(allocator);
     defer column_map.deinit();
-    for (header, 0..) |col_name, idx| {
+    for (header, 0..) |col_name_raw, idx| {
+        const col_name = std.mem.trim(u8, col_name_raw, " \t\r\n"); // trim header whitespace (#101)
         const lower = try allocator.alloc(u8, col_name.len);
         _ = std.ascii.lowerString(lower, col_name);
         lower_header[idx] = lower;
@@ -3007,7 +3012,7 @@ fn executeScalarAgg(
             _ = std.ascii.lowerString(lower, effective_col);
             const cidx = column_map.get(lower) orelse return error.ColumnNotFound;
             try col_kinds.append(allocator, .{ .regular = cidx });
-            try out_header_list.append(allocator, if (sa.alias) |a| a else header[cidx]);
+            try out_header_list.append(allocator, if (sa.alias) |a| a else std.mem.trim(u8, header[cidx], " \t\r\n")); // trim header whitespace (#101)
         }
     }
     try writer.writeHeader(out_header_list.items, opts.no_header);
@@ -3251,13 +3256,20 @@ fn executeScalarAgg(
                 const cnt: u32 = if (accum.distinct_sets[i]) |ds| ds.count() else 0;
                 break :blk try std.fmt.allocPrint(allocator, "{d}", .{cnt});
             },
-            .sum => try fmtAggrF64(allocator, accum.sums[i], spec.round_digits),
+            .sum => blk: {
+                // SQL semantics: SUM over zero matching rows is NULL, not 0 (issue #104).
+                // COUNT is the only aggregate where "no rows" and "0" coincide.
+                break :blk if (accum.sum_counts[i] > 0)
+                    try fmtAggrF64(allocator, accum.sums[i], spec.round_digits)
+                else
+                    try allocator.dupe(u8, "");
+            },
             .avg => blk: {
                 const cnt = accum.sum_counts[i];
                 break :blk if (cnt > 0)
                     try fmtAggrF64(allocator, accum.sums[i] / @as(f64, @floatFromInt(cnt)), spec.round_digits)
                 else
-                    try allocator.dupe(u8, "0");
+                    try allocator.dupe(u8, "");
             },
             .min => blk: {
                 const v = accum.mins[i];
@@ -3899,7 +3911,8 @@ fn executeGroupBy(
     }
     var column_map = std.StringHashMap(usize).init(allocator);
     defer column_map.deinit();
-    for (header, 0..) |col_name, idx| {
+    for (header, 0..) |col_name_raw, idx| {
+        const col_name = std.mem.trim(u8, col_name_raw, " \t\r\n"); // trim header whitespace (#101)
         const lower = try allocator.alloc(u8, col_name.len);
         _ = std.ascii.lowerString(lower, col_name);
         lower_header[idx] = lower;
@@ -4087,7 +4100,7 @@ fn executeGroupBy(
                 _ = std.ascii.lowerString(lower, effective_col);
                 if (column_map.get(lower)) |cidx| {
                     try col_kinds.append(allocator, .{ .regular = cidx });
-                    try out_header_list.append(allocator, if (sa.alias) |a| a else header[cidx]);
+                    try out_header_list.append(allocator, if (sa.alias) |a| a else std.mem.trim(u8, header[cidx], " \t\r\n")); // trim header whitespace (#101)
                 } else {
                     // Maybe a STRFTIME/SUBSTR expression that also appears in GROUP BY
                     var gi_found: ?usize = null;
@@ -4567,13 +4580,19 @@ fn executeGroupBy(
                     const cnt: u32 = if (accum.distinct_sets[i]) |ds| ds.count() else 0;
                     break :blk try std.fmt.allocPrint(allocator, "{d}", .{cnt});
                 },
-                .sum => try fmtAggrF64(allocator, accum.sums[i], spec.round_digits),
+                .sum => blk: {
+                    // SQL semantics: SUM over zero matching rows is NULL, not 0 (issue #104).
+                    break :blk if (accum.sum_counts[i] > 0)
+                        try fmtAggrF64(allocator, accum.sums[i], spec.round_digits)
+                    else
+                        try allocator.dupe(u8, "");
+                },
                 .avg => blk: {
                     const cnt = accum.sum_counts[i];
                     break :blk if (cnt > 0)
                         try fmtAggrF64(allocator, accum.sums[i] / @as(f64, @floatFromInt(cnt)), spec.round_digits)
                     else
-                        try allocator.dupe(u8, "0");
+                        try allocator.dupe(u8, "");
                 },
                 .min => blk: {
                     const v = accum.mins[i];
