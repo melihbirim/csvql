@@ -44,7 +44,7 @@ description: "Notes on building csvql, an analytical CSV query engine for AI age
   <a class="post" href="csvql-vs-pandas.html">
     <div class="date">2026-08-05</div>
     <h2>csvql vs pandas: Querying a CSV Without Loading It First</h2>
-    <p>pandas needs to load the whole file into a DataFrame before you can ask it anything. csvql doesn't. That difference is 15 to 19x on speed and about 4x on memory, even before counting the load step pandas can't skip.</p>
+    <p>pandas needs to load the whole file into a DataFrame before you can ask it anything. csvql doesn't. That's 17 to 24x tuned, 50 to 76x against how most pandas code is actually written, plus about 4x less memory.</p>
   </a>
   <a class="post" href="what-one-comment-found.html">
     <div class="date">2026-08-04</div>

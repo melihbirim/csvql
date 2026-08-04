@@ -77,17 +77,23 @@ def csvql_run(sql):
 
 
 print(f"\n  csvql vs pandas — {CSV}  ({os.path.getsize(CSV) / 1e6:.0f} MB, best-of-{RUNS})\n")
-print(f"  {'query':<45} {'csvql':>10} {'pandas':>10} {'ratio':>8}")
+print(f"  {'query':<45} {'csvql':>10} {'pandas':>10} {'ratio':>8}   {'pandas(no usecols)':>20} {'ratio':>8}")
 
 for label, sql, pandas_op in QUERIES:
     csvql_t = best_of(lambda: csvql_run(sql), RUNS)
 
-    def pandas_full():
+    def pandas_usecols():
         df = pd.read_csv(CSV, usecols=USE_COLS)
         pandas_op(df)
 
-    pandas_t = best_of(pandas_full, RUNS)
-    ratio = pandas_t / csvql_t
-    print(f"  {label:<45} {csvql_t:>9.3f}s {pandas_t:>9.3f}s {ratio:>7.1f}x")
+    def pandas_naive():
+        df = pd.read_csv(CSV)
+        pandas_op(df)
+
+    pandas_uc_t = best_of(pandas_usecols, RUNS)
+    pandas_naive_t = best_of(pandas_naive, RUNS)
+    ratio_uc = pandas_uc_t / csvql_t
+    ratio_naive = pandas_naive_t / csvql_t
+    print(f"  {label:<45} {csvql_t:>9.3f}s {pandas_uc_t:>9.3f}s {ratio_uc:>7.1f}x   {pandas_naive_t:>19.3f}s {ratio_naive:>7.1f}x")
 
 print()

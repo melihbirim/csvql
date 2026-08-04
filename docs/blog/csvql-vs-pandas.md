@@ -1,7 +1,7 @@
 ---
 layout: post
 title: "csvql vs pandas: Querying a CSV Without Loading It First"
-description: "pandas needs to load the whole file into a DataFrame before you can ask it anything. csvql doesn't. On the same NYC taxi queries, that difference is 15 to 19x on speed and about 4x on memory, even before counting the load step pandas can't skip."
+description: "pandas needs to load the whole file into a DataFrame before you can ask it anything. csvql doesn't. On the same NYC taxi queries, that's 17 to 24x with pandas tuned via usecols, and 50 to 76x against how most pandas code is actually written."
 date: 2026-08-05
 ---
 
@@ -11,20 +11,20 @@ pandas is the default tool most people reach for to look at a CSV in Python. It'
 
 Same dataset as the [DuckDB benchmark](csvql-vs-duckdb-nyc-taxi.html): a 425 MB, 1 million row slice of the NYC taxi dataset. Same rule too: both sides do the same work, cold, every run. pandas has no "query the file in place" mode, so its side is `pd.read_csv()` followed by the pandas-equivalent operation. That's not a handicap, that's how you use pandas.
 
-To keep it fair to pandas, I passed `usecols` with exactly the columns each query needs, the way anyone optimizing pandas code actually would. Four queries, best of 3 runs each:
+I ran this two ways, both real, both reproducible with the same script. First, tuned: pandas gets `usecols` with exactly the columns each query needs, the way anyone optimizing pandas code actually would. Second, naive: a plain `pd.read_csv(file)`, which is what most pandas code actually looks like day to day, nobody hand-picks columns for a quick script. Four queries, best of 3 runs each:
 
-| Query | csvql | pandas | Speedup |
-| ----- | ----- | ------ | ------- |
-| COUNT(*) GROUP BY cab_type | **0.079s** | 1.186s | **15.0x** |
-| AVG(total_amount) GROUP BY passenger_count | **0.062s** | 1.178s | **19.1x** |
-| COUNT(*) WHERE trip_distance > 5 | **0.059s** | 1.138s | **19.4x** |
-| Top 3 passenger_count by AVG(tip_amount) | **0.063s** | 1.175s | **18.6x** |
+| Query | csvql | pandas (usecols) | Speedup | pandas (no usecols) | Speedup |
+| ----- | ----- | ----------------- | ------- | -------------------- | ------- |
+| COUNT(*) GROUP BY cab_type | **0.071s** | 1.704s | **24.1x** | 5.356s | **75.8x** |
+| AVG(total_amount) GROUP BY passenger_count | **0.086s** | 1.697s | **19.8x** | 5.115s | **59.6x** |
+| COUNT(*) WHERE trip_distance > 5 | **0.091s** | 1.751s | **19.2x** | 5.131s | **56.3x** |
+| Top 3 passenger_count by AVG(tip_amount) | **0.102s** | 1.688s | **16.6x** | 5.138s | **50.5x** |
 
 Both sides agree on the actual numbers, this isn't a case of one engine cutting corners: `cab_type` groups came back `green: 32447, yellow: 967553` identically on both.
 
 ## Where the time actually goes
 
-pandas' per-query time barely moves between these four queries, 1.14 to 1.19 seconds each. That's not coincidence, it's `pd.read_csv()` itself dominating. The actual `groupby` or filter afterward is fast, DataFrames are good at that part. The cost is parsing 425 MB of CSV text into a DataFrame before any of that can start, and pandas pays that cost fresh on every single call because there's no persistent structure sitting between your query and the file.
+pandas' per-query time barely moves within either column, 1.69 to 1.75 seconds tuned, 5.1 to 5.4 seconds naive. That's not coincidence, it's `pd.read_csv()` itself dominating both. The actual `groupby` or filter afterward is fast, DataFrames are good at that part. The cost is parsing 425 MB of CSV text into a DataFrame before any of that can start, and pandas pays that cost fresh on every single call because there's no persistent structure sitting between your query and the file. Skipping unused columns with `usecols` helps a lot, about 3x here, but it's still an order of magnitude slower than not building a DataFrame at all.
 
 csvql pays a version of that same parsing cost, but it's an order of magnitude cheaper, because it never builds a DataFrame. It scans the raw bytes, applies the query while scanning, and emits only the result rows. No intermediate object graph, no dtype inference across 51 columns you're not using, no Python-object overhead per cell.
 
