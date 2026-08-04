@@ -45,6 +45,14 @@ csvql doesn't have an "efficient mode" you opt into. There's no DataFrame constr
 
 pandas earns its dominance for a different job: once the data is loaded, transforming it, joining it against other in-memory structures, feeding it into a model, is exactly what DataFrames are for. If that's the job, load it once and reuse it. But "I have a CSV and one question about it" is a much more common task than that framing gives it credit for, and paying a multi-second, near-gigabyte tax for a single `groupby` is the wrong trade for it.
 
+## Before you even get to run a query
+
+There's a cost before any of the numbers above: getting pandas installed in the first place. `pip install pandas` pulls in numpy and python-dateutil as required dependencies, not optional ones. A clean install in a fresh virtualenv took about 18 seconds on a normal connection, and the installed footprint is around 106 MB (pandas plus numpy alone). That's before you've written a single line of your own code.
+
+csvql is a single static binary with zero runtime dependencies, about 1.2 MB. `brew install melihbirim/csvql/csvql` and it's done, no interpreter, no package resolver, nothing else to pull in.
+
+None of this matters if pandas is already sitting in your environment for other reasons, it usually is. But for a throwaway script, a CI job, or a container image where every dependency is something else to build, patch, and audit, that gap compounds. A 1.2 MB binary with nothing behind it is a fundamentally smaller thing to trust than 106 MB of C-extension-backed Python packages.
+
 ## Reproduce it
 
 ```bash
