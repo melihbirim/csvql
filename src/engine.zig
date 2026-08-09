@@ -837,7 +837,7 @@ fn scalarProcessChunk(ctx: *ScalarWorkerCtx) !void {
 
         var scan: usize = 0;
         while (scan < n) {
-            const nl = std.mem.indexOfScalarPos(u8, io_buf, scan, '\n') orelse {
+            const nl = csv.findRecordEnd(io_buf[0..n], scan, ctx.delimiter) orelse {
                 try seam_buf.appendSlice(ctx.allocator, io_buf[scan..n]);
                 break;
             };
@@ -857,15 +857,15 @@ fn scalarProcessChunk(ctx: *ScalarWorkerCtx) !void {
 
             _ = row_arena.reset(.retain_capacity);
 
-            // Parse all fields into stack buffer (zero-alloc)
-            var n_fields: usize = 0;
-            var it = std.mem.splitScalar(u8, line, ctx.delimiter);
-            while (it.next()) |f| {
-                if (n_fields >= field_buf.len) break;
-                field_buf[n_fields] = f;
-                n_fields += 1;
-            }
+            // Parse all fields (quote-aware: commas/newlines inside quotes don't
+            // split the row, surrounding quotes are stripped) — issue #93.
+            const n_fields = simd.parseCSVFieldsStatic(line, &field_buf, ctx.delimiter) catch continue;
             const fields = field_buf[0..n_fields];
+            for (fields) |*f| {
+                if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
+                    f.* = unescapeQuotesArenaAlloc(row_arena.allocator(), f.*) catch f.*;
+                }
+            }
 
             // WHERE filter
             if (ctx.where_expr) |expr| {
@@ -929,14 +929,13 @@ fn scalarProcessChunk(ctx: *ScalarWorkerCtx) !void {
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
         if (line.len == 0) break :flush;
         _ = row_arena.reset(.retain_capacity);
-        var n_fields: usize = 0;
-        var it = std.mem.splitScalar(u8, line, ctx.delimiter);
-        while (it.next()) |f| {
-            if (n_fields >= field_buf.len) break;
-            field_buf[n_fields] = f;
-            n_fields += 1;
-        }
+        const n_fields = simd.parseCSVFieldsStatic(line, &field_buf, ctx.delimiter) catch break :flush;
         const fields = field_buf[0..n_fields];
+        for (fields) |*f| {
+            if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
+                f.* = unescapeQuotesArenaAlloc(row_arena.allocator(), f.*) catch f.*;
+            }
+        }
         if (ctx.where_expr) |expr| {
             if (expr == .comparison) {
                 const comp = expr.comparison;
@@ -1090,10 +1089,10 @@ fn executeParallelScalar(
         var end = if (i == n_threads - 1) data.len else data_start + (i + 1) * chunk_size;
         // Align to line boundaries
         if (i > 0) {
-            if (std.mem.indexOfScalarPos(u8, data, start, '\n')) |nl| start = nl + 1;
+            if (csv.findRecordEnd(data, start, opts.delimiter)) |nl| start = nl + 1;
         }
         if (i < n_threads - 1) {
-            if (std.mem.indexOfScalarPos(u8, data, end, '\n')) |nl| end = nl + 1;
+            if (csv.findRecordEnd(data, end, opts.delimiter)) |nl| end = nl + 1;
         }
         worker_ctxs[i] = ScalarWorkerCtx{
             .file_path = query.file_path,
@@ -1374,15 +1373,26 @@ fn joinWorkerRun(w: *JoinWorkerCtx) !void {
     // ponytail: 512-column ceiling matches the other parallel scan paths; a wider
     // table would fall back to the sequential reader, not corrupt.
     var field_buf: [512][]const u8 = undefined;
+    // Scratch arena for the rare field containing an escaped "" quote pair
+    // (issue #89). Reset every row — `wa` is the whole-worker scratch buffer
+    // and deliberately not reset per row (no-per-row-alloc hot loop).
+    var unescape_arena = std.heap.ArenaAllocator.init(w.parent_allocator);
+    defer unescape_arena.deinit();
     var pos = w.chunk_start;
     while (pos < w.chunk_end) {
-        const nl = std.mem.indexOfScalarPos(u8, w.data, pos, '\n') orelse w.data.len;
+        const nl = csv.findRecordEnd(w.data, pos, w.delimiter) orelse w.data.len;
         var end = nl;
         if (end > pos and w.data[end - 1] == '\r') end -= 1;
         const line = w.data[pos..end];
         pos = nl + 1;
         if (line.len == 0) continue;
         const rec = splitLine(line, &field_buf, w.delimiter);
+        _ = unescape_arena.reset(.retain_capacity);
+        for (field_buf[0..rec.len]) |*f| {
+            if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
+                f.* = unescapeQuotesArenaAlloc(unescape_arena.allocator(), f.*) catch f.*;
+            }
+        }
         for (0..w.base_w) |ci| merged[ci] = if (ci < rec.len) rec[ci] else "";
         try expandAndEmit(merged, w.base_w, 0, &ctx);
     }
@@ -1639,7 +1649,7 @@ fn executeJoin(
         const base_data = mapFile(allocator, base_file, base_size) catch break :parallel;
         defer unmapFile(allocator, base_data);
         const header_nl = std.mem.indexOfScalar(u8, base_data, '\n') orelse break :parallel;
-        const chunks = try splitLineChunks(base_data, header_nl + 1, nthreads, aa);
+        const chunks = try splitLineChunks(base_data, header_nl + 1, nthreads, aa, opts.delimiter);
 
         const tmp_dir: []const u8 = (if (builtin.os.tag == .windows)
             std.process.getEnvVarOwned(aa, "TEMP")
@@ -2294,6 +2304,28 @@ fn columnLookupError(expr: []const u8) anyerror {
         if (c == '*' or c == '/') return error.ArithmeticExpressionsNotSupported;
     }
     return error.ColumnNotFound;
+}
+
+/// Collapse `""` escape pairs to `"` within an already quote-stripped field.
+/// Only called when the field is known to contain `""` — see issue #89.
+/// Used by the parallel worker threads (#93), which each reset their own
+/// per-row arena so this never accumulates across rows.
+fn unescapeQuotesArenaAlloc(alloc: Allocator, field: []const u8) ![]const u8 {
+    const out = try alloc.alloc(u8, field.len);
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < field.len) {
+        if (field[i] == '"' and i + 1 < field.len and field[i + 1] == '"') {
+            out[w] = '"';
+            w += 1;
+            i += 2;
+        } else {
+            out[w] = field[i];
+            w += 1;
+            i += 1;
+        }
+    }
+    return out[0..w];
 }
 
 inline fn parseNumericFast(s: []const u8) !f64 {
@@ -3047,7 +3079,7 @@ fn executeScalarAgg(
     const num_cores_sa = options_mod.effectiveThreadCount(opts);
     if (num_cores_sa > 1 and file_size > 10 * 1024 * 1024) {
         const n_threads = num_cores_sa;
-        const chunks = try splitLineChunks(data, hinfo.data_start, n_threads, allocator);
+        const chunks = try splitLineChunks(data, hinfo.data_start, n_threads, allocator, opts.delimiter);
         defer allocator.free(chunks);
 
         var thread_ctxs = try allocator.alloc(ScalarAggWorkerCtx, n_threads);
@@ -3331,6 +3363,7 @@ fn splitLineChunks(
     data_start: usize,
     n: usize,
     allocator: Allocator,
+    delimiter: u8,
 ) ![][2]usize {
     const result = try allocator.alloc([2]usize, n);
     const body_len = data.len - data_start;
@@ -3339,10 +3372,10 @@ fn splitLineChunks(
         var start = data_start + i * chunk_size;
         var end = if (i + 1 == n) data.len else data_start + (i + 1) * chunk_size;
         if (i > 0) {
-            if (std.mem.indexOfScalarPos(u8, data, start, '\n')) |nl| start = nl + 1;
+            if (csv.findRecordEnd(data, start, delimiter)) |nl| start = nl + 1;
         }
         if (i + 1 < n) {
-            if (std.mem.indexOfScalarPos(u8, data, end, '\n')) |nl| end = nl + 1;
+            if (csv.findRecordEnd(data, end, delimiter)) |nl| end = nl + 1;
         }
         result[i] = .{ start, end };
     }
@@ -3378,8 +3411,17 @@ fn gbProcessRecord(
     field_stk: *[256][]const u8,
     key_buf: *std.ArrayListUnmanaged(u8),
     line: []const u8,
+    unescape_arena: *std.heap.ArenaAllocator,
 ) !void {
     const record = splitLine(line, field_stk, ctx.delimiter);
+    // Unescape any field containing an escaped "" quote pair (issue #89).
+    // Reset every row — `aa` lives for the whole chunk, this doesn't.
+    _ = unescape_arena.reset(.retain_capacity);
+    for (field_stk[0..record.len]) |*f| {
+        if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
+            f.* = unescapeQuotesArenaAlloc(unescape_arena.allocator(), f.*) catch f.*;
+        }
+    }
 
     // WHERE filter
     if (ctx.where_expr) |expr| {
@@ -3568,6 +3610,12 @@ fn gbWorkerScan(ctx: *GbWorkerCtx) !void {
     var field_stk: [256][]const u8 = undefined;
     var key_buf = std.ArrayListUnmanaged(u8){};
 
+    // Scratch arena for the rare field containing an escaped "" quote pair
+    // (issue #89). Reset every row inside gbProcessRecord; `aa` lives for
+    // the whole chunk and would leak if used for this instead.
+    var unescape_arena = std.heap.ArenaAllocator.init(ctx.arena.child_allocator);
+    defer unescape_arena.deinit();
+
     var file_pos: usize = ctx.chunk_start;
     while (file_pos < ctx.chunk_end) {
         const to_read = @min(IO_BUF, ctx.chunk_end - file_pos);
@@ -3577,7 +3625,7 @@ fn gbWorkerScan(ctx: *GbWorkerCtx) !void {
 
         var scan: usize = 0;
         while (scan < n) {
-            const nl = std.mem.indexOfScalarPos(u8, io_buf, scan, '\n') orelse {
+            const nl = csv.findRecordEnd(io_buf[0..n], scan, ctx.delimiter) orelse {
                 try seam_buf.appendSlice(aa, io_buf[scan..n]);
                 break;
             };
@@ -3594,14 +3642,14 @@ fn gbWorkerScan(ctx: *GbWorkerCtx) !void {
             if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
             scan = nl + 1;
             if (line.len == 0) continue;
-            try gbProcessRecord(ctx, aa, &field_stk, &key_buf, line);
+            try gbProcessRecord(ctx, aa, &field_stk, &key_buf, line, &unescape_arena);
         }
     }
     // Flush any partial line remaining in the seam buffer
     if (seam_buf.items.len > 0) {
         var line: []const u8 = seam_buf.items;
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-        if (line.len > 0) try gbProcessRecord(ctx, aa, &field_stk, &key_buf, line);
+        if (line.len > 0) try gbProcessRecord(ctx, aa, &field_stk, &key_buf, line, &unescape_arena);
     }
 }
 
@@ -3642,6 +3690,12 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
 
     var field_stk: [256][]const u8 = undefined;
 
+    // Scratch arena for the rare field containing an escaped "" quote pair
+    // (issue #89). Reset every row, unlike `aa` which lives for the whole
+    // chunk — the common unescaped case allocates nothing here.
+    var unescape_arena = std.heap.ArenaAllocator.init(ctx.arena.child_allocator);
+    defer unescape_arena.deinit();
+
     var file_pos: usize = ctx.chunk_start;
     while (file_pos < ctx.chunk_end) {
         const to_read = @min(IO_BUF, ctx.chunk_end - file_pos);
@@ -3651,7 +3705,7 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
 
         var scan: usize = 0;
         while (scan < n) {
-            const nl = std.mem.indexOfScalarPos(u8, io_buf, scan, '\n') orelse {
+            const nl = csv.findRecordEnd(io_buf[0..n], scan, ctx.delimiter) orelse {
                 try seam_buf.appendSlice(aa, io_buf[scan..n]);
                 break;
             };
@@ -3670,6 +3724,12 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
             if (line.len == 0) continue;
 
             const record = splitLine(line, &field_stk, ctx.delimiter);
+            _ = unescape_arena.reset(.retain_capacity);
+            for (field_stk[0..record.len]) |*f| {
+                if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
+                    f.* = unescapeQuotesArenaAlloc(unescape_arena.allocator(), f.*) catch f.*;
+                }
+            }
             if (ctx.where_expr) |expr| {
                 if (expr == .comparison) {
                     const comp = expr.comparison;
@@ -3777,6 +3837,12 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
         if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
         if (line.len > 0) row: {
             const record = splitLine(line, &field_stk, ctx.delimiter);
+            _ = unescape_arena.reset(.retain_capacity);
+            for (field_stk[0..record.len]) |*f| {
+                if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
+                    f.* = unescapeQuotesArenaAlloc(unescape_arena.allocator(), f.*) catch f.*;
+                }
+            }
             if (ctx.where_expr) |expr| {
                 if (expr == .comparison) {
                     const comp = expr.comparison;
@@ -4209,7 +4275,7 @@ fn executeGroupBy(
     const num_cores = options_mod.effectiveThreadCount(opts);
     if (num_cores > 1 and file_size > 10 * 1024 * 1024) {
         const n_threads = num_cores;
-        const chunks = try splitLineChunks(data, hinfo.data_start, n_threads, allocator);
+        const chunks = try splitLineChunks(data, hinfo.data_start, n_threads, allocator, opts.delimiter);
         defer allocator.free(chunks);
 
         var thread_ctxs = try allocator.alloc(GbWorkerCtx, n_threads);

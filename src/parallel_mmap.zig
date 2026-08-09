@@ -24,6 +24,28 @@ fn unmapFile(allocator: Allocator, data: []const u8) void {
     }
 }
 
+/// Collapse `""` escape pairs to `"` within an already quote-stripped field.
+/// Only called when the field is known to contain `""` — see issue #89.
+/// simd.parseCSVFieldsStatic (the zero-copy variant used in this file) does
+/// not unescape; simd.parseCSVFields (the allocating variant) already does.
+fn unescapeQuotesArena(arena: *std.heap.ArenaAllocator, field: []const u8) ![]const u8 {
+    const out = try arena.allocator().alloc(u8, field.len);
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < field.len) {
+        if (field[i] == '"' and i + 1 < field.len and field[i + 1] == '"') {
+            out[w] = '"';
+            w += 1;
+            i += 2;
+        } else {
+            out[w] = field[i];
+            w += 1;
+            i += 1;
+        }
+    }
+    return out[0..w];
+}
+
 const WorkChunk = struct {
     start: usize,
     end: usize,
@@ -204,12 +226,12 @@ pub fn executeParallelMapped(
         var end = if (i == num_threads - 1) data.len else data_start + ((i + 1) * chunk_size);
 
         if (i > 0) {
-            if (std.mem.indexOfScalarPos(u8, data, start, '\n')) |newline| {
+            if (csv.findRecordEnd(data, start, opts.delimiter)) |newline| {
                 start = newline + 1;
             }
         }
         if (i < num_threads - 1) {
-            if (std.mem.indexOfScalarPos(u8, data, end, '\n')) |newline| {
+            if (csv.findRecordEnd(data, end, opts.delimiter)) |newline| {
                 end = newline + 1;
             }
         }
@@ -314,6 +336,12 @@ pub fn executeParallelMapped(
         var ob_distinct_seen = std.StringHashMap(void).init(allocator);
         defer ob_distinct_seen.deinit();
 
+        // Scratch arena for the rare field containing an escaped "" quote pair
+        // (issue #89). Reset every row; ob_distinct_arena above must persist
+        // for the whole loop instead, so it can't double as this scratch space.
+        var unescape_arena = std.heap.ArenaAllocator.init(allocator);
+        defer unescape_arena.deinit();
+
         var written: usize = 0;
         for (sorted) |entry| {
             if (query.limit >= 0 and written >= @as(usize, @intCast(query.limit))) break;
@@ -321,6 +349,12 @@ pub fn executeParallelMapped(
             // Parse the raw line to extract output columns (quote-aware)
             var field_buf: [256][]const u8 = undefined;
             const field_count = simd.parseCSVFieldsStatic(entry.line, &field_buf, opts.delimiter) catch continue;
+            _ = unescape_arena.reset(.retain_capacity);
+            for (field_buf[0..field_count]) |*f| {
+                if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
+                    f.* = unescapeQuotesArena(&unescape_arena, f.*) catch f.*;
+                }
+            }
 
             for (output_indices.items, 0..) |idx, j| {
                 output_row[j] = if (idx < field_count) field_buf[idx] else "";
@@ -497,7 +531,7 @@ fn processSortChunk(ctx: *SortWorkerContext) !void {
     var line_start: usize = 0;
     while (line_start < chunk_data.len) {
         const remaining = chunk_data[line_start..];
-        const line_end = std.mem.indexOfScalar(u8, remaining, '\n') orelse chunk_data.len - line_start;
+        const line_end = (csv.findRecordEnd(chunk_data, line_start, ctx.delimiter) orelse chunk_data.len) - line_start;
 
         var line = remaining[0..line_end];
         if (line.len > 0 and line[line.len - 1] == '\r') {
@@ -713,7 +747,7 @@ fn processChunk(ctx: *WorkerContext) !void {
 
             var scan: usize = 0;
             while (scan < n) {
-                const nl = std.mem.indexOfScalarPos(u8, io_buf, scan, '\n') orelse {
+                const nl = csv.findRecordEnd(io_buf[0..n], scan, ctx.delimiter) orelse {
                     try seam_buf.appendSlice(arena_alloc, io_buf[scan..n]);
                     break;
                 };
@@ -746,7 +780,7 @@ fn processChunk(ctx: *WorkerContext) !void {
         var line_start: usize = 0;
         while (line_start < chunk_data.len) {
             const remaining = chunk_data[line_start..];
-            const line_end = std.mem.indexOfScalar(u8, remaining, '\n') orelse chunk_data.len - line_start;
+            const line_end = (csv.findRecordEnd(chunk_data, line_start, ctx.delimiter) orelse chunk_data.len) - line_start;
             var line = remaining[0..line_end];
             if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
             if (line.len > 0) try processOneLine(ctx, arena_alloc, &fields, line);
