@@ -758,10 +758,15 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
         };
     }
 
-    // Parse LIMIT clause if present
+    // Parse LIMIT clause if present. A negative value is invalid SQL, not a
+    // synonym for "no limit" — reject it explicitly rather than let it reach
+    // the query.limit < 0 sentinel used downstream to mean "no LIMIT clause
+    // was given at all" (issue #106).
     if (limit_idx) |idx| {
         const limit_part = std.mem.trim(u8, rest[idx + 5 ..], &std.ascii.whitespace);
-        query.limit = try std.fmt.parseInt(i32, limit_part, 10);
+        const parsed_limit = try std.fmt.parseInt(i32, limit_part, 10);
+        if (parsed_limit < 0) return error.NegativeLimitNotAllowed;
+        query.limit = parsed_limit;
     }
 
     return query;
