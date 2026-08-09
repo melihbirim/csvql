@@ -294,6 +294,17 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 | **ORDER BY**  | `ORDER BY col [ASC\|DESC]`, multi-column `ORDER BY col1 ASC, col2 DESC`, alias, or positional (`ORDER BY 1`) |
 | **LIMIT**     | `LIMIT n`                                                               |
 
+### Known differences from DuckDB
+
+Two intentional differences, found via differential testing against DuckDB (see the [blog post](https://melihbirim.github.io/csvql/blog/what-one-comment-found.html)) and kept as-is rather than "fixed", documented here so they don't surprise anyone migrating queries:
+
+| Behavior | csvql | DuckDB |
+| -------- | ----- | ------ |
+| `LENGTH(col)` on a unicode string | Byte length (UTF-8 bytes) | Character count (codepoints) |
+| Empty CSV field | Stays an empty string | Inferred as `NULL` |
+
+If you need character count instead of byte length, or NULL instead of empty-string semantics, be aware the two engines diverge here rather than assume identical output.
+
 ### Aggregate Examples
 
 ```bash
