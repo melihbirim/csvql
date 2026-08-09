@@ -249,6 +249,10 @@ fn hasScalarSelectFunctions(query: parser.Query) bool {
     for (query.columns) |col| {
         const sa = splitAlias(col);
         const e = std.mem.trim(u8, sa.expr, &std.ascii.whitespace);
+        // Bare CASE WHEN (not wrapped in an aggregate) has no parens at all,
+        // so it needs the scalar path too — SUM(CASE WHEN ...) still starts
+        // with "SUM(" and is unaffected, that stays on the aggregate path (#105).
+        if (std.ascii.startsWithIgnoreCase(e, "case ")) return true;
         const open = std.mem.indexOf(u8, e, "(") orelse continue;
         const fn_raw = std.mem.trim(u8, e[0..open], &std.ascii.whitespace);
         // Skip empty (would be a syntax error anyway)
@@ -4666,6 +4670,17 @@ fn executeGroupBy(
                         .split_part => |*a| a.col_idx = 0,
                         .greatest, .least => |*a| for (a.colsMut()) |*ci| {
                             ci.* = 0;
+                        },
+                        .case_when => |*cw| {
+                            cw.cond_col_idx = 0;
+                            switch (cw.then_val) {
+                                .col_idx => |*ci| ci.* = 0,
+                                else => {},
+                            }
+                            switch (cw.else_val) {
+                                .col_idx => |*ci| ci.* = 0,
+                                else => {},
+                            }
                         },
                     }
                     break :blk scalar.eval(adj_spec, &rec, gb_scalar_arena.allocator());

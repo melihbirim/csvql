@@ -41,6 +41,7 @@ pub const ScalarSpec = union(enum) {
     split_part: SplitPartArgs, // SPLIT_PART(col, 'delim', n) — n-th field (1-based)
     greatest: VariadicArgs, // GREATEST(a, b, ...) — row-wise max
     least: VariadicArgs, // LEAST(a, b, ...) — row-wise min
+    case_when: CaseWhenArgs, // bare CASE WHEN ... THEN ... ELSE ... END (#105)
 
     pub const ReplaceArgs = struct {
         col_idx: usize,
@@ -115,6 +116,29 @@ pub const ScalarSpec = union(enum) {
         digits: u8, // number of decimal places (0 = round to integer)
     };
 
+    /// THEN/ELSE branch value for a bare CASE WHEN (issue #105): a quoted
+    /// string literal, a bare numeric literal, or a column reference.
+    pub const CaseValue = union(enum) {
+        string_lit: []const u8,
+        numeric_lit: f64,
+        col_idx: usize,
+    };
+
+    pub const CaseOp = enum { eq, ne, gt, ge, lt, le };
+
+    /// A bare `CASE WHEN col op value THEN a ELSE b END` in a plain SELECT
+    /// column (not wrapped in an aggregate — that path is parseCaseAggCall
+    /// in engine.zig, numeric-only). Single condition, no AND/OR/nesting,
+    /// same scope the aggregate version already supports.
+    pub const CaseWhenArgs = struct {
+        cond_col_idx: usize,
+        op: CaseOp,
+        rhs_numeric: ?f64, // set when the WHEN condition's RHS is numeric
+        rhs_string: ?[]const u8, // set when the WHEN condition's RHS is a string literal
+        then_val: CaseValue,
+        else_val: CaseValue,
+    };
+
     /// Return the primary column index this spec operates on.
     pub fn colIdx(self: ScalarSpec) usize {
         return switch (self) {
@@ -129,6 +153,7 @@ pub const ScalarSpec = union(enum) {
             .replace => |a| a.col_idx,
             .split_part => |a| a.col_idx,
             .greatest, .least => |a| a.cols()[0],
+            .case_when => |a| a.cond_col_idx,
         };
     }
 };
@@ -156,6 +181,15 @@ pub fn tryParseScalar(
     allocator: Allocator,
 ) !?ScalarSpec {
     const t = std.mem.trim(u8, expr, &std.ascii.whitespace);
+
+    // Bare CASE WHEN has no parens at all, so it must be checked before the
+    // paren-based dispatch below rejects it outright (#105).
+    if (std.ascii.startsWithIgnoreCase(t, "case")) {
+        if (try tryParseCaseWhen(t, column_map, allocator)) |args| {
+            return .{ .case_when = args };
+        }
+        return null;
+    }
 
     // Must have balanced parens: '(' somewhere and ')' as last non-whitespace char.
     const open = std.mem.indexOf(u8, t, "(") orelse return null;
@@ -426,6 +460,98 @@ pub fn tryParseScalar(
     return null; // not a recognized scalar function
 }
 
+/// Parse a bare `CASE WHEN col op value THEN a ELSE b END` (no outer
+/// aggregate wrapper — that's parseCaseAggCall in engine.zig). `t` is
+/// already known to start with "CASE" (case-insensitive).
+/// Single condition, no AND/OR/nesting — same scope as the aggregate version.
+fn tryParseCaseWhen(t: []const u8, column_map: std.StringHashMap(usize), allocator: Allocator) !?ScalarSpec.CaseWhenArgs {
+    const after_case = std.mem.trim(u8, t[4..], &std.ascii.whitespace);
+    if (after_case.len < 5 or !std.ascii.eqlIgnoreCase(after_case[0..5], "WHEN ")) return null;
+    const cond_and_rest = after_case[5..];
+
+    const then_idx = std.ascii.indexOfIgnoreCase(cond_and_rest, " THEN ") orelse return null;
+    const cond_str = std.mem.trim(u8, cond_and_rest[0..then_idx], &std.ascii.whitespace);
+    const after_then = cond_and_rest[then_idx + 6 ..];
+
+    const else_idx = std.ascii.indexOfIgnoreCase(after_then, " ELSE ") orelse return null;
+    const then_str = std.mem.trim(u8, after_then[0..else_idx], &std.ascii.whitespace);
+    const after_else = after_then[else_idx + 6 ..];
+
+    const else_str = blk: {
+        const trimmed_end = std.mem.trim(u8, after_else, &std.ascii.whitespace);
+        if (trimmed_end.len >= 3 and std.ascii.eqlIgnoreCase(trimmed_end[trimmed_end.len - 3 ..], "END")) {
+            break :blk std.mem.trim(u8, trimmed_end[0 .. trimmed_end.len - 3], &std.ascii.whitespace);
+        }
+        return null;
+    };
+
+    // Condition: "<col> <op> <value>" — single comparison, matching the
+    // aggregate CASE WHEN's scope. Find the operator by scanning for the
+    // longest match first so ">=" doesn't get cut short as ">".
+    const Op = struct { text: []const u8, op: ScalarSpec.CaseOp };
+    const ops = [_]Op{
+        .{ .text = "!=", .op = .ne },
+        .{ .text = "<>", .op = .ne },
+        .{ .text = ">=", .op = .ge },
+        .{ .text = "<=", .op = .le },
+        .{ .text = "=", .op = .eq },
+        .{ .text = ">", .op = .gt },
+        .{ .text = "<", .op = .lt },
+    };
+    var found_op: ?ScalarSpec.CaseOp = null;
+    var op_pos: usize = 0;
+    var op_len: usize = 0;
+    for (ops) |o| {
+        if (std.mem.indexOf(u8, cond_str, o.text)) |pos| {
+            if (found_op == null or pos < op_pos) {
+                found_op = o.op;
+                op_pos = pos;
+                op_len = o.text.len;
+            }
+        }
+    }
+    const op = found_op orelse return null;
+    const cond_col_str = std.mem.trim(u8, cond_str[0..op_pos], &std.ascii.whitespace);
+    const rhs_str = std.mem.trim(u8, cond_str[op_pos + op_len ..], &std.ascii.whitespace);
+
+    const cond_col_idx = try resolveCol(cond_col_str, column_map, allocator) orelse
+        return error.ColumnNotFound;
+
+    var rhs_numeric: ?f64 = null;
+    var rhs_string: ?[]const u8 = null;
+    if (rhs_str.len >= 2 and rhs_str[0] == '\'' and rhs_str[rhs_str.len - 1] == '\'') {
+        rhs_string = rhs_str[1 .. rhs_str.len - 1];
+    } else if (std.fmt.parseFloat(f64, rhs_str)) |v| {
+        rhs_numeric = v;
+    } else |_| {
+        return null; // unrecognized RHS — not a column ref, matches aggregate CASE's scope
+    }
+
+    const then_val = try parseCaseValue(then_str, column_map, allocator);
+    const else_val = try parseCaseValue(else_str, column_map, allocator);
+
+    return ScalarSpec.CaseWhenArgs{
+        .cond_col_idx = cond_col_idx,
+        .op = op,
+        .rhs_numeric = rhs_numeric,
+        .rhs_string = rhs_string,
+        .then_val = then_val,
+        .else_val = else_val,
+    };
+}
+
+/// THEN/ELSE branch: quoted string literal, numeric literal, or column reference.
+fn parseCaseValue(s: []const u8, column_map: std.StringHashMap(usize), allocator: Allocator) !ScalarSpec.CaseValue {
+    if (s.len >= 2 and s[0] == '\'' and s[s.len - 1] == '\'') {
+        return .{ .string_lit = s[1 .. s.len - 1] };
+    }
+    if (std.fmt.parseFloat(f64, s)) |v| {
+        return .{ .numeric_lit = v };
+    } else |_| {}
+    const idx = try resolveCol(s, column_map, allocator) orelse return error.ColumnNotFound;
+    return .{ .col_idx = idx };
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Evaluation
 // ──────────────────────────────────────────────────────────────────────────────
@@ -635,7 +761,43 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
             const buf = arena.alloc(u8, 32) catch return "0";
             return std.fmt.bufPrint(buf, "{d}", .{result}) catch "0";
         },
+        .case_when => |args| {
+            const fv = field(record, args.cond_col_idx);
+            var matches = false;
+            if (args.rhs_numeric) |threshold| {
+                const val = std.fmt.parseFloat(f64, fv) catch {
+                    return resolveCaseValue(args.else_val, record, arena);
+                };
+                matches = switch (args.op) {
+                    .eq => val == threshold,
+                    .ne => val != threshold,
+                    .gt => val > threshold,
+                    .ge => val >= threshold,
+                    .lt => val < threshold,
+                    .le => val <= threshold,
+                };
+            } else if (args.rhs_string) |rhs| {
+                // Only equality/inequality are meaningful for string comparisons.
+                matches = switch (args.op) {
+                    .eq => std.mem.eql(u8, fv, rhs),
+                    .ne => !std.mem.eql(u8, fv, rhs),
+                    else => false,
+                };
+            }
+            return resolveCaseValue(if (matches) args.then_val else args.else_val, record, arena);
+        },
     }
+}
+
+fn resolveCaseValue(v: ScalarSpec.CaseValue, record: []const []const u8, arena: Allocator) []const u8 {
+    return switch (v) {
+        .string_lit => |s| s,
+        .col_idx => |idx| field(record, idx),
+        .numeric_lit => |n| blk: {
+            const buf = arena.alloc(u8, 32) catch break :blk "";
+            break :blk fmtNum(buf, n);
+        },
+    };
 }
 
 /// Evaluate an OutputColSpec (direct pass-through or scalar transform).
