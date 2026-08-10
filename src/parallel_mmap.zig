@@ -29,7 +29,15 @@ fn unmapFile(allocator: Allocator, data: []const u8) void {
 /// simd.parseCSVFieldsStatic (the zero-copy variant used in this file) does
 /// not unescape; simd.parseCSVFields (the allocating variant) already does.
 fn unescapeQuotesArena(arena: *std.heap.ArenaAllocator, field: []const u8) ![]const u8 {
-    const out = try arena.allocator().alloc(u8, field.len);
+    return unescapeQuotesAlloc(arena.allocator(), field);
+}
+
+/// Same collapse as unescapeQuotesArena, but takes a plain Allocator so
+/// callers can choose a persistent allocator (a value that must outlive
+/// this row, e.g. an ORDER BY sort key stored for later) instead of a
+/// per-row arena that would leave it dangling after the next reset (#107).
+fn unescapeQuotesAlloc(alloc: Allocator, field: []const u8) ![]const u8 {
+    const out = try alloc.alloc(u8, field.len);
     var w: usize = 0;
     var i: usize = 0;
     while (i < field.len) {
@@ -528,6 +536,11 @@ fn processSortChunk(ctx: *SortWorkerContext) !void {
     const chunk_data = ctx.data[ctx.chunk.start..ctx.chunk.end];
     const order_col = ctx.order_by_col_idx;
 
+    // Scratch arena for transient doubled-quote unescaping (WHERE-filter
+    // only — see the sort-key comment below for why that one is separate).
+    var unescape_arena = std.heap.ArenaAllocator.init(ctx.allocator);
+    defer unescape_arena.deinit();
+
     var line_start: usize = 0;
     while (line_start < chunk_data.len) {
         const remaining = chunk_data[line_start..];
@@ -546,13 +559,25 @@ fn processSortChunk(ctx: *SortWorkerContext) !void {
                 continue;
             };
 
+            // Transient unescaped copies for WHERE-filter comparisons only
+            // (issue #107) — field_buf itself stays raw so the sort-key
+            // extraction below can unescape independently into a persistent
+            // allocator instead of this per-row-reset one.
+            _ = unescape_arena.reset(.retain_capacity);
+            var eval_buf: [256][]const u8 = field_buf;
+            for (eval_buf[0..field_count]) |*f| {
+                if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
+                    f.* = unescapeQuotesAlloc(unescape_arena.allocator(), f.*) catch f.*;
+                }
+            }
+
             // Fast WHERE evaluation
             if (ctx.query.where_expr) |expr| {
                 if (expr == .comparison) {
                     const comp = expr.comparison;
                     if (ctx.where_column_idx) |col_idx| {
                         if (col_idx < field_count) {
-                            const field_value = field_buf[col_idx];
+                            const field_value = eval_buf[col_idx];
                             if (comp.numeric_value) |threshold| {
                                 const val = std.fmt.parseFloat(f64, field_value) catch {
                                     line_start += line_end + 1;
@@ -585,21 +610,28 @@ fn processSortChunk(ctx: *SortWorkerContext) !void {
                         }
                     } else {
                         // Column not found via precomputed index: fall back to direct eval
-                        if (!parser.evaluateDirect(expr, field_buf[0..field_count], ctx.lower_header)) {
+                        if (!parser.evaluateDirect(expr, eval_buf[0..field_count], ctx.lower_header)) {
                             line_start += line_end + 1;
                             continue;
                         }
                     }
                 } else {
                     // Complex expression (AND/OR/NOT): evaluate directly
-                    if (!parser.evaluateDirect(expr, field_buf[0..field_count], ctx.lower_header)) {
+                    if (!parser.evaluateDirect(expr, eval_buf[0..field_count], ctx.lower_header)) {
                         line_start += line_end + 1;
                         continue;
                     }
                 }
             }
-            // Extract sort key and pre-parse numeric value — zero per-row allocation!
-            const sort_key = if (order_col < field_count) field_buf[order_col] else "";
+            // Extract sort key and pre-parse numeric value — zero per-row allocation
+            // in the common case. Unescape via ctx.allocator (not the per-row
+            // unescape_arena above) when needed, since this value is stored in
+            // ctx.result and must outlive this iteration (issue #107).
+            const raw_sort_key = if (order_col < field_count) field_buf[order_col] else "";
+            const sort_key = if (std.mem.indexOf(u8, raw_sort_key, "\"\"") != null)
+                unescapeQuotesAlloc(ctx.allocator, raw_sort_key) catch raw_sort_key
+            else
+                raw_sort_key;
             const numeric_key = std.fmt.parseFloat(f64, sort_key) catch std.math.nan(f64);
             try ctx.result.append(ctx.allocator, SortLine{
                 .numeric_key = numeric_key,
