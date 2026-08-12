@@ -12,6 +12,8 @@ pub const AggregateType = enum {
     median,
     variance, // population variance (VAR_POP)
     stddev, // population standard deviation (STDDEV_POP)
+    variance_samp, // sample variance (VAR_SAMP) — bare VARIANCE/VAR default (#110)
+    stddev_samp, // sample standard deviation (STDDEV_SAMP) — bare STDDEV default (#110)
     group_concat, // GROUP_CONCAT(col [, 'sep']) — concatenate group values
 };
 
@@ -67,10 +69,16 @@ pub fn parseAggregateFunc(allocator: Allocator, expr: []const u8) !?AggregateFun
         func_type = .max;
     } else if (std.mem.eql(u8, func_lower, "median")) {
         func_type = .median;
-    } else if (std.mem.eql(u8, func_lower, "variance") or std.mem.eql(u8, func_lower, "var_pop")) {
+    } else if (std.mem.eql(u8, func_lower, "var_pop")) {
         func_type = .variance;
-    } else if (std.mem.eql(u8, func_lower, "stddev") or std.mem.eql(u8, func_lower, "stddev_pop") or std.mem.eql(u8, func_lower, "std")) {
+    } else if (std.mem.eql(u8, func_lower, "stddev_pop")) {
         func_type = .stddev;
+    } else if (std.mem.eql(u8, func_lower, "variance") or std.mem.eql(u8, func_lower, "var_samp") or std.mem.eql(u8, func_lower, "var")) {
+        // Bare VARIANCE defaults to sample (N-1), matching DuckDB/SQL-standard
+        // convention — not population, despite the enum member name (#110).
+        func_type = .variance_samp;
+    } else if (std.mem.eql(u8, func_lower, "stddev") or std.mem.eql(u8, func_lower, "stddev_samp") or std.mem.eql(u8, func_lower, "std")) {
+        func_type = .stddev_samp;
     } else if (std.mem.eql(u8, func_lower, "group_concat") or std.mem.eql(u8, func_lower, "string_agg")) {
         func_type = .group_concat;
     } else {

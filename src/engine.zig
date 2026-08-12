@@ -268,9 +268,12 @@ fn hasScalarSelectFunctions(query: parser.Query) bool {
             std.ascii.eqlIgnoreCase(fn_raw, "string_agg") or
             std.ascii.eqlIgnoreCase(fn_raw, "median") or
             std.ascii.eqlIgnoreCase(fn_raw, "variance") or
+            std.ascii.eqlIgnoreCase(fn_raw, "var") or
             std.ascii.eqlIgnoreCase(fn_raw, "var_pop") or
+            std.ascii.eqlIgnoreCase(fn_raw, "var_samp") or
             std.ascii.eqlIgnoreCase(fn_raw, "stddev") or
             std.ascii.eqlIgnoreCase(fn_raw, "stddev_pop") or
+            std.ascii.eqlIgnoreCase(fn_raw, "stddev_samp") or
             std.ascii.eqlIgnoreCase(fn_raw, "std") or
             std.ascii.eqlIgnoreCase(fn_raw, "strftime") or
             std.ascii.eqlIgnoreCase(fn_raw, "round") or
@@ -2596,12 +2599,21 @@ fn fmtGroupConcat(allocator: Allocator, cl: ?std.ArrayList([]const u8), sep: []c
 
 /// Format population VARIANCE (sum_sq/n - mean^2) or STDDEV (its sqrt) from the
 /// running sum, sum-of-squares, and count. Empty group → "0".
-fn fmtVarStd(allocator: Allocator, sum_sq: f64, sum: f64, n: i64, is_stddev: bool, round_digits: ?u8) ![]u8 {
-    if (n < 1) return allocator.dupe(u8, "0");
+/// is_sample selects the N-1 (sample) denominator instead of N (population) —
+/// #110: bare VARIANCE/STDDEV default to sample, matching DuckDB/SQL-standard
+/// convention. Sample variance/stddev is undefined below 2 data points,
+/// matching DuckDB's NULL there (csvql's empty-string NULL-equivalent).
+fn fmtVarStd(allocator: Allocator, sum_sq: f64, sum: f64, n: i64, is_stddev: bool, is_sample: bool, round_digits: ?u8) ![]u8 {
+    if (is_sample) {
+        if (n < 2) return allocator.dupe(u8, "");
+    } else if (n < 1) {
+        return allocator.dupe(u8, "0");
+    }
     const nf: f64 = @floatFromInt(n);
     const mean = sum / nf;
-    var v = sum_sq / nf - mean * mean;
+    var v = sum_sq / nf - mean * mean; // population variance
     if (v < 0) v = 0; // guard tiny negative from float rounding
+    if (is_sample and n > 1) v = v * nf / (nf - 1.0); // population -> sample
     if (is_stddev) v = @sqrt(v);
     return fmtAggrF64(allocator, v, round_digits);
 }
@@ -2626,9 +2638,12 @@ fn isAggregateExpr(col: []const u8) bool {
         std.mem.eql(u8, lower, "string_agg") or
         std.mem.eql(u8, lower, "median") or
         std.mem.eql(u8, lower, "variance") or
+        std.mem.eql(u8, lower, "var") or
         std.mem.eql(u8, lower, "var_pop") or
+        std.mem.eql(u8, lower, "var_samp") or
         std.mem.eql(u8, lower, "stddev") or
         std.mem.eql(u8, lower, "stddev_pop") or
+        std.mem.eql(u8, lower, "stddev_samp") or
         std.mem.eql(u8, lower, "std");
 }
 
@@ -3231,18 +3246,18 @@ fn executeScalarAgg(
                             }
                         }
                     },
-                    .sum, .avg, .variance, .stddev => {
+                    .sum, .avg, .variance, .stddev, .variance_samp, .stddev_samp => {
                         if (spec.case_when) |cw| {
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
                             const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
                             accum.sums[i] += val;
-                            if (spec.func_type == .variance or spec.func_type == .stddev) accum.sum_sqs[i] += val * val;
+                            if (spec.func_type == .variance or spec.func_type == .stddev or spec.func_type == .variance_samp or spec.func_type == .stddev_samp) accum.sum_sqs[i] += val * val;
                             accum.sum_counts[i] += 1;
                         } else if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
                                 if (parseNumericFast(record[cidx])) |val| {
                                     accum.sums[i] += val;
-                                    if (spec.func_type == .variance or spec.func_type == .stddev) accum.sum_sqs[i] += val * val;
+                                    if (spec.func_type == .variance or spec.func_type == .stddev or spec.func_type == .variance_samp or spec.func_type == .stddev_samp) accum.sum_sqs[i] += val * val;
                                     accum.sum_counts[i] += 1;
                                 } else |_| {}
                             }
@@ -3321,8 +3336,10 @@ fn executeScalarAgg(
                 else
                     try allocator.dupe(u8, "");
             },
-            .variance => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], false, spec.round_digits),
-            .stddev => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], true, spec.round_digits),
+            .variance => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], false, false, spec.round_digits),
+            .stddev => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], true, false, spec.round_digits),
+            .variance_samp => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], false, true, spec.round_digits),
+            .stddev_samp => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], true, true, spec.round_digits),
             .median => try fmtMedian(allocator, accum.value_lists[i], spec.round_digits),
 
             .group_concat => try fmtGroupConcat(allocator, accum.concat_lists[i], spec.sep),
@@ -3536,18 +3553,18 @@ fn gbProcessRecord(
                     }
                 }
             },
-            .sum, .avg, .variance, .stddev => {
+            .sum, .avg, .variance, .stddev, .variance_samp, .stddev_samp => {
                 if (spec.case_when) |cw| {
                     const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
                     const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
                     accum.sums[i] += val;
-                    if (spec.func_type == .variance or spec.func_type == .stddev) accum.sum_sqs[i] += val * val;
+                    if (spec.func_type == .variance or spec.func_type == .stddev or spec.func_type == .variance_samp or spec.func_type == .stddev_samp) accum.sum_sqs[i] += val * val;
                     accum.sum_counts[i] += 1;
                 } else if (spec.col_idx) |cidx| {
                     if (cidx < record.len) {
                         if (parseNumericFast(record[cidx])) |val| {
                             accum.sums[i] += val;
-                            if (spec.func_type == .variance or spec.func_type == .stddev) accum.sum_sqs[i] += val * val;
+                            if (spec.func_type == .variance or spec.func_type == .stddev or spec.func_type == .variance_samp or spec.func_type == .stddev_samp) accum.sum_sqs[i] += val * val;
                             accum.sum_counts[i] += 1;
                         } else |_| {}
                     }
@@ -3792,18 +3809,18 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                             }
                         }
                     },
-                    .sum, .avg, .variance, .stddev => {
+                    .sum, .avg, .variance, .stddev, .variance_samp, .stddev_samp => {
                         if (spec.case_when) |cw| {
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
                             const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
                             ctx.partial_accum.sums[i] += val;
-                            if (spec.func_type == .variance or spec.func_type == .stddev) ctx.partial_accum.sum_sqs[i] += val * val;
+                            if (spec.func_type == .variance or spec.func_type == .stddev or spec.func_type == .variance_samp or spec.func_type == .stddev_samp) ctx.partial_accum.sum_sqs[i] += val * val;
                             ctx.partial_accum.sum_counts[i] += 1;
                         } else if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
                                 if (parseNumericFast(record[cidx])) |val| {
                                     ctx.partial_accum.sums[i] += val;
-                                    if (spec.func_type == .variance or spec.func_type == .stddev) ctx.partial_accum.sum_sqs[i] += val * val;
+                                    if (spec.func_type == .variance or spec.func_type == .stddev or spec.func_type == .variance_samp or spec.func_type == .stddev_samp) ctx.partial_accum.sum_sqs[i] += val * val;
                                     ctx.partial_accum.sum_counts[i] += 1;
                                 } else |_| {}
                             }
@@ -3904,18 +3921,18 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                             }
                         }
                     },
-                    .sum, .avg, .variance, .stddev => {
+                    .sum, .avg, .variance, .stddev, .variance_samp, .stddev_samp => {
                         if (spec.case_when) |cw| {
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
                             const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
                             ctx.partial_accum.sums[i] += val;
-                            if (spec.func_type == .variance or spec.func_type == .stddev) ctx.partial_accum.sum_sqs[i] += val * val;
+                            if (spec.func_type == .variance or spec.func_type == .stddev or spec.func_type == .variance_samp or spec.func_type == .stddev_samp) ctx.partial_accum.sum_sqs[i] += val * val;
                             ctx.partial_accum.sum_counts[i] += 1;
                         } else if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
                                 if (parseNumericFast(record[cidx])) |val| {
                                     ctx.partial_accum.sums[i] += val;
-                                    if (spec.func_type == .variance or spec.func_type == .stddev) ctx.partial_accum.sum_sqs[i] += val * val;
+                                    if (spec.func_type == .variance or spec.func_type == .stddev or spec.func_type == .variance_samp or spec.func_type == .stddev_samp) ctx.partial_accum.sum_sqs[i] += val * val;
                                     ctx.partial_accum.sum_counts[i] += 1;
                                 } else |_| {}
                             }
@@ -4587,18 +4604,18 @@ fn executeGroupBy(
                             }
                         }
                     },
-                    .sum, .avg, .variance, .stddev => {
+                    .sum, .avg, .variance, .stddev, .variance_samp, .stddev_samp => {
                         if (spec.case_when) |cw| {
                             const fv = if (cw.cond_col_idx < record.len) record[cw.cond_col_idx] else "";
                             const val = if (parser.compareValues(cw.comp, fv)) cw.then_val.resolve(record) else cw.else_val.resolve(record);
                             accum.sums[i] += val;
-                            if (spec.func_type == .variance or spec.func_type == .stddev) accum.sum_sqs[i] += val * val;
+                            if (spec.func_type == .variance or spec.func_type == .stddev or spec.func_type == .variance_samp or spec.func_type == .stddev_samp) accum.sum_sqs[i] += val * val;
                             accum.sum_counts[i] += 1;
                         } else if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
                                 if (parseNumericFast(record[cidx])) |val| {
                                     accum.sums[i] += val;
-                                    if (spec.func_type == .variance or spec.func_type == .stddev) accum.sum_sqs[i] += val * val;
+                                    if (spec.func_type == .variance or spec.func_type == .stddev or spec.func_type == .variance_samp or spec.func_type == .stddev_samp) accum.sum_sqs[i] += val * val;
                                     accum.sum_counts[i] += 1;
                                 } else |_| {}
                             }
@@ -4728,8 +4745,10 @@ fn executeGroupBy(
                     else
                         try allocator.dupe(u8, "");
                 },
-                .variance => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], false, spec.round_digits),
-                .stddev => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], true, spec.round_digits),
+                .variance => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], false, false, spec.round_digits),
+                .stddev => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], true, false, spec.round_digits),
+                .variance_samp => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], false, true, spec.round_digits),
+                .stddev_samp => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], true, true, spec.round_digits),
                 .median => try fmtMedian(allocator, accum.value_lists[i], spec.round_digits),
 
                 .group_concat => try fmtGroupConcat(allocator, accum.concat_lists[i], spec.sep),
@@ -4974,15 +4993,37 @@ test "MEDIAN: odd and even counts, scalar and GROUP BY" {
     try std.testing.expect(std.mem.indexOf(u8, out, "b,6") != null);
 }
 
-test "VARIANCE / STDDEV: population, scalar and GROUP BY" {
+test "VARIANCE / STDDEV: bare defaults to sample, _POP stays population (#110)" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    // x = {2,4,4,4,5,5,7,9}: mean 5, population variance 4, stddev 2.
+    // x = {2,4,4,4,5,5,7,9}: n=8, mean 5, population variance 4, stddev 2.
+    // Sample variance = 4 * 8/7 ≈ 4.5714, sample stddev ≈ 2.1381.
     const data = "x\n2\n4\n4\n4\n5\n5\n7\n9\n";
-    const out = try runQueryForTest(allocator, &tmp, data, "SELECT VARIANCE(x) AS v, STDDEV(x) AS s FROM '{s}'");
+
+    const out_pop = try runQueryForTest(allocator, &tmp, data, "SELECT VAR_POP(x) AS v, STDDEV_POP(x) AS s FROM '{s}'");
+    defer allocator.free(out_pop);
+    try std.testing.expect(std.mem.indexOf(u8, out_pop, "4,2") != null);
+
+    const out_bare = try runQueryForTest(allocator, &tmp, data, "SELECT VARIANCE(x) AS v, STDDEV(x) AS s FROM '{s}'");
+    defer allocator.free(out_bare);
+    try std.testing.expect(std.mem.indexOf(u8, out_bare, "4.571428") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_bare, "2.1380") != null);
+
+    const out_samp = try runQueryForTest(allocator, &tmp, data, "SELECT VAR_SAMP(x) AS v, STDDEV_SAMP(x) AS s FROM '{s}'");
+    defer allocator.free(out_samp);
+    try std.testing.expect(std.mem.indexOf(u8, out_samp, "4.571428") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out_samp, "2.1380") != null);
+}
+
+test "VARIANCE / STDDEV: sample is undefined (empty) for a single-row group" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = "g,v\nA,5\n";
+    const out = try runQueryForTest(allocator, &tmp, data, "SELECT STDDEV(v) AS s FROM '{s}'");
     defer allocator.free(out);
-    try std.testing.expect(std.mem.indexOf(u8, out, "4,2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "s\n\n") != null or std.mem.endsWith(u8, std.mem.trim(u8, out, "\n"), "s"));
 }
 
 test "--no-input-header: first row is data, columns named c1..cN" {

@@ -203,7 +203,7 @@ run_section_queries() {
   run_query \
     "VARIANCE STDDEV GROUP BY department" \
     "SELECT department, VARIANCE(salary), STDDEV(salary) FROM '${CSV}' GROUP BY department ORDER BY department" \
-    "SELECT department, VAR_POP(salary), STDDEV_POP(salary) FROM read_csv_auto('${CSV}') GROUP BY department ORDER BY department"
+    "SELECT department, VAR_SAMP(salary), STDDEV_SAMP(salary) FROM read_csv_auto('${CSV}') GROUP BY department ORDER BY department"
 
   run_query \
     "MEDIAN(salary) GROUP BY department" \

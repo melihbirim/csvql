@@ -349,7 +349,10 @@ pub fn tryParseScalar(
             const arg = std.mem.trim(u8, token, &std.ascii.whitespace);
             if (arg.len >= 2 and arg[0] == '\'' and arg[arg.len - 1] == '\'') {
                 fallback = arg[1 .. arg.len - 1];
-            } else {
+            } else if (std.fmt.parseFloat(f64, arg)) |_| {
+                // Bare numeric literal fallback, e.g. COALESCE(a, 999) (#109).
+                fallback = arg;
+            } else |_| {
                 if (args.cols_len >= args.cols_buf.len) return error.TooManyArgs;
                 const cidx = try resolveCol(arg, column_map, allocator) orelse
                     return error.ColumnNotFound;

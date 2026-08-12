@@ -269,7 +269,7 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 | **COUNT**     | `COUNT(*)` or `COUNT(col)` — with or without `GROUP BY`                 |
 | **SUM**       | `SUM(col)` or `SUM(CASE WHEN cond THEN n ELSE m END)` — conditional sum |
 | **AVG**       | `AVG(col)` — full precision; with or without `GROUP BY`                 |
-| **VARIANCE / STDDEV** | `VARIANCE(col)`, `STDDEV(col)` — population variance / std deviation (aliases `VAR_POP`, `STDDEV_POP`) |
+| **VARIANCE / STDDEV** | `VARIANCE(col)`, `STDDEV(col)` — sample variance / std deviation, N-1 denominator (aliases `VAR`, `VAR_SAMP`, `STDDEV_SAMP`). Population variants: `VAR_POP(col)`, `STDDEV_POP(col)` |
 | **MEDIAN** | `MEDIAN(col)` — median of numeric values (mean of the two middles for an even count) |
 | **GROUP_CONCAT** | `GROUP_CONCAT(col [, 'sep'])` — concatenate group values (default separator `,`; alias `STRING_AGG`) |
 | **CASE WHEN** | `CASE WHEN col OP val THEN n ELSE m END` inside any aggregate function  |
