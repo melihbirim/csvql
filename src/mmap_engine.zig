@@ -387,6 +387,7 @@ pub fn executeMapped(
                 try appendSortEntry(&(arena.?), entries, allocator, opts.format, output_row, output_header.items, order_by_col_idx.?);
                 rows_written += 1;
             } else {
+                if (query.limit == 0) break; // stop before the first write (#111)
                 try writer.writeRecord(output_row);
                 rows_written += 1;
 

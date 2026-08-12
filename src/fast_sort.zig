@@ -145,6 +145,10 @@ pub const TopKHeap = struct {
 
     /// Insert an element. If heap is full, only insert if better than current worst.
     pub fn insert(self: *TopKHeap, entry: SortKey) void {
+        // k=0 (LIMIT 0): nothing to insert into a zero-capacity heap. Without
+        // this guard the else branch below reads self.items[0] on an empty
+        // slice — undefined behavior, segfaults under ReleaseFast (#111).
+        if (self.capacity == 0) return;
         if (self.len < self.capacity) {
             self.items[self.len] = entry;
             self.len += 1;

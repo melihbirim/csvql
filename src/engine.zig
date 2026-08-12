@@ -704,6 +704,8 @@ fn executeSequential(
             rows_written += 1;
         } else {
             // Write directly (no ORDER BY)
+            // LIMIT 0 must stop before the first write, not after it (#111).
+            if (query.limit == 0) break;
             try writer.writeRecord(output_row);
             rows_written += 1;
 
@@ -1301,6 +1303,7 @@ fn expandAndEmit(merged: [][]const u8, filled_w: usize, step_idx: usize, ctx: *J
                 if (!parser.evaluate(expr, row_map)) return;
             }
         }
+        if (ctx.limit == 0) return error.LimitReached; // stop before the first write (#111)
         for (ctx.output_indices, 0..) |midx, oi| ctx.output_row[oi] = merged[midx];
         try ctx.writer.writeRecord(ctx.output_row);
         ctx.rows_written += 1;
@@ -2144,6 +2147,7 @@ fn executeFromStdin(
             try distinct_seen_stdin.put(try distinct_arena_stdin.allocator().dupe(u8, row_key), {});
         }
 
+        if (query.limit == 0) break; // stop before the first write (#111)
         try writer.writeRecord(output_row);
         rows_written += 1;
 

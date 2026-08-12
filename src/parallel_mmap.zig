@@ -511,6 +511,7 @@ pub fn executeParallelMapped(
                     try distinct_seen.put(try distinct_arena.allocator().dupe(u8, row_key), {});
                 }
 
+                if (query.limit == 0) break; // stop before the first write (#111)
                 try writer.writeRecord(row);
                 total_written += 1;
 
