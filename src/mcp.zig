@@ -201,18 +201,24 @@ fn toolCsvQuery(
     // then refused below, because the query still read the data.
     if (g_audit) |ap| audit.record(allocator, ap, sql, std.mem.count(u8, trimmed, "{"), trimmed.len);
 
-    // Hard byte cap: even 100 rows of wide columns must not flood the context.
+    // runQuery already tried shrinking LIMIT to fit MAX_RESULT_BYTES. This
+    // only fires when even a single row doesn't fit (pathologically wide).
     if (trimmed.len > MAX_RESULT_BYTES) {
-        const msg = try std.fmt.allocPrint(allocator, "Result is {d} bytes — too large to return. Narrow it: select fewer columns, add a WHERE filter, or aggregate (COUNT/SUM/AVG with GROUP BY) instead of selecting raw rows.", .{trimmed.len});
+        const msg = try std.fmt.allocPrint(allocator, "Result is {d} bytes — too large to return even at a single row. Narrow it: select fewer columns, add a WHERE filter, or aggregate (COUNT/SUM/AVG with GROUP BY) instead of selecting raw rows.", .{trimmed.len});
         defer allocator.free(msg);
         try sendToolError(allocator, id, msg, resp);
         return;
     }
 
-    // Note partial results only when the row cap was actually hit (each JSON row
-    // object starts with '{'); a complete result under the cap needs no note.
     const rows = std.mem.count(u8, trimmed, "{");
-    if (res.row_capped and rows >= DEFAULT_ROW_CAP) {
+    if (res.shrunk_for_bytes) {
+        // Adaptive shaping kicked in: even the default row cap was too wide
+        // for the byte budget, so we returned fewer rows than usual instead
+        // of erroring outright.
+        const withNote = try std.fmt.allocPrint(allocator, "{s}\n\n[Showing {d} rows — narrowed automatically to fit the response size budget (columns are wide). Add LIMIT/WHERE or aggregate for different results.]", .{ trimmed, res.shrunk_to });
+        defer allocator.free(withNote);
+        try sendToolResult(allocator, id, withNote, resp);
+    } else if (res.row_capped and rows >= DEFAULT_ROW_CAP) {
         const withNote = try std.fmt.allocPrint(allocator, "{s}\n\n[Showing first {d} rows — no LIMIT was given. Add LIMIT/WHERE or aggregate for complete or narrower results.]", .{ trimmed, DEFAULT_ROW_CAP });
         defer allocator.free(withNote);
         try sendToolResult(allocator, id, withNote, resp);
@@ -338,22 +344,14 @@ const MAX_RESULT_BYTES: usize = 12 * 1024;
 const QueryResult = struct {
     output: []u8, // caller frees
     row_capped: bool, // true when we injected DEFAULT_ROW_CAP (result may be partial)
+    shrunk_for_bytes: bool = false, // true when we auto-narrowed LIMIT to fit MAX_RESULT_BYTES
+    shrunk_to: i32 = 0, // the LIMIT we shrank to, when shrunk_for_bytes is true
 };
 
-fn runQuery(allocator: Allocator, sql: []const u8, format: options_mod.OutputFormat) !QueryResult {
-    var q = try parser.parse(allocator, sql);
-    defer q.deinit();
-
-    // No LIMIT given → bound the row count so a bare SELECT can't dump the table.
-    var row_capped = false;
-    if (q.limit < 0) {
-        q.limit = DEFAULT_ROW_CAP;
-        row_capped = true;
-    }
-
-    // Capture engine output via a temp file (engine.execute writes to std.fs.File).
-    // Use the OS temp dir (TMPDIR/TEMP) with a unique name so it works on Windows
-    // too and parallel test processes don't collide.
+/// Run one query to a temp file and return its raw output.
+/// Uses the OS temp dir (TMPDIR/TEMP) with a unique name so it works on
+/// Windows too and parallel test processes don't collide.
+fn runOnce(allocator: Allocator, q: parser.Query, format: options_mod.OutputFormat) ![]u8 {
     const tmp_base = if (builtin.os.tag == .windows)
         (std.process.getEnvVarOwned(allocator, "TEMP") catch null)
     else
@@ -380,8 +378,47 @@ fn runQuery(allocator: Allocator, sql: []const u8, format: options_mod.OutputFor
     try engine.execute(allocator, q, tmp_file, opts);
 
     try tmp_file.seekTo(0);
-    const output = try tmp_file.readToEndAlloc(allocator, 100 * 1024 * 1024);
-    return .{ .output = output, .row_capped = row_capped };
+    return try tmp_file.readToEndAlloc(allocator, 100 * 1024 * 1024);
+}
+
+fn runQuery(allocator: Allocator, sql: []const u8, format: options_mod.OutputFormat) !QueryResult {
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    // No LIMIT given → bound the row count so a bare SELECT can't dump the table.
+    var row_capped = false;
+    if (q.limit < 0) {
+        q.limit = DEFAULT_ROW_CAP;
+        row_capped = true;
+    }
+
+    var output = try runOnce(allocator, q, format);
+
+    // Token-aware adaptive shaping: wide columns can blow the byte budget
+    // even at DEFAULT_ROW_CAP rows. Rather than hard-reject and force the
+    // agent into a blind retry loop, shrink LIMIT to what actually fits and
+    // say so — a narrower real answer beats an error for a caller that's
+    // paying for every round trip in tokens.
+    var shrunk_for_bytes = false;
+    var shrunk_to: i32 = 0;
+    if (output.len > MAX_RESULT_BYTES and q.limit > 1) {
+        const rows_returned = std.mem.count(u8, output, "{");
+        if (rows_returned > 0) {
+            const avg_bytes = output.len / rows_returned;
+            const budget = MAX_RESULT_BYTES - 512; // leave room for the note we append
+            const target_rows: i32 = @intCast(@max(1, budget / (avg_bytes + 8)));
+            if (target_rows < q.limit) {
+                allocator.free(output);
+                q.limit = target_rows;
+                output = try runOnce(allocator, q, format);
+                row_capped = true;
+                shrunk_for_bytes = true;
+                shrunk_to = target_rows;
+            }
+        }
+    }
+
+    return .{ .output = output, .row_capped = row_capped, .shrunk_for_bytes = shrunk_for_bytes, .shrunk_to = shrunk_to };
 }
 
 // ---------------------------------------------------------------------------
