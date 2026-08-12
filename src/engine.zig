@@ -305,7 +305,7 @@ pub fn ensurePathAllowed(allocator: Allocator, path: []const u8, roots: []const 
     return error.PathOutsideAllowedRoot;
 }
 
-pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.File, opts: options_mod.Options) anyerror!void {
+pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.File, opts: options_mod.Options) !void {
     // --root sandbox: reject any file outside the allowed trees before opening.
     try ensurePathAllowed(allocator, query.file_path, opts.roots);
     for (query.joins) |j| try ensurePathAllowed(allocator, j.right_file, opts.roots);
@@ -1577,7 +1577,16 @@ fn executeJoinThenAggregate(
     stage2_query.order_by = new_order_by;
     var stage2_opts = opts;
     stage2_opts.no_input_header = false;
-    try execute(allocator, stage2_query, output_file, stage2_opts);
+
+    // Dispatch directly to the leaf function instead of recursing through
+    // execute() — avoids a self-recursive call in the middle of execute()'s
+    // own dispatch, which forced an anyerror!void signature and caused a
+    // severe compile-time blowup on at least one build configuration.
+    if (stage2_query.group_by.len == 0) {
+        try executeScalarAgg(allocator, stage2_query, output_file, stage2_opts);
+    } else {
+        try executeGroupBy(allocator, stage2_query, output_file, stage2_opts);
+    }
 }
 
 /// Execute an INNER JOIN between two or more CSV files using a pipelined hash-join.
