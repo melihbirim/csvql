@@ -4227,6 +4227,56 @@ fn executeGroupBy(
     }
     try writer.writeHeader(out_header_list.items, opts.no_header);
 
+    // HAVING may reference an aggregate that isn't in SELECT at all (standard
+    // SQL: HAVING SUM(salary) ... HAVING COUNT(*) > 1 is valid even without
+    // COUNT(*) projected). If so, accumulate it too — otherwise the HAVING
+    // lookup below never finds a value and every row gets filtered out (#108).
+    // Scope: single top-level comparison only, matching CASE WHEN's existing scope.
+    var having_extra_agg_idx: ?usize = null;
+    var having_extra_agg_text: []const u8 = "";
+    if (query.having_expr) |hexpr| {
+        if (hexpr == .comparison) {
+            const hcol = hexpr.comparison.column; // already lowercased by the parser
+            var already_covered = false;
+            for (query.columns) |col| {
+                const sa = splitAlias(col);
+                var lower_buf: [256]u8 = undefined;
+                if (sa.expr.len <= lower_buf.len) {
+                    const lower_expr = std.ascii.lowerString(lower_buf[0..sa.expr.len], sa.expr);
+                    if (std.mem.eql(u8, lower_expr, hcol)) {
+                        already_covered = true;
+                        break;
+                    }
+                }
+            }
+            if (!already_covered) {
+                if (try aggregation.parseAggregateFunc(allocator, hcol)) |parsed_agg| {
+                    var agg_func = parsed_agg;
+                    errdefer agg_func.deinit(allocator);
+                    var col_idx: ?usize = null;
+                    if (agg_func.column) |agg_col| {
+                        const lower = try allocator.alloc(u8, agg_col.len);
+                        defer allocator.free(lower);
+                        _ = std.ascii.lowerString(lower, agg_col);
+                        col_idx = column_map.get(lower) orelse return error.ColumnNotFound;
+                        allocator.free(agg_col);
+                        agg_func.column = null;
+                    }
+                    having_extra_agg_idx = agg_specs.items.len;
+                    having_extra_agg_text = try allocator.dupe(u8, hcol);
+                    const gc_sep: []const u8 = agg_func.sep orelse ",";
+                    agg_func.sep = null;
+                    try agg_specs.append(allocator, AggSpec{
+                        .func_type = agg_func.func_type,
+                        .col_idx = col_idx,
+                        .alias = agg_func.alias,
+                        .sep = gc_sep,
+                    });
+                }
+            }
+        }
+    }
+
     // -- Precompute WHERE fast path -----------------------------------------
     var where_col_idx: ?usize = null;
     if (query.where_expr) |expr| {
@@ -4775,6 +4825,13 @@ fn executeGroupBy(
                 _ = std.ascii.lowerString(expr_lower, sa.expr);
                 if (!having_map.contains(expr_lower)) {
                     try having_map.put(expr_lower, output_row[hi]);
+                }
+            }
+            // Aggregate referenced only in HAVING, not in SELECT (#108) —
+            // accumulated separately above, read from agg_results by its index.
+            if (having_extra_agg_idx) |eidx| {
+                if (!having_map.contains(having_extra_agg_text)) {
+                    try having_map.put(having_extra_agg_text, agg_results[eidx]);
                 }
             }
             if (!parser.evaluate(hav_expr, having_map)) continue;
