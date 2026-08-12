@@ -305,7 +305,7 @@ pub fn ensurePathAllowed(allocator: Allocator, path: []const u8, roots: []const 
     return error.PathOutsideAllowedRoot;
 }
 
-pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.File, opts: options_mod.Options) !void {
+pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.File, opts: options_mod.Options) anyerror!void {
     // --root sandbox: reject any file outside the allowed trees before opening.
     try ensurePathAllowed(allocator, query.file_path, opts.roots);
     for (query.joins) |j| try ensurePathAllowed(allocator, j.right_file, opts.roots);
@@ -325,9 +325,15 @@ pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.Fi
         return;
     }
 
-    // JOIN query: load right table into hash map, probe with left table
+    // JOIN query: load right table into hash map, probe with left table.
+    // If it also has an aggregate/GROUP BY/HAVING, that's not something
+    // executeJoin can do — materialize and delegate instead (#112).
     if (query.joins.len > 0) {
-        try executeJoin(allocator, query, output_file, opts);
+        if (hasAggregates(query) or query.group_by.len > 0) {
+            try executeJoinThenAggregate(allocator, query, output_file, opts);
+        } else {
+            try executeJoin(allocator, query, output_file, opts);
+        }
         return;
     }
 
@@ -1401,6 +1407,177 @@ fn joinWorkerRun(w: *JoinWorkerCtx) !void {
     }
     try writer.finish();
     try writer.flush();
+}
+
+fn isIdentChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+fn isIdentStartChar(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '_';
+}
+
+/// Rewrite every "alias.column" reference in `text` to the bare "column" —
+/// used to translate a query written against qualified JOIN columns into one
+/// that can run against the flattened, materialized single-table result
+/// (issue #112). Returns error.AmbiguousColumnReference if the bare name
+/// collides across the joined tables' own headers, rather than silently
+/// picking one.
+fn dealiasText(aa: Allocator, text: []const u8, aliases: []const []const u8, dups: *const std.StringHashMap(void)) ![]const u8 {
+    var out = std.ArrayListUnmanaged(u8){};
+    var i: usize = 0;
+    outer: while (i < text.len) {
+        const at_boundary = i == 0 or !isIdentChar(text[i - 1]);
+        if (at_boundary) {
+            for (aliases) |al| {
+                if (i + al.len < text.len and
+                    std.ascii.eqlIgnoreCase(text[i .. i + al.len], al) and
+                    text[i + al.len] == '.' and
+                    i + al.len + 1 < text.len and
+                    isIdentStartChar(text[i + al.len + 1]))
+                {
+                    var j = i + al.len + 1;
+                    while (j < text.len and isIdentChar(text[j])) : (j += 1) {}
+                    const bare = text[i + al.len + 1 .. j];
+                    var lower_buf: [256]u8 = undefined;
+                    if (bare.len <= lower_buf.len) {
+                        const lower = std.ascii.lowerString(lower_buf[0..bare.len], bare);
+                        if (dups.contains(lower)) return error.AmbiguousColumnReference;
+                    }
+                    try out.appendSlice(aa, bare);
+                    i = j;
+                    continue :outer;
+                }
+            }
+        }
+        try out.append(aa, text[i]);
+        i += 1;
+    }
+    return out.items;
+}
+
+/// JOIN + aggregate/GROUP BY/HAVING (issue #112). executeJoin itself has no
+/// aggregation logic — it only does row-by-row projection. Rather than
+/// reimplementing accumulation a third time inside the join path, materialize
+/// the joined+filtered rows (WHERE already applied) to a temp CSV with a flat
+/// (bare-name) schema via the existing executeJoin SELECT * path, dealias the
+/// query's qualified column references to match, and delegate to the
+/// existing, already-hardened executeScalarAgg/executeGroupBy machinery.
+fn executeJoinThenAggregate(
+    allocator: Allocator,
+    query: parser.Query,
+    output_file: std.fs.File,
+    opts: options_mod.Options,
+) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+
+    var aliases = std.ArrayListUnmanaged([]const u8){};
+    try aliases.append(aa, query.joins[0].left_alias);
+    for (query.joins) |j| try aliases.append(aa, j.right_alias);
+
+    // Detect bare column names that collide across the joined tables' own
+    // headers — a qualified reference to one of these can't be safely
+    // dealiased without knowing which table's copy was actually meant.
+    var seen_names = std.StringHashMap(void).init(aa);
+    var dup_names = std.StringHashMap(void).init(aa);
+    {
+        var file_paths = std.ArrayListUnmanaged([]const u8){};
+        try file_paths.append(aa, query.file_path);
+        for (query.joins) |j| try file_paths.append(aa, j.right_file);
+        for (file_paths.items) |fp| {
+            const f = try std.fs.cwd().openFile(fp, .{});
+            defer f.close();
+            const stat = try f.stat();
+            const data = try mapFile(aa, f, stat.size);
+            defer unmapFile(aa, data);
+            const hinfo = try csv.resolveMmapHeader(aa, data, opts);
+            for (hinfo.names) |name| {
+                const lower = try aa.alloc(u8, name.len);
+                _ = std.ascii.lowerString(lower, name);
+                if (seen_names.contains(lower)) {
+                    try dup_names.put(lower, {});
+                } else {
+                    try seen_names.put(lower, {});
+                }
+            }
+        }
+    }
+
+    // Dealias SELECT columns and GROUP BY (raw expression text).
+    var new_columns = try aa.alloc([]u8, query.columns.len);
+    for (query.columns, 0..) |col, i| {
+        new_columns[i] = @constCast(try dealiasText(aa, col, aliases.items, &dup_names));
+    }
+    var new_group_by = try aa.alloc([]u8, query.group_by.len);
+    for (query.group_by, 0..) |col, i| {
+        new_group_by[i] = @constCast(try dealiasText(aa, col, aliases.items, &dup_names));
+    }
+
+    // Dealias HAVING (single top-level comparison — matches this codebase's
+    // existing scope for CASE WHEN and similar features).
+    var new_having: ?parser.Expression = null;
+    if (query.having_expr) |hexpr| {
+        if (hexpr == .comparison) {
+            var c = hexpr.comparison;
+            c.column = @constCast(try dealiasText(aa, c.column, aliases.items, &dup_names));
+            new_having = .{ .comparison = c };
+        } else {
+            new_having = hexpr;
+        }
+    }
+
+    // Dealias ORDER BY (primary + secondary keys).
+    var new_order_by: ?parser.OrderBy = null;
+    if (query.order_by) |ob| {
+        var secondary = try aa.alloc(parser.OrderByKey, ob.secondary.len);
+        for (ob.secondary, 0..) |k, i| {
+            secondary[i] = .{ .column = @constCast(try dealiasText(aa, k.column, aliases.items, &dup_names)), .order = k.order };
+        }
+        new_order_by = .{
+            .column = @constCast(try dealiasText(aa, ob.column, aliases.items, &dup_names)),
+            .order = ob.order,
+            .secondary = secondary,
+        };
+    }
+
+    // ── Stage 1: materialize the joined+filtered rows (SELECT *, no LIMIT) ──
+    const tmp_dir: []const u8 = (if (builtin.os.tag == .windows)
+        std.process.getEnvVarOwned(aa, "TEMP")
+    else
+        std.process.getEnvVarOwned(aa, "TMPDIR")) catch (if (builtin.os.tag == .windows) "." else "/tmp");
+    const stamp = std.time.nanoTimestamp();
+    const tmp_path = try std.fmt.allocPrint(aa, "{s}{c}csvql_joinagg_{d}.tmp", .{ tmp_dir, std.fs.path.sep, stamp });
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    {
+        const tmp_file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+        defer tmp_file.close();
+        var stage1_query = query;
+        stage1_query.all_columns = true;
+        stage1_query.columns = &[_][]u8{};
+        stage1_query.group_by = &[_][]u8{};
+        stage1_query.having_expr = null;
+        stage1_query.order_by = null;
+        stage1_query.limit = -1;
+        stage1_query.distinct = false;
+        var stage1_opts = opts;
+        stage1_opts.no_header = false;
+        try executeJoin(allocator, stage1_query, tmp_file, stage1_opts);
+    }
+
+    // ── Stage 2: run the (dealiased) aggregate/GROUP BY query against it ──
+    var stage2_query = query;
+    stage2_query.file_path = @constCast(tmp_path);
+    stage2_query.joins = &[_]parser.JoinClause{};
+    stage2_query.where_expr = null; // already applied in stage 1
+    stage2_query.columns = new_columns;
+    stage2_query.group_by = new_group_by;
+    stage2_query.having_expr = new_having;
+    stage2_query.order_by = new_order_by;
+    var stage2_opts = opts;
+    stage2_opts.no_input_header = false;
+    try execute(allocator, stage2_query, output_file, stage2_opts);
 }
 
 /// Execute an INNER JOIN between two or more CSV files using a pipelined hash-join.
