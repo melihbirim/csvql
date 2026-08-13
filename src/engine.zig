@@ -5200,6 +5200,7 @@ fn executeGroupBy(
                                 else => {},
                             }
                         },
+                        .is_null_check => |*a| a.col_idx = 0,
                     }
                     break :blk scalar.eval(adj_spec, &rec, gb_scalar_arena.allocator());
                 },

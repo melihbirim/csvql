@@ -42,6 +42,7 @@ pub const ScalarSpec = union(enum) {
     greatest: VariadicArgs, // GREATEST(a, b, ...) — row-wise max
     least: VariadicArgs, // LEAST(a, b, ...) — row-wise min
     case_when: CaseWhenArgs, // bare CASE WHEN ... THEN ... ELSE ... END (#105)
+    is_null_check: IsNullArgs, // col IS NULL / col IS NOT NULL as a SELECT expression
 
     pub const ReplaceArgs = struct {
         col_idx: usize,
@@ -126,6 +127,11 @@ pub const ScalarSpec = union(enum) {
 
     pub const CaseOp = enum { eq, ne, gt, ge, lt, le };
 
+    pub const IsNullArgs = struct {
+        col_idx: usize,
+        negate: bool, // true = IS NOT NULL
+    };
+
     /// A bare `CASE WHEN col op value THEN a ELSE b END` in a plain SELECT
     /// column (not wrapped in an aggregate — that path is parseCaseAggCall
     /// in engine.zig, numeric-only). Single condition, no AND/OR/nesting,
@@ -154,6 +160,7 @@ pub const ScalarSpec = union(enum) {
             .split_part => |a| a.col_idx,
             .greatest, .least => |a| a.cols()[0],
             .case_when => |a| a.cond_col_idx,
+            .is_null_check => |a| a.col_idx,
         };
     }
 };
@@ -181,6 +188,17 @@ pub fn tryParseScalar(
     allocator: Allocator,
 ) !?ScalarSpec {
     const t = std.mem.trim(u8, expr, &std.ascii.whitespace);
+
+    // col IS NULL / col IS NOT NULL as a SELECT expression has no wrapping
+    // parens either, so it must be checked before the paren-based dispatch.
+    if (std.ascii.indexOfIgnoreCase(t, " is not null")) |idx| {
+        const cidx = try resolveCol(t[0..idx], column_map, allocator) orelse return error.ColumnNotFound;
+        return .{ .is_null_check = .{ .col_idx = cidx, .negate = true } };
+    }
+    if (std.ascii.indexOfIgnoreCase(t, " is null")) |idx| {
+        const cidx = try resolveCol(t[0..idx], column_map, allocator) orelse return error.ColumnNotFound;
+        return .{ .is_null_check = .{ .col_idx = cidx, .negate = false } };
+    }
 
     // Bare CASE WHEN has no parens at all, so it must be checked before the
     // paren-based dispatch below rejects it outright (#105).
@@ -596,6 +614,11 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
                 if (i == args.n) return part;
             }
             return "";
+        },
+        .is_null_check => |args| {
+            const is_null = field(record, args.col_idx).len == 0;
+            const result = if (args.negate) !is_null else is_null;
+            return if (result) "true" else "false";
         },
         .greatest => |args| return pickExtreme(record, args.cols(), true),
         .least => |args| return pickExtreme(record, args.cols(), false),
