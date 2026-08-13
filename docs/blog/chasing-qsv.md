@@ -17,6 +17,12 @@ There are two entirely different things you can measure here, and the first mist
 
 csvql's answer on these two questions is different, and both answers are real.
 
+## A caveat on the qsv build, upfront
+
+The single-thread parser numbers in the next section come from `brew install qsv`, the standard install path most people use. Worth knowing: qsv also has an optional multithreaded, mem-mapped Polars CSV reader, but Homebrew's formula builds it without that feature — confirmed by checking the formula itself (`features = %w[apply fetch foreach geocode lens luau to feature_capable]`, no `polars`) and by `qsv --version`, which lists every compiled-in feature and doesn't include it.
+
+For the full-query comparison later in this post, that caveat doesn't apply — we downloaded qsv's official prebuilt release binary instead (`qsv-22.0.1-aarch64-apple-darwin.zip` from [the GitHub releases page](https://github.com/dathere/qsv/releases)), which does have `polars-0.55.2` compiled in (confirmed the same way, via `qsv --version`). That's the real multithreaded qsv, no asterisk.
+
 ## Starting point: 1.9x behind, single-thread
 
 First honest measurement, same 7.9 GB file, same machine, `qsv count --no-polars` (confirmed single-threaded — this particular build doesn't have the multithreaded Polars reader compiled in) against csvql's real field parser:
@@ -122,14 +128,16 @@ csvql was actually ~5x *ahead* on the small file. The first number was a cold-st
 
 ## Where it landed
 
-Full query wall-clock, same 7.9 GB file:
+Full query wall-clock, both tools using every core available — qsv's official prebuilt binary with Polars, csvql's default parallel scan, same 7.9 GB file and same 70 MB file:
 
-| | Wall-clock throughput |
-|---|---|
-| qsv count | 636 MB/s |
-| csvql `COUNT(*)` | 3456 MB/s |
+| File | qsv (multithreaded) | csvql | csvql advantage |
+|---|---|---|---|
+| 70 MB | 534 MB/s | 1750 MB/s | 3.3x |
+| 7.9 GB | 672 MB/s | 3640 MB/s | 5.4x |
 
-5.4x ahead on the number a user actually experiences, because csvql parallelizes across all cores by default and this qsv build doesn't. Single-thread, raw parsing: parity, not ahead, and that's the honest remaining gap if "fastest CSV parser" is meant literally rather than "fastest CSV query."
+Multithreading barely moved qsv's number on the big file (672 MB/s here vs 636 MB/s for the single-threaded Homebrew build) — at that size the row count workload looks I/O-bound either way, or `count` specifically doesn't parallelize as well as qsv's other commands. Either way, the gap holds with qsv running its actual fastest mode, not a crippled build.
+
+Single-thread, raw parsing is the different story: parity, not ahead, and that's the honest remaining gap if "fastest CSV parser" is meant literally rather than "fastest CSV query."
 
 ## Reproduce it
 
