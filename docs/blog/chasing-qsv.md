@@ -137,6 +137,23 @@ Full query wall-clock, both tools using every core available — qsv's official 
 
 Multithreading barely moved qsv's number on the big file (672 MB/s here vs 636 MB/s for the single-threaded Homebrew build) — at that size the row count workload looks I/O-bound either way, or `count` specifically doesn't parallelize as well as qsv's other commands. Either way, the gap holds with qsv running its actual fastest mode, not a crippled build.
 
+## Why, specifically
+
+Not a guess — the `time` output for the 7.9 GB run says exactly where the difference is (Apple M2 Pro, 12 cores, both processes given the whole machine):
+
+| | user | system | %CPU | wall |
+|---|---|---|---|---|
+| qsv (polars) | 18.96s | 22.66s | 343% | 12.1s |
+| csvql | 18.73s | 2.25s | 938% | 2.2s |
+
+Two things in that table, not one.
+
+**Core usage.** csvql used ~9.4 of 12 cores; qsv-polars used ~3.4. csvql's parallel strategy is about as simple as parallelism gets: split the file into byte-aligned chunks up front, hand one chunk to each thread, each thread independently SIMD-scans its own chunk with no coordination until the final sum. Polars is a general dataframe engine — its CSV reader builds a typed, queryable DataFrame (schema inference, per-column typed arrays, chunk merging across threads), and that coordination overhead caps how many cores actually help for a task as trivial as counting rows.
+
+**System time.** qsv-polars spent 22.66s in the kernel, csvql spent 2.25s — 10x more kernel time despite less wall-clock work getting done. That's consistent with materializing DataFrame structures (more allocation, more page faults) for an operation that doesn't need them; a plain record count shouldn't touch the kernel much beyond reading the file off disk.
+
+Neither of these is a knock on qsv. It's the cost of being a general-purpose engine that can feed 65 other subcommands, `stats`, `frequency`, `schema`, a full dataframe pipeline, off the same reader. csvql's reader only has one job: answer the SQL query and hand back the result. Purpose-built beats general-purpose exactly on the task it was built for, and loses everywhere else.
+
 Single-thread, raw parsing is the different story: parity, not ahead, and that's the honest remaining gap if "fastest CSV parser" is meant literally rather than "fastest CSV query."
 
 ## Reproduce it
