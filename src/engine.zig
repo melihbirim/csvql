@@ -2549,6 +2549,22 @@ inline fn splitLine(line: []const u8, buf: [][]const u8, delim: u8) []const []co
 /// expressions, so `STRFTIME('%Y-%m', col) AS month` correctly splits into
 /// `STRFTIME('%Y-%m', col)` and `month`.
 /// The returned slices point into the original `expr` memory.
+/// Recursively collect every plain Comparison leaf out of a WHERE/HAVING
+/// expression tree (AND/OR/NOT combinations), skipping scalar_comparison
+/// nodes (DATEDIFF/DATEADD/EXTRACT), which HAVING's extra-aggregate lookup
+/// doesn't need to special-case.
+fn collectComparisons(expr: parser.Expression, out: *std.ArrayListUnmanaged(parser.Comparison), allocator: Allocator) !void {
+    switch (expr) {
+        .comparison => |c| try out.append(allocator, c),
+        .scalar_comparison => {},
+        .binary => |b| {
+            try collectComparisons(b.left, out, allocator);
+            try collectComparisons(b.right, out, allocator);
+        },
+        .unary => |u| try collectComparisons(u.expr, out, allocator),
+    }
+}
+
 /// Reserved words that must never be mistaken for an implicit (no-AS) alias
 /// trailing a SELECT expression, e.g. "CASE WHEN x THEN 1 ELSE 0 END" must
 /// not be read as expr="...END" alias missing / expr="..." alias="END".
@@ -4666,12 +4682,15 @@ fn executeGroupBy(
     // SQL: HAVING SUM(salary) ... HAVING COUNT(*) > 1 is valid even without
     // COUNT(*) projected). If so, accumulate it too — otherwise the HAVING
     // lookup below never finds a value and every row gets filtered out (#108).
-    // Scope: single top-level comparison only, matching CASE WHEN's existing scope.
-    var having_extra_agg_idx: ?usize = null;
-    var having_extra_agg_text: []const u8 = "";
+    // Walks the whole HAVING expression tree (AND/OR/NOT of multiple
+    // comparisons), not just a single top-level comparison (#117-having),
+    // since e.g. "HAVING COUNT(*) >= 3 AND MAX(salary) > 80000" needs both.
+    var having_extra_aggs = std.ArrayListUnmanaged(struct { idx: usize, text: []const u8 }){};
     if (query.having_expr) |hexpr| {
-        if (hexpr == .comparison) {
-            const hcol = hexpr.comparison.column; // already lowercased by the parser
+        var comparisons = std.ArrayListUnmanaged(parser.Comparison){};
+        collectComparisons(hexpr, &comparisons, allocator) catch {};
+        for (comparisons.items) |hcomp| {
+            const hcol = hcomp.column; // already lowercased by the parser
             var already_covered = false;
             for (query.columns) |col| {
                 const sa = splitAlias(col);
@@ -4684,30 +4703,37 @@ fn executeGroupBy(
                     }
                 }
             }
-            if (!already_covered) {
-                if (try aggregation.parseAggregateFunc(allocator, hcol)) |parsed_agg| {
-                    var agg_func = parsed_agg;
-                    errdefer agg_func.deinit(allocator);
-                    var col_idx: ?usize = null;
-                    if (agg_func.column) |agg_col| {
-                        const lower = try allocator.alloc(u8, agg_col.len);
-                        defer allocator.free(lower);
-                        _ = std.ascii.lowerString(lower, agg_col);
-                        col_idx = column_map.get(lower) orelse return error.ColumnNotFound;
-                        allocator.free(agg_col);
-                        agg_func.column = null;
-                    }
-                    having_extra_agg_idx = agg_specs.items.len;
-                    having_extra_agg_text = try allocator.dupe(u8, hcol);
-                    const gc_sep: []const u8 = agg_func.sep orelse ",";
-                    agg_func.sep = null;
-                    try agg_specs.append(allocator, AggSpec{
-                        .func_type = agg_func.func_type,
-                        .col_idx = col_idx,
-                        .alias = agg_func.alias,
-                        .sep = gc_sep,
-                    });
+            if (already_covered) continue;
+            // Skip if we already queued this exact expression (e.g. it appears twice).
+            var already_queued = false;
+            for (having_extra_aggs.items) |ea| {
+                if (std.mem.eql(u8, ea.text, hcol)) {
+                    already_queued = true;
+                    break;
                 }
+            }
+            if (already_queued) continue;
+            if (try aggregation.parseAggregateFunc(allocator, hcol)) |parsed_agg| {
+                var agg_func = parsed_agg;
+                errdefer agg_func.deinit(allocator);
+                var col_idx: ?usize = null;
+                if (agg_func.column) |agg_col| {
+                    const lower = try allocator.alloc(u8, agg_col.len);
+                    defer allocator.free(lower);
+                    _ = std.ascii.lowerString(lower, agg_col);
+                    col_idx = column_map.get(lower) orelse return error.ColumnNotFound;
+                    allocator.free(agg_col);
+                    agg_func.column = null;
+                }
+                const gc_sep: []const u8 = agg_func.sep orelse ",";
+                agg_func.sep = null;
+                try having_extra_aggs.append(allocator, .{ .idx = agg_specs.items.len, .text = try allocator.dupe(u8, hcol) });
+                try agg_specs.append(allocator, AggSpec{
+                    .func_type = agg_func.func_type,
+                    .col_idx = col_idx,
+                    .alias = agg_func.alias,
+                    .sep = gc_sep,
+                });
             }
         }
     }
@@ -5272,11 +5298,11 @@ fn executeGroupBy(
                     try having_map.put(expr_lower, output_row[hi]);
                 }
             }
-            // Aggregate referenced only in HAVING, not in SELECT (#108) —
-            // accumulated separately above, read from agg_results by its index.
-            if (having_extra_agg_idx) |eidx| {
-                if (!having_map.contains(having_extra_agg_text)) {
-                    try having_map.put(having_extra_agg_text, agg_results[eidx]);
+            // Aggregate(s) referenced only in HAVING, not in SELECT (#108) —
+            // accumulated separately above, read from agg_results by index.
+            for (having_extra_aggs.items) |ea| {
+                if (!having_map.contains(ea.text)) {
+                    try having_map.put(ea.text, agg_results[ea.idx]);
                 }
             }
             if (!parser.evaluate(hav_expr, having_map)) continue;
