@@ -2168,6 +2168,10 @@ const ColKind = union(enum) {
     /// scalar function applied to a group key at output time
     /// (e.g. SELECT UPPER(city), COUNT(*) FROM x GROUP BY city)
     group_key_scalar: struct { gi: usize, spec: scalar.ScalarSpec },
+    /// CASE WHEN with an aggregate inside its condition, evaluated once per
+    /// group at output time against agg_results[agg_idx] (#113), e.g.
+    /// SELECT dept, CASE WHEN AVG(salary) > 80000 THEN 'high' ELSE 'low' END.
+    agg_case: struct { agg_idx: usize, spec: scalar.ScalarSpec },
 };
 
 /// Describes a STRFTIME('%Y-%m', col) GROUP BY / SELECT expression.
@@ -2695,6 +2699,91 @@ fn parseCaseAggCall(
     };
 }
 
+/// Find a top-level (outside any parens) comparison operator in `cond`,
+/// longest match first so ">=" isn't cut short as ">". Used to split
+/// "AVG(salary) > 80000" into left/op/right without a real SQL expression
+/// parser, since the left side can be an aggregate call, not a plain column.
+fn splitCaseCondAtOp(cond: []const u8) ?struct { left: []const u8, op_text: []const u8, right: []const u8 } {
+    const ops = [_][]const u8{ "!=", "<>", ">=", "<=", "=", ">", "<" };
+    var depth: i32 = 0;
+    var i: usize = 0;
+    while (i < cond.len) : (i += 1) {
+        const c = cond[i];
+        if (c == '(') {
+            depth += 1;
+        } else if (c == ')') {
+            depth -= 1;
+        } else if (depth == 0) {
+            for (ops) |op| {
+                if (i + op.len <= cond.len and std.mem.eql(u8, cond[i .. i + op.len], op)) {
+                    return .{
+                        .left = std.mem.trim(u8, cond[0..i], &std.ascii.whitespace),
+                        .op_text = op,
+                        .right = std.mem.trim(u8, cond[i + op.len ..], &std.ascii.whitespace),
+                    };
+                }
+            }
+        }
+    }
+    return null;
+}
+
+/// A bare "CASE WHEN <agg_call> <op> <value> THEN <a> ELSE <b> END" — the
+/// reverse of parseCaseAggCall (there, an aggregate wraps a CASE; here, CASE
+/// wraps a condition that itself contains an aggregate), evaluated once per
+/// group/scalar-result at output time rather than per row (#113). Single
+/// comparison, string/numeric THEN/ELSE — same scope as the other CASE WHEN
+/// variants in this codebase.
+///
+/// Reuses scalar.tryParseScalar/scalar.eval for the actual THEN/ELSE parsing
+/// and evaluation (#105's machinery) by rewriting the aggregate call to a
+/// placeholder column name, then evaluating that spec at output time against
+/// a synthetic single-field record containing the aggregate's computed value.
+fn parseCaseWithAggCondition(
+    allocator: Allocator,
+    expr: []const u8,
+    column_map: std.StringHashMap(usize),
+) !?struct { agg_func: aggregation.AggregateFunc, spec: scalar.ScalarSpec } {
+    const t = std.mem.trim(u8, expr, &std.ascii.whitespace);
+    if (t.len < 10 or !std.ascii.eqlIgnoreCase(t[0..4], "CASE")) return null;
+    const after_case = std.mem.trim(u8, t[4..], &std.ascii.whitespace);
+    if (after_case.len < 5 or !std.ascii.eqlIgnoreCase(after_case[0..5], "WHEN ")) return null;
+    const cond_and_rest = after_case[5..];
+
+    const then_idx = std.ascii.indexOfIgnoreCase(cond_and_rest, " THEN ") orelse return null;
+    const cond_str = std.mem.trim(u8, cond_and_rest[0..then_idx], &std.ascii.whitespace);
+    const after_then = cond_and_rest[then_idx + 6 ..];
+
+    const else_idx = std.ascii.indexOfIgnoreCase(after_then, " ELSE ") orelse return null;
+    const then_str = std.mem.trim(u8, after_then[0..else_idx], &std.ascii.whitespace);
+    const after_else = after_then[else_idx + 6 ..];
+
+    const else_str = blk: {
+        const trimmed_end = std.mem.trim(u8, after_else, &std.ascii.whitespace);
+        if (trimmed_end.len >= 3 and std.ascii.eqlIgnoreCase(trimmed_end[trimmed_end.len - 3 ..], "END")) {
+            break :blk std.mem.trim(u8, trimmed_end[0 .. trimmed_end.len - 3], &std.ascii.whitespace);
+        }
+        return null;
+    };
+
+    const split = splitCaseCondAtOp(cond_str) orelse return null;
+    const agg_func = try aggregation.parseAggregateFunc(allocator, split.left) orelse return null;
+
+    const placeholder_map_key = "__agg0__";
+    var placeholder_map = std.StringHashMap(usize).init(allocator);
+    defer placeholder_map.deinit();
+    try placeholder_map.put(placeholder_map_key, 0);
+
+    const rewritten = try std.fmt.allocPrint(allocator, "CASE WHEN {s} {s} {s} THEN {s} ELSE {s} END", .{
+        placeholder_map_key, split.op_text, split.right, then_str, else_str,
+    });
+    defer allocator.free(rewritten);
+
+    const spec = (try scalar.tryParseScalar(rewritten, placeholder_map, allocator)) orelse return null;
+    _ = column_map; // condition's own column refs (if any beyond the aggregate) aren't supported — matches this codebase's single-comparison CASE scope
+    return .{ .agg_func = agg_func, .spec = spec };
+}
+
 fn parseRoundWrapper(col: []const u8) ?struct { inner: []const u8, digits: u8 } {
     const t = std.mem.trim(u8, col, &std.ascii.whitespace);
     if (t.len < 9) return null; // minimum length for ROUND(X,0)
@@ -2814,6 +2903,13 @@ fn isAggregateExpr(col: []const u8) bool {
     if (parseRoundWrapper(col)) |rw| {
         return isAggregateExpr(rw.inner);
     }
+    // CASE WHEN <agg_call> ... END: the aggregate is inside the condition,
+    // not at the top level, so the name_part check below (which only looks
+    // at text before the first '(') would never see it (#113). Must run
+    // before that check's length-based early return kicks in.
+    if (std.ascii.startsWithIgnoreCase(std.mem.trim(u8, col, &std.ascii.whitespace), "case")) {
+        return conditionHasAggregateCall(col);
+    }
     const paren = std.mem.indexOf(u8, col, "(") orelse return false;
     const name_part = std.mem.trim(u8, col[0..paren], &std.ascii.whitespace);
     if (name_part.len == 0 or name_part.len > 12) return false;
@@ -2835,6 +2931,35 @@ fn isAggregateExpr(col: []const u8) bool {
         std.mem.eql(u8, lower, "stddev_pop") or
         std.mem.eql(u8, lower, "stddev_samp") or
         std.mem.eql(u8, lower, "std");
+}
+
+/// Heuristic scan for a known aggregate function name immediately followed
+/// by '(' anywhere in a CASE WHEN's condition portion (before " THEN ").
+/// Word-boundary aware to avoid matching inside a longer identifier.
+/// This only decides dispatch routing; parseCaseWithAggCondition does the
+/// real, precise parsing once routed to the right execution path.
+fn conditionHasAggregateCall(col: []const u8) bool {
+    const then_idx = std.ascii.indexOfIgnoreCase(col, " then ") orelse return false;
+    const cond = col[0..then_idx];
+    const names = [_][]const u8{
+        "count",  "sum",      "avg",     "min",      "max", "group_concat", "string_agg",
+        "median", "variance", "var_pop", "var_samp", "var", "stddev_pop",   "stddev_samp",
+        "stddev", "std",
+    };
+    var i: usize = 0;
+    while (i < cond.len) : (i += 1) {
+        const at_boundary = i == 0 or !(std.ascii.isAlphanumeric(cond[i - 1]) or cond[i - 1] == '_');
+        if (!at_boundary) continue;
+        for (names) |name| {
+            if (i + name.len < cond.len and
+                std.ascii.eqlIgnoreCase(cond[i .. i + name.len], name) and
+                cond[i + name.len] == '(')
+            {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 /// Returns true if any SELECT column is an aggregate expression (no alloc).
@@ -3195,25 +3320,55 @@ fn executeScalarAgg(
 
         // CASE WHEN: check before parseAggregateFunc
         if (std.ascii.indexOfIgnoreCase(effective_col, "CASE") != null) cw_blk: {
-            const cw_result = try parseCaseAggCall(allocator, effective_col, column_map) orelse break :cw_blk;
-            const alias = if (sa.alias) |ua|
-                try allocator.dupe(u8, ua)
-            else
-                try allocator.dupe(u8, effective_col);
-            errdefer allocator.free(alias);
-            var cs = cw_result.case_spec;
-            errdefer cs.comp.deinit(allocator);
-            const agg_idx = agg_specs.items.len;
-            try col_kinds.append(allocator, .{ .aggregate = agg_idx });
-            try out_header_list.append(allocator, alias);
-            try agg_specs.append(allocator, AggSpec{
-                .func_type = cw_result.func_type,
-                .col_idx = null,
-                .alias = alias,
-                .round_digits = round_digits,
-                .case_when = cs,
-            });
-            continue;
+            if (try parseCaseAggCall(allocator, effective_col, column_map)) |cw_result| {
+                const alias = if (sa.alias) |ua|
+                    try allocator.dupe(u8, ua)
+                else
+                    try allocator.dupe(u8, effective_col);
+                errdefer allocator.free(alias);
+                var cs = cw_result.case_spec;
+                errdefer cs.comp.deinit(allocator);
+                const agg_idx = agg_specs.items.len;
+                try col_kinds.append(allocator, .{ .aggregate = agg_idx });
+                try out_header_list.append(allocator, alias);
+                try agg_specs.append(allocator, AggSpec{
+                    .func_type = cw_result.func_type,
+                    .col_idx = null,
+                    .alias = alias,
+                    .round_digits = round_digits,
+                    .case_when = cs,
+                });
+                continue;
+            }
+            // CASE WHEN with an aggregate inside its condition (#113).
+            if (try parseCaseWithAggCondition(allocator, effective_col, column_map)) |result| {
+                var agg_func = result.agg_func;
+                errdefer agg_func.deinit(allocator);
+                const agg_idx = agg_specs.items.len;
+                var col_idx: ?usize = null;
+                if (agg_func.column) |agg_col| {
+                    const lower = try allocator.alloc(u8, agg_col.len);
+                    defer allocator.free(lower);
+                    _ = std.ascii.lowerString(lower, agg_col);
+                    col_idx = column_map.get(lower) orelse return error.ColumnNotFound;
+                    allocator.free(agg_col);
+                    agg_func.column = null;
+                }
+                const display_alias = if (sa.alias) |ua| try allocator.dupe(u8, ua) else try allocator.dupe(u8, effective_col);
+                const gc_sep: []const u8 = agg_func.sep orelse ",";
+                agg_func.sep = null;
+                try agg_specs.append(allocator, AggSpec{
+                    .func_type = agg_func.func_type,
+                    .col_idx = col_idx,
+                    .alias = agg_func.alias,
+                    .round_digits = null,
+                    .sep = gc_sep,
+                });
+                try col_kinds.append(allocator, .{ .agg_case = .{ .agg_idx = agg_idx, .spec = result.spec } });
+                try out_header_list.append(allocator, display_alias);
+                continue;
+            }
+            break :cw_blk;
         }
         if (try aggregation.parseAggregateFunc(allocator, effective_col)) |parsed_agg| {
             var agg_func = parsed_agg;
@@ -3546,6 +3701,13 @@ fn executeScalarAgg(
             .group_key => "",
             .group_key_scalar => "",
             .aggregate => |agg_idx| agg_results[agg_idx],
+            .agg_case => |ac| blk: {
+                // CASE WHEN with an aggregate in its condition (#113). Only
+                // one output row ever exists here, so a dedicated arena for
+                // this one allocation would be overkill — plain allocator.
+                const rec: [1][]const u8 = .{agg_results[ac.agg_idx]};
+                break :blk scalar.eval(ac.spec, &rec, allocator);
+            },
         };
     }
     try writer.writeRecord(output_row);
@@ -4318,25 +4480,56 @@ fn executeGroupBy(
 
             // CASE WHEN: check before parseAggregateFunc
             if (std.ascii.indexOfIgnoreCase(effective_col, "CASE") != null) cw_blk: {
-                const cw_result = try parseCaseAggCall(allocator, effective_col, column_map) orelse break :cw_blk;
-                const alias = if (sa.alias) |ua|
-                    try allocator.dupe(u8, ua)
-                else
-                    try allocator.dupe(u8, effective_col);
-                errdefer allocator.free(alias);
-                var cs = cw_result.case_spec;
-                errdefer cs.comp.deinit(allocator);
-                const agg_idx = agg_specs.items.len;
-                try col_kinds.append(allocator, .{ .aggregate = agg_idx });
-                try out_header_list.append(allocator, alias);
-                try agg_specs.append(allocator, AggSpec{
-                    .func_type = cw_result.func_type,
-                    .col_idx = null,
-                    .alias = alias,
-                    .round_digits = round_digits,
-                    .case_when = cs,
-                });
-                continue;
+                if (try parseCaseAggCall(allocator, effective_col, column_map)) |cw_result| {
+                    const alias = if (sa.alias) |ua|
+                        try allocator.dupe(u8, ua)
+                    else
+                        try allocator.dupe(u8, effective_col);
+                    errdefer allocator.free(alias);
+                    var cs = cw_result.case_spec;
+                    errdefer cs.comp.deinit(allocator);
+                    const agg_idx = agg_specs.items.len;
+                    try col_kinds.append(allocator, .{ .aggregate = agg_idx });
+                    try out_header_list.append(allocator, alias);
+                    try agg_specs.append(allocator, AggSpec{
+                        .func_type = cw_result.func_type,
+                        .col_idx = null,
+                        .alias = alias,
+                        .round_digits = round_digits,
+                        .case_when = cs,
+                    });
+                    continue;
+                }
+                // CASE WHEN with an aggregate inside its condition, e.g.
+                // CASE WHEN AVG(salary) > 80000 THEN 'high' ELSE 'low' END (#113).
+                if (try parseCaseWithAggCondition(allocator, effective_col, column_map)) |result| {
+                    var agg_func = result.agg_func;
+                    errdefer agg_func.deinit(allocator);
+                    const agg_idx = agg_specs.items.len;
+                    var col_idx: ?usize = null;
+                    if (agg_func.column) |agg_col| {
+                        const lower = try allocator.alloc(u8, agg_col.len);
+                        defer allocator.free(lower);
+                        _ = std.ascii.lowerString(lower, agg_col);
+                        col_idx = column_map.get(lower) orelse return error.ColumnNotFound;
+                        allocator.free(agg_col);
+                        agg_func.column = null;
+                    }
+                    const display_alias = if (sa.alias) |ua| try allocator.dupe(u8, ua) else try allocator.dupe(u8, effective_col);
+                    const gc_sep: []const u8 = agg_func.sep orelse ",";
+                    agg_func.sep = null;
+                    try agg_specs.append(allocator, AggSpec{
+                        .func_type = agg_func.func_type,
+                        .col_idx = col_idx,
+                        .alias = agg_func.alias,
+                        .round_digits = null,
+                        .sep = gc_sep,
+                    });
+                    try col_kinds.append(allocator, .{ .agg_case = .{ .agg_idx = agg_idx, .spec = result.spec } });
+                    try out_header_list.append(allocator, display_alias);
+                    continue;
+                }
+                break :cw_blk;
             }
             if (try aggregation.parseAggregateFunc(allocator, effective_col)) |parsed_agg| {
                 var agg_func = parsed_agg;
@@ -5009,6 +5202,13 @@ fn executeGroupBy(
                         },
                     }
                     break :blk scalar.eval(adj_spec, &rec, gb_scalar_arena.allocator());
+                },
+                .agg_case => |ac| blk: {
+                    // CASE WHEN with an aggregate in its condition (#113) — the
+                    // spec's cond_col_idx already points at slot 0, built that
+                    // way in parseCaseWithAggCondition's placeholder rewrite.
+                    const rec: [1][]const u8 = .{agg_results[ac.agg_idx]};
+                    break :blk scalar.eval(ac.spec, &rec, gb_scalar_arena.allocator());
                 },
             };
         }
