@@ -69,13 +69,20 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // Benchmark executables
+    const simd_mod = b.createModule(.{
+        .root_source_file = b.path("src/simd.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const csv_bench_root = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("bench/csv_parse_bench.zig"),
+    });
+    csv_bench_root.addImport("simd", simd_mod);
     const csv_bench = b.addExecutable(.{
         .name = "csv_parse_bench",
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .root_source_file = b.path("bench/csv_parse_bench.zig"),
-        }),
+        .root_module = csv_bench_root,
     });
     csv_bench.linkLibC();
     b.installArtifact(csv_bench);

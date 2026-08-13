@@ -1,9 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const simd = @import("simd");
 
 fn mapFile(allocator: std.mem.Allocator, file: std.fs.File, size: u64) ![]const u8 {
     if (builtin.os.tag == .windows) return file.readToEndAlloc(allocator, @intCast(size));
     const mapped = try std.posix.mmap(null, @intCast(size), std.posix.PROT.READ, .{ .TYPE = .SHARED }, file.handle, 0);
+    std.posix.madvise(mapped.ptr, mapped.len, std.posix.MADV.SEQUENTIAL) catch {};
     return mapped;
 }
 
@@ -57,6 +59,57 @@ pub fn main() !void {
 
     // Benchmark 3: Memory-mapped (our best approach)
     try benchmarkMmap(allocator, file_path);
+
+    // Benchmark 4: real field parser (parseCSVFieldsStatic) — this is the
+    // actual production parsing cost, not just a byte scan. Single-threaded.
+    try benchmarkRealParser(allocator, file_path);
+}
+
+fn benchmarkRealParser(allocator: std.mem.Allocator, file_path: []const u8) !void {
+    var timer = try std.time.Timer.start();
+
+    const file = try std.fs.cwd().openFile(file_path, .{});
+    defer file.close();
+    const file_size = (try file.stat()).size;
+    const data = try mapFile(allocator, file, file_size);
+    defer unmapFile(allocator, data);
+
+    var row_count: usize = 0;
+    var field_total: usize = 0;
+    var field_buf: [256][]const u8 = undefined;
+
+    var line_start: usize = 0;
+    var i: usize = 0;
+    while (i < data.len) : (i += 1) {
+        if (data[i] == '\n') {
+            var line_end = i;
+            if (line_end > line_start and data[line_end - 1] == '\r') line_end -= 1;
+            const line = data[line_start..line_end];
+            if (line.len > 0) {
+                const n = simd.parseCSVFieldsStatic(line, &field_buf, ',') catch 0;
+                field_total += n;
+                row_count += 1;
+            }
+            line_start = i + 1;
+        }
+    }
+    if (line_start < data.len) {
+        const line = data[line_start..data.len];
+        const n = simd.parseCSVFieldsStatic(line, &field_buf, ',') catch 0;
+        field_total += n;
+        row_count += 1;
+    }
+
+    const elapsed = timer.read();
+    const ms = @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
+    const mb = @as(f64, @floatFromInt(file_size)) / (1024.0 * 1024.0);
+
+    std.debug.print("4. Real field parser (parseCSVFieldsStatic, single-thread):\n", .{});
+    std.debug.print("   Rows: {d}\n", .{row_count});
+    std.debug.print("   Fields: {d}\n", .{field_total});
+    std.debug.print("   Time: {d:.2}ms\n", .{ms});
+    std.debug.print("   Speed: {d:.0} rows/sec\n", .{@as(f64, @floatFromInt(row_count)) / (ms / 1000.0)});
+    std.debug.print("   Throughput: {d:.0} MB/sec\n\n", .{mb / (ms / 1000.0)});
 }
 
 fn benchmarkOurReader(_: std.mem.Allocator, file_path: []const u8) !void {

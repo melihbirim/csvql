@@ -89,9 +89,30 @@ pub fn findCommasSIMD(line: []const u8, positions: []usize, delimiter: u8) usize
 /// Use `parseCSVFields` (ArrayList version) when `""` → `"` unescaping is also required.
 /// Returns `error.TooManyColumns` if more fields are found than `buf` can hold.
 pub fn parseCSVFieldsStatic(line: []const u8, buf: [][]const u8, delimiter: u8) !usize {
-    // Fast path: no quotes — plain splitScalar (zero overhead), preserving the
-    // std.mem.splitScalar contract (empty line yields one empty field).
+    // Fast path: no quotes — SIMD comma scan, preserving the std.mem.splitScalar
+    // contract (empty line yields one empty field).
     if (std.mem.indexOfScalar(u8, line, '"') == null) {
+        // Request up to buf.len delimiter positions (one more than the
+        // buf.len-1 max valid count): if findCommasSIMD fills all buf.len
+        // slots, there are >= buf.len delimiters, i.e. >= buf.len+1 fields,
+        // which is always an overflow — no ambiguity with "exactly enough".
+        var positions_stack: [512]usize = undefined;
+        if (buf.len <= positions_stack.len) {
+            const positions = positions_stack[0..buf.len];
+            const delim_count = findCommasSIMD(line, positions, delimiter);
+            if (delim_count == buf.len) return error.TooManyColumns;
+            var count: usize = 0;
+            var start: usize = 0;
+            for (positions[0..delim_count]) |pos| {
+                buf[count] = line[start..pos];
+                count += 1;
+                start = pos + 1;
+            }
+            buf[count] = line[start..];
+            count += 1;
+            return count;
+        }
+        // buf too large for the stack scratch space — scalar fallback.
         var count: usize = 0;
         var iter = std.mem.splitScalar(u8, line, delimiter);
         while (iter.next()) |field| {
