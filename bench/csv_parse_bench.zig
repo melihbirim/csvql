@@ -78,20 +78,20 @@ fn benchmarkRealParser(allocator: std.mem.Allocator, file_path: []const u8) !voi
     var field_total: usize = 0;
     var field_buf: [256][]const u8 = undefined;
 
+    // Vectorized newline search (std.mem.indexOfScalarPos is SIMD-backed) —
+    // a hand-rolled scalar byte loop here would bottleneck the benchmark on
+    // line-splitting instead of measuring the field parser it's meant to time.
     var line_start: usize = 0;
-    var i: usize = 0;
-    while (i < data.len) : (i += 1) {
-        if (data[i] == '\n') {
-            var line_end = i;
-            if (line_end > line_start and data[line_end - 1] == '\r') line_end -= 1;
-            const line = data[line_start..line_end];
-            if (line.len > 0) {
-                const n = simd.parseCSVFieldsStatic(line, &field_buf, ',') catch 0;
-                field_total += n;
-                row_count += 1;
-            }
-            line_start = i + 1;
+    while (std.mem.indexOfScalarPos(u8, data, line_start, '\n')) |nl| {
+        var line_end = nl;
+        if (line_end > line_start and data[line_end - 1] == '\r') line_end -= 1;
+        const line = data[line_start..line_end];
+        if (line.len > 0) {
+            const n = simd.parseCSVFieldsStatic(line, &field_buf, ',') catch 0;
+            field_total += n;
+            row_count += 1;
         }
+        line_start = nl + 1;
     }
     if (line_start < data.len) {
         const line = data[line_start..data.len];

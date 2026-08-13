@@ -29,6 +29,20 @@ pub const MmapHeader = struct {
 /// slice with an explicit start offset so mmap-based scan loops that don't
 /// go through BulkCsvReader can stay quote-aware too.
 pub fn findRecordEnd(data: []const u8, start: usize, delimiter: u8) ?usize {
+    // Fast path: SIMD-scan for the next newline, then SIMD-scan the span
+    // before it for a quote byte. Most rows have no quotes at all, so this
+    // skips the scalar state machine below entirely for the common case.
+    // Any quote byte in the span (even one that wouldn't actually open a
+    // quoted field, e.g. mid-field) falls back to the scalar path — that's
+    // always correct, just conservative.
+    const nl = std.mem.indexOfScalarPos(u8, data, start, '\n') orelse return null;
+    if (std.mem.indexOfScalarPos(u8, data[0..nl], start, '"') == null) {
+        return nl;
+    }
+    return findRecordEndScalar(data, start, delimiter);
+}
+
+fn findRecordEndScalar(data: []const u8, start: usize, delimiter: u8) ?usize {
     var i = start;
     var in_quote = false;
     var at_field_start = true;

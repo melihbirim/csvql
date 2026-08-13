@@ -57,17 +57,19 @@ pub fn findCommasSIMD(line: []const u8, positions: []usize, delimiter: u8) usize
 
     var i: usize = 0;
 
-    // SIMD main loop — 16 bytes per iteration
-    while (i + VecSize <= line.len and count < positions.len) : (i += VecSize) {
+    // SIMD main loop — 16 bytes per iteration. Comparison result is bitcast
+    // to a u16 bitmask and walked with @ctz/mask-clear so only set bits cost
+    // an iteration, instead of always branching over all 16 lanes.
+    while (i + VecSize <= line.len) : (i += VecSize) {
         const chunk: Vec = line[i..][0..VecSize].*;
-        const matches = chunk == delim_vec;
-
-        var j: usize = 0;
-        while (j < VecSize) : (j += 1) {
-            if (matches[j] and count < positions.len) {
-                positions[count] = i + j;
-                count += 1;
-            }
+        const matches: @Vector(VecSize, bool) = chunk == delim_vec;
+        var bitmask: u16 = @bitCast(matches);
+        while (bitmask != 0) {
+            if (count >= positions.len) return count;
+            const bit = @ctz(bitmask);
+            positions[count] = i + bit;
+            count += 1;
+            bitmask &= bitmask - 1;
         }
     }
 
