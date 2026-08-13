@@ -2549,10 +2549,36 @@ inline fn splitLine(line: []const u8, buf: [][]const u8, delim: u8) []const []co
 /// expressions, so `STRFTIME('%Y-%m', col) AS month` correctly splits into
 /// `STRFTIME('%Y-%m', col)` and `month`.
 /// The returned slices point into the original `expr` memory.
+/// Reserved words that must never be mistaken for an implicit (no-AS) alias
+/// trailing a SELECT expression, e.g. "CASE WHEN x THEN 1 ELSE 0 END" must
+/// not be read as expr="...END" alias missing / expr="..." alias="END".
+const implicit_alias_stopwords = [_][]const u8{
+    "end",  "then", "else",     "when", "case", "from", "and",
+    "or",   "not",  "is",       "null", "in",   "like", "asc",
+    "desc", "as",   "distinct",
+};
+
+fn isImplicitAliasStopword(tok: []const u8) bool {
+    for (implicit_alias_stopwords) |kw| {
+        if (std.ascii.eqlIgnoreCase(tok, kw)) return true;
+    }
+    return false;
+}
+
+fn isBareIdent(tok: []const u8) bool {
+    if (tok.len == 0) return false;
+    if (!(std.ascii.isAlphabetic(tok[0]) or tok[0] == '_')) return false;
+    for (tok[1..]) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
+    }
+    return true;
+}
+
 fn splitAlias(expr: []const u8) struct { expr: []const u8, alias: ?[]const u8 } {
     var depth: usize = 0;
     var i: usize = 0;
     var last_as: ?usize = null;
+    var last_top_space: ?usize = null;
     while (i < expr.len) {
         if (expr[i] == '\'') {
             i += 1;
@@ -2576,6 +2602,7 @@ fn splitAlias(expr: []const u8) struct { expr: []const u8, alias: ?[]const u8 } 
         {
             last_as = i;
         }
+        if (depth == 0 and expr[i] == ' ') last_top_space = i;
         i += 1;
     }
     if (last_as) |idx| {
@@ -2589,6 +2616,14 @@ fn splitAlias(expr: []const u8) struct { expr: []const u8, alias: ?[]const u8 } 
                 .expr = std.mem.trim(u8, expr[0..idx], &std.ascii.whitespace),
                 .alias = alias,
             };
+        }
+    }
+    // Implicit alias: "expr alias" with no AS keyword, e.g. "COUNT(*) c".
+    if (last_top_space) |idx| {
+        const head = std.mem.trim(u8, expr[0..idx], &std.ascii.whitespace);
+        const tail = std.mem.trim(u8, expr[idx + 1 ..], &std.ascii.whitespace);
+        if (head.len > 0 and isBareIdent(tail) and !isImplicitAliasStopword(tail)) {
+            return .{ .expr = head, .alias = tail };
         }
     }
     return .{ .expr = expr, .alias = null };
