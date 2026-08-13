@@ -147,6 +147,8 @@ pub const Comparison = struct {
     numeric_value: ?f64,
     /// Non-null when this is an IN (...) expression; holds the list of values to match.
     in_values: ?[][]u8 = null,
+    /// true for NOT IN (...) — negates the in_values membership check.
+    in_negate: bool = false,
     /// BETWEEN: upper bound string (value field holds lower bound)
     between_high: ?[]u8 = null,
     /// BETWEEN: upper bound as f64 (null if non-numeric)
@@ -924,12 +926,25 @@ pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
         return parseLikeComparison(allocator, trimmed, idx);
     }
 
+    // Check for NOT IN (...) before IN (...) — "col NOT IN (" contains " IN ("
+    // as a substring starting after "NOT", so NOT IN must be checked first or
+    // it gets misparsed as a plain IN with "col NOT" as the column name (#115).
+    if (std.ascii.indexOfIgnoreCase(trimmed, " NOT IN (")) |idx| {
+        const col_candidate = std.mem.trim(u8, trimmed[0..idx], &std.ascii.whitespace);
+        if (std.mem.indexOfAny(u8, col_candidate, "=<>!'\"(") == null) {
+            // idx (before " NOT IN (") is correct for both ends: column_part
+            // uses input[0..idx] (just the column), and the paren search in
+            // input[idx..] finds '(' regardless of the "NOT IN" text before it.
+            return parseInComparison(allocator, trimmed, idx, true);
+        }
+    }
+
     // Check for IN (...) operator before = (so "col IN (...)" doesn't match the = path)
     if (std.ascii.indexOfIgnoreCase(trimmed, " IN (")) |idx| {
         const col_candidate = std.mem.trim(u8, trimmed[0..idx], &std.ascii.whitespace);
         // Only treat as IN if the left-hand side looks like a plain identifier (no operators/quotes)
         if (std.mem.indexOfAny(u8, col_candidate, "=<>!'\"(") == null) {
-            return parseInComparison(allocator, trimmed, idx);
+            return parseInComparison(allocator, trimmed, idx, false);
         }
     }
 
@@ -985,7 +1000,7 @@ fn parseBetween(allocator: Allocator, input: []const u8, between_idx: usize) !Ex
     } };
 }
 
-fn parseInComparison(allocator: Allocator, input: []const u8, in_idx: usize) !Expression {
+fn parseInComparison(allocator: Allocator, input: []const u8, in_idx: usize, negate: bool) !Expression {
     const column_part = std.mem.trim(u8, input[0..in_idx], &std.ascii.whitespace);
     // Skip to the opening paren: " IN (" so paren is 4 chars after in_idx
     const after_in = input[in_idx..];
@@ -1031,6 +1046,7 @@ fn parseInComparison(allocator: Allocator, input: []const u8, in_idx: usize) !Ex
             .value = try allocator.dupe(u8, ""),
             .numeric_value = null,
             .in_values = try values.toOwnedSlice(allocator),
+            .in_negate = negate,
         },
     };
 }
@@ -1397,12 +1413,12 @@ pub fn compareValues(comp: Comparison, candidate: []const u8) bool {
     if (comp.operator == .is_null) return candidate.len == 0;
     if (comp.operator == .is_not_null) return candidate.len != 0;
 
-    // IN (...) — check membership against the list of values
+    // IN (...) / NOT IN (...) — check membership against the list of values
     if (comp.in_values) |vals| {
         for (vals) |v| {
-            if (std.mem.eql(u8, candidate, v)) return true;
+            if (std.mem.eql(u8, candidate, v)) return !comp.in_negate;
         }
-        return false;
+        return comp.in_negate;
     }
 
     // BETWEEN low AND high
