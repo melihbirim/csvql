@@ -3457,7 +3457,7 @@ fn executeScalarAgg(
             const lower = try allocator.alloc(u8, effective_col.len);
             defer allocator.free(lower);
             _ = std.ascii.lowerString(lower, effective_col);
-            const cidx = column_map.get(lower) orelse return error.ColumnNotFound;
+            const cidx = column_map.get(lower) orelse return columnLookupError(effective_col);
             try col_kinds.append(allocator, .{ .regular = cidx });
             try out_header_list.append(allocator, if (sa.alias) |a| a else std.mem.trim(u8, header[cidx], " \t\r\n")); // trim header whitespace (#101)
         }
@@ -4666,10 +4666,10 @@ fn executeGroupBy(
                                 try col_kinds.append(allocator, .{ .group_key_scalar = .{ .gi = gi, .spec = sc_spec } });
                                 try out_header_list.append(allocator, if (sa.alias) |a| a else effective_col);
                             } else {
-                                return error.ColumnNotFound;
+                                return columnLookupError(effective_col);
                             }
                         } else {
-                            return error.ColumnNotFound;
+                            return columnLookupError(effective_col);
                         }
                     }
                 }

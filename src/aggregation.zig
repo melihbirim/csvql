@@ -43,6 +43,13 @@ pub fn parseAggregateFunc(allocator: Allocator, expr: []const u8) !?AggregateFun
 
     if (close_paren <= open_paren) return null;
 
+    // Reject "COUNT(*) * 2", "SUM(x) + 1" etc: trailing content after the
+    // call's closing paren means this isn't a bare aggregate call, and
+    // silently ignoring the trailing arithmetic would return a wrong value
+    // instead of erroring. Returning null here lets it fall through to the
+    // regular-column path, which reports error.ArithmeticExpressionsNotSupported.
+    if (std.mem.trim(u8, trimmed[close_paren + 1 ..], &std.ascii.whitespace).len != 0) return null;
+
     const func_name = std.mem.trim(u8, trimmed[0..open_paren], &std.ascii.whitespace);
     const column_part = std.mem.trim(u8, trimmed[open_paren + 1 .. close_paren], &std.ascii.whitespace);
 
