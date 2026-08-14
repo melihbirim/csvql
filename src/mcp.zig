@@ -222,6 +222,16 @@ fn toolCsvQuery(
         const withNote = try std.fmt.allocPrint(allocator, "{s}\n\n[Showing first {d} rows — no LIMIT was given. Add LIMIT/WHERE or aggregate for complete or narrower results.]", .{ trimmed, DEFAULT_ROW_CAP });
         defer allocator.free(withNote);
         try sendToolResult(allocator, id, withNote, resp);
+    } else if (rows == 0) {
+        // Zero rows on its own is ambiguous — confirmed negative or a
+        // silently broken query look identical. Say what was actually
+        // scanned so the caller can trust the negative (#130).
+        const withNote = if (res.zero_rows_file_total) |total|
+            try std.fmt.allocPrint(allocator, "{s}\n\n[0 rows matched — full file scanned ({d} total rows in the source file).]", .{ trimmed, total })
+        else
+            try std.fmt.allocPrint(allocator, "{s}\n\n[0 rows matched.]", .{trimmed});
+        defer allocator.free(withNote);
+        try sendToolResult(allocator, id, withNote, resp);
     } else {
         try sendToolResult(allocator, id, trimmed, resp);
     }
@@ -346,6 +356,13 @@ const QueryResult = struct {
     row_capped: bool, // true when we injected DEFAULT_ROW_CAP (result may be partial)
     shrunk_for_bytes: bool = false, // true when we auto-narrowed LIMIT to fit MAX_RESULT_BYTES
     shrunk_to: i32 = 0, // the LIMIT we shrank to, when shrunk_for_bytes is true
+    /// Set when the primary result had zero rows: total rows in the source
+    /// file, so the caller can distinguish a confirmed negative ("full file
+    /// scanned, N rows total, none matched") from a silently broken query
+    /// that also happens to return nothing (#130). Null if the total-count
+    /// probe itself failed — never block the primary (already-successful)
+    /// result on that.
+    zero_rows_file_total: ?i64 = null,
 };
 
 /// Run one query to a temp file and return its raw output.
@@ -418,7 +435,42 @@ fn runQuery(allocator: Allocator, sql: []const u8, format: options_mod.OutputFor
         }
     }
 
-    return .{ .output = output, .row_capped = row_capped, .shrunk_for_bytes = shrunk_for_bytes, .shrunk_to = shrunk_to };
+    // Zero rows is ambiguous on its own — a genuine "nothing matched" and a
+    // silently broken query (misparsed WHERE, wrong column resolution) look
+    // identical to the caller. Probe the source file's total row count so a
+    // confirmed negative can say so (#130). Best-effort: any failure here
+    // just leaves the hint null, never disturbs the already-successful
+    // primary result.
+    var zero_rows_file_total: ?i64 = null;
+    if (std.mem.count(u8, std.mem.trim(u8, output, "\r\n "), "{") == 0) {
+        zero_rows_file_total = probeFileTotalRows(allocator, q.file_path) catch null;
+    }
+
+    return .{ .output = output, .row_capped = row_capped, .shrunk_for_bytes = shrunk_for_bytes, .shrunk_to = shrunk_to, .zero_rows_file_total = zero_rows_file_total };
+}
+
+/// SELECT COUNT(*) against the same source file, no WHERE — the "how many
+/// rows does this file actually have" context for a zero-row result (#130).
+fn probeFileTotalRows(allocator: Allocator, file_path: []const u8) !?i64 {
+    const count_sql = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM '{s}'", .{file_path});
+    defer allocator.free(count_sql);
+    var count_q = try parser.parse(allocator, count_sql);
+    defer count_q.deinit();
+    const count_output = try runOnce(allocator, count_q, .json);
+    defer allocator.free(count_output);
+
+    // Output looks like [{"COUNT(*)":123}] — pull out the first number.
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, count_output, .{}) catch return null;
+    defer parsed.deinit();
+    const arr = parsed.value.array;
+    if (arr.items.len == 0) return null;
+    var it = arr.items[0].object.iterator();
+    const first = it.next() orelse return null;
+    return switch (first.value_ptr.*) {
+        .integer => |n| n,
+        .float => |f| @intFromFloat(f),
+        else => null,
+    };
 }
 
 // ---------------------------------------------------------------------------
