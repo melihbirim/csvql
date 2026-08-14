@@ -41,6 +41,7 @@ pub const ScalarSpec = union(enum) {
     split_part: SplitPartArgs, // SPLIT_PART(col, 'delim', n) — n-th field (1-based)
     greatest: VariadicArgs, // GREATEST(a, b, ...) — row-wise max
     least: VariadicArgs, // LEAST(a, b, ...) — row-wise min
+    concat: ConcatArgs, // CONCAT(a, b, ...) — column refs and/or string literals
     case_when: CaseWhenArgs, // bare CASE WHEN ... THEN ... ELSE ... END (#105)
     is_null_check: IsNullArgs, // col IS NULL / col IS NOT NULL as a SELECT expression
 
@@ -127,6 +128,22 @@ pub const ScalarSpec = union(enum) {
 
     pub const CaseOp = enum { eq, ne, gt, ge, lt, le };
 
+    /// One CONCAT argument: either a column reference or a string literal.
+    pub const ConcatPart = union(enum) {
+        col_idx: usize,
+        literal: []const u8, // slice into the query expr (query-lifetime)
+    };
+
+    /// Up to 8 args for CONCAT.
+    pub const ConcatArgs = struct {
+        parts_buf: [8]ConcatPart = undefined,
+        parts_len: usize,
+
+        pub fn parts(self: *const ConcatArgs) []const ConcatPart {
+            return self.parts_buf[0..self.parts_len];
+        }
+    };
+
     pub const IsNullArgs = struct {
         col_idx: usize,
         negate: bool, // true = IS NOT NULL
@@ -161,6 +178,9 @@ pub const ScalarSpec = union(enum) {
             .greatest, .least => |a| a.cols()[0],
             .case_when => |a| a.cond_col_idx,
             .is_null_check => |a| a.col_idx,
+            .concat => |a| for (a.parts()) |p| {
+                if (p == .col_idx) break p.col_idx;
+            } else 0,
         };
     }
 };
@@ -325,6 +345,39 @@ pub fn tryParseScalar(
         }
         if (v.cols_len < 2) return null;
         return if (std.mem.eql(u8, fn_lower, "greatest")) .{ .greatest = v } else .{ .least = v };
+    }
+
+    // ── CONCAT(a, b, ...) — column refs and/or 'string' literals ────────────
+    if (std.mem.eql(u8, fn_lower, "concat")) {
+        var v = ScalarSpec.ConcatArgs{ .parts_len = 0 };
+        var start: usize = 0;
+        var in_quote = false;
+        var i: usize = 0;
+        while (i <= args_str.len) : (i += 1) {
+            const at_end = i == args_str.len;
+            const c: u8 = if (at_end) ',' else args_str[i];
+            if (!at_end and c == '\'') {
+                in_quote = !in_quote;
+                continue;
+            }
+            if (in_quote) continue;
+            if (c == ',') {
+                const arg = std.mem.trim(u8, args_str[start..i], &std.ascii.whitespace);
+                start = i + 1;
+                if (arg.len == 0) continue;
+                if (v.parts_len >= v.parts_buf.len) return error.TooManyArgs;
+                if (arg.len >= 2 and arg[0] == '\'' and arg[arg.len - 1] == '\'') {
+                    v.parts_buf[v.parts_len] = .{ .literal = arg[1 .. arg.len - 1] };
+                } else {
+                    const cidx = try resolveCol(arg, column_map, allocator) orelse
+                        return error.ColumnNotFound;
+                    v.parts_buf[v.parts_len] = .{ .col_idx = cidx };
+                }
+                v.parts_len += 1;
+            }
+        }
+        if (v.parts_len < 1) return null;
+        return .{ .concat = v };
     }
 
     // ── MOD ────────────────────────────────────────────────────────────────
@@ -622,6 +675,26 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
         },
         .greatest => |args| return pickExtreme(record, args.cols(), true),
         .least => |args| return pickExtreme(record, args.cols(), false),
+        .concat => |args| {
+            var total: usize = 0;
+            for (args.parts()) |p| {
+                total += switch (p) {
+                    .col_idx => |ci| field(record, ci).len,
+                    .literal => |lit| lit.len,
+                };
+            }
+            const buf = arena.alloc(u8, total) catch return "";
+            var off: usize = 0;
+            for (args.parts()) |p| {
+                const s = switch (p) {
+                    .col_idx => |ci| field(record, ci),
+                    .literal => |lit| lit,
+                };
+                @memcpy(buf[off .. off + s.len], s);
+                off += s.len;
+            }
+            return buf;
+        },
         .length => |cidx| {
             const v = field(record, cidx);
             const buf = arena.alloc(u8, 20) catch return "0";

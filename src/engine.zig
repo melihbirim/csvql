@@ -5262,6 +5262,9 @@ fn executeGroupBy(
                             }
                         },
                         .is_null_check => |*a| a.col_idx = 0,
+                        .concat => |*a| for (a.parts_buf[0..a.parts_len]) |*p| {
+                            if (p.* == .col_idx) p.* = .{ .col_idx = 0 };
+                        },
                     }
                     break :blk scalar.eval(adj_spec, &rec, gb_scalar_arena.allocator());
                 },
