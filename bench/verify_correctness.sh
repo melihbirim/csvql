@@ -360,6 +360,16 @@ check \
   "SELECT department, LOWER(TRIM(department)) AS d FROM '$CSV' GROUP BY department ORDER BY department" \
   "SELECT department, LOWER(TRIM(department)) AS d FROM read_csv_auto('$CSV') GROUP BY department ORDER BY department"
 
+check \
+  "Table alias outside JOIN, AS keyword (#121)" \
+  "SELECT t.name, t.department FROM '$CSV' AS t WHERE t.salary > 100000 ORDER BY t.name, t.department" \
+  "SELECT t.name, t.department FROM read_csv_auto('$CSV') AS t WHERE t.salary > 100000 ORDER BY t.name, t.department"
+
+check \
+  "Table alias outside JOIN, bare (no AS) (#121)" \
+  "SELECT t.name FROM '$CSV' t WHERE t.department = 'Sales' ORDER BY t.name" \
+  "SELECT t.name FROM read_csv_auto('$CSV') t WHERE t.department = 'Sales' ORDER BY t.name"
+
 # ════════════════════════════════════════════════════════════════
 echo ""
 echo "── JOIN (hash-join, exercises parallel probe on large base) ─"

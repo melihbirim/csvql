@@ -153,6 +153,8 @@ pub const Comparison = struct {
     between_high: ?[]u8 = null,
     /// BETWEEN: upper bound as f64 (null if non-numeric)
     between_high_num: ?f64 = null,
+    /// Non-null for "col % divisor op value" — candidate is taken mod this before comparing.
+    mod_divisor: ?f64 = null,
 
     pub fn deinit(self: Comparison, allocator: Allocator) void {
         allocator.free(self.column);
@@ -323,8 +325,52 @@ fn detectJoinKeyword(s: []const u8) ?JoinKeyword {
 
 const FileAlias = struct { file: []u8, alias: []u8 };
 
+fn isAliasIdentChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+fn isAliasIdentStartChar(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '_';
+}
+
+/// Rewrite every "alias.column" reference in `text` to the bare "column"
+/// (#121), e.g. "FROM 'f.csv' AS t WHERE t.dept = 'Eng'" needs "t.dept"
+/// resolved as "dept". Single alias, no ambiguity tracking needed since a
+/// non-JOIN query only ever has the one table.
+fn stripSingleAlias(allocator: Allocator, text: []const u8, alias: []const u8) ![]const u8 {
+    if (alias.len == 0) return text;
+    var out = std.ArrayListUnmanaged(u8){};
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    outer: while (i < text.len) {
+        const at_boundary = i == 0 or !isAliasIdentChar(text[i - 1]);
+        if (at_boundary and i + alias.len < text.len and
+            std.ascii.eqlIgnoreCase(text[i .. i + alias.len], alias) and
+            text[i + alias.len] == '.' and
+            i + alias.len + 1 < text.len and
+            isAliasIdentStartChar(text[i + alias.len + 1]))
+        {
+            i += alias.len + 1; // skip "alias."
+            continue :outer;
+        }
+        try out.append(allocator, text[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Strip a leading "AS " (case-insensitive) from an alias candidate, e.g.
+/// "AS t" -> "t". No-op when there's no AS keyword (bare "t" is already
+/// valid, matching JOIN's existing alias syntax).
+fn stripAsKeyword(s: []const u8) []const u8 {
+    if (s.len > 3 and std.ascii.eqlIgnoreCase(s[0..3], "AS ")) {
+        return std.mem.trim(u8, s[3..], &std.ascii.whitespace);
+    }
+    return s;
+}
+
 /// Extract a file path and optional alias from a string like:
 ///   'path/to/file.csv' alias
+///   'path/to/file.csv' AS alias
 ///   'path/to/file.csv'
 ///   path/to/file.csv alias
 ///   path/to/file.csv
@@ -337,7 +383,7 @@ fn extractFileAndAlias(allocator: Allocator, input: []const u8) !FileAlias {
         // Quoted path: find closing single-quote
         const end_q = std.mem.indexOfScalar(u8, s[1..], '\'') orelse return error.InvalidQuery;
         const file_raw = s[1 .. end_q + 1]; // inside the quotes
-        const after = std.mem.trim(u8, s[end_q + 2 ..], &std.ascii.whitespace);
+        const after = stripAsKeyword(std.mem.trim(u8, s[end_q + 2 ..], &std.ascii.whitespace));
         const alias_buf = try allocator.alloc(u8, after.len);
         _ = std.ascii.lowerString(alias_buf, after);
         return FileAlias{
@@ -348,7 +394,7 @@ fn extractFileAndAlias(allocator: Allocator, input: []const u8) !FileAlias {
         // Unquoted path: split on first whitespace
         if (std.mem.indexOfAny(u8, s, &std.ascii.whitespace)) |sp| {
             const file_raw = s[0..sp];
-            const after = std.mem.trim(u8, s[sp + 1 ..], &std.ascii.whitespace);
+            const after = stripAsKeyword(std.mem.trim(u8, s[sp + 1 ..], &std.ascii.whitespace));
             const alias_buf = try allocator.alloc(u8, after.len);
             _ = std.ascii.lowerString(alias_buf, after);
             return FileAlias{
@@ -465,6 +511,13 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
 
     // This is a simplified parser - full implementation would use proper regex or parser combinator
     // For now, we'll do basic string parsing
+
+    // Scratch space for single-table alias dealiasing (#121) — transient
+    // buffers only (rewritten column/clause text), never stored on Query, so
+    // a throwaway arena is simpler and safer than tracking individual frees
+    // across every early-return path in this function.
+    var alias_scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer alias_scratch.deinit();
 
     var trimmed = std.mem.trim(u8, input, &std.ascii.whitespace);
 
@@ -637,10 +690,30 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
         if (order_by_idx_pre) |i| fend = @min(fend, i);
         if (limit_idx_pre) |i| fend = @min(fend, i);
 
-        const fp = std.mem.trim(u8, from_rest[0..fend], &std.ascii.whitespace);
-        query.file_path = try allocator.dupe(u8, trimQuotes(fp));
+        const fp_raw = std.mem.trim(u8, from_rest[0..fend], &std.ascii.whitespace);
+        const file_alias = try extractFileAndAlias(allocator, fp_raw);
+        defer allocator.free(file_alias.alias);
+        query.file_path = try allocator.dupe(u8, trimQuotes(file_alias.file));
+        allocator.free(file_alias.file);
         query.joins = try allocator.alloc(JoinClause, 0);
-        rest = from_rest;
+
+        if (file_alias.alias.len > 0) {
+            // Dealias "alias.col" -> "col" in SELECT columns (already parsed above).
+            for (query.columns) |*col| {
+                const dealiased = try stripSingleAlias(alias_scratch.allocator(), col.*, file_alias.alias);
+                if (dealiased.ptr != col.*.ptr) {
+                    const owned = try allocator.dupe(u8, dealiased);
+                    allocator.free(col.*);
+                    col.* = owned;
+                }
+            }
+            // Dealias the remainder (WHERE/GROUP BY/HAVING/ORDER BY raw text)
+            // before those clauses are parsed below. Lives in alias_scratch,
+            // which outlives the rest of this function.
+            rest = try stripSingleAlias(alias_scratch.allocator(), from_rest, file_alias.alias);
+        } else {
+            rest = from_rest;
+        }
     }
 
     // Parse the clause keywords (WHERE / GROUP BY / ORDER BY / LIMIT) from `rest`
@@ -953,6 +1026,12 @@ pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
     // so that e.g. DATEDIFF(...) > 5 is not parsed as a plain `>` comparison.
     if (try parseScalarWhereComparison(allocator, trimmed)) |expr| return expr;
 
+    // "col % divisor op value" (#119) — must come before the bare-operator
+    // checks below so "id % 2 = 0" isn't parsed as column "id % 2".
+    if (std.mem.indexOf(u8, trimmed, " % ")) |mod_idx| {
+        if (try parseModComparison(allocator, trimmed, mod_idx)) |expr| return expr;
+    }
+
     // Check for operators (simple case - no parentheses)
     if (std.mem.indexOf(u8, trimmed, ">=")) |idx| {
         return parseComparison(allocator, trimmed, ">=", idx);
@@ -1256,6 +1335,49 @@ fn parseComparison(allocator: Allocator, input: []const u8, op_str: []const u8, 
     };
 }
 
+/// Parse "col % divisor op value" (#119), e.g. "id % 2 = 0". Returns null
+/// when the text after " % " doesn't contain a recognized comparison
+/// operator or the divisor/value aren't numeric, letting the caller fall
+/// through to the normal comparison paths.
+fn parseModComparison(allocator: Allocator, input: []const u8, mod_idx: usize) !?Expression {
+    const column_part = std.mem.trim(u8, input[0..mod_idx], &std.ascii.whitespace);
+    if (column_part.len == 0) return null;
+    const rest = std.mem.trim(u8, input[mod_idx + 3 ..], &std.ascii.whitespace);
+
+    // Longer operators first so "!=" / ">=" / "<=" aren't matched as "=" / ">" / "<".
+    const ops = [_][]const u8{ "!=", ">=", "<=", "=", ">", "<" };
+    for (ops) |op_str| {
+        const op_idx = std.mem.indexOf(u8, rest, op_str) orelse continue;
+        const divisor_str = std.mem.trim(u8, rest[0..op_idx], &std.ascii.whitespace);
+        const value_str = std.mem.trim(u8, rest[op_idx + op_str.len ..], &std.ascii.whitespace);
+        const divisor = std.fmt.parseFloat(f64, divisor_str) catch return null;
+        if (divisor == 0) return null;
+        _ = std.fmt.parseFloat(f64, value_str) catch return null; // validate it's numeric
+        const operator = Operator.fromString(op_str) orelse return null;
+
+        const column_lower = try allocator.alloc(u8, column_part.len);
+        _ = std.ascii.lowerString(column_lower, column_part);
+        return Expression{
+            .comparison = Comparison{
+                .column = column_lower,
+                .operator = operator,
+                .value = try allocator.dupe(u8, value_str),
+                // Deliberately left null: every WHERE fast-path call site in
+                // engine.zig/mmap_engine.zig/parallel_mmap.zig branches on
+                // `if (comp.numeric_value) |threshold|` for its own inline
+                // numeric switch and only falls back to compareValues() in
+                // the else branch. Leaving this null routes mod comparisons
+                // through compareValues() everywhere without touching every
+                // one of those call sites (#119) — compareValues parses the
+                // expected value from comp.value instead.
+                .numeric_value = null,
+                .mod_divisor = divisor,
+            },
+        };
+    }
+    return null;
+}
+
 fn trimQuotes(input: []const u8) []const u8 {
     if (input.len >= 2) {
         if ((input[0] == '\'' and input[input.len - 1] == '\'') or
@@ -1412,6 +1534,24 @@ pub fn compareValues(comp: Comparison, candidate: []const u8) bool {
     // IS NULL / IS NOT NULL
     if (comp.operator == .is_null) return candidate.len == 0;
     if (comp.operator == .is_not_null) return candidate.len != 0;
+
+    // "col % divisor op value" (#119) — truncated remainder, sign follows the
+    // dividend, matching SQL's % operator semantics (not Zig's @mod, which
+    // follows the divisor's sign).
+    if (comp.mod_divisor) |divisor| {
+        const val = std.fmt.parseFloat(f64, candidate) catch return false;
+        const expected = std.fmt.parseFloat(f64, comp.value) catch return false;
+        const remainder = @rem(val, divisor);
+        return switch (comp.operator) {
+            .equal => remainder == expected,
+            .not_equal => remainder != expected,
+            .greater => remainder > expected,
+            .greater_equal => remainder >= expected,
+            .less => remainder < expected,
+            .less_equal => remainder <= expected,
+            .like, .ilike, .between, .is_null, .is_not_null => unreachable,
+        };
+    }
 
     // IN (...) / NOT IN (...) — check membership against the list of values
     if (comp.in_values) |vals| {
