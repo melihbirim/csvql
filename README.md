@@ -253,15 +253,16 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 | Feature       | Syntax                                                                  |
 | ------------- | ----------------------------------------------------------------------- |
 | **SELECT**    | `SELECT col1, col2` or `SELECT *`                                       |
-| **AS alias**  | `SELECT expr AS alias` — rename any column or expression in output      |
+| **AS alias**  | `SELECT expr AS alias` — rename any column or expression in output; `AS` is optional (`SELECT expr alias` also works) |
 | **DISTINCT**  | `SELECT DISTINCT col1, col2` — deduplicates output rows                 |
-| **FROM**      | `FROM 'file.csv'` or `FROM -` (stdin)                                   |
+| **FROM**      | `FROM 'file.csv'` or `FROM -` (stdin); optional table alias — `FROM 'file.csv' AS t` or bare `FROM 'file.csv' t`, reference columns as `t.col` |
 | **WHERE**     | `=`, `!=`, `>`, `>=`, `<`, `<=` with auto numeric coercion              |
+| **Modulo**    | `WHERE col % n = val` — integer remainder test in WHERE (also `MOD(col, n)` as a SELECT expression) |
 | **LIKE**      | `WHERE col LIKE 'pattern'` — `%` any sequence, `_` any single char      |
 | **ILIKE**     | `WHERE col ILIKE 'pattern'` — same as LIKE but case-insensitive         |
 | **BETWEEN**   | `WHERE col BETWEEN low AND high` — inclusive numeric or string range    |
-| **IN**        | `WHERE col IN ('a', 'b', 'c')` — membership test                        |
-| **IS NULL**   | `WHERE col IS NULL` / `WHERE col IS NOT NULL` — empty-field test        |
+| **IN / NOT IN** | `WHERE col IN ('a', 'b', 'c')`, `WHERE col NOT IN ('a', 'b')` — membership test and its negation |
+| **IS NULL**   | `WHERE col IS NULL` / `WHERE col IS NOT NULL` — empty-field test; also usable as a SELECT expression (`SELECT col IS NOT NULL AS has_val`), returns `true`/`false` |
 | **NOT**       | `WHERE NOT expr` — logical negation of any condition                    |
 | **AND / OR**  | `WHERE cond1 AND cond2` / `WHERE cond1 OR cond2` — compound conditions  |
 | **JOIN**      | `FROM 'a.csv' a [INNER] JOIN 'b.csv' b ON a.key = b.key`               |
@@ -272,14 +273,15 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 | **VARIANCE / STDDEV** | `VARIANCE(col)`, `STDDEV(col)` — sample variance / std deviation, N-1 denominator (aliases `VAR`, `VAR_SAMP`, `STDDEV_SAMP`). Population variants: `VAR_POP(col)`, `STDDEV_POP(col)` |
 | **MEDIAN** | `MEDIAN(col)` — median of numeric values (mean of the two middles for an even count) |
 | **GROUP_CONCAT** | `GROUP_CONCAT(col [, 'sep'])` — concatenate group values (default separator `,`; alias `STRING_AGG`) |
-| **CASE WHEN** | `CASE WHEN col OP val THEN n ELSE m END` inside any aggregate function  |
+| **CASE WHEN** | `CASE WHEN col OP val THEN n ELSE m END` inside any aggregate function, or wrapping an aggregate in its own condition — `CASE WHEN AVG(col) > n THEN ... END` |
 | **MIN / MAX** | `MIN(col)`, `MAX(col)` — with or without `GROUP BY`                     |
-| **HAVING**    | `HAVING expr` — filter groups after aggregation (e.g. `HAVING COUNT(*) > 5`) |
+| **HAVING**    | `HAVING expr` — filter groups after aggregation (e.g. `HAVING COUNT(*) > 5`); `AND`/`OR` of multiple aggregates not in `SELECT` also works (e.g. `HAVING COUNT(*) > 5 AND MAX(col) > 100`) |
 | **STRFTIME**  | `STRFTIME('%Y-%m', col)` — date bucketing in `SELECT` and `GROUP BY`    |
 | **DATE_PART** | `DATE_PART('year', col)` — extract `year`/`month`/`day`/`hour`/`minute`/`second`; alias for `STRFTIME` in `SELECT` and `GROUP BY` |
-| **UPPER / LOWER** | `SELECT UPPER(col), LOWER(col)` — case conversion                  |
-| **TRIM**      | `SELECT TRIM(col)` — strip leading and trailing whitespace              |
-| **LENGTH**    | `SELECT LENGTH(col)` — byte length of the value                         |
+| **UPPER / LOWER** | `SELECT UPPER(col), LOWER(col)` — case conversion; one level of nesting supported, e.g. `LOWER(TRIM(col))` |
+| **TRIM**      | `SELECT TRIM(col)` — strip leading and trailing whitespace; nestable, e.g. `TRIM(UPPER(col))` |
+| **LENGTH**    | `SELECT LENGTH(col)` — byte length of the value; nestable, e.g. `LENGTH(TRIM(col))` |
+| **CONCAT**    | `SELECT CONCAT(col1, '-', col2, ...)` — concatenate columns and/or string literals |
 | **SUBSTR**    | `SELECT SUBSTR(col, start, len)` — substring (1-based, `len` optional)  |
 | **REPLACE**   | `SELECT REPLACE(col, 'from', 'to')` — replace all occurrences of a substring |
 | **SPLIT_PART**| `SELECT SPLIT_PART(col, 'delim', n)` — n-th field (1-based) after splitting on delim |
@@ -302,8 +304,23 @@ Two intentional differences, found via differential testing against DuckDB (see 
 | -------- | ----- | ------ |
 | `LENGTH(col)` on a unicode string | Byte length (UTF-8 bytes) | Character count (codepoints) |
 | Empty CSV field | Stays an empty string | Inferred as `NULL` |
+| `DATEDIFF('hour'/'minute'/etc, a, b)` on a non-exact interval | Fractional (e.g. `8.5` hours) | Truncated to whole units (e.g. `8`) |
 
-If you need character count instead of byte length, or NULL instead of empty-string semantics, be aware the two engines diverge here rather than assume identical output.
+If you need character count instead of byte length, NULL instead of empty-string semantics, or truncated instead of fractional interval math, be aware the two engines diverge here rather than assume identical output.
+
+### Known limitations
+
+Not yet supported — these error clearly rather than silently returning wrong data, and are tracked as open issues:
+
+| Limitation | Tracking |
+| ---------- | -------- |
+| `ORDER BY` on a column not in the `SELECT` list | [#117](https://github.com/melihbirim/csvql/issues/117) |
+| Subqueries (`WHERE col IN (SELECT ...)`, `HAVING x > (SELECT ...)`) | [#124](https://github.com/melihbirim/csvql/issues/124) |
+| `UNION` / `INTERSECT` / `EXCEPT` | [#122](https://github.com/melihbirim/csvql/issues/122), [#127](https://github.com/melihbirim/csvql/issues/127) |
+| Window functions (`RANK() OVER (...)`, etc.) | [#126](https://github.com/melihbirim/csvql/issues/126) |
+| Plain `SELECT STRFTIME(...)` / `DATE_PART(...)` without `GROUP BY` | [#133](https://github.com/melihbirim/csvql/issues/133) |
+| `GREATEST`/`LEAST` with a numeric literal argument (column args only for now) | [#134](https://github.com/melihbirim/csvql/issues/134) |
+| `OFFSET` clause | [#70](https://github.com/melihbirim/csvql/issues/70) |
 
 ### Aggregate Examples
 
@@ -363,6 +380,20 @@ csvql "SELECT LOWER(department) AS dept, AVG(salary) FROM 'data.csv' GROUP BY de
 
 # Mix scalars with AS aliases
 csvql "SELECT UPPER(name) AS Name, CAST(salary AS INTEGER) AS Salary FROM 'data.csv' ORDER BY Salary DESC"
+
+# CONCAT — combine columns and string literals
+csvql "SELECT CONCAT(first_name, ' ', last_name) AS full_name FROM 'data.csv'"
+csvql "SELECT CONCAT(name, ' (', department, ')') FROM 'data.csv'"
+
+# Nested functions — one level of composition
+csvql "SELECT name, LOWER(TRIM(department)) FROM 'data.csv'"
+csvql "SELECT department, LENGTH(TRIM(department)) FROM 'data.csv' GROUP BY department"
+
+# IS NULL / IS NOT NULL as a SELECT expression
+csvql "SELECT name, email IS NOT NULL AS has_email FROM 'data.csv'"
+
+# Table alias outside JOIN
+csvql "SELECT t.name, t.salary FROM 'data.csv' AS t WHERE t.salary > 100000"
 ```
 
 ### WHERE Filter Examples
