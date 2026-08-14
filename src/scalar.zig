@@ -42,6 +42,7 @@ pub const ScalarSpec = union(enum) {
     greatest: VariadicArgs, // GREATEST(a, b, ...) — row-wise max
     least: VariadicArgs, // LEAST(a, b, ...) — row-wise min
     concat: ConcatArgs, // CONCAT(a, b, ...) — column refs and/or string literals
+    nested: NestedArgs, // UPPER(TRIM(col)) etc — one level of function composition (#120)
     case_when: CaseWhenArgs, // bare CASE WHEN ... THEN ... ELSE ... END (#105)
     is_null_check: IsNullArgs, // col IS NULL / col IS NOT NULL as a SELECT expression
 
@@ -144,6 +145,16 @@ pub const ScalarSpec = union(enum) {
         }
     };
 
+    /// UPPER(TRIM(col)) etc: outer is one of the plain single-arg string
+    /// functions, inner is any other ScalarSpec evaluated first against the
+    /// same record. Heap-allocated (query-lifetime allocator) since ScalarSpec
+    /// can't hold itself by value.
+    pub const NestedArgs = struct {
+        pub const OuterFn = enum { upper, lower, trim, length };
+        outer_fn: OuterFn,
+        inner: *const ScalarSpec,
+    };
+
     pub const IsNullArgs = struct {
         col_idx: usize,
         negate: bool, // true = IS NOT NULL
@@ -181,6 +192,7 @@ pub const ScalarSpec = union(enum) {
             .concat => |a| for (a.parts()) |p| {
                 if (p == .col_idx) break p.col_idx;
             } else 0,
+            .nested => |a| a.inner.colIdx(),
         };
     }
 };
@@ -252,6 +264,28 @@ pub fn tryParseScalar(
         std.mem.eql(u8, fn_lower, "floor");
 
     if (single_arg_fn) {
+        // Nested call, e.g. LOWER(TRIM(col)) (#120) — args_str itself is a
+        // function call rather than a bare column, which resolveCol rejects
+        // outright (it treats any '(' in the arg as invalid). Parse the
+        // inner expression recursively and compose, restricted to the four
+        // outer functions that only need a string in, string out.
+        if (std.mem.indexOf(u8, args_str, "(") != null) {
+            const outer_fn: ScalarSpec.NestedArgs.OuterFn = if (std.mem.eql(u8, fn_lower, "upper"))
+                .upper
+            else if (std.mem.eql(u8, fn_lower, "lower"))
+                .lower
+            else if (std.mem.eql(u8, fn_lower, "trim"))
+                .trim
+            else if (std.mem.eql(u8, fn_lower, "length"))
+                .length
+            else
+                return error.NestedFunctionNotSupported;
+            const inner_spec = try tryParseScalar(args_str, column_map, allocator) orelse
+                return error.ColumnNotFound;
+            const inner_ptr = try allocator.create(ScalarSpec);
+            inner_ptr.* = inner_spec;
+            return .{ .nested = .{ .outer_fn = outer_fn, .inner = inner_ptr } };
+        }
         const cidx = try resolveCol(args_str, column_map, allocator) orelse
             return error.ColumnNotFound;
         if (std.mem.eql(u8, fn_lower, "upper")) return .{ .upper = cidx };
@@ -667,6 +701,16 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
                 if (i == args.n) return part;
             }
             return "";
+        },
+        .nested => |args| {
+            const inner_val = eval(args.inner.*, record, arena);
+            const inner_rec: [1][]const u8 = .{inner_val};
+            return switch (args.outer_fn) {
+                .upper => eval(.{ .upper = 0 }, &inner_rec, arena),
+                .lower => eval(.{ .lower = 0 }, &inner_rec, arena),
+                .trim => eval(.{ .trim = 0 }, &inner_rec, arena),
+                .length => eval(.{ .length = 0 }, &inner_rec, arena),
+            };
         },
         .is_null_check => |args| {
             const is_null = field(record, args.col_idx).len == 0;

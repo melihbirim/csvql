@@ -2569,6 +2569,77 @@ inline fn splitLine(line: []const u8, buf: [][]const u8, delim: u8) []const []co
 /// expressions, so `STRFTIME('%Y-%m', col) AS month` correctly splits into
 /// `STRFTIME('%Y-%m', col)` and `month`.
 /// The returned slices point into the original `expr` memory.
+/// Evaluate a scalar spec against a single synthetic value (e.g. a GROUP BY
+/// key at output time), remapping the spec's column index/indices to 0 to
+/// point into a wrapped one-element record.
+///
+/// `.nested`'s inner spec is a `*const ScalarSpec` shared across every row —
+/// mutating through that pointer to remap it in place would corrupt it for
+/// every other row, so nested composition recurses through this same
+/// function (on a local copy, never the shared pointer) instead of trying to
+/// fit into the generic "zero out this field" switch below.
+fn evalScalarOnSingleValue(spec: scalar.ScalarSpec, value: []const u8, arena: Allocator) []const u8 {
+    if (spec == .nested) {
+        const inner_val = evalScalarOnSingleValue(spec.nested.inner.*, value, arena);
+        const inner_rec: [1][]const u8 = .{inner_val};
+        return switch (spec.nested.outer_fn) {
+            .upper => scalar.eval(.{ .upper = 0 }, &inner_rec, arena),
+            .lower => scalar.eval(.{ .lower = 0 }, &inner_rec, arena),
+            .trim => scalar.eval(.{ .trim = 0 }, &inner_rec, arena),
+            .length => scalar.eval(.{ .length = 0 }, &inner_rec, arena),
+        };
+    }
+
+    const rec: [1][]const u8 = .{value};
+    var adj_spec = spec;
+    switch (adj_spec) {
+        .upper => |*ci| ci.* = 0,
+        .lower => |*ci| ci.* = 0,
+        .trim => |*ci| ci.* = 0,
+        .length => |*ci| ci.* = 0,
+        .abs => |*ci| ci.* = 0,
+        .ceil => |*ci| ci.* = 0,
+        .floor => |*ci| ci.* = 0,
+        .cast_int => |*ci| ci.* = 0,
+        .cast_float => |*ci| ci.* = 0,
+        .cast_text => |*ci| ci.* = 0,
+        .substr => |*a| a.col_idx = 0,
+        .mod_op => |*a| a.col_idx = 0,
+        .coalesce => |*a| {
+            for (a.colsMut()) |*ci| ci.* = 0;
+        },
+        .datediff => |*a| {
+            a.start_col = 0;
+            a.end_col = 0;
+        },
+        .dateadd => |*a| a.date_col = 0,
+        .extract => |*a| a.date_col = 0,
+        .round_op => |*a| a.col_idx = 0,
+        .replace => |*a| a.col_idx = 0,
+        .split_part => |*a| a.col_idx = 0,
+        .greatest, .least => |*a| for (a.colsMut()) |*ci| {
+            ci.* = 0;
+        },
+        .case_when => |*cw| {
+            cw.cond_col_idx = 0;
+            switch (cw.then_val) {
+                .col_idx => |*ci| ci.* = 0,
+                else => {},
+            }
+            switch (cw.else_val) {
+                .col_idx => |*ci| ci.* = 0,
+                else => {},
+            }
+        },
+        .is_null_check => |*a| a.col_idx = 0,
+        .concat => |*a| for (a.parts_buf[0..a.parts_len]) |*p| {
+            if (p.* == .col_idx) p.* = .{ .col_idx = 0 };
+        },
+        .nested => unreachable, // handled by the early return above
+    }
+    return scalar.eval(adj_spec, &rec, arena);
+}
+
 /// Recursively collect every plain Comparison leaf out of a WHERE/HAVING
 /// expression tree (AND/OR/NOT combinations), skipping scalar_comparison
 /// nodes (DATEDIFF/DATEADD/EXTRACT), which HAVING's extra-aggregate lookup
@@ -5238,55 +5309,7 @@ fn executeGroupBy(
                 .group_key_scalar => |gks| blk: {
                     // Apply scalar function to the group key value at output time
                     const key_val: []const u8 = if (gks.gi < accum.key_values.len) accum.key_values[gks.gi] else "";
-                    // Wrap into a single-element slice for scalar.eval
-                    const rec: [1][]const u8 = .{key_val};
-                    // Build a spec with col_idx=0 pointing into our single-element record
-                    var adj_spec = gks.spec;
-                    switch (adj_spec) {
-                        .upper => |*ci| ci.* = 0,
-                        .lower => |*ci| ci.* = 0,
-                        .trim => |*ci| ci.* = 0,
-                        .length => |*ci| ci.* = 0,
-                        .abs => |*ci| ci.* = 0,
-                        .ceil => |*ci| ci.* = 0,
-                        .floor => |*ci| ci.* = 0,
-                        .cast_int => |*ci| ci.* = 0,
-                        .cast_float => |*ci| ci.* = 0,
-                        .cast_text => |*ci| ci.* = 0,
-                        .substr => |*a| a.col_idx = 0,
-                        .mod_op => |*a| a.col_idx = 0,
-                        .coalesce => |*a| {
-                            for (a.colsMut()) |*ci| ci.* = 0;
-                        },
-                        .datediff => |*a| {
-                            a.start_col = 0;
-                            a.end_col = 0;
-                        },
-                        .dateadd => |*a| a.date_col = 0,
-                        .extract => |*a| a.date_col = 0,
-                        .round_op => |*a| a.col_idx = 0,
-                        .replace => |*a| a.col_idx = 0,
-                        .split_part => |*a| a.col_idx = 0,
-                        .greatest, .least => |*a| for (a.colsMut()) |*ci| {
-                            ci.* = 0;
-                        },
-                        .case_when => |*cw| {
-                            cw.cond_col_idx = 0;
-                            switch (cw.then_val) {
-                                .col_idx => |*ci| ci.* = 0,
-                                else => {},
-                            }
-                            switch (cw.else_val) {
-                                .col_idx => |*ci| ci.* = 0,
-                                else => {},
-                            }
-                        },
-                        .is_null_check => |*a| a.col_idx = 0,
-                        .concat => |*a| for (a.parts_buf[0..a.parts_len]) |*p| {
-                            if (p.* == .col_idx) p.* = .{ .col_idx = 0 };
-                        },
-                    }
-                    break :blk scalar.eval(adj_spec, &rec, gb_scalar_arena.allocator());
+                    break :blk evalScalarOnSingleValue(gks.spec, key_val, gb_scalar_arena.allocator());
                 },
                 .agg_case => |ac| blk: {
                     // CASE WHEN with an aggregate in its condition (#113) — the

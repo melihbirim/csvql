@@ -342,13 +342,23 @@ check \
 
 check \
   "IS NULL / IS NOT NULL in SELECT (#114)" \
-  "SELECT name, department IS NOT NULL AS has_dept FROM '$CSV' ORDER BY name LIMIT 20" \
-  "SELECT name, department IS NOT NULL AS has_dept FROM read_csv_auto('$CSV') ORDER BY name LIMIT 20"
+  "SELECT id, name, department IS NOT NULL AS has_dept FROM '$CSV' WHERE id <= 20 ORDER BY id" \
+  "SELECT id, name, department IS NOT NULL AS has_dept FROM read_csv_auto('$CSV') WHERE id <= 20 ORDER BY id"
 
 check \
   "CONCAT with column and literal args (#125)" \
-  "SELECT name, CONCAT(name, '-', department) AS tag FROM '$CSV' ORDER BY name LIMIT 20" \
-  "SELECT name, CONCAT(name, '-', department) AS tag FROM read_csv_auto('$CSV') ORDER BY name LIMIT 20"
+  "SELECT id, name, CONCAT(name, '-', department) AS tag FROM '$CSV' WHERE id <= 20 ORDER BY id" \
+  "SELECT id, name, CONCAT(name, '-', department) AS tag FROM read_csv_auto('$CSV') WHERE id <= 20 ORDER BY id"
+
+check \
+  "Nested scalar functions: LOWER(TRIM(col)) (#120)" \
+  "SELECT id, name, LOWER(TRIM(department)) AS d FROM '$CSV' WHERE id <= 20 ORDER BY id" \
+  "SELECT id, name, LOWER(TRIM(department)) AS d FROM read_csv_auto('$CSV') WHERE id <= 20 ORDER BY id"
+
+check \
+  "Nested scalar functions in GROUP BY key (#120)" \
+  "SELECT department, LOWER(TRIM(department)) AS d FROM '$CSV' GROUP BY department ORDER BY department" \
+  "SELECT department, LOWER(TRIM(department)) AS d FROM read_csv_auto('$CSV') GROUP BY department ORDER BY department"
 
 # ════════════════════════════════════════════════════════════════
 echo ""
