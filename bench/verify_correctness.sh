@@ -171,6 +171,29 @@ check_approx \
   "SELECT SUM(salary) FROM '$CSV' WHERE salary > 100000" \
   "SELECT SUM(salary) FROM read_csv_auto('$CSV') WHERE salary > 100000"
 
+check_approx \
+  "VARIANCE(salary) / STDDEV(salary)" \
+  "SELECT VARIANCE(salary), STDDEV(salary) FROM '$CSV'" \
+  "SELECT VAR_SAMP(salary), STDDEV_SAMP(salary) FROM read_csv_auto('$CSV')" \
+  "1"
+
+check_approx \
+  "MEDIAN(salary)" \
+  "SELECT MEDIAN(salary) FROM '$CSV'" \
+  "SELECT MEDIAN(salary) FROM read_csv_auto('$CSV')"
+
+GC="$TMP/groupconcat.csv"
+cat > "$GC" <<'EOF'
+dept,city
+HR,Austin
+Eng,Boston
+HR,Denver
+EOF
+check \
+  "GROUP_CONCAT by department (small fixture — insertion-order dependent, avoids large-file parallel-scan reordering)" \
+  "SELECT dept, GROUP_CONCAT(city) FROM '$GC' GROUP BY dept ORDER BY dept" \
+  "SELECT dept, string_agg(city, ',') FROM read_csv_auto('$GC') GROUP BY dept ORDER BY dept"
+
 # ════════════════════════════════════════════════════════════════
 echo ""
 echo "── GROUP BY ────────────────────────────────────────────────"
@@ -307,6 +330,16 @@ check \
   "SELECT DISTINCT city FROM '$CSV' WHERE city LIKE '%o%' ORDER BY city" \
   "SELECT DISTINCT city FROM read_csv_auto('$CSV') WHERE city LIKE '%o%' ORDER BY city"
 
+check \
+  "WHERE city ILIKE 'nyc' (case-insensitive)" \
+  "SELECT DISTINCT city FROM '$CSV' WHERE city ILIKE 'nyc'" \
+  "SELECT DISTINCT city FROM read_csv_auto('$CSV') WHERE city ILIKE 'nyc'"
+
+check \
+  "WHERE age BETWEEN 25 AND 30" \
+  "SELECT name, age FROM '$CSV' WHERE age BETWEEN 25 AND 30 ORDER BY name, age" \
+  "SELECT name, age FROM read_csv_auto('$CSV') WHERE age BETWEEN 25 AND 30 ORDER BY name, age"
+
 # ════════════════════════════════════════════════════════════════
 echo ""
 echo "── ORDER BY ────────────────────────────────────────────────"
@@ -325,6 +358,11 @@ check \
   "GROUP BY dept ORDER BY COUNT DESC" \
   "SELECT department, COUNT(*) FROM '$CSV' GROUP BY department ORDER BY COUNT(*) DESC" \
   "SELECT department, COUNT(*) FROM read_csv_auto('$CSV') GROUP BY department ORDER BY count(*) DESC"
+
+check \
+  "ORDER BY positional (ORDER BY 1)" \
+  "SELECT department, COUNT(*) FROM '$CSV' GROUP BY department ORDER BY 1" \
+  "SELECT department, COUNT(*) FROM read_csv_auto('$CSV') GROUP BY department ORDER BY 1"
 
 # ════════════════════════════════════════════════════════════════
 echo ""
@@ -369,6 +407,81 @@ check \
   "Table alias outside JOIN, bare (no AS) (#121)" \
   "SELECT t.name FROM '$CSV' t WHERE t.department = 'Sales' ORDER BY t.name" \
   "SELECT t.name FROM read_csv_auto('$CSV') t WHERE t.department = 'Sales' ORDER BY t.name"
+
+# ════════════════════════════════════════════════════════════════
+echo ""
+echo "── Scalar Functions ──────────────────────────────────────────"
+
+check \
+  "REPLACE(city, 'o', '0')" \
+  "SELECT DISTINCT REPLACE(city, 'o', '0') FROM '$CSV' ORDER BY 1" \
+  "SELECT DISTINCT REPLACE(city, 'o', '0') FROM read_csv_auto('$CSV') ORDER BY 1"
+
+check \
+  "SPLIT_PART(department, 'a', 1)" \
+  "SELECT DISTINCT SPLIT_PART(department, 'a', 1) FROM '$CSV' ORDER BY 1" \
+  "SELECT DISTINCT SPLIT_PART(department, 'a', 1) FROM read_csv_auto('$CSV') ORDER BY 1"
+
+check \
+  "GREATEST(age, salary) / LEAST(age, salary) — column args only, see #134" \
+  "SELECT id, name, GREATEST(age, salary), LEAST(age, salary) FROM '$CSV' WHERE id <= 20 ORDER BY id" \
+  "SELECT id, name, GREATEST(age, salary), LEAST(age, salary) FROM read_csv_auto('$CSV') WHERE id <= 20 ORDER BY id"
+
+check \
+  "ABS/CEIL/FLOOR — bare column args only" \
+  "SELECT id, ABS(age), CEIL(salary), FLOOR(salary) FROM '$CSV' WHERE id <= 20 ORDER BY id" \
+  "SELECT id, ABS(age), CEIL(salary), FLOOR(salary) FROM read_csv_auto('$CSV') WHERE id <= 20 ORDER BY id"
+
+check \
+  "MOD(age, 3) as a SELECT expression" \
+  "SELECT id, MOD(age, 3) FROM '$CSV' WHERE id <= 20 ORDER BY id" \
+  "SELECT id, MOD(age, 3) FROM read_csv_auto('$CSV') WHERE id <= 20 ORDER BY id"
+
+check \
+  "COALESCE(department, 'Unknown')" \
+  "SELECT id, COALESCE(department, 'Unknown') FROM '$CSV' WHERE id <= 20 ORDER BY id" \
+  "SELECT id, COALESCE(department, 'Unknown') FROM read_csv_auto('$CSV') WHERE id <= 20 ORDER BY id"
+
+check \
+  "CAST(salary AS INTEGER/TEXT)" \
+  "SELECT id, CAST(salary AS INTEGER), CAST(salary AS TEXT) FROM '$CSV' WHERE id <= 20 ORDER BY id" \
+  "SELECT id, CAST(salary AS INTEGER), CAST(salary AS VARCHAR) FROM read_csv_auto('$CSV') WHERE id <= 20 ORDER BY id"
+
+check_approx \
+  "CAST(salary AS FLOAT)" \
+  "SELECT id, CAST(salary AS FLOAT) FROM '$CSV' WHERE id <= 20 ORDER BY id" \
+  "SELECT id, CAST(salary AS FLOAT) FROM read_csv_auto('$CSV') WHERE id <= 20 ORDER BY id" \
+  "1"
+
+# ════════════════════════════════════════════════════════════════
+echo ""
+echo "── Date/Time Functions ─────────────────────────────────────"
+
+DATES="$TMP/dates.csv"
+cat > "$DATES" <<'EOF'
+id,event,started_at,ended_at
+1,launch,2024-01-15 09:00:00,2024-01-15 17:30:00
+2,migration,2024-02-01 00:00:00,2024-02-03 12:00:00
+3,rollout,2024-03-10 08:15:00,2024-03-10 08:45:00
+4,incident,2024-06-20 22:00:00,2024-06-21 02:00:00
+5,review,2024-07-04 10:00:00,2024-07-04 11:30:00
+6,maintenance,2024-08-01 00:00:00,2024-08-03 00:00:00
+EOF
+
+check \
+  "DATEDIFF('day', started_at, ended_at) — exact-day data avoids the fractional-vs-truncated difference (see README Known differences)" \
+  "SELECT id, DATEDIFF('day', started_at, ended_at) FROM '$DATES' WHERE id = 6 ORDER BY id" \
+  "SELECT id, DATEDIFF('day', started_at, ended_at) FROM read_csv_auto('$DATES') WHERE id = 6 ORDER BY id"
+
+check \
+  "DATEADD('day', 7, started_at)" \
+  "SELECT id, DATEADD('day', 7, started_at) FROM '$DATES' ORDER BY id" \
+  "SELECT id, started_at + INTERVAL 7 DAY FROM read_csv_auto('$DATES') ORDER BY id"
+
+check \
+  "STRFTIME('%Y-%m', started_at) date bucketing (GROUP BY path — plain SELECT tracked in #133)" \
+  "SELECT STRFTIME('%Y-%m', started_at), COUNT(*) FROM '$DATES' GROUP BY STRFTIME('%Y-%m', started_at) ORDER BY 1" \
+  "SELECT strftime(started_at, '%Y-%m'), COUNT(*) FROM read_csv_auto('$DATES') GROUP BY strftime(started_at, '%Y-%m') ORDER BY 1"
 
 # ════════════════════════════════════════════════════════════════
 echo ""
