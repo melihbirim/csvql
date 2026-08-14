@@ -41,6 +41,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so the changelog step can diff against the previous tag
 
       - name: Setup Zig
         uses: goto-bus-stop/setup-zig@v2
@@ -81,6 +83,22 @@ jobs:
           name: ${{ matrix.artifact }}
           path: release/${{ matrix.artifact }}.${{ matrix.pkg }}
 
+      - name: Generate changelog from commits since last tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          PREV_TAG=$(git tag --sort=-creatordate | grep -v "^${GITHUB_REF_NAME}\$" | head -n1)
+          {
+            echo "## What's fixed / changed"
+            echo
+            if [ -n "$PREV_TAG" ]; then
+              git log --pretty=format:"- %s" "$PREV_TAG"..HEAD | grep -E "^- (fix|feat|perf):" || echo "- No categorized changes since $PREV_TAG"
+            else
+              echo "- Initial release"
+            fi
+          } > release-notes.md
+          cat release-notes.md
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/')
@@ -88,6 +106,7 @@ jobs:
           files: |
             release/${{ matrix.artifact }}.${{ matrix.pkg }}
             release/${{ matrix.artifact }}.mcpb
+          body_path: release-notes.md
           draft: false
           prerelease: false
 
