@@ -21,7 +21,10 @@
     "simd",
     "fast",
     "etl",
-    "parser"
+    "parser",
+    "agent",
+    "ai",
+    "mcp"
   ],
   "license": "MIT",
   "repository": {
