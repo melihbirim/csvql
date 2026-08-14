@@ -215,6 +215,21 @@ check \
   "SELECT department, COUNT(*) FROM '$CSV' WHERE salary > 100000 GROUP BY department ORDER BY department" \
   "SELECT department, COUNT(*) FROM read_csv_auto('$CSV') WHERE salary > 100000 GROUP BY department ORDER BY department"
 
+check \
+  "CASE WHEN with aggregate in condition (#113)" \
+  "SELECT department, CASE WHEN AVG(salary) > 80000 THEN 'high' ELSE 'low' END AS tier FROM '$CSV' GROUP BY department ORDER BY department" \
+  "SELECT department, CASE WHEN AVG(salary) > 80000 THEN 'high' ELSE 'low' END AS tier FROM read_csv_auto('$CSV') GROUP BY department ORDER BY department"
+
+check \
+  "HAVING AND of two aggregates not in SELECT (#118)" \
+  "SELECT department, COUNT(*) FROM '$CSV' GROUP BY department HAVING COUNT(*) > 5 AND MAX(salary) > 80000 ORDER BY department" \
+  "SELECT department, COUNT(*) FROM read_csv_auto('$CSV') GROUP BY department HAVING COUNT(*) > 5 AND MAX(salary) > 80000 ORDER BY department"
+
+check \
+  "Implicit alias, no AS keyword (#116)" \
+  "SELECT department d, COUNT(*) c FROM '$CSV' GROUP BY department ORDER BY department" \
+  "SELECT department AS d, COUNT(*) AS c FROM read_csv_auto('$CSV') GROUP BY department ORDER BY department"
+
 # ════════════════════════════════════════════════════════════════
 echo ""
 echo "── DISTINCT ────────────────────────────────────────────────"
@@ -262,6 +277,16 @@ check \
   "WHERE city = 'NYC'" \
   "SELECT name, city FROM '$CSV' WHERE city = 'NYC' ORDER BY name" \
   "SELECT name, city FROM read_csv_auto('$CSV') WHERE city = 'NYC' ORDER BY name"
+
+check \
+  "WHERE id % 2 = 0 (modulo, #119)" \
+  "SELECT name, id FROM '$CSV' WHERE id % 2 = 0 ORDER BY id, name" \
+  "SELECT name, id FROM read_csv_auto('$CSV') WHERE id % 2 = 0 ORDER BY id, name"
+
+check \
+  "WHERE department NOT IN ('Sales') (#115)" \
+  "SELECT name FROM '$CSV' WHERE department NOT IN ('Sales') ORDER BY name" \
+  "SELECT name FROM read_csv_auto('$CSV') WHERE department NOT IN ('Sales') ORDER BY name"
 
 # ════════════════════════════════════════════════════════════════
 echo ""
@@ -314,6 +339,16 @@ check \
   "Column projection + WHERE" \
   "SELECT name, department FROM '$CSV' WHERE age < 25 ORDER BY name, department" \
   "SELECT name, department FROM read_csv_auto('$CSV') WHERE age < 25 ORDER BY name, department"
+
+check \
+  "IS NULL / IS NOT NULL in SELECT (#114)" \
+  "SELECT name, department IS NOT NULL AS has_dept FROM '$CSV' ORDER BY name LIMIT 20" \
+  "SELECT name, department IS NOT NULL AS has_dept FROM read_csv_auto('$CSV') ORDER BY name LIMIT 20"
+
+check \
+  "CONCAT with column and literal args (#125)" \
+  "SELECT name, CONCAT(name, '-', department) AS tag FROM '$CSV' ORDER BY name LIMIT 20" \
+  "SELECT name, CONCAT(name, '-', department) AS tag FROM read_csv_auto('$CSV') ORDER BY name LIMIT 20"
 
 # ════════════════════════════════════════════════════════════════
 echo ""

@@ -194,7 +194,12 @@ const RowSortCtx = struct {
 
 /// Resolve a GROUP BY ORDER BY column (name/alias/positional) to a 0-based
 /// output-column index. Returns null when not found.
-fn resolveGroupOrderIdx(col: []const u8, out_hdr: []const []const u8, alloc: std.mem.Allocator) !?usize {
+///
+/// `raw_columns` is the pre-alias SELECT column text (query.columns) so that
+/// e.g. "SELECT department AS d ... ORDER BY department" resolves even though
+/// the displayed header is "d", not "department" (#131) — standard SQL lets
+/// ORDER BY reference either the alias or the original expression.
+fn resolveGroupOrderIdx(col: []const u8, out_hdr: []const []const u8, raw_columns: []const []const u8, alloc: std.mem.Allocator) !?usize {
     const pos_num = std.fmt.parseInt(usize, col, 10) catch 0;
     if (pos_num >= 1 and pos_num <= out_hdr.len) return pos_num - 1;
     const lcol = try alloc.alloc(u8, col.len);
@@ -205,6 +210,15 @@ fn resolveGroupOrderIdx(col: []const u8, out_hdr: []const []const u8, alloc: std
         defer alloc.free(lh);
         _ = std.ascii.lowerString(lh, hdr);
         if (std.mem.eql(u8, lh, lcol)) return pos;
+    }
+    // Fall back to the pre-alias source expression for each SELECT column.
+    for (raw_columns, 0..) |raw, pos| {
+        const expr = std.mem.trim(u8, splitAlias(raw).expr, &std.ascii.whitespace);
+        if (expr.len != col.len) continue;
+        var buf: [256]u8 = undefined;
+        if (expr.len > buf.len) continue;
+        const lexpr = std.ascii.lowerString(buf[0..expr.len], expr);
+        if (std.mem.eql(u8, lexpr, lcol)) return pos;
     }
     return null;
 }
@@ -253,6 +267,12 @@ fn hasScalarSelectFunctions(query: parser.Query) bool {
         // so it needs the scalar path too — SUM(CASE WHEN ...) still starts
         // with "SUM(" and is unaffected, that stays on the aggregate path (#105).
         if (std.ascii.startsWithIgnoreCase(e, "case ")) return true;
+        // "col IS NULL" / "col IS NOT NULL" also has no parens. Without this
+        // check these silently fell through to the size-routed mmap/parallel
+        // paths on files > 5-10MB, which have no scalar-function support at
+        // all, giving ColumnNotFound instead of the correct true/false value.
+        if (std.ascii.indexOfIgnoreCase(e, " is null") != null or
+            std.ascii.indexOfIgnoreCase(e, " is not null") != null) return true;
         const open = std.mem.indexOf(u8, e, "(") orelse continue;
         const fn_raw = std.mem.trim(u8, e[0..open], &std.ascii.whitespace);
         // Skip empty (would be a syntax error anyway)
@@ -5127,10 +5147,10 @@ fn executeGroupBy(
     var collected = std.ArrayListUnmanaged([]const []const u8){};
     defer collected.deinit(allocator);
     if (query.order_by) |ob| {
-        const idx = (try resolveGroupOrderIdx(ob.column, out_header_list.items, allocator)) orelse return error.OrderByColumnNotFound;
+        const idx = (try resolveGroupOrderIdx(ob.column, out_header_list.items, query.columns, allocator)) orelse return error.OrderByColumnNotFound;
         try order_keys.append(allocator, .{ .col_idx = idx, .order = ob.order });
         for (ob.secondary) |sk| {
-            const sidx = (try resolveGroupOrderIdx(sk.column, out_header_list.items, allocator)) orelse return error.OrderByColumnNotFound;
+            const sidx = (try resolveGroupOrderIdx(sk.column, out_header_list.items, query.columns, allocator)) orelse return error.OrderByColumnNotFound;
             try order_keys.append(allocator, .{ .col_idx = sidx, .order = sk.order });
         }
     }
