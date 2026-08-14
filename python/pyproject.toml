@@ -9,7 +9,7 @@ description = "Fast CSV querying from Python — powered by a Zig/SIMD engine"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
-keywords = ["csv", "query", "sql", "fast", "simd"]
+keywords = ["csv", "query", "sql", "fast", "simd", "agent", "ai", "mcp"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
