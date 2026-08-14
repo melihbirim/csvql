@@ -1063,6 +1063,49 @@ test "COALESCE: returns error.TooManyArgs for more than 8 column args" {
     );
 }
 
+test "CONCAT: mixed columns and string literals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var column_map = std.StringHashMap(usize).init(allocator);
+    try column_map.put("name", 0);
+    try column_map.put("dept", 1);
+
+    const spec = (try tryParseScalar("CONCAT(name, '-', dept)", column_map, allocator)).?;
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    try std.testing.expectEqualStrings("Alice-Eng", eval(spec, &.{ "Alice", "Eng" }, fba.allocator()));
+}
+
+test "CONCAT: literal containing a comma is not split as a separate arg" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var column_map = std.StringHashMap(usize).init(allocator);
+    try column_map.put("name", 0);
+
+    const spec = (try tryParseScalar("CONCAT(name, ', hello')", column_map, allocator)).?;
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    try std.testing.expectEqualStrings("Alice, hello", eval(spec, &.{"Alice"}, fba.allocator()));
+}
+
+test "CONCAT: unresolvable column errors" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var column_map = std.StringHashMap(usize).init(allocator);
+    try column_map.put("name", 0);
+
+    try std.testing.expectError(
+        error.ColumnNotFound,
+        tryParseScalar("CONCAT(name, missing_col)", column_map, allocator),
+    );
+}
+
 test "ROUND: digits > 6 produces correct decimal places" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
