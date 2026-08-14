@@ -645,8 +645,13 @@ fn executeSequential(
                         continue; // Column doesn't exist in this row
                     }
                 } else {
-                    // Column not found in header, skip all rows
-                    continue;
+                    // WHERE references a column that isn't a plain header
+                    // name (typo, or an unsupported pattern like a scalar
+                    // function wrapping the column). Erroring is the correct
+                    // behavior here — silently treating this as "zero rows
+                    // match" would be indistinguishable from a genuine
+                    // negative result to the caller (#138).
+                    return columnLookupError(comp.column);
                 }
             } else {
                 // Complex expressions (AND/OR/NOT): evaluate directly without per-row HashMap
@@ -2129,8 +2134,13 @@ fn executeFromStdin(
                         continue; // Column doesn't exist in this row
                     }
                 } else {
-                    // Column not found in header, skip all rows
-                    continue;
+                    // WHERE references a column that isn't a plain header
+                    // name (typo, or an unsupported pattern like a scalar
+                    // function wrapping the column). Erroring is the correct
+                    // behavior here — silently treating this as "zero rows
+                    // match" would be indistinguishable from a genuine
+                    // negative result to the caller (#138).
+                    return columnLookupError(comp.column);
                 }
             } else {
                 // Complex expressions (AND/OR/NOT): evaluate directly without per-row HashMap

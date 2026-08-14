@@ -352,8 +352,11 @@ pub fn executeMapped(
                             continue;
                         }
                     } else {
-                        line_start += line_end + 1;
-                        continue;
+                        // WHERE references a column that isn't a plain header
+                        // name — erroring is correct here; silently treating
+                        // this as "zero rows match" would be indistinguishable
+                        // from a genuine negative result to the caller (#138).
+                        return error.ColumnNotFound;
                     }
                 } else {
                     if (!parser.evaluateDirect(expr, fields, lower_header)) {
