@@ -4285,10 +4285,15 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                 count += 1;
                 record = field_stk[0..count];
             }
-            _ = unescape_arena.reset(.retain_capacity);
-            for (field_stk[0..record.len]) |*f| {
-                if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
-                    f.* = unescapeQuotesArenaAlloc(unescape_arena.allocator(), f.*) catch f.*;
+            // A "" escaped-quote pair can only exist inside a field that had
+            // a quote in the source bytes — skip this scan entirely for the
+            // fused no-quote path, where it's provably a no-op.
+            if (fused.had_quote) {
+                _ = unescape_arena.reset(.retain_capacity);
+                for (field_stk[0..record.len]) |*f| {
+                    if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
+                        f.* = unescapeQuotesArenaAlloc(unescape_arena.allocator(), f.*) catch f.*;
+                    }
                 }
             }
             if (ctx.where_expr) |expr| {
