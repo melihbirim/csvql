@@ -4242,16 +4242,49 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
 
         var scan: usize = 0;
         while (scan < work.len) {
-            const nl = csv.findRecordEnd(work, scan, ctx.delimiter) orelse {
-                try seam_buf.appendSlice(aa, work[scan..]);
-                break;
-            };
-            var line: []const u8 = work[scan..nl];
-            if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-            scan = nl + 1;
-            if (line.len == 0) continue;
+            // Fused single-pass scan (#139 follow-up): finds the record end,
+            // every comma position, and whether a quote is present all in
+            // one SIMD sweep, replacing findRecordEnd's own newline+quote
+            // scan followed by parseCSVFieldsStatic's separate comma scan
+            // over the same bytes. Falls back to the original two-call path
+            // whenever a quote is present — same conservative contract as
+            // findRecordEnd's own fast path.
+            var comma_positions: [256]usize = undefined;
+            const fused = simd.scanRecordFused(work, scan, ctx.delimiter, &comma_positions);
 
-            const record = splitLine(line, &field_stk, ctx.delimiter);
+            var record: []const []const u8 = undefined;
+
+            if (fused.had_quote) {
+                const nl = csv.findRecordEnd(work, scan, ctx.delimiter) orelse {
+                    try seam_buf.appendSlice(aa, work[scan..]);
+                    break;
+                };
+                var line: []const u8 = work[scan..nl];
+                if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+                scan = nl + 1;
+                if (line.len == 0) continue;
+                record = splitLine(line, &field_stk, ctx.delimiter);
+            } else {
+                const abs_end = fused.end orelse {
+                    try seam_buf.appendSlice(aa, work[scan..]);
+                    break;
+                };
+                var content_end = abs_end;
+                if (content_end > scan and work[content_end - 1] == '\r') content_end -= 1;
+                const row_start = scan;
+                scan = abs_end + 1;
+                if (content_end <= row_start) continue;
+                var count: usize = 0;
+                var s = row_start;
+                for (comma_positions[0..fused.comma_count]) |p| {
+                    field_stk[count] = work[s..p];
+                    count += 1;
+                    s = p + 1;
+                }
+                field_stk[count] = work[s..content_end];
+                count += 1;
+                record = field_stk[0..count];
+            }
             _ = unescape_arena.reset(.retain_capacity);
             for (field_stk[0..record.len]) |*f| {
                 if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
