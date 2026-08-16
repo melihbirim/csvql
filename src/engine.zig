@@ -2632,8 +2632,8 @@ fn evalScalarOnSingleValue(spec: scalar.ScalarSpec, value: []const u8, arena: Al
         .round_op => |*a| a.col_idx = 0,
         .replace => |*a| a.col_idx = 0,
         .split_part => |*a| a.col_idx = 0,
-        .greatest, .least => |*a| for (a.colsMut()) |*ci| {
-            ci.* = 0;
+        .greatest, .least => |*a| for (a.parts_buf[0..a.parts_len]) |*p| {
+            if (p.* == .col_idx) p.* = .{ .col_idx = 0 };
         },
         .case_when => |*cw| {
             cw.cond_col_idx = 0;

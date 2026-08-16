@@ -39,8 +39,8 @@ pub const ScalarSpec = union(enum) {
     round_op: RoundArgs, // ROUND(col[, digits])
     replace: ReplaceArgs, // REPLACE(col, 'from', 'to') — replace all occurrences
     split_part: SplitPartArgs, // SPLIT_PART(col, 'delim', n) — n-th field (1-based)
-    greatest: VariadicArgs, // GREATEST(a, b, ...) — row-wise max
-    least: VariadicArgs, // LEAST(a, b, ...) — row-wise min
+    greatest: ConcatArgs, // GREATEST(a, b, ...) — row-wise max, columns and/or literals (#134)
+    least: ConcatArgs, // LEAST(a, b, ...) — row-wise min, columns and/or literals (#134)
     concat: ConcatArgs, // CONCAT(a, b, ...) — column refs and/or string literals
     nested: NestedArgs, // UPPER(TRIM(col)) etc — one level of function composition (#120)
     case_when: CaseWhenArgs, // bare CASE WHEN ... THEN ... ELSE ... END (#105)
@@ -56,19 +56,6 @@ pub const ScalarSpec = union(enum) {
         col_idx: usize,
         delim: []const u8, // slice into the query expr
         n: usize, // 1-based field index
-    };
-
-    /// Up to 8 column args for GREATEST/LEAST.
-    pub const VariadicArgs = struct {
-        cols_buf: [8]usize = undefined,
-        cols_len: usize,
-
-        pub fn cols(self: *const VariadicArgs) []const usize {
-            return self.cols_buf[0..self.cols_len];
-        }
-        pub fn colsMut(self: *VariadicArgs) []usize {
-            return self.cols_buf[0..self.cols_len];
-        }
     };
 
     pub const SubstrArgs = struct {
@@ -186,7 +173,9 @@ pub const ScalarSpec = union(enum) {
             .round_op => |a| a.col_idx,
             .replace => |a| a.col_idx,
             .split_part => |a| a.col_idx,
-            .greatest, .least => |a| a.cols()[0],
+            .greatest, .least => |a| for (a.parts()) |p| {
+                if (p == .col_idx) break p.col_idx;
+            } else 0,
             .case_when => |a| a.cond_col_idx,
             .is_null_check => |a| a.col_idx,
             .concat => |a| for (a.parts()) |p| {
@@ -364,20 +353,44 @@ pub fn tryParseScalar(
         return .{ .split_part = .{ .col_idx = cidx, .delim = delim, .n = n } };
     }
 
-    // ── GREATEST / LEAST(a, b, ...) ────────────────────────────────────────
+    // ── GREATEST / LEAST(a, b, ...) — columns and/or numeric literals (#134) ─
     if (std.mem.eql(u8, fn_lower, "greatest") or std.mem.eql(u8, fn_lower, "least")) {
-        var v = ScalarSpec.VariadicArgs{ .cols_len = 0 };
-        var it = std.mem.splitScalar(u8, args_str, ',');
-        while (it.next()) |token| {
-            const arg = std.mem.trim(u8, token, &std.ascii.whitespace);
-            if (arg.len == 0) continue;
-            if (v.cols_len >= v.cols_buf.len) return error.TooManyArgs;
-            const cidx = try resolveCol(arg, column_map, allocator) orelse
-                return error.ColumnNotFound;
-            v.cols_buf[v.cols_len] = cidx;
-            v.cols_len += 1;
+        var v = ScalarSpec.ConcatArgs{ .parts_len = 0 };
+        // Quote-aware top-level comma split (a literal arg could itself be a
+        // quoted string containing a comma), same technique as CONCAT.
+        var start: usize = 0;
+        var in_quote = false;
+        var i: usize = 0;
+        while (i <= args_str.len) : (i += 1) {
+            const at_end = i == args_str.len;
+            const c: u8 = if (at_end) ',' else args_str[i];
+            if (!at_end and c == '\'') {
+                in_quote = !in_quote;
+                continue;
+            }
+            if (in_quote) continue;
+            if (c == ',') {
+                const arg = std.mem.trim(u8, args_str[start..i], &std.ascii.whitespace);
+                start = i + 1;
+                if (arg.len == 0) continue;
+                if (v.parts_len >= v.parts_buf.len) return error.TooManyArgs;
+                if (arg.len >= 2 and arg[0] == '\'' and arg[arg.len - 1] == '\'') {
+                    v.parts_buf[v.parts_len] = .{ .literal = arg[1 .. arg.len - 1] };
+                } else if (try resolveCol(arg, column_map, allocator)) |cidx| {
+                    v.parts_buf[v.parts_len] = .{ .col_idx = cidx };
+                } else if (std.fmt.parseFloat(f64, arg)) |_| {
+                    // Bare numeric literal, e.g. GREATEST(age, 30). Only
+                    // numeric — an unquoted non-numeric, non-column token
+                    // (likely a typo) still errors instead of silently
+                    // becoming a literal string.
+                    v.parts_buf[v.parts_len] = .{ .literal = arg };
+                } else |_| {
+                    return error.ColumnNotFound;
+                }
+                v.parts_len += 1;
+            }
         }
-        if (v.cols_len < 2) return null;
+        if (v.parts_len < 2) return null;
         return if (std.mem.eql(u8, fn_lower, "greatest")) .{ .greatest = v } else .{ .least = v };
     }
 
@@ -717,8 +730,26 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
             const result = if (args.negate) !is_null else is_null;
             return if (result) "true" else "false";
         },
-        .greatest => |args| return pickExtreme(record, args.cols(), true),
-        .least => |args| return pickExtreme(record, args.cols(), false),
+        .greatest => |args| {
+            var vals: [8][]const u8 = undefined;
+            for (args.parts(), 0..) |p, idx| {
+                vals[idx] = switch (p) {
+                    .col_idx => |ci| field(record, ci),
+                    .literal => |lit| lit,
+                };
+            }
+            return pickExtremeValues(vals[0..args.parts().len], true);
+        },
+        .least => |args| {
+            var vals: [8][]const u8 = undefined;
+            for (args.parts(), 0..) |p, idx| {
+                vals[idx] = switch (p) {
+                    .col_idx => |ci| field(record, ci),
+                    .literal => |lit| lit,
+                };
+            }
+            return pickExtremeValues(vals[0..args.parts().len], false);
+        },
         .concat => |args| {
             var total: usize = 0;
             for (args.parts()) |p| {
@@ -958,31 +989,31 @@ pub fn evalOutputCol(spec: OutputColSpec, record: []const []const u8, arena: All
 /// Safe indexed field access (returns "" when index is out of range).
 /// Row-wise max/min across columns. Numeric compare when every value parses as a
 /// number, otherwise lexicographic. Returns the winning field slice (no alloc).
-fn pickExtreme(record: []const []const u8, cols: []const usize, want_max: bool) []const u8 {
+fn pickExtremeValues(values: []const []const u8, want_max: bool) []const u8 {
     var all_num = true;
-    for (cols) |c| {
-        _ = std.fmt.parseFloat(f64, field(record, c)) catch {
+    for (values) |v| {
+        _ = std.fmt.parseFloat(f64, v) catch {
             all_num = false;
             break;
         };
     }
-    var best_idx = cols[0];
+    var best = values[0];
     if (all_num) {
-        var best = std.fmt.parseFloat(f64, field(record, cols[0])) catch 0;
-        for (cols[1..]) |c| {
-            const v = std.fmt.parseFloat(f64, field(record, c)) catch 0;
-            if ((want_max and v > best) or (!want_max and v < best)) {
+        var best_num = std.fmt.parseFloat(f64, values[0]) catch 0;
+        for (values[1..]) |v| {
+            const n = std.fmt.parseFloat(f64, v) catch 0;
+            if ((want_max and n > best_num) or (!want_max and n < best_num)) {
+                best_num = n;
                 best = v;
-                best_idx = c;
             }
         }
     } else {
-        for (cols[1..]) |c| {
-            const cmp = std.mem.order(u8, field(record, c), field(record, best_idx));
-            if ((want_max and cmp == .gt) or (!want_max and cmp == .lt)) best_idx = c;
+        for (values[1..]) |v| {
+            const cmp = std.mem.order(u8, v, best);
+            if ((want_max and cmp == .gt) or (!want_max and cmp == .lt)) best = v;
         }
     }
-    return field(record, best_idx);
+    return best;
 }
 
 inline fn field(record: []const []const u8, idx: usize) []const u8 {

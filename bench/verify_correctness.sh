@@ -423,9 +423,9 @@ check \
   "SELECT DISTINCT SPLIT_PART(department, 'a', 1) FROM read_csv_auto('$CSV') ORDER BY 1"
 
 check \
-  "GREATEST(age, salary) / LEAST(age, salary) — column args only, see #134" \
-  "SELECT id, name, GREATEST(age, salary), LEAST(age, salary) FROM '$CSV' WHERE id <= 20 ORDER BY id" \
-  "SELECT id, name, GREATEST(age, salary), LEAST(age, salary) FROM read_csv_auto('$CSV') WHERE id <= 20 ORDER BY id"
+  "GREATEST/LEAST with column and numeric literal args (#134)" \
+  "SELECT id, name, GREATEST(age, salary), LEAST(age, 30) FROM '$CSV' WHERE id <= 20 ORDER BY id" \
+  "SELECT id, name, GREATEST(age, salary), LEAST(age, 30) FROM read_csv_auto('$CSV') WHERE id <= 20 ORDER BY id"
 
 check \
   "ABS/CEIL/FLOOR — bare column args only" \
