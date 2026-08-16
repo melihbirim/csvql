@@ -4624,7 +4624,17 @@ fn executeGroupBy(
         }
         allocator.free(group_specs);
     }
-    for (query.group_by, 0..) |col, i| {
+    for (query.group_by, 0..) |raw_col, i| {
+        // Positional GROUP BY (e.g. "GROUP BY 1") resolves to the
+        // corresponding SELECT column's expression — same convention
+        // positional ORDER BY already supports (#136).
+        const col: []const u8 = blk: {
+            const pos_num = std.fmt.parseInt(usize, raw_col, 10) catch break :blk raw_col;
+            if (pos_num >= 1 and pos_num <= query.columns.len and !query.all_columns) {
+                break :blk splitAlias(query.columns[pos_num - 1]).expr;
+            }
+            break :blk raw_col;
+        };
         if (try parseStrftimeRaw(allocator, col, column_map)) |sf| {
             group_specs[i] = .{ .strftime = sf };
         } else if (try parseSubstrRaw(allocator, col, column_map)) |ss| {
