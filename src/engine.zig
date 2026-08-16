@@ -4253,6 +4253,7 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
             const fused = simd.scanRecordFused(work, scan, ctx.delimiter, &comma_positions);
 
             var record: []const []const u8 = undefined;
+            var where_prechecked = false;
 
             if (fused.had_quote) {
                 const nl = csv.findRecordEnd(work, scan, ctx.delimiter) orelse {
@@ -4274,6 +4275,47 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                 const row_start = scan;
                 scan = abs_end + 1;
                 if (content_end <= row_start) continue;
+
+                // Fast pre-check: for a plain "col OP literal" WHERE, pull
+                // just the target column's value out of the comma positions
+                // we already have and test it before building the full
+                // field array — on a wide table with a selective filter,
+                // most rows never need the other N-1 columns materialized
+                // at all. Skipped for complex (AND/OR/NOT) expressions or
+                // an unresolved WHERE column, which still need the full
+                // record either way; that case is handled unchanged below.
+                if (ctx.where_expr) |expr| {
+                    if (expr == .comparison) {
+                        if (ctx.where_col_idx) |cidx| {
+                            const total_fields = fused.comma_count + 1;
+                            if (cidx >= total_fields) continue;
+                            const fstart = if (cidx == 0) row_start else comma_positions[cidx - 1] + 1;
+                            const fend = if (cidx == fused.comma_count) content_end else comma_positions[cidx];
+                            const fv = work[fstart..fend];
+                            const comp = expr.comparison;
+                            var matches = false;
+                            if (comp.numeric_value) |threshold| {
+                                const val = parseNumericFast(fv) catch continue;
+                                matches = switch (comp.operator) {
+                                    .equal => val == threshold,
+                                    .not_equal => val != threshold,
+                                    .greater => val > threshold,
+                                    .greater_equal => val >= threshold,
+                                    .less => val < threshold,
+                                    .less_equal => val <= threshold,
+                                    .like => parser.matchLike(fv, comp.value),
+                                    .ilike => parser.matchILike(fv, comp.value),
+                                    .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
+                                };
+                            } else {
+                                matches = parser.compareValues(comp, fv);
+                            }
+                            if (!matches) continue;
+                            where_prechecked = true;
+                        }
+                    }
+                }
+
                 var count: usize = 0;
                 var s = row_start;
                 for (comma_positions[0..fused.comma_count]) |p| {
@@ -4296,7 +4338,7 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                     }
                 }
             }
-            if (ctx.where_expr) |expr| {
+            if (!where_prechecked) if (ctx.where_expr) |expr| {
                 if (expr == .comparison) {
                     const comp = expr.comparison;
                     const cidx = ctx.where_col_idx orelse continue;
@@ -4323,7 +4365,7 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                 } else {
                     if (!parser.evaluateDirect(expr, record, ctx.lower_header)) continue;
                 }
-            }
+            };
             ctx.partial_accum.count += 1;
             for (ctx.agg_specs, 0..) |spec, i| {
                 switch (spec.func_type) {
