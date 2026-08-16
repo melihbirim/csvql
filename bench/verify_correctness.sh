@@ -602,6 +602,24 @@ check_approx \
 # newline in a quoted field (aggregate scan isn't quote-aware about \n): #92
 
 # ════════════════════════════════════════════════════════════════
+# Large-file, quote-heavy regression check (#139): the parallel scalar-agg
+# path's per-2MB-IO-buffer scan lost a record's quote state across reads,
+# so a numeric WHERE filter on a large quoted CSV could silently undercount
+# even though a bare COUNT(*) still came out right. Only ever reproduced
+# with a real multi-GB quoted file, not a synthetic one — gated on the
+# gitignored taxi fixture (bench/bench_taxi.sh downloads it) so CI stays
+# green without that multi-GB download.
+TAXI_CSV="${SCRIPT_DIR}/bench/.taxi-data/trips.csv"
+if [[ -f "$TAXI_CSV" ]]; then
+  echo ""
+  echo "── Large quoted-field file, parallel WHERE (#139) ───────────"
+  check \
+    "COUNT(*) WHERE trip_distance > 5 (taxi dataset, parallel scan)" \
+    "SELECT COUNT(*) FROM '$TAXI_CSV' WHERE trip_distance > 5" \
+    "SELECT COUNT(*) FROM read_csv_auto('$TAXI_CSV') WHERE trip_distance > 5"
+fi
+
+# ════════════════════════════════════════════════════════════════
 echo ""
 echo "── Summary ─────────────────────────────────────────────────"
 echo "  Total:  $TOTAL"
