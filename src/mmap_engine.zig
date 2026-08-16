@@ -293,19 +293,51 @@ pub fn executeMapped(
     // Split into lines using bulk operations
     var line_start: usize = data_start;
     while (line_start < data.len) {
-        const remaining = data[line_start..];
-        const line_end = (csv.findRecordEnd(data, line_start, opts.delimiter) orelse data.len) - line_start;
+        // Fused single-pass scan (#139): finds the record end, every comma
+        // position, and whether a quote byte is present all in one SIMD
+        // sweep, instead of findRecordEnd's own newline+quote scan followed
+        // by parseCSVFieldsStatic's separate comma scan over the same bytes.
+        // Falls back to the original two-call path (still correct, just
+        // slower) whenever a quote is present.
+        var field_buf: [256][]const u8 = undefined;
+        var comma_positions: [256]usize = undefined;
+        const scan = simd.scanRecordFused(data, line_start, opts.delimiter, &comma_positions);
 
-        var line = remaining[0..line_end];
-        // Trim \r if present
-        if (line.len > 0 and line[line.len - 1] == '\r') {
-            line = line[0 .. line.len - 1];
+        var line_end: usize = undefined;
+        var field_count: usize = undefined;
+
+        if (scan.had_quote) {
+            line_end = (csv.findRecordEnd(data, line_start, opts.delimiter) orelse data.len) - line_start;
+            var line = data[line_start..][0..line_end];
+            if (line.len > 0 and line[line.len - 1] == '\r') {
+                line = line[0 .. line.len - 1];
+            }
+            field_count = if (line.len > 0)
+                simd.parseCSVFieldsStatic(line, &field_buf, opts.delimiter) catch break
+            else
+                0;
+        } else {
+            const abs_end = scan.end orelse data.len;
+            line_end = abs_end - line_start;
+            var content_end = abs_end;
+            if (content_end > line_start and data[content_end - 1] == '\r') content_end -= 1;
+            if (content_end > line_start) {
+                var start = line_start;
+                var count: usize = 0;
+                for (comma_positions[0..scan.comma_count]) |p| {
+                    field_buf[count] = data[start..p];
+                    count += 1;
+                    start = p + 1;
+                }
+                field_buf[count] = data[start..content_end];
+                count += 1;
+                field_count = count;
+            } else {
+                field_count = 0;
+            }
         }
 
-        if (line.len > 0) {
-            // Parse fields as slices into mmap data (quote-aware, zero-copy where possible)
-            var field_buf: [256][]const u8 = undefined;
-            const field_count = simd.parseCSVFieldsStatic(line, &field_buf, opts.delimiter) catch break;
+        if (field_count > 0) {
             const fields = field_buf[0..field_count];
             _ = unescape_arena.reset(.retain_capacity);
             for (fields) |*field| {

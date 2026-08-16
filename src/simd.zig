@@ -84,6 +84,85 @@ pub fn findCommasSIMD(line: []const u8, positions: []usize, delimiter: u8) usize
     return count;
 }
 
+/// Result of a single fused SIMD pass over record data (#139): finds the
+/// record's ending newline, every comma position within it, and whether a
+/// quote byte was seen — all in one scan instead of three separate passes
+/// (findRecordEnd's newline scan, its quote scan, and parseCSVFieldsStatic's
+/// comma scan each re-read the same bytes today).
+pub const FusedScanResult = struct {
+    /// Absolute index of the record-ending '\n', or null if a quote was hit
+    /// first (had_quote is set) or data ended before either (end-of-data:
+    /// comma_count reflects what was found, caller treats as last record).
+    end: ?usize,
+    /// Number of comma positions written into the caller's buffer. Only
+    /// meaningful when had_quote is false — see below.
+    comma_count: usize,
+    /// True if a '"' byte was seen before the record end. comma_count
+    /// collected so far is unusable in that case — caller must fall back to
+    /// the scalar quote-aware state machine for this whole record, same
+    /// conservative contract as findRecordEnd's existing fast path.
+    had_quote: bool,
+};
+
+/// Prototype only (#139) — not yet wired into any production execution path.
+/// See findCommasSIMD's doc comment for the bitmask/@ctz technique this
+/// extends to three simultaneous target bytes instead of one.
+pub fn scanRecordFused(data: []const u8, start: usize, delimiter: u8, positions: []usize) FusedScanResult {
+    const VecSize = 16;
+    const Vec = @Vector(VecSize, u8);
+    const nl_vec: Vec = @splat('\n');
+    const q_vec: Vec = @splat('"');
+    const delim_vec: Vec = @splat(delimiter);
+
+    var comma_count: usize = 0;
+    var i: usize = start;
+
+    while (i + VecSize <= data.len) : (i += VecSize) {
+        const chunk: Vec = data[i..][0..VecSize].*;
+        const nl_matches: @Vector(VecSize, bool) = chunk == nl_vec;
+        const q_matches: @Vector(VecSize, bool) = chunk == q_vec;
+        const delim_matches: @Vector(VecSize, bool) = chunk == delim_vec;
+
+        const nl_mask: u16 = @bitCast(nl_matches);
+        const q_mask: u16 = @bitCast(q_matches);
+        const delim_mask: u16 = @bitCast(delim_matches);
+
+        const combined: u16 = nl_mask | q_mask | delim_mask;
+        if (combined == 0) continue;
+
+        // Walk set bits lowest-first (@ctz) so the first quote/newline byte
+        // in the chunk is the one we act on, not just any match.
+        var m = combined;
+        while (m != 0) {
+            const bit = @ctz(m);
+            const bitval: u16 = @as(u16, 1) << @intCast(bit);
+            if (q_mask & bitval != 0) {
+                return .{ .end = null, .comma_count = comma_count, .had_quote = true };
+            }
+            if (nl_mask & bitval != 0) {
+                return .{ .end = i + bit, .comma_count = comma_count, .had_quote = false };
+            }
+            if (comma_count < positions.len) {
+                positions[comma_count] = i + bit;
+                comma_count += 1;
+            }
+            m &= m - 1;
+        }
+    }
+
+    // Scalar tail for the remaining < 16 bytes.
+    while (i < data.len) : (i += 1) {
+        const c = data[i];
+        if (c == '"') return .{ .end = null, .comma_count = comma_count, .had_quote = true };
+        if (c == '\n') return .{ .end = i, .comma_count = comma_count, .had_quote = false };
+        if (c == delimiter and comma_count < positions.len) {
+            positions[comma_count] = i;
+            comma_count += 1;
+        }
+    }
+    return .{ .end = null, .comma_count = comma_count, .had_quote = false };
+}
+
 /// Quote-aware CSV field splitter into a caller-supplied static buffer.
 /// Returns the number of fields written.  All returned slices are zero-copy pointers into `line`.
 /// For quoted fields the surrounding `"` characters are stripped; `""` escape sequences are

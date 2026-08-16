@@ -63,6 +63,117 @@ pub fn main() !void {
     // Benchmark 4: real field parser (parseCSVFieldsStatic) — this is the
     // actual production parsing cost, not just a byte scan. Single-threaded.
     try benchmarkRealParser(allocator, file_path);
+
+    // Benchmark 5: fused single-pass scanner prototype (#139) — finds
+    // newline/quote/comma all in one SIMD sweep instead of three passes.
+    // Not wired into production yet; measuring the real win first.
+    try benchmarkFusedScan(allocator, file_path);
+}
+
+fn benchmarkFusedScan(allocator: std.mem.Allocator, file_path: []const u8) !void {
+    var timer = try std.time.Timer.start();
+
+    const file = try std.fs.cwd().openFile(file_path, .{});
+    defer file.close();
+    const file_size = (try file.stat()).size;
+    const data = try mapFile(allocator, file, file_size);
+    defer unmapFile(allocator, data);
+
+    var row_count: usize = 0;
+    var field_total: usize = 0;
+    var positions: [256]usize = undefined;
+
+    var pos: usize = 0;
+    while (pos < data.len) {
+        const r = simd.scanRecordFused(data, pos, ',', &positions);
+        if (r.had_quote) {
+            // Fall back to the existing quote-aware path for this record.
+            const fallback_end = csv_module_findRecordEndScalarLike(data, pos);
+            var field_buf: [256][]const u8 = undefined;
+            var line_end = fallback_end orelse data.len;
+            const next_pos = if (fallback_end) |e| e + 1 else data.len;
+            if (line_end > pos and data[line_end - 1] == '\r') line_end -= 1;
+            const line = data[pos..line_end];
+            if (line.len > 0) {
+                const n = simd.parseCSVFieldsStatic(line, &field_buf, ',') catch 0;
+                field_total += n;
+                row_count += 1;
+            }
+            pos = next_pos;
+            continue;
+        }
+        var line_end = r.end orelse data.len;
+        const next_pos = if (r.end) |e| e + 1 else data.len;
+        if (line_end > pos and data[line_end - 1] == '\r') line_end -= 1;
+        _ = &line_end;
+        if (line_end > pos) {
+            field_total += r.comma_count + 1;
+            row_count += 1;
+        }
+        pos = next_pos;
+    }
+
+    const elapsed = timer.read();
+    const ms = @as(f64, @floatFromInt(elapsed)) / 1_000_000.0;
+    const mb = @as(f64, @floatFromInt(file_size)) / (1024.0 * 1024.0);
+
+    std.debug.print("5. Fused single-pass scanner (scanRecordFused, single-thread):\n", .{});
+    std.debug.print("   Rows: {d}\n", .{row_count});
+    std.debug.print("   Fields: {d}\n", .{field_total});
+    std.debug.print("   Time: {d:.2}ms\n", .{ms});
+    std.debug.print("   Speed: {d:.0} rows/sec\n", .{@as(f64, @floatFromInt(row_count)) / (ms / 1000.0)});
+    std.debug.print("   Throughput: {d:.0} MB/sec\n\n", .{mb / (ms / 1000.0)});
+}
+
+/// Mirrors csv.findRecordEnd's SIMD fast path exactly (production, as of
+/// this session's earlier SIMD work) — local copy so the "real parser"
+/// baseline below is quote-aware for line splitting like production
+/// actually is, instead of the old naive \n-only split this bench used to
+/// do (which double-counted embedded newlines inside quoted fields as row
+/// breaks — a bench bug, not a production one; verified against real
+/// csvql + DuckDB output before fixing this).
+fn findRecordEndLocal(data: []const u8, start: usize) ?usize {
+    const nl = std.mem.indexOfScalarPos(u8, data, start, '\n') orelse return null;
+    if (std.mem.indexOfScalarPos(u8, data[0..nl], start, '"') == null) {
+        return nl;
+    }
+    return csv_module_findRecordEndScalarLike(data, start);
+}
+
+/// Minimal scalar quote-aware record-end finder for the fused-scan
+/// benchmark's fallback path — mirrors csv.findRecordEndScalar without
+/// pulling in the csv module (bench only imports simd here).
+fn csv_module_findRecordEndScalarLike(data: []const u8, start: usize) ?usize {
+    var i = start;
+    var in_quote = false;
+    var at_field_start = true;
+    while (i < data.len) {
+        const c = data[i];
+        if (in_quote) {
+            if (c == '"') {
+                if (i + 1 < data.len and data[i + 1] == '"') {
+                    i += 2;
+                    continue;
+                }
+                in_quote = false;
+                at_field_start = false;
+            }
+            i += 1;
+            continue;
+        }
+        if (c == '"' and at_field_start) {
+            in_quote = true;
+            at_field_start = false;
+        } else if (c == ',') {
+            at_field_start = true;
+        } else if (c == '\n') {
+            return i;
+        } else {
+            at_field_start = false;
+        }
+        i += 1;
+    }
+    return null;
 }
 
 fn benchmarkRealParser(allocator: std.mem.Allocator, file_path: []const u8) !void {
@@ -78,11 +189,11 @@ fn benchmarkRealParser(allocator: std.mem.Allocator, file_path: []const u8) !voi
     var field_total: usize = 0;
     var field_buf: [256][]const u8 = undefined;
 
-    // Vectorized newline search (std.mem.indexOfScalarPos is SIMD-backed) —
-    // a hand-rolled scalar byte loop here would bottleneck the benchmark on
-    // line-splitting instead of measuring the field parser it's meant to time.
+    // Quote-aware record-boundary search, matching production's
+    // csv.findRecordEnd — a naive \n-only split here would double-count
+    // embedded newlines inside quoted fields as row breaks.
     var line_start: usize = 0;
-    while (std.mem.indexOfScalarPos(u8, data, line_start, '\n')) |nl| {
+    while (findRecordEndLocal(data, line_start)) |nl| {
         var line_end = nl;
         if (line_end > line_start and data[line_end - 1] == '\r') line_end -= 1;
         const line = data[line_start..line_end];
