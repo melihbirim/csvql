@@ -2659,6 +2659,16 @@ fn evalScalarOnSingleValue(spec: scalar.ScalarSpec, value: []const u8, arena: Al
 /// expression tree (AND/OR/NOT combinations), skipping scalar_comparison
 /// nodes (DATEDIFF/DATEADD/EXTRACT), which HAVING's extra-aggregate lookup
 /// doesn't need to special-case.
+/// Heuristic: does `s` look like a function call (IDENT(...)), e.g. from a
+/// HAVING RHS like "COUNT(*)"? Used to detect the unsupported
+/// aggregate-vs-aggregate HAVING comparison (#135) so it errors instead of
+/// silently comparing against the literal text and never matching.
+fn looksLikeFunctionCall(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (!(std.ascii.isAlphabetic(s[0]) or s[0] == '_')) return false;
+    return std.mem.indexOfScalar(u8, s, '(') != null;
+}
+
 fn collectComparisons(expr: parser.Expression, out: *std.ArrayListUnmanaged(parser.Comparison), allocator: Allocator) !void {
     switch (expr) {
         .comparison => |c| try out.append(allocator, c),
@@ -4897,6 +4907,17 @@ fn executeGroupBy(
     if (query.having_expr) |hexpr| {
         var comparisons = std.ArrayListUnmanaged(parser.Comparison){};
         collectComparisons(hexpr, &comparisons, allocator) catch {};
+        // HAVING comparing two aggregate expressions (e.g. "HAVING COUNT(*)
+        // = COUNT(*)") isn't supported — only "aggregate OP literal". The
+        // RHS is parsed as a literal, so if it looks like a function call
+        // and doesn't parse as numeric, comparing against it would always
+        // silently fail (every group filtered out with no error, #135).
+        // Error clearly instead of returning wrong data.
+        for (comparisons.items) |hcomp| {
+            if (hcomp.numeric_value == null and looksLikeFunctionCall(hcomp.value)) {
+                return error.UnsupportedHavingComparesTwoAggregates;
+            }
+        }
         for (comparisons.items) |hcomp| {
             const hcol = hcomp.column; // already lowercased by the parser
             var already_covered = false;
