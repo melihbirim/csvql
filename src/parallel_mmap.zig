@@ -778,22 +778,31 @@ fn processChunk(ctx: *WorkerContext) !void {
             if (n == 0) break;
             file_pos += n;
 
+            // If a record was left incomplete at the end of the previous read
+            // (no closing newline found yet), its quote state (open or not)
+            // carries over — findRecordEnd assumes `start` is a genuine record
+            // start with clean quote state, so searching io_buf alone here
+            // would let an embedded delimiter inside a still-open quoted field
+            // (opened before this buffer) get misread as a real one (same bug
+            // class as #139, found in engine.zig's scalarAggWorkerScan and
+            // fixed the same way there). Search the combined bytes from
+            // position 0 instead so that assumption holds.
+            var work: []const u8 = io_buf[0..n];
+            if (seam_buf.items.len > 0) {
+                combined_buf.clearRetainingCapacity();
+                try combined_buf.appendSlice(arena_alloc, seam_buf.items);
+                try combined_buf.appendSlice(arena_alloc, io_buf[0..n]);
+                seam_buf.clearRetainingCapacity();
+                work = combined_buf.items;
+            }
+
             var scan: usize = 0;
-            while (scan < n) {
-                const nl = csv.findRecordEnd(io_buf[0..n], scan, ctx.delimiter) orelse {
-                    try seam_buf.appendSlice(arena_alloc, io_buf[scan..n]);
+            while (scan < work.len) {
+                const nl = csv.findRecordEnd(work, scan, ctx.delimiter) orelse {
+                    try seam_buf.appendSlice(arena_alloc, work[scan..]);
                     break;
                 };
-                var line: []const u8 = undefined;
-                if (seam_buf.items.len > 0) {
-                    combined_buf.clearRetainingCapacity();
-                    try combined_buf.appendSlice(arena_alloc, seam_buf.items);
-                    try combined_buf.appendSlice(arena_alloc, io_buf[scan..nl]);
-                    seam_buf.clearRetainingCapacity();
-                    line = combined_buf.items;
-                } else {
-                    line = io_buf[scan..nl];
-                }
+                var line: []const u8 = work[scan..nl];
                 if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
                 scan = nl + 1;
                 if (line.len == 0) continue;

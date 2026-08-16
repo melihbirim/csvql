@@ -871,22 +871,27 @@ fn scalarProcessChunk(ctx: *ScalarWorkerCtx) !void {
         if (n == 0) break;
         file_pos += n;
 
+        // Same seam-continuation fix as #139 (engine.zig scalarAggWorkerScan):
+        // build the combined seam+fresh buffer before searching for the
+        // record end, not after, so findRecordEnd's clean-quote-state
+        // assumption holds when a record's opening quote was in the
+        // previous read.
+        var work: []const u8 = io_buf[0..n];
+        if (seam_buf.items.len > 0) {
+            combined_buf.clearRetainingCapacity();
+            try combined_buf.appendSlice(ctx.allocator, seam_buf.items);
+            try combined_buf.appendSlice(ctx.allocator, io_buf[0..n]);
+            seam_buf.clearRetainingCapacity();
+            work = combined_buf.items;
+        }
+
         var scan: usize = 0;
-        while (scan < n) {
-            const nl = csv.findRecordEnd(io_buf[0..n], scan, ctx.delimiter) orelse {
-                try seam_buf.appendSlice(ctx.allocator, io_buf[scan..n]);
+        while (scan < work.len) {
+            const nl = csv.findRecordEnd(work, scan, ctx.delimiter) orelse {
+                try seam_buf.appendSlice(ctx.allocator, work[scan..]);
                 break;
             };
-            var line: []const u8 = undefined;
-            if (seam_buf.items.len > 0) {
-                combined_buf.clearRetainingCapacity();
-                try combined_buf.appendSlice(ctx.allocator, seam_buf.items);
-                try combined_buf.appendSlice(ctx.allocator, io_buf[scan..nl]);
-                seam_buf.clearRetainingCapacity();
-                line = combined_buf.items;
-            } else {
-                line = io_buf[scan..nl];
-            }
+            var line: []const u8 = work[scan..nl];
             if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
             scan = nl + 1;
             if (line.len == 0) continue;
@@ -4144,22 +4149,27 @@ fn gbWorkerScan(ctx: *GbWorkerCtx) !void {
         if (n == 0) break;
         file_pos += n;
 
+        // Same seam-continuation fix as #139 (engine.zig scalarAggWorkerScan):
+        // build the combined seam+fresh buffer before searching for the
+        // record end, not after, so findRecordEnd's clean-quote-state
+        // assumption holds when a record's opening quote was in the
+        // previous read.
+        var work: []const u8 = io_buf[0..n];
+        if (seam_buf.items.len > 0) {
+            combined_buf.clearRetainingCapacity();
+            try combined_buf.appendSlice(aa, seam_buf.items);
+            try combined_buf.appendSlice(aa, io_buf[0..n]);
+            seam_buf.clearRetainingCapacity();
+            work = combined_buf.items;
+        }
+
         var scan: usize = 0;
-        while (scan < n) {
-            const nl = csv.findRecordEnd(io_buf[0..n], scan, ctx.delimiter) orelse {
-                try seam_buf.appendSlice(aa, io_buf[scan..n]);
+        while (scan < work.len) {
+            const nl = csv.findRecordEnd(work, scan, ctx.delimiter) orelse {
+                try seam_buf.appendSlice(aa, work[scan..]);
                 break;
             };
-            var line: []const u8 = undefined;
-            if (seam_buf.items.len > 0) {
-                combined_buf.clearRetainingCapacity();
-                try combined_buf.appendSlice(aa, seam_buf.items);
-                try combined_buf.appendSlice(aa, io_buf[scan..nl]);
-                seam_buf.clearRetainingCapacity();
-                line = combined_buf.items;
-            } else {
-                line = io_buf[scan..nl];
-            }
+            var line: []const u8 = work[scan..nl];
             if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
             scan = nl + 1;
             if (line.len == 0) continue;
