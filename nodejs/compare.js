@@ -363,7 +363,7 @@ section('10. STREAMING — process rows one at a time (low memory)');
 
 lib('csvql');
 code(["// csvql streams internally on every query — no streaming API exposed to JS",
-      "// sync query() always uses ~5 MB RAM regardless of file size"]);
+      "// sync query() RAM stays flat (tens of MB) regardless of file size"]);
 ok('always low memory, no extra code needed');
 
 lib('csv-parse');

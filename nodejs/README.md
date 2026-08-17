@@ -2,7 +2,7 @@
 
 Fast SQL queries on CSV files from Node.js — powered by a Zig/SIMD engine via N-API.
 
-The engine streams through the file instead of loading it into memory, so RAM stays ~5 MB regardless of file size. Prebuilt native binaries ship for macOS (arm64/x64), Linux (x64/arm64), and Windows (x64) — no compiler needed.
+The engine streams through the file instead of loading it into memory, so RAM stays flat — tens of MB — regardless of file size. Prebuilt native binaries ship for macOS (arm64/x64), Linux (x64/arm64), and Windows (x64) — no compiler needed.
 
 ## Install
 

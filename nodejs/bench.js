@@ -215,7 +215,7 @@ const features = [
     ['SQL ORDER BY / sort',       '✓',              '✗ manual .sort()',   '✗ manual .sort()'],
     ['SQL JOIN across files',     '✓',              '✗',                  '✗'],
     ['SIMD parsing',              '✓',              '✗',                  '✗'],
-    ['Sync API — low memory',     '✓ always ~5 MB', '✗ loads all rows',   '✗ loads all rows'],
+    ['Sync API — low memory',     '✓ flat, tens of MB', '✗ loads all rows',   '✗ loads all rows'],
     ['Streaming (low memory)',     '✓ always',       '✓ async API only',   '✓ async API only'],
     ['Custom delimiter (TSV…)',   '✗',              '✓',                  '✓'],
     ['CSV writing (unparse)',      '✗',              '✗',                  '✓'],

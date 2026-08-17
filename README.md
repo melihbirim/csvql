@@ -741,7 +741,7 @@ csvql.query(
 )
 ```
 
-**Memory:** the engine streams through the file internally — RAM stays ~5 MB regardless of file size. Compare with `csv-parse` or `papaparse` sync APIs, which materialise all rows as JS objects (200–650 MB for a 42 MB / 1M row file).
+**Memory:** the engine streams through the file internally — RAM stays flat (tens of MB) regardless of file size. Compare with `csv-parse` or `papaparse` sync APIs, which materialise all rows as JS objects (200–650 MB for a 42 MB / 1M row file).
 
 #### ETL — CSV → filter → database
 

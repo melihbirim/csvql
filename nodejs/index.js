@@ -4,8 +4,8 @@
  * csvql — fast SQL queries on CSV files from Node.js
  *
  * Uses the csvql Zig/SIMD engine via N-API. The engine streams through the
- * file without loading it into memory, so RAM usage stays ~5 MB regardless
- * of file size.
+ * file instead of loading it into memory, so RAM usage stays flat (tens of
+ * MB) regardless of file size.
  *
  * @example
  * const csvql = require('csvql-query');
@@ -168,7 +168,7 @@ function cleanUp(temps) {
  * as an array of objects.
  *
  * The engine streams through the file without loading all rows into memory,
- * so RAM stays ~5 MB for any file size. Values are typed where possible
+ * so RAM stays flat (tens of MB) for any file size. Values are typed where possible
  * (numbers come back as JS numbers via JSON.parse).
  *
  * @param {string}       sql   SQL query. File paths go in FROM/JOIN clauses.

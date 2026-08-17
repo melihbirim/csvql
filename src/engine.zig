@@ -3236,6 +3236,8 @@ fn executeDistinct(
                     break;
                 }
             }
+            // Unresolved column: error, don't silently treat as zero matches (#138-class bug).
+            if (where_col_idx == null) return columnLookupError(expr.comparison.column);
         }
     }
 
@@ -3590,6 +3592,8 @@ fn executeScalarAgg(
                     break;
                 }
             }
+            // Unresolved column: error, don't silently treat as zero matches (#138-class bug).
+            if (where_col_idx == null) return columnLookupError(expr.comparison.column);
         }
     }
 
@@ -4977,6 +4981,8 @@ fn executeGroupBy(
                     break;
                 }
             }
+            // Unresolved column: error, don't silently treat as zero matches (#138-class bug).
+            if (where_col_idx == null) return columnLookupError(expr.comparison.column);
         }
     }
 
