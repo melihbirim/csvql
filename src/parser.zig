@@ -1530,6 +1530,62 @@ pub fn evaluateDirect(expr: Expression, fields: []const []const u8, lower_header
     }
 }
 
+/// Recursively validate that every column referenced anywhere in a WHERE
+/// expression tree (including inside AND/OR/NOT) actually exists in the
+/// header. `evaluate`/`evaluateDirect` above return a plain `bool`, not an
+/// error union, so a column that doesn't resolve inside a compound
+/// expression has no way to surface as an error from the per-row hot path —
+/// it silently reads as "false" for every row instead. Called once at query
+/// setup, not per row, so this is cheap: a linear column-vs-header scan per
+/// referenced column, not a scan per row.
+pub fn validateWhereExprColumns(expr: Expression, lower_header: []const []const u8) !void {
+    switch (expr) {
+        .comparison => |c| {
+            for (lower_header) |lh| {
+                if (std.mem.eql(u8, lh, c.column)) return;
+            }
+            return error.ColumnNotFound;
+        },
+        .scalar_comparison => |sc| {
+            for (lower_header) |lh| {
+                if (std.mem.eql(u8, lh, sc.col1_name)) break;
+            } else return error.ColumnNotFound;
+            if (sc.col2_name) |c2| {
+                for (lower_header) |lh| {
+                    if (std.mem.eql(u8, lh, c2)) break;
+                } else return error.ColumnNotFound;
+            }
+        },
+        .binary => |b| {
+            try validateWhereExprColumns(b.left, lower_header);
+            try validateWhereExprColumns(b.right, lower_header);
+        },
+        .unary => |u| try validateWhereExprColumns(u.expr, lower_header),
+    }
+}
+
+/// Same validation as validateWhereExprColumns, for the JOIN path, whose
+/// merged-row column lookup is a col_map (bare + alias-qualified names) built
+/// during the merge, not a flat lower_header array.
+pub fn validateWhereExprColumnsMap(expr: Expression, col_map: std.StringHashMap(usize)) !void {
+    switch (expr) {
+        .comparison => |c| {
+            if (col_map.get(c.column) == null) return error.ColumnNotFound;
+        },
+        .scalar_comparison => |sc| {
+            if (col_map.get(sc.col1_name) == null) return error.ColumnNotFound;
+            if (sc.col2_name) |c2| {
+                if (col_map.get(c2) == null) return error.ColumnNotFound;
+            }
+        },
+        .binary => |b| {
+            try validateWhereExprColumnsMap(b.left, col_map);
+            try validateWhereExprColumnsMap(b.right, col_map);
+        },
+        .unary => |u| try validateWhereExprColumnsMap(u.expr, col_map),
+    }
+}
+
 pub fn compareValues(comp: Comparison, candidate: []const u8) bool {
     // IS NULL / IS NOT NULL
     if (comp.operator == .is_null) return candidate.len == 0;

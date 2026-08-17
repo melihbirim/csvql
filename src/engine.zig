@@ -531,6 +531,8 @@ fn executeSequential(
     // Write output header
     try writer.writeHeader(output_header.items, opts.no_header);
 
+    if (query.where_expr) |we| try parser.validateWhereExprColumns(we, lower_header);
+
     // OPTIMIZATION: Find WHERE column index for fast lookup (avoid HashMap in hot path)
     var where_column_idx: ?usize = null;
     if (query.where_expr) |expr| {
@@ -543,6 +545,8 @@ fn executeSequential(
                     break;
                 }
             }
+            // Unresolved column: error, don't silently treat as zero matches (#138-class bug).
+            if (where_column_idx == null) return columnLookupError(comp.column);
         }
     }
 
@@ -843,6 +847,66 @@ fn scalarWorkerThread(ctx: *ScalarWorkerCtx) void {
     };
 }
 
+/// WHERE filter + projection for a single already-split record. Shared by
+/// the fused single-pass scan path and the quote-aware fallback, so the
+/// filter/projection logic isn't duplicated per caller.
+fn scalarProcessRecord(ctx: *ScalarWorkerCtx, row_arena: *std.heap.ArenaAllocator, fields: []const []const u8) !void {
+    // WHERE filter
+    if (ctx.where_expr) |expr| {
+        if (expr == .comparison) {
+            const comp = expr.comparison;
+            if (ctx.where_column_idx) |ci| {
+                const fv = if (ci < fields.len) fields[ci] else "";
+                if (comp.numeric_value) |threshold| {
+                    const val = std.fmt.parseFloat(f64, fv) catch return;
+                    const ok = switch (comp.operator) {
+                        .equal => val == threshold,
+                        .not_equal => val != threshold,
+                        .greater => val > threshold,
+                        .greater_equal => val >= threshold,
+                        .less => val < threshold,
+                        .less_equal => val <= threshold,
+                        .like => parser.matchLike(fv, comp.value),
+                        .ilike => parser.matchILike(fv, comp.value),
+                        .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
+                    };
+                    if (!ok) return;
+                } else {
+                    if (!parser.compareValues(comp, fv)) return;
+                }
+            } else return;
+        } else {
+            // AND/OR/NOT — no HashMap needed
+            if (!parser.evaluateDirect(expr, fields, ctx.lower_header)) return;
+        }
+    }
+
+    // Project through scalar specs and write CSV row to per-thread buffer
+    for (ctx.output_specs, 0..) |spec, j| {
+        if (j > 0) try ctx.output_buf.append(ctx.allocator, ctx.delimiter);
+        const value = scalar.evalOutputCol(spec, fields, row_arena.allocator());
+        // Minimal CSV quoting
+        var needs_quote = false;
+        for (value) |c| {
+            if (c == ctx.delimiter or c == '"' or c == '\r' or c == '\n') {
+                needs_quote = true;
+                break;
+            }
+        }
+        if (needs_quote) {
+            try ctx.output_buf.append(ctx.allocator, '"');
+            for (value) |c| {
+                if (c == '"') try ctx.output_buf.append(ctx.allocator, '"');
+                try ctx.output_buf.append(ctx.allocator, c);
+            }
+            try ctx.output_buf.append(ctx.allocator, '"');
+        } else {
+            try ctx.output_buf.appendSlice(ctx.allocator, value);
+        }
+    }
+    try ctx.output_buf.append(ctx.allocator, '\n');
+}
+
 fn scalarProcessChunk(ctx: *ScalarWorkerCtx) !void {
     // Per-row arena: reset after each row so scalar allocations (UPPER/LOWER etc.)
     // don't accumulate.  Capacity is retained so there's no system-call overhead
@@ -887,81 +951,61 @@ fn scalarProcessChunk(ctx: *ScalarWorkerCtx) !void {
 
         var scan: usize = 0;
         while (scan < work.len) {
-            const nl = csv.findRecordEnd(work, scan, ctx.delimiter) orelse {
-                try seam_buf.appendSlice(ctx.allocator, work[scan..]);
-                break;
-            };
-            var line: []const u8 = work[scan..nl];
-            if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-            scan = nl + 1;
-            if (line.len == 0) continue;
+            // Fused single-pass scan (same technique as scalarAggWorkerScan
+            // and gbWorkerScan, #139 follow-up): finds the record end, every
+            // delimiter position, and whether a quote is present in one SIMD
+            // sweep, replacing findRecordEnd's own scan followed by
+            // parseCSVFieldsStatic's separate quote-check + delimiter scan
+            // over the same bytes. Falls back to the original quote-aware
+            // path whenever a quote is present.
+            var comma_positions: [256]usize = undefined;
+            const fused = simd.scanRecordFused(work, scan, ctx.delimiter, &comma_positions);
 
             _ = row_arena.reset(.retain_capacity);
 
-            // Parse all fields (quote-aware: commas/newlines inside quotes don't
-            // split the row, surrounding quotes are stripped) — issue #93.
-            const n_fields = simd.parseCSVFieldsStatic(line, &field_buf, ctx.delimiter) catch continue;
-            const fields = field_buf[0..n_fields];
-            for (fields) |*f| {
-                if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
-                    f.* = unescapeQuotesArenaAlloc(row_arena.allocator(), f.*) catch f.*;
-                }
-            }
+            if (fused.had_quote) {
+                const nl = csv.findRecordEnd(work, scan, ctx.delimiter) orelse {
+                    try seam_buf.appendSlice(ctx.allocator, work[scan..]);
+                    break;
+                };
+                var line: []const u8 = work[scan..nl];
+                if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+                scan = nl + 1;
+                if (line.len == 0) continue;
 
-            // WHERE filter
-            if (ctx.where_expr) |expr| {
-                if (expr == .comparison) {
-                    const comp = expr.comparison;
-                    if (ctx.where_column_idx) |ci| {
-                        const fv = if (ci < fields.len) fields[ci] else "";
-                        if (comp.numeric_value) |threshold| {
-                            const val = std.fmt.parseFloat(f64, fv) catch continue;
-                            const ok = switch (comp.operator) {
-                                .equal => val == threshold,
-                                .not_equal => val != threshold,
-                                .greater => val > threshold,
-                                .greater_equal => val >= threshold,
-                                .less => val < threshold,
-                                .less_equal => val <= threshold,
-                                .like => parser.matchLike(fv, comp.value),
-                                .ilike => parser.matchILike(fv, comp.value),
-                                .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
-                            };
-                            if (!ok) continue;
-                        } else {
-                            if (!parser.compareValues(comp, fv)) continue;
-                        }
-                    } else continue;
-                } else {
-                    // AND/OR/NOT — no HashMap needed
-                    if (!parser.evaluateDirect(expr, fields, ctx.lower_header)) continue;
-                }
-            }
-
-            // Project through scalar specs and write CSV row to per-thread buffer
-            for (ctx.output_specs, 0..) |spec, j| {
-                if (j > 0) try ctx.output_buf.append(ctx.allocator, ctx.delimiter);
-                const value = scalar.evalOutputCol(spec, fields, row_arena.allocator());
-                // Minimal CSV quoting
-                var needs_quote = false;
-                for (value) |c| {
-                    if (c == ctx.delimiter or c == '"' or c == '\r' or c == '\n') {
-                        needs_quote = true;
-                        break;
+                // Parse all fields (quote-aware: commas/newlines inside quotes don't
+                // split the row, surrounding quotes are stripped) — issue #93.
+                const n_fields = simd.parseCSVFieldsStatic(line, &field_buf, ctx.delimiter) catch continue;
+                const fields = field_buf[0..n_fields];
+                for (fields) |*f| {
+                    if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
+                        f.* = unescapeQuotesArenaAlloc(row_arena.allocator(), f.*) catch f.*;
                     }
                 }
-                if (needs_quote) {
-                    try ctx.output_buf.append(ctx.allocator, '"');
-                    for (value) |c| {
-                        if (c == '"') try ctx.output_buf.append(ctx.allocator, '"');
-                        try ctx.output_buf.append(ctx.allocator, c);
-                    }
-                    try ctx.output_buf.append(ctx.allocator, '"');
-                } else {
-                    try ctx.output_buf.appendSlice(ctx.allocator, value);
-                }
+                try scalarProcessRecord(ctx, &row_arena, fields);
+                continue;
             }
-            try ctx.output_buf.append(ctx.allocator, '\n');
+
+            const abs_end = fused.end orelse {
+                try seam_buf.appendSlice(ctx.allocator, work[scan..]);
+                break;
+            };
+            var content_end = abs_end;
+            if (content_end > scan and work[content_end - 1] == '\r') content_end -= 1;
+            const row_start = scan;
+            scan = abs_end + 1;
+            if (content_end <= row_start) continue;
+
+            var count: usize = 0;
+            var s = row_start;
+            for (comma_positions[0..fused.comma_count]) |p| {
+                field_buf[count] = work[s..p];
+                count += 1;
+                s = p + 1;
+            }
+            field_buf[count] = work[s..content_end];
+            count += 1;
+            try scalarProcessRecord(ctx, &row_arena, field_buf[0..count]);
         }
     }
     // Flush any partial line remaining in the seam buffer
@@ -977,55 +1021,7 @@ fn scalarProcessChunk(ctx: *ScalarWorkerCtx) !void {
                 f.* = unescapeQuotesArenaAlloc(row_arena.allocator(), f.*) catch f.*;
             }
         }
-        if (ctx.where_expr) |expr| {
-            if (expr == .comparison) {
-                const comp = expr.comparison;
-                if (ctx.where_column_idx) |ci| {
-                    const fv = if (ci < fields.len) fields[ci] else "";
-                    if (comp.numeric_value) |threshold| {
-                        const val = std.fmt.parseFloat(f64, fv) catch break :flush;
-                        const ok = switch (comp.operator) {
-                            .equal => val == threshold,
-                            .not_equal => val != threshold,
-                            .greater => val > threshold,
-                            .greater_equal => val >= threshold,
-                            .less => val < threshold,
-                            .less_equal => val <= threshold,
-                            .like => parser.matchLike(fv, comp.value),
-                            .ilike => parser.matchILike(fv, comp.value),
-                            .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
-                        };
-                        if (!ok) break :flush;
-                    } else {
-                        if (!parser.compareValues(comp, fv)) break :flush;
-                    }
-                } else break :flush;
-            } else {
-                if (!parser.evaluateDirect(expr, fields, ctx.lower_header)) break :flush;
-            }
-        }
-        for (ctx.output_specs, 0..) |spec, j| {
-            if (j > 0) try ctx.output_buf.append(ctx.allocator, ctx.delimiter);
-            const value = scalar.evalOutputCol(spec, fields, row_arena.allocator());
-            var needs_quote = false;
-            for (value) |c| {
-                if (c == ctx.delimiter or c == '"' or c == '\r' or c == '\n') {
-                    needs_quote = true;
-                    break;
-                }
-            }
-            if (needs_quote) {
-                try ctx.output_buf.append(ctx.allocator, '"');
-                for (value) |c| {
-                    if (c == '"') try ctx.output_buf.append(ctx.allocator, '"');
-                    try ctx.output_buf.append(ctx.allocator, c);
-                }
-                try ctx.output_buf.append(ctx.allocator, '"');
-            } else {
-                try ctx.output_buf.appendSlice(ctx.allocator, value);
-            }
-        }
-        try ctx.output_buf.append(ctx.allocator, '\n');
+        scalarProcessRecord(ctx, &row_arena, fields) catch break :flush;
     }
 }
 
@@ -1094,6 +1090,8 @@ fn executeParallelScalar(
     }
     const output_specs = output_specs_list.items;
 
+    if (query.where_expr) |we| try parser.validateWhereExprColumns(we, lower_header);
+
     // WHERE column index
     var where_column_idx: ?usize = null;
     if (query.where_expr) |expr| {
@@ -1104,6 +1102,8 @@ fn executeParallelScalar(
                     break;
                 }
             }
+            // Unresolved column: error, don't silently treat as zero matches (#138-class bug).
+            if (where_column_idx == null) return columnLookupError(expr.comparison.column);
         }
     }
 
@@ -1830,15 +1830,18 @@ fn executeJoin(
         }
     }
 
+    if (query.where_expr) |we| try parser.validateWhereExprColumnsMap(we, col_map);
+
     var where_merged_idx: ?usize = null;
     if (query.where_expr) |expr| {
         if (expr == .comparison) {
             const col = expr.comparison.column;
             if (col_map.get(col)) |idx| {
                 where_merged_idx = idx;
-            } else if (std.mem.indexOf(u8, col, ".") != null) {
-                // Qualified reference (alias.col) that col_map didn't find means unknown
-                // alias — never silently fall back to bare name.
+            } else {
+                // Unresolved column (unknown alias, or a bare name that doesn't exist
+                // in any joined table) — error, don't silently treat as zero matches
+                // (#138-class bug).
                 return error.ColumnNotFound;
             }
         }
@@ -2057,6 +2060,8 @@ fn executeFromStdin(
     // Write output header
     try writer.writeHeader(output_header.items, opts.no_header);
 
+    if (query.where_expr) |we| try parser.validateWhereExprColumns(we, lower_header);
+
     // OPTIMIZATION: Find WHERE column index for fast lookup (avoid HashMap in hot path)
     var where_column_idx_stdin: ?usize = null;
     if (query.where_expr) |expr| {
@@ -2069,6 +2074,8 @@ fn executeFromStdin(
                     break;
                 }
             }
+            // Unresolved column: error, don't silently treat as zero matches (#138-class bug).
+            if (where_column_idx_stdin == null) return columnLookupError(comp.column);
         }
     }
 
@@ -3226,6 +3233,8 @@ fn executeDistinct(
     }
     try writer.writeHeader(out_header.items, opts.no_header);
 
+    if (query.where_expr) |we| try parser.validateWhereExprColumns(we, lower_header);
+
     // WHERE fast-path index
     var where_col_idx: ?usize = null;
     if (query.where_expr) |expr| {
@@ -3581,6 +3590,8 @@ fn executeScalarAgg(
         }
     }
     try writer.writeHeader(out_header_list.items, opts.no_header);
+
+    if (query.where_expr) |we| try parser.validateWhereExprColumns(we, lower_header);
 
     // -- WHERE fast-path index --
     var where_col_idx: ?usize = null;
@@ -3962,7 +3973,19 @@ fn gbProcessRecord(
             f.* = unescapeQuotesArenaAlloc(unescape_arena.allocator(), f.*) catch f.*;
         }
     }
+    try gbProcessRecordCore(ctx, aa, key_buf, record);
+}
 
+/// Same as gbProcessRecord but takes an already-split, already-unescaped
+/// record — used by the fused single-pass scan path, which builds `record`
+/// directly from comma positions found during record-end detection instead
+/// of re-scanning the line for quotes and delimiters.
+fn gbProcessRecordCore(
+    ctx: *GbWorkerCtx,
+    aa: Allocator,
+    key_buf: *std.ArrayListUnmanaged(u8),
+    record: []const []const u8,
+) !void {
     // WHERE filter
     if (ctx.where_expr) |expr| {
         if (expr == .comparison) {
@@ -4179,15 +4202,48 @@ fn gbWorkerScan(ctx: *GbWorkerCtx) !void {
 
         var scan: usize = 0;
         while (scan < work.len) {
-            const nl = csv.findRecordEnd(work, scan, ctx.delimiter) orelse {
+            // Fused single-pass scan (same technique as scalarAggWorkerScan,
+            // #139 follow-up): finds the record end, every delimiter
+            // position, and whether a quote is present in one SIMD sweep,
+            // replacing findRecordEnd's own scan followed by splitLine's
+            // separate quote-check + delimiter scan over the same bytes.
+            // Falls back to the original path whenever a quote is present.
+            var comma_positions: [256]usize = undefined;
+            const fused = simd.scanRecordFused(work, scan, ctx.delimiter, &comma_positions);
+
+            if (fused.had_quote) {
+                const nl = csv.findRecordEnd(work, scan, ctx.delimiter) orelse {
+                    try seam_buf.appendSlice(aa, work[scan..]);
+                    break;
+                };
+                var line: []const u8 = work[scan..nl];
+                if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+                scan = nl + 1;
+                if (line.len == 0) continue;
+                try gbProcessRecord(ctx, aa, &field_stk, &key_buf, line, &unescape_arena);
+                continue;
+            }
+
+            const abs_end = fused.end orelse {
                 try seam_buf.appendSlice(aa, work[scan..]);
                 break;
             };
-            var line: []const u8 = work[scan..nl];
-            if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-            scan = nl + 1;
-            if (line.len == 0) continue;
-            try gbProcessRecord(ctx, aa, &field_stk, &key_buf, line, &unescape_arena);
+            var content_end = abs_end;
+            if (content_end > scan and work[content_end - 1] == '\r') content_end -= 1;
+            const row_start = scan;
+            scan = abs_end + 1;
+            if (content_end <= row_start) continue;
+
+            var count: usize = 0;
+            var s = row_start;
+            for (comma_positions[0..fused.comma_count]) |p| {
+                field_stk[count] = work[s..p];
+                count += 1;
+                s = p + 1;
+            }
+            field_stk[count] = work[s..content_end];
+            count += 1;
+            try gbProcessRecordCore(ctx, aa, &key_buf, field_stk[0..count]);
         }
     }
     // Flush any partial line remaining in the seam buffer
@@ -4970,6 +5026,8 @@ fn executeGroupBy(
             }
         }
     }
+
+    if (query.where_expr) |we| try parser.validateWhereExprColumns(we, lower_header);
 
     // -- Precompute WHERE fast path -----------------------------------------
     var where_col_idx: ?usize = null;

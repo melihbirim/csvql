@@ -212,6 +212,8 @@ pub fn executeMapped(
     }
     try writer.writeHeader(output_header.items, opts.no_header);
 
+    if (query.where_expr) |we| try parser.validateWhereExprColumns(we, lower_header);
+
     // OPTIMIZATION: Find WHERE column index for fast lookup
     var where_column_idx: ?usize = null;
     if (query.where_expr) |expr| {
@@ -223,6 +225,8 @@ pub fn executeMapped(
                     break;
                 }
             }
+            // Unresolved column: error, don't silently treat as zero matches (#138-class bug).
+            if (where_column_idx == null) return error.ColumnNotFound;
         }
     }
 

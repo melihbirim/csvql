@@ -198,6 +198,8 @@ pub fn executeParallelMapped(
     }
     try writer.writeHeader(output_header.items, opts.no_header);
 
+    if (query.where_expr) |we| try parser.validateWhereExprColumns(we, lower_header);
+
     // Find WHERE column index for fast lookup (avoid HashMap in hot path)
     var where_column_idx: ?usize = null;
     if (query.where_expr) |expr| {
@@ -210,6 +212,8 @@ pub fn executeParallelMapped(
                     break;
                 }
             }
+            // Unresolved column: error, don't silently treat as zero matches (#138-class bug).
+            if (where_column_idx == null) return error.ColumnNotFound;
         }
     }
 
@@ -662,14 +666,24 @@ fn processOneLine(
 ) !void {
     fields.clearRetainingCapacity();
     try simd.parseCSVFields(line, fields, arena_alloc, ctx.delimiter);
+    try processFields(ctx, fields.items);
+}
 
+/// WHERE filter + projection for an already-split record. Shared by the
+/// quote-aware parseCSVFields path and the fused single-pass scan path,
+/// which builds `fields` directly from comma positions found during
+/// record-end detection instead of re-scanning the line.
+fn processFields(
+    ctx: *WorkerContext,
+    fields: []const []const u8,
+) !void {
     // Fast WHERE evaluation using direct index lookup (avoid HashMap!)
     if (ctx.query.where_expr) |expr| {
         if (expr == .comparison) {
             const comp = expr.comparison;
             if (ctx.where_column_idx) |col_idx| {
-                if (col_idx < fields.items.len) {
-                    const field_value = fields.items[col_idx];
+                if (col_idx < fields.len) {
+                    const field_value = fields[col_idx];
                     if (comp.numeric_value) |threshold| {
                         const val = std.fmt.parseFloat(f64, field_value) catch return;
                         const matches = switch (comp.operator) {
@@ -689,10 +703,10 @@ fn processOneLine(
                     }
                 } else return;
             } else {
-                if (!parser.evaluateDirect(expr, fields.items, ctx.lower_header)) return;
+                if (!parser.evaluateDirect(expr, fields, ctx.lower_header)) return;
             }
         } else {
-            if (!parser.evaluateDirect(expr, fields.items, ctx.lower_header)) return;
+            if (!parser.evaluateDirect(expr, fields, ctx.lower_header)) return;
         }
     }
 
@@ -700,7 +714,7 @@ fn processOneLine(
         if (ctx.format == .csv) {
             for (ctx.output_indices, 0..) |idx, j| {
                 if (j > 0) try ctx.output_buf.append(ctx.allocator, ctx.delimiter);
-                const value = if (idx < fields.items.len) fields.items[idx] else "";
+                const value = if (idx < fields.len) fields[idx] else "";
                 var needs_quote = false;
                 for (value) |c| {
                     if (c == ctx.delimiter or c == '"' or c == '\r' or c == '\n') {
@@ -729,7 +743,7 @@ fn processOneLine(
             for (ctx.output_indices, 0..) |idx, j| {
                 if (j > 0) try ctx.output_buf.append(ctx.allocator, ',');
                 try ctx.output_buf.appendSlice(ctx.allocator, ctx.key_fragments[j]);
-                const value = if (idx < fields.items.len) fields.items[idx] else "";
+                const value = if (idx < fields.len) fields[idx] else "";
                 if (csv.isJsonNumber(value)) {
                     try ctx.output_buf.appendSlice(ctx.allocator, value);
                 } else {
@@ -745,7 +759,7 @@ fn processOneLine(
         // mmap path: build row from slices pointing into mmap data (valid until munmap)
         var output_row = try ctx.allocator.alloc([]const u8, ctx.output_indices.len);
         for (ctx.output_indices, 0..) |idx, j| {
-            output_row[j] = if (idx < fields.items.len) fields.items[idx] else "";
+            output_row[j] = if (idx < fields.len) fields[idx] else "";
         }
         try ctx.result.append(ctx.allocator, output_row);
     }
@@ -757,6 +771,7 @@ fn processChunk(ctx: *WorkerContext) !void {
     const arena_alloc = arena.allocator();
 
     var fields = try std.ArrayList([]const u8).initCapacity(arena_alloc, 20);
+    var field_stk: [256][]const u8 = undefined;
 
     if (ctx.use_parallel_output) {
         // pread path: each worker opens its own file descriptor and issues independent
@@ -798,15 +813,50 @@ fn processChunk(ctx: *WorkerContext) !void {
 
             var scan: usize = 0;
             while (scan < work.len) {
-                const nl = csv.findRecordEnd(work, scan, ctx.delimiter) orelse {
+                // Fused single-pass scan (same technique as engine.zig's
+                // scalarAggWorkerScan/gbWorkerScan/scalarProcessChunk, #139
+                // follow-up): finds the record end, every delimiter
+                // position, and whether a quote is present in one SIMD
+                // sweep, replacing findRecordEnd's own scan followed by
+                // parseCSVFields's separate quote-check + delimiter scan
+                // over the same bytes. Falls back to the original quote-aware
+                // path whenever a quote is present.
+                var comma_positions: [256]usize = undefined;
+                const fused = simd.scanRecordFused(work, scan, ctx.delimiter, &comma_positions);
+
+                if (fused.had_quote) {
+                    const nl = csv.findRecordEnd(work, scan, ctx.delimiter) orelse {
+                        try seam_buf.appendSlice(arena_alloc, work[scan..]);
+                        break;
+                    };
+                    var line: []const u8 = work[scan..nl];
+                    if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+                    scan = nl + 1;
+                    if (line.len == 0) continue;
+                    try processOneLine(ctx, arena_alloc, &fields, line);
+                    continue;
+                }
+
+                const abs_end = fused.end orelse {
                     try seam_buf.appendSlice(arena_alloc, work[scan..]);
                     break;
                 };
-                var line: []const u8 = work[scan..nl];
-                if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-                scan = nl + 1;
-                if (line.len == 0) continue;
-                try processOneLine(ctx, arena_alloc, &fields, line);
+                var content_end = abs_end;
+                if (content_end > scan and work[content_end - 1] == '\r') content_end -= 1;
+                const row_start = scan;
+                scan = abs_end + 1;
+                if (content_end <= row_start) continue;
+
+                var count: usize = 0;
+                var s = row_start;
+                for (comma_positions[0..fused.comma_count]) |p| {
+                    field_stk[count] = work[s..p];
+                    count += 1;
+                    s = p + 1;
+                }
+                field_stk[count] = work[s..content_end];
+                count += 1;
+                try processFields(ctx, field_stk[0..count]);
             }
         }
         // Flush any partial line in the seam buffer (last line without trailing newline)
