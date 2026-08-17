@@ -10,7 +10,7 @@ const audit = @import("audit.zig");
 const zigtable = @import("zigtable");
 const Allocator = std.mem.Allocator;
 
-const version = "2.4.1";
+const version = "2.4.2";
 
 const help_text =
     \\csvql — the world's fastest CSV query engine
