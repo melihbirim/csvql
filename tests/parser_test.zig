@@ -416,3 +416,43 @@ test "evaluateDirect: NOT negates condition" {
     const fields_la = [_][]const u8{"LA"};
     try std.testing.expect(parser.evaluateDirect(where, &fields_la, &header));
 }
+
+test "subquery in WHERE IN errors clearly instead of silently misparsing (#124)" {
+    const allocator = std.testing.allocator;
+    const result = parser.parse(allocator, "SELECT name FROM 't.csv' WHERE dept IN (SELECT dept FROM 't.csv' WHERE salary > 80000)");
+    try std.testing.expectError(error.SubqueriesNotSupported, result);
+}
+
+test "subquery in HAVING errors clearly instead of silently misparsing (#124)" {
+    const allocator = std.testing.allocator;
+    const result = parser.parse(allocator, "SELECT dept, AVG(salary) FROM 't.csv' GROUP BY dept HAVING AVG(salary) > (SELECT AVG(salary) FROM 't.csv')");
+    try std.testing.expectError(error.SubqueriesNotSupported, result);
+}
+
+test "INTERSECT errors clearly instead of silently returning empty (#127)" {
+    const allocator = std.testing.allocator;
+    const result = parser.parse(allocator, "SELECT name FROM 't.csv' WHERE dept='Eng' INTERSECT SELECT name FROM 't.csv' WHERE salary > 80000");
+    try std.testing.expectError(error.UnsupportedSetOperation, result);
+}
+
+test "EXCEPT errors clearly instead of silently returning empty (#127)" {
+    const allocator = std.testing.allocator;
+    const result = parser.parse(allocator, "SELECT name FROM 't.csv' EXCEPT SELECT name FROM 't.csv' WHERE salary > 80000");
+    try std.testing.expectError(error.UnsupportedSetOperation, result);
+}
+
+test "WHERE col % divisor op value filters correctly (#119)" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(allocator, "SELECT * FROM 'test.csv' WHERE id % 2 = 0");
+    defer query.deinit();
+
+    const where = query.where_expr orelse return error.TestUnexpectedNull;
+    const header = [_][]const u8{"id"};
+
+    const even = [_][]const u8{"4"};
+    try std.testing.expect(parser.evaluateDirect(where, &even, &header));
+
+    const odd = [_][]const u8{"3"};
+    try std.testing.expect(!parser.evaluateDirect(where, &odd, &header));
+}

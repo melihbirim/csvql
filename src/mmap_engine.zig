@@ -76,10 +76,10 @@ fn appendSortEntry(
     format: options_mod.OutputFormat,
     output_row: []const []const u8,
     output_header: []const []const u8,
-    order_by_col_idx: usize,
+    sort_val: []const u8,
 ) !void {
     const sort_key_start = a.pos;
-    _ = try a.append(output_row[order_by_col_idx]);
+    _ = try a.append(sort_val);
     const sort_key_end = a.pos;
     const numeric_key = std.fmt.parseFloat(f64, a.data[sort_key_start..sort_key_end]) catch std.math.nan(f64);
 
@@ -234,6 +234,9 @@ pub fn executeMapped(
     var sort_entries: ?std.ArrayList(PendingSortEntry) = null;
     var arena: ?ArenaBuffer = null;
     var order_by_col_idx: ?usize = null;
+    // Set when the ORDER BY column isn't projected — sourced from the raw
+    // source row instead of the output row (#117).
+    var order_by_raw_idx: ?usize = null;
     defer {
         if (sort_entries) |*entries| entries.deinit(allocator);
         if (arena) |*a| a.deinit();
@@ -274,6 +277,15 @@ pub fn executeMapped(
             }
         }
         if (order_by_col_idx == null) {
+            // Not projected — fall back to the raw source column (#117).
+            for (lower_header, 0..) |name, idx| {
+                if (std.mem.eql(u8, name, order_by.column)) {
+                    order_by_raw_idx = idx;
+                    break;
+                }
+            }
+        }
+        if (order_by_col_idx == null and order_by_raw_idx == null) {
             return error.OrderByColumnNotFound;
         }
     }
@@ -423,7 +435,11 @@ pub fn executeMapped(
             }
 
             if (sort_entries) |*entries| {
-                try appendSortEntry(&(arena.?), entries, allocator, opts.format, output_row, output_header.items, order_by_col_idx.?);
+                const sort_val = if (order_by_col_idx) |oi| output_row[oi] else blk: {
+                    const ri = order_by_raw_idx.?;
+                    break :blk if (ri < fields.len) fields[ri] else "";
+                };
+                try appendSortEntry(&(arena.?), entries, allocator, opts.format, output_row, output_header.items, sort_val);
                 rows_written += 1;
             } else {
                 if (query.limit == 0) break; // stop before the first write (#111)
@@ -525,6 +541,36 @@ test "DISTINCT does not falsely collapse rows longer than the dedup key buffer" 
     try std.testing.expectEqual(@as(usize, 3), row_count);
 }
 
+// TDD Test: ORDER BY on a column not in the SELECT list must sort by the raw
+// source column instead of erroring (issue #117).
+test "executeMapped: ORDER BY a column not in the SELECT list sorts by the raw source column (#117)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const in_file = try tmp.dir.createFile("in.csv", .{ .read = true });
+    defer in_file.close();
+    try in_file.writeAll("name,salary\ncarol,50000\nalice,90000\nbob,70000\n");
+    try in_file.seekTo(0);
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath("in.csv", &path_buf);
+    const sql = try std.fmt.allocPrint(allocator, "SELECT name FROM '{s}' ORDER BY salary", .{path});
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out_file.close();
+    try executeMapped(allocator, query, in_file, out_file, .{});
+
+    try out_file.seekTo(0);
+    const out = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(out);
+
+    try std.testing.expectEqualStrings("name\ncarol\nbob\nalice\n", out);
+}
+
 // TDD Test: sort-key/line offsets recorded by appendSortEntry must still
 // resolve to the correct bytes after a LATER row's append forces ArenaBuffer
 // to realloc the shared backing buffer — a raw slice captured at append time
@@ -542,10 +588,10 @@ test "appendSortEntry offsets survive arena realloc from a later row" {
     const header = &[_][]const u8{ "id", "val" };
 
     var row1 = [_][]const u8{ "1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" };
-    try appendSortEntry(&a, &entries, allocator, .csv, &row1, header, 1);
+    try appendSortEntry(&a, &entries, allocator, .csv, &row1, header, row1[1]);
 
     var row2 = [_][]const u8{ "2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" };
-    try appendSortEntry(&a, &entries, allocator, .csv, &row2, header, 1);
+    try appendSortEntry(&a, &entries, allocator, .csv, &row2, header, row2[1]);
 
     // Materialize only after all rows are appended, per the documented
     // ArenaBuffer offset pattern.

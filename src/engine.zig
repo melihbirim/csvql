@@ -9,6 +9,7 @@ const aggregation = @import("aggregation.zig");
 const simd = @import("simd.zig");
 const options_mod = @import("options.zig");
 const scalar = @import("scalar.zig");
+const datetime = @import("datetime.zig");
 const arena_buffer = @import("arena_buffer.zig");
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
@@ -199,9 +200,19 @@ const RowSortCtx = struct {
 /// e.g. "SELECT department AS d ... ORDER BY department" resolves even though
 /// the displayed header is "d", not "department" (#131) — standard SQL lets
 /// ORDER BY reference either the alias or the original expression.
-fn resolveGroupOrderIdx(col: []const u8, out_hdr: []const []const u8, raw_columns: []const []const u8, alloc: std.mem.Allocator) !?usize {
+/// A resolved ORDER BY column position for GROUP BY output. `.output` indexes
+/// the projected output row (as before); `.group_key` indexes `group_specs`/
+/// `accum.key_values` directly for a GROUP BY key that wasn't SELECT'd —
+/// standard SQL allows ordering by any grouping key even if it isn't
+/// projected (#117).
+const GroupOrderRef = union(enum) {
+    output: usize,
+    group_key: usize,
+};
+
+fn resolveGroupOrderIdx(col: []const u8, out_hdr: []const []const u8, raw_columns: []const []const u8, group_by: []const []const u8, alloc: std.mem.Allocator) !?GroupOrderRef {
     const pos_num = std.fmt.parseInt(usize, col, 10) catch 0;
-    if (pos_num >= 1 and pos_num <= out_hdr.len) return pos_num - 1;
+    if (pos_num >= 1 and pos_num <= out_hdr.len) return .{ .output = pos_num - 1 };
     const lcol = try alloc.alloc(u8, col.len);
     defer alloc.free(lcol);
     _ = std.ascii.lowerString(lcol, col);
@@ -209,7 +220,7 @@ fn resolveGroupOrderIdx(col: []const u8, out_hdr: []const []const u8, raw_column
         const lh = try alloc.alloc(u8, hdr.len);
         defer alloc.free(lh);
         _ = std.ascii.lowerString(lh, hdr);
-        if (std.mem.eql(u8, lh, lcol)) return pos;
+        if (std.mem.eql(u8, lh, lcol)) return .{ .output = pos };
     }
     // Fall back to the pre-alias source expression for each SELECT column.
     for (raw_columns, 0..) |raw, pos| {
@@ -218,7 +229,16 @@ fn resolveGroupOrderIdx(col: []const u8, out_hdr: []const []const u8, raw_column
         var buf: [256]u8 = undefined;
         if (expr.len > buf.len) continue;
         const lexpr = std.ascii.lowerString(buf[0..expr.len], expr);
-        if (std.mem.eql(u8, lexpr, lcol)) return pos;
+        if (std.mem.eql(u8, lexpr, lcol)) return .{ .output = pos };
+    }
+    // Not SELECT'd at all — fall back to a GROUP BY key that isn't projected.
+    for (group_by, 0..) |gb, gi| {
+        const expr = std.mem.trim(u8, gb, &std.ascii.whitespace);
+        if (expr.len != col.len) continue;
+        var buf: [256]u8 = undefined;
+        if (expr.len > buf.len) continue;
+        const lexpr = std.ascii.lowerString(buf[0..expr.len], expr);
+        if (std.mem.eql(u8, lexpr, lcol)) return .{ .group_key = gi };
     }
     return null;
 }
@@ -256,7 +276,7 @@ pub const Query = parser.Query;
 
 /// Return true when any SELECT column is a scalar function that needs per-row
 /// evaluation (UPPER, LOWER, TRIM, LENGTH, SUBSTR, ABS, CEIL, FLOOR, MOD,
-/// COALESCE, CAST).  Aggregate functions, STRFTIME, SUBSTR-as-GROUP-BY-key,
+/// COALESCE, CAST, STRFTIME).  Aggregate functions, SUBSTR-as-GROUP-BY-key,
 /// and CASE WHEN are handled by their own dedicated paths and are excluded.
 fn hasScalarSelectFunctions(query: parser.Query) bool {
     if (query.all_columns) return false;
@@ -295,7 +315,6 @@ fn hasScalarSelectFunctions(query: parser.Query) bool {
             std.ascii.eqlIgnoreCase(fn_raw, "stddev_pop") or
             std.ascii.eqlIgnoreCase(fn_raw, "stddev_samp") or
             std.ascii.eqlIgnoreCase(fn_raw, "std") or
-            std.ascii.eqlIgnoreCase(fn_raw, "strftime") or
             std.ascii.eqlIgnoreCase(fn_raw, "round") or
             std.ascii.startsWithIgnoreCase(fn_raw, "case")) continue;
         return true;
@@ -554,6 +573,10 @@ fn executeSequential(
     var sort_offsets: ?std.ArrayList(SortRowOffsets) = null;
     var arena: ?ArenaBuffer = null;
     var order_by_column_idx: ?usize = null;
+    // Set when the ORDER BY column isn't in the SELECT list — sourced from the
+    // raw source row instead of the projected output row (#117). Standard SQL
+    // and DuckDB both allow sorting by an un-projected column.
+    var order_by_raw_idx: ?usize = null;
     var order_by_resolved_keys = std.ArrayList(ResolvedOrderKey){};
     defer order_by_resolved_keys.deinit(allocator);
     defer {
@@ -569,14 +592,25 @@ fn executeSequential(
         // Resolve primary key
         order_by_column_idx = try resolveOrderByIdx(order_by.column, output_header.items, output_specs.items, lower_header, allocator);
         if (order_by_column_idx == null) {
-            return error.OrderByColumnNotFound;
-        }
-        try order_by_resolved_keys.append(allocator, .{ .col_idx = order_by_column_idx.?, .order = order_by.order });
+            // Not projected — fall back to the raw source column (#117).
+            for (lower_header, 0..) |name, idx| {
+                if (std.mem.eql(u8, name, order_by.column)) {
+                    order_by_raw_idx = idx;
+                    break;
+                }
+            }
+            if (order_by_raw_idx == null) return error.OrderByColumnNotFound;
+        } else {
+            try order_by_resolved_keys.append(allocator, .{ .col_idx = order_by_column_idx.?, .order = order_by.order });
 
-        // Resolve secondary keys (skip any that can't be found)
-        for (order_by.secondary) |sk| {
-            if (try resolveOrderByIdx(sk.column, output_header.items, output_specs.items, lower_header, allocator)) |si| {
-                try order_by_resolved_keys.append(allocator, .{ .col_idx = si, .order = sk.order });
+            // Resolve secondary keys (skip any that can't be found). Only
+            // meaningful when the primary key is itself output-resolvable,
+            // since the multi-key comparator re-derives values from the
+            // projected output line (see MultiKeyCtx).
+            for (order_by.secondary) |sk| {
+                if (try resolveOrderByIdx(sk.column, output_header.items, output_specs.items, lower_header, allocator)) |si| {
+                    try order_by_resolved_keys.append(allocator, .{ .col_idx = si, .order = sk.order });
+                }
             }
         }
     }
@@ -694,7 +728,7 @@ fn executeSequential(
             // Parse numeric key NOW from the source slice (stable, from record).
             // Then store offsets into the arena — NOT slices — because arena can
             // reallocate and invalidate pointers during later rows.
-            const sort_val = output_row[order_by_column_idx.?];
+            const sort_val = if (order_by_column_idx) |oi| output_row[oi] else record[order_by_raw_idx.?];
             const numeric_key = std.fmt.parseFloat(f64, sort_val) catch std.math.nan(f64);
             const a = &(arena.?);
             const sort_key_start = a.pos;
@@ -2359,51 +2393,7 @@ fn parseStrftimeRaw(allocator: Allocator, raw: []const u8, column_map: std.Strin
 /// Apply a strftime format to an ISO-8601 datetime string (YYYY-MM-DD HH:MM:SS).
 /// Writes the result into `buf` (64 bytes) and returns the filled slice.
 /// Supported specifiers: %Y %m %d %H %M %S; all other characters are copied literally.
-fn applyStrftime(fmt: []const u8, date_str: []const u8, buf: *[64]u8) []const u8 {
-    var pos: usize = 0;
-    var fi: usize = 0;
-    while (fi < fmt.len and pos + 4 <= buf.len) : (fi += 1) {
-        if (fmt[fi] == '%' and fi + 1 < fmt.len) {
-            fi += 1;
-            switch (fmt[fi]) {
-                'Y' => if (date_str.len >= 4) {
-                    @memcpy(buf[pos..][0..4], date_str[0..4]);
-                    pos += 4;
-                },
-                'm' => if (date_str.len >= 7) {
-                    @memcpy(buf[pos..][0..2], date_str[5..7]);
-                    pos += 2;
-                },
-                'd' => if (date_str.len >= 10) {
-                    @memcpy(buf[pos..][0..2], date_str[8..10]);
-                    pos += 2;
-                },
-                'H' => if (date_str.len >= 13) {
-                    @memcpy(buf[pos..][0..2], date_str[11..13]);
-                    pos += 2;
-                },
-                'M' => if (date_str.len >= 16) {
-                    @memcpy(buf[pos..][0..2], date_str[14..16]);
-                    pos += 2;
-                },
-                'S' => if (date_str.len >= 19) {
-                    @memcpy(buf[pos..][0..2], date_str[17..19]);
-                    pos += 2;
-                },
-                else => {
-                    buf[pos] = '%';
-                    pos += 1;
-                    buf[pos] = fmt[fi];
-                    pos += 1;
-                },
-            }
-        } else {
-            buf[pos] = fmt[fi];
-            pos += 1;
-        }
-    }
-    return buf[0..pos];
-}
+const applyStrftime = datetime.applyStrftime;
 
 /// Map a DATE_PART unit to the equivalent strftime specifier.
 fn datePartFmt(unit: []const u8) ?[]const u8 {
@@ -2636,6 +2626,7 @@ fn evalScalarOnSingleValue(spec: scalar.ScalarSpec, value: []const u8, arena: Al
         },
         .dateadd => |*a| a.date_col = 0,
         .extract => |*a| a.date_col = 0,
+        .strftime => |*a| a.date_col = 0,
         .round_op => |*a| a.col_idx = 0,
         .replace => |*a| a.col_idx = 0,
         .split_part => |*a| a.col_idx = 0,
@@ -3254,6 +3245,9 @@ fn executeDistinct(
     var sort_offsets_mmap: ?std.ArrayList(SortRowOffsets) = null;
     var sort_arena: ?ArenaBuffer = null;
     var order_by_out_pos: ?usize = null;
+    // Set when the ORDER BY column isn't projected — sourced from the raw
+    // source row instead of the deduped output row (#117).
+    var order_by_raw_idx: ?usize = null;
     defer {
         if (sort_offsets_mmap) |*e| e.deinit(allocator);
         if (sort_arena) |*a| a.deinit();
@@ -3287,7 +3281,16 @@ fn executeDistinct(
                 }
             }
         }
-        if (order_by_out_pos == null) return error.OrderByColumnNotFound;
+        // Not projected — fall back to the raw source column (#117).
+        if (order_by_out_pos == null) {
+            for (lower_header, 0..) |name, idx| {
+                if (std.mem.eql(u8, name, ob.column)) {
+                    order_by_raw_idx = idx;
+                    break;
+                }
+            }
+        }
+        if (order_by_out_pos == null and order_by_raw_idx == null) return error.OrderByColumnNotFound;
     }
 
     // Dedup set + arena for key storage
@@ -3367,7 +3370,10 @@ fn executeDistinct(
         // Either buffer for ORDER BY or write directly
         if (sort_offsets_mmap) |*offsets| {
             const a = &(sort_arena.?);
-            const sort_val = out_row[order_by_out_pos.?];
+            const sort_val = if (order_by_out_pos) |oi| out_row[oi] else blk: {
+                const ri = order_by_raw_idx.?;
+                break :blk if (ri < record.len) record[ri] else "";
+            };
             const numeric_key = std.fmt.parseFloat(f64, sort_val) catch std.math.nan(f64);
             const sort_key_start = a.pos;
             _ = try a.append(sort_val);
@@ -5419,11 +5425,22 @@ fn executeGroupBy(
     defer row_arena.deinit();
     var collected = std.ArrayListUnmanaged([]const []const u8){};
     defer collected.deinit(allocator);
+    // GROUP BY keys not in SELECT are appended as hidden trailing columns on
+    // `row_copy` below so RowSortCtx can still sort by them (#117).
+    const out_len = col_kinds.items.len;
     if (query.order_by) |ob| {
-        const idx = (try resolveGroupOrderIdx(ob.column, out_header_list.items, query.columns, allocator)) orelse return error.OrderByColumnNotFound;
+        const ref = (try resolveGroupOrderIdx(ob.column, out_header_list.items, query.columns, query.group_by, allocator)) orelse return error.OrderByColumnNotFound;
+        const idx = switch (ref) {
+            .output => |i| i,
+            .group_key => |gi| out_len + gi,
+        };
         try order_keys.append(allocator, .{ .col_idx = idx, .order = ob.order });
         for (ob.secondary) |sk| {
-            const sidx = (try resolveGroupOrderIdx(sk.column, out_header_list.items, query.columns, allocator)) orelse return error.OrderByColumnNotFound;
+            const sref = (try resolveGroupOrderIdx(sk.column, out_header_list.items, query.columns, query.group_by, allocator)) orelse return error.OrderByColumnNotFound;
+            const sidx = switch (sref) {
+                .output => |i| i,
+                .group_key => |gi| out_len + gi,
+            };
             try order_keys.append(allocator, .{ .col_idx = sidx, .order = sk.order });
         }
     }
@@ -5581,8 +5598,9 @@ fn executeGroupBy(
             // Defer output: copy the row (its fields point into per-iteration
             // scratch that is freed/reset) and sort the full set below.
             const ra = row_arena.allocator();
-            const row_copy = try ra.alloc([]const u8, output_row.len);
+            const row_copy = try ra.alloc([]const u8, output_row.len + group_specs.len);
             for (output_row, 0..) |f, fi| row_copy[fi] = try ra.dupe(u8, f);
+            for (group_specs, 0..) |_, gi| row_copy[output_row.len + gi] = try ra.dupe(u8, accum.key_values[gi]);
             try collected.append(allocator, row_copy);
         }
     }
@@ -5591,7 +5609,7 @@ fn executeGroupBy(
         std.mem.sort([]const []const u8, collected.items, RowSortCtx{ .keys = order_keys.items }, RowSortCtx.lessThan);
         for (collected.items) |row| {
             if (query.limit >= 0 and rows_output >= query.limit) break;
-            try writer.writeRecord(row);
+            try writer.writeRecord(row[0..out_len]);
             rows_output += 1;
         }
     }
@@ -6198,6 +6216,34 @@ test "COUNT(*) with GROUP BY: counts per group" {
     try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "Engineering,2"));
     try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "Marketing,2"));
     try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "Sales,1"));
+}
+
+test "ORDER BY a column not in the SELECT list sorts by the raw source column (#117)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile("people.csv", .{});
+        defer f.close();
+        try f.writeAll("name,salary\ncarol,50000\nalice,90000\nbob,70000\n");
+    }
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath("people.csv", &path_buf);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT name FROM '{s}' ORDER BY salary", .{path});
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out_file.close();
+    try execute(allocator, query, out_file, .{});
+
+    try out_file.seekTo(0);
+    const out = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(out);
+
+    try std.testing.expectEqualStrings("name\ncarol\nbob\nalice\n", out);
 }
 
 test "COUNT(*) with WHERE and GROUP BY" {
@@ -8183,4 +8229,126 @@ test "EXTRACT in WHERE: filters rows by year" {
     try std.testing.expect(!std.mem.containsAtLeast(u8, data, 1, "1,")); // 2025, excluded
     try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "2")); // 2026
     try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "3")); // 2026
+}
+
+test "GROUP BY: ORDER BY a grouping key not in the SELECT list sorts by that key (#117)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile("employees.csv", .{});
+        defer f.close();
+        try f.writeAll("name,department\n" ++
+            "carol,Sales\n" ++
+            "alice,Engineering\n" ++
+            "bob,Marketing\n");
+    }
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath("employees.csv", &path_buf);
+
+    // department is a GROUP BY key but not SELECT'd — still a legal ORDER BY target.
+    const sql = try std.fmt.allocPrint(allocator, "SELECT name FROM '{s}' GROUP BY name, department ORDER BY department", .{path});
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out_file.close();
+    try execute(allocator, query, out_file, .{});
+
+    try out_file.seekTo(0);
+    const out = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(out);
+
+    try std.testing.expectEqualStrings("name\nalice\nbob\ncarol\n", out);
+}
+
+test "plain SELECT STRFTIME(...) without GROUP BY formats per row (#133)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile("events.csv", .{});
+        defer f.close();
+        try f.writeAll("id,started_at\n1,2026-01-15 09:30:00\n2,2026-03-20 08:00:00\n");
+    }
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath("events.csv", &path_buf);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT id, STRFTIME('%Y-%m', started_at) FROM '{s}'", .{path});
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out_file.close();
+    try execute(allocator, query, out_file, .{});
+
+    try out_file.seekTo(0);
+    const out = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "1,2026-01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "2,2026-03") != null);
+}
+
+test "WHERE UPPER(col) = ... errors instead of silently returning wrong data on aggregate/GROUP BY paths (#138)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile("d.csv", .{});
+        defer f.close();
+        try f.writeAll("id,dept\n1,Eng\n2,eng\n3,Sales\n");
+    }
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath("d.csv", &path_buf);
+
+    {
+        const sql = try std.fmt.allocPrint(allocator, "SELECT COUNT(*) FROM '{s}' WHERE UPPER(dept) = 'ENG'", .{path});
+        defer allocator.free(sql);
+        var query = try parser.parse(allocator, sql);
+        defer query.deinit();
+        const out_file = try tmp.dir.createFile("out1.csv", .{ .read = true });
+        defer out_file.close();
+        try std.testing.expectError(error.ColumnNotFound, execute(allocator, query, out_file, .{}));
+    }
+    {
+        const sql = try std.fmt.allocPrint(allocator, "SELECT dept, COUNT(*) FROM '{s}' WHERE UPPER(dept) = 'ENG' GROUP BY dept", .{path});
+        defer allocator.free(sql);
+        var query = try parser.parse(allocator, sql);
+        defer query.deinit();
+        const out_file = try tmp.dir.createFile("out2.csv", .{ .read = true });
+        defer out_file.close();
+        try std.testing.expectError(error.ColumnNotFound, execute(allocator, query, out_file, .{}));
+    }
+}
+
+test "plain SELECT DATE_PART(...) without GROUP BY extracts per row (#133)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile("events2.csv", .{});
+        defer f.close();
+        try f.writeAll("id,started_at\n1,2026-01-15 09:30:00\n2,2026-03-20 08:00:00\n");
+    }
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath("events2.csv", &path_buf);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT id, DATE_PART('month', started_at) FROM '{s}'", .{path});
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out_file.close();
+    try execute(allocator, query, out_file, .{});
+
+    try out_file.seekTo(0);
+    const out = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(out);
+
+    try std.testing.expect(std.mem.indexOf(u8, out, "1,01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "2,03") != null);
 }

@@ -36,6 +36,7 @@ pub const ScalarSpec = union(enum) {
     datediff: DatediffArgs, // DATEDIFF(unit, start_col, end_col)
     dateadd: DateaddArgs, // DATEADD(unit, amount, date_col)
     extract: ExtractArgs, // EXTRACT(part FROM date_col)
+    strftime: StrftimeArgs, // STRFTIME('fmt', date_col) (#133)
     round_op: RoundArgs, // ROUND(col[, digits])
     replace: ReplaceArgs, // REPLACE(col, 'from', 'to') — replace all occurrences
     split_part: SplitPartArgs, // SPLIT_PART(col, 'delim', n) — n-th field (1-based)
@@ -98,6 +99,11 @@ pub const ScalarSpec = union(enum) {
 
     pub const ExtractArgs = struct {
         part: []const u8, // 'year', 'month', 'day', 'hour', 'minute', 'second'
+        date_col: usize,
+    };
+
+    pub const StrftimeArgs = struct {
+        fmt: []const u8, // e.g. "%Y-%m" — slice into the query expr
         date_col: usize,
     };
 
@@ -170,6 +176,7 @@ pub const ScalarSpec = union(enum) {
             .datediff => |a| a.start_col, // return first column
             .dateadd => |a| a.date_col,
             .extract => |a| a.date_col,
+            .strftime => |a| a.date_col,
             .round_op => |a| a.col_idx,
             .replace => |a| a.col_idx,
             .split_part => |a| a.col_idx,
@@ -578,6 +585,20 @@ pub fn tryParseScalar(
         return .{ .extract = .{ .part = part_raw, .date_col = date_col } };
     }
 
+    // ── STRFTIME('fmt', date_col) (#133) ────────────────────────────────────
+    if (std.mem.eql(u8, fn_lower, "strftime")) {
+        const comma1 = std.mem.indexOfScalar(u8, args_str, ',') orelse return null;
+        const fmt_raw = std.mem.trim(u8, args_str[0..comma1], &std.ascii.whitespace);
+        const fmt = if (fmt_raw.len >= 2 and fmt_raw[0] == '\'' and fmt_raw[fmt_raw.len - 1] == '\'')
+            fmt_raw[1 .. fmt_raw.len - 1]
+        else
+            fmt_raw;
+        const date_str = std.mem.trim(u8, args_str[comma1 + 1 ..], &std.ascii.whitespace);
+        const date_col = try resolveCol(date_str, column_map, allocator) orelse
+            return error.ColumnNotFound;
+        return .{ .strftime = .{ .fmt = fmt, .date_col = date_col } };
+    }
+
     return null; // not a recognized scalar function
 }
 
@@ -934,6 +955,14 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
 
             const buf = arena.alloc(u8, 32) catch return "0";
             return std.fmt.bufPrint(buf, "{d}", .{result}) catch "0";
+        },
+        .strftime => |args| {
+            const date_val = field(record, args.date_col);
+            var stack_buf: [64]u8 = undefined;
+            const formatted = datetime.applyStrftime(args.fmt, date_val, &stack_buf);
+            const buf = arena.alloc(u8, formatted.len) catch return "";
+            @memcpy(buf, formatted);
+            return buf;
         },
         .case_when => |args| {
             const fv = field(record, args.cond_col_idx);

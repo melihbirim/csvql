@@ -354,6 +354,55 @@ pub fn formatDateTime(allocator: std.mem.Allocator, timestamp: i64) ![]u8 {
     });
 }
 
+/// Apply a strftime format to an ISO-8601 datetime string (YYYY-MM-DD HH:MM:SS).
+/// Writes the result into `buf` (64 bytes) and returns the filled slice.
+/// Supported specifiers: %Y %m %d %H %M %S; all other characters are copied literally.
+pub fn applyStrftime(fmt: []const u8, date_str: []const u8, buf: *[64]u8) []const u8 {
+    var pos: usize = 0;
+    var fi: usize = 0;
+    while (fi < fmt.len and pos + 4 <= buf.len) : (fi += 1) {
+        if (fmt[fi] == '%' and fi + 1 < fmt.len) {
+            fi += 1;
+            switch (fmt[fi]) {
+                'Y' => if (date_str.len >= 4) {
+                    @memcpy(buf[pos..][0..4], date_str[0..4]);
+                    pos += 4;
+                },
+                'm' => if (date_str.len >= 7) {
+                    @memcpy(buf[pos..][0..2], date_str[5..7]);
+                    pos += 2;
+                },
+                'd' => if (date_str.len >= 10) {
+                    @memcpy(buf[pos..][0..2], date_str[8..10]);
+                    pos += 2;
+                },
+                'H' => if (date_str.len >= 13) {
+                    @memcpy(buf[pos..][0..2], date_str[11..13]);
+                    pos += 2;
+                },
+                'M' => if (date_str.len >= 16) {
+                    @memcpy(buf[pos..][0..2], date_str[14..16]);
+                    pos += 2;
+                },
+                'S' => if (date_str.len >= 19) {
+                    @memcpy(buf[pos..][0..2], date_str[17..19]);
+                    pos += 2;
+                },
+                else => {
+                    buf[pos] = '%';
+                    pos += 1;
+                    buf[pos] = fmt[fi];
+                    pos += 1;
+                },
+            }
+        } else {
+            buf[pos] = fmt[fi];
+            pos += 1;
+        }
+    }
+    return buf[0..pos];
+}
+
 /// Format a Unix timestamp as date only: YYYY-MM-DD
 pub fn formatDate(allocator: std.mem.Allocator, timestamp: i64) ![]u8 {
     const dt = DateTime.fromTimestamp(timestamp);

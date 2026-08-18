@@ -61,7 +61,7 @@ const help_text =
     \\
     \\NOT SUPPORTED:
     \\  subqueries, multiple ORDER BY columns,
-    \\  UNION, INSERT/UPDATE/DELETE
+    \\  UNION, INTERSECT, EXCEPT, INSERT/UPDATE/DELETE
     \\
     \\OPTIONS:
     \\  -h, --help              Show this help

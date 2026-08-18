@@ -521,6 +521,17 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
 
     var trimmed = std.mem.trim(u8, input, &std.ascii.whitespace);
 
+    // Set operators (UNION/INTERSECT/EXCEPT) and subqueries aren't supported.
+    // Erroring clearly here is far better than silently misparsing into wrong
+    // results (#124, #127) — e.g. a bare "INTERSECT" would otherwise just
+    // become garbage trailing text on whatever clause precedes it, and
+    // "(SELECT ...)" inside WHERE/HAVING would silently fail column lookup
+    // or match nothing instead of raising an error.
+    inline for ([_][]const u8{ " UNION ", " INTERSECT ", " EXCEPT " }) |kw| {
+        if (containsKeywordOutsideQuotes(trimmed, kw)) return error.UnsupportedSetOperation;
+    }
+    if (containsKeywordOutsideQuotes(trimmed, "(SELECT")) return error.SubqueriesNotSupported;
+
     // Extract SELECT clause
     const select_idx = std.ascii.indexOfIgnoreCase(trimmed, "SELECT") orelse return error.InvalidQuery;
     // Use paren-aware search so EXTRACT(year FROM col) doesn't match as the table FROM.
