@@ -67,9 +67,11 @@ echo "  DuckDB: $("$DUCKDB" --version 2>/dev/null | head -1 || echo "unknown")"
 echo ""
 
 # ── helper ───────────────────────────────────────────────────────
-# check <label> <csvql_sql> <duckdb_sql>
-# Runs both queries, strips csvql header, sorts both outputs, then diffs.
-# For float results sets NUMERIC_COMPARE=1 to allow rounding tolerance.
+# check <label> <csvql_sql> <duckdb_sql> [sort_key]
+# Runs both queries, strips csvql header, then diffs. Exact string equality —
+# use check_approx for any result containing a float (AVG/VARIANCE/STDDEV/
+# division), since csvql and DuckDB can format the same float with a
+# different number of trailing digits even when the value is identical.
 check() {
   local label="$1"
   local csvql_sql="$2"
@@ -82,13 +84,23 @@ check() {
   local err_csvql="$TMP/csvql_err_${TOTAL}.txt"
   local err_duck="$TMP/duck_err_${TOTAL}.txt"
 
-  # Run queries. Exit codes come from PIPESTATUS[0] (the query engine, not
-  # `tail`/`sort`) so a crash or execution error is never masked into an
-  # empty-vs-empty false pass.
-  "$CSVQL" "$csvql_sql" 2>"$err_csvql" | tail -n +2 | sort $sort_key > "$out_csvql"
-  local csvql_rc=${PIPESTATUS[0]}
-  "$DUCKDB" -csv -noheader -c "$duck_sql" 2>"$err_duck" | sort $sort_key > "$out_duck"
-  local duck_rc=${PIPESTATUS[0]}
+  # When the query itself has an ORDER BY, row order is a claim under test —
+  # sorting both sides before diff would silently hide a wrong-order bug.
+  # Compare exact engine output order in that case; sort only for queries
+  # with no defined order (plain WHERE scans, unordered GROUP BY/JOIN),
+  # where the two engines' internal row order is allowed to differ.
+  local csvql_rc duck_rc
+  if echo "$csvql_sql" | grep -qi '\border[[:space:]]\+by\b'; then
+    "$CSVQL" "$csvql_sql" 2>"$err_csvql" | tail -n +2 > "$out_csvql"
+    csvql_rc=${PIPESTATUS[0]}
+    "$DUCKDB" -csv -noheader -c "$duck_sql" 2>"$err_duck" > "$out_duck"
+    duck_rc=${PIPESTATUS[0]}
+  else
+    "$CSVQL" "$csvql_sql" 2>"$err_csvql" | tail -n +2 | sort $sort_key > "$out_csvql"
+    csvql_rc=${PIPESTATUS[0]}
+    "$DUCKDB" -csv -noheader -c "$duck_sql" 2>"$err_duck" | sort $sort_key > "$out_duck"
+    duck_rc=${PIPESTATUS[0]}
+  fi
 
   if [[ $csvql_rc -ne 0 ]]; then
     printf "  ${RED}FAIL${RESET}  %s (csvql exited %d)\n" "$label" "$csvql_rc"
@@ -126,7 +138,15 @@ check() {
   fi
 }
 
-# check_approx: for float aggregates — rounds both sides to N decimal places before diff
+# check_approx <label> <csvql_sql> <duckdb_sql> [decimals=4]
+# For float aggregates (AVG, VARIANCE, STDDEV, SUM of non-integers): rounds
+# every numeric-looking field on both sides to `decimals` places (default 4)
+# before diffing. This is a formatting tolerance, not a numerical-accuracy
+# one — csvql and DuckDB both compute with f64, so any genuine precision
+# divergence beyond float rounding noise is still a real bug and will still
+# fail at 4 decimal places. Lower `decimals` (e.g. pass 2) only for values
+# where the two engines' rounding-half-to-even vs rounding-half-up choice
+# can legitimately differ in the last couple of digits.
 check_approx() {
   local label="$1"
   local csvql_sql="$2"
@@ -139,6 +159,10 @@ check_approx() {
   local err_csvql="$TMP/csvql_err_${TOTAL}.txt"
   local err_duck="$TMP/duck_err_${TOTAL}.txt"
 
+  # Same order-sensitivity rule as check() — see comment there.
+  local order_pipe=(sort)
+  if echo "$csvql_sql" | grep -qi '\border[[:space:]]\+by\b'; then order_pipe=(cat); fi
+
   "$CSVQL" "$csvql_sql" 2>"$err_csvql" | tail -n +2 | \
     awk -v d="$decimals" '{
       for(i=1;i<=NF;i++) {
@@ -147,7 +171,7 @@ check_approx() {
         } else printf "%s", $i
         printf (i<NF?",":"\n")
       }
-    }' FS=',' OFS=',' | sort > "$out_csvql"
+    }' FS=',' OFS=',' | "${order_pipe[@]}" > "$out_csvql"
   local csvql_rc=${PIPESTATUS[0]}
 
   "$DUCKDB" -csv -noheader -c "$duck_sql" 2>"$err_duck" | \
@@ -158,7 +182,7 @@ check_approx() {
         } else printf "%s", $i
         printf (i<NF?",":"\n")
       }
-    }' FS=',' OFS=',' | sort > "$out_duck"
+    }' FS=',' OFS=',' | "${order_pipe[@]}" > "$out_duck"
   local duck_rc=${PIPESTATUS[0]}
 
   if [[ $csvql_rc -ne 0 ]]; then
@@ -343,18 +367,18 @@ echo "── WHERE Filters ─────────────────�
 
 check \
   "WHERE age = 30 (exact numeric)" \
-  "SELECT name, age FROM '$CSV' WHERE age = 30 ORDER BY name, age" \
-  "SELECT name, age FROM read_csv_auto('$CSV') WHERE age = 30 ORDER BY name, age"
+  "SELECT name, age FROM '$CSV' WHERE age = 30 ORDER BY name, age, id" \
+  "SELECT name, age FROM read_csv_auto('$CSV') WHERE age = 30 ORDER BY name, age, id"
 
 check \
   "WHERE salary >= 100000 AND salary <= 110000" \
-  "SELECT name, salary FROM '$CSV' WHERE salary >= 100000 AND salary <= 110000 ORDER BY salary, name" \
-  "SELECT name, salary FROM read_csv_auto('$CSV') WHERE salary >= 100000 AND salary <= 110000 ORDER BY salary, name"
+  "SELECT name, salary FROM '$CSV' WHERE salary >= 100000 AND salary <= 110000 ORDER BY salary, name, id" \
+  "SELECT name, salary FROM read_csv_auto('$CSV') WHERE salary >= 100000 AND salary <= 110000 ORDER BY salary, name, id"
 
 check \
   "WHERE city = 'NYC'" \
-  "SELECT name, city FROM '$CSV' WHERE city = 'NYC' ORDER BY name" \
-  "SELECT name, city FROM read_csv_auto('$CSV') WHERE city = 'NYC' ORDER BY name"
+  "SELECT name, city FROM '$CSV' WHERE city = 'NYC' ORDER BY name, id" \
+  "SELECT name, city FROM read_csv_auto('$CSV') WHERE city = 'NYC' ORDER BY name, id"
 
 check \
   "WHERE id % 2 = 0 (modulo, #119)" \
@@ -363,8 +387,8 @@ check \
 
 check \
   "WHERE department NOT IN ('Sales') (#115)" \
-  "SELECT name FROM '$CSV' WHERE department NOT IN ('Sales') ORDER BY name" \
-  "SELECT name FROM read_csv_auto('$CSV') WHERE department NOT IN ('Sales') ORDER BY name"
+  "SELECT name FROM '$CSV' WHERE department NOT IN ('Sales') ORDER BY name, id" \
+  "SELECT name FROM read_csv_auto('$CSV') WHERE department NOT IN ('Sales') ORDER BY name, id"
 
 # ════════════════════════════════════════════════════════════════
 echo ""
@@ -372,13 +396,13 @@ echo "── LIKE Pattern Matching ───────────────
 
 check \
   "WHERE name LIKE 'A%' (prefix)" \
-  "SELECT name FROM '$CSV' WHERE name LIKE 'A%' ORDER BY name" \
-  "SELECT name FROM read_csv_auto('$CSV') WHERE name LIKE 'A%' ORDER BY name"
+  "SELECT name FROM '$CSV' WHERE name LIKE 'A%' ORDER BY name, id" \
+  "SELECT name FROM read_csv_auto('$CSV') WHERE name LIKE 'A%' ORDER BY name, id"
 
 check \
   "WHERE name LIKE '%e' (suffix)" \
-  "SELECT name FROM '$CSV' WHERE name LIKE '%e' ORDER BY name" \
-  "SELECT name FROM read_csv_auto('$CSV') WHERE name LIKE '%e' ORDER BY name"
+  "SELECT name FROM '$CSV' WHERE name LIKE '%e' ORDER BY name, id" \
+  "SELECT name FROM read_csv_auto('$CSV') WHERE name LIKE '%e' ORDER BY name, id"
 
 check \
   "WHERE city LIKE '%o%' (contains)" \
@@ -392,8 +416,8 @@ check \
 
 check \
   "WHERE age BETWEEN 25 AND 30" \
-  "SELECT name, age FROM '$CSV' WHERE age BETWEEN 25 AND 30 ORDER BY name, age" \
-  "SELECT name, age FROM read_csv_auto('$CSV') WHERE age BETWEEN 25 AND 30 ORDER BY name, age"
+  "SELECT name, age FROM '$CSV' WHERE age BETWEEN 25 AND 30 ORDER BY name, age, id" \
+  "SELECT name, age FROM read_csv_auto('$CSV') WHERE age BETWEEN 25 AND 30 ORDER BY name, age, id"
 
 # ════════════════════════════════════════════════════════════════
 echo ""
@@ -406,13 +430,13 @@ check \
 
 check \
   "ORDER BY salary DESC LIMIT 5 (unique keys)" \
-  "SELECT city, MAX(salary) as ms FROM '$CSV' GROUP BY city ORDER BY ms DESC" \
-  "SELECT city, MAX(salary) as ms FROM read_csv_auto('$CSV') GROUP BY city ORDER BY ms DESC"
+  "SELECT city, MAX(salary) as ms FROM '$CSV' GROUP BY city ORDER BY ms DESC, city" \
+  "SELECT city, MAX(salary) as ms FROM read_csv_auto('$CSV') GROUP BY city ORDER BY ms DESC, city"
 
 check \
   "GROUP BY dept ORDER BY COUNT DESC" \
-  "SELECT department, COUNT(*) FROM '$CSV' GROUP BY department ORDER BY COUNT(*) DESC" \
-  "SELECT department, COUNT(*) FROM read_csv_auto('$CSV') GROUP BY department ORDER BY count(*) DESC"
+  "SELECT department, COUNT(*) FROM '$CSV' GROUP BY department ORDER BY COUNT(*) DESC, department" \
+  "SELECT department, COUNT(*) FROM read_csv_auto('$CSV') GROUP BY department ORDER BY count(*) DESC, department"
 
 check \
   "ORDER BY positional (ORDER BY 1)" \
@@ -430,8 +454,8 @@ check \
 
 check \
   "Column projection + WHERE" \
-  "SELECT name, department FROM '$CSV' WHERE age < 25 ORDER BY name, department" \
-  "SELECT name, department FROM read_csv_auto('$CSV') WHERE age < 25 ORDER BY name, department"
+  "SELECT name, department FROM '$CSV' WHERE age < 25 ORDER BY name, department, id" \
+  "SELECT name, department FROM read_csv_auto('$CSV') WHERE age < 25 ORDER BY name, department, id"
 
 check \
   "IS NULL / IS NOT NULL in SELECT (#114)" \
@@ -455,13 +479,13 @@ check \
 
 check \
   "Table alias outside JOIN, AS keyword (#121)" \
-  "SELECT t.name, t.department FROM '$CSV' AS t WHERE t.salary > 100000 ORDER BY t.name, t.department" \
-  "SELECT t.name, t.department FROM read_csv_auto('$CSV') AS t WHERE t.salary > 100000 ORDER BY t.name, t.department"
+  "SELECT t.name, t.department FROM '$CSV' AS t WHERE t.salary > 100000 ORDER BY t.name, t.department, t.id" \
+  "SELECT t.name, t.department FROM read_csv_auto('$CSV') AS t WHERE t.salary > 100000 ORDER BY t.name, t.department, t.id"
 
 check \
   "Table alias outside JOIN, bare (no AS) (#121)" \
-  "SELECT t.name FROM '$CSV' t WHERE t.department = 'Sales' ORDER BY t.name" \
-  "SELECT t.name FROM read_csv_auto('$CSV') t WHERE t.department = 'Sales' ORDER BY t.name"
+  "SELECT t.name FROM '$CSV' t WHERE t.department = 'Sales' ORDER BY t.name, t.id" \
+  "SELECT t.name FROM read_csv_auto('$CSV') t WHERE t.department = 'Sales' ORDER BY t.name, t.id"
 
 # ════════════════════════════════════════════════════════════════
 echo ""
