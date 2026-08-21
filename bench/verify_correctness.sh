@@ -470,6 +470,24 @@ check \
   "SELECT name, age FROM '$CSV' WHERE age BETWEEN 25 AND 30 ORDER BY name, age, id" \
   "SELECT name, age FROM read_csv_auto('$CSV') WHERE age BETWEEN 25 AND 30 ORDER BY name, age, id"
 
+# IS NULL/IS NOT NULL combined with AND/OR — found via the differential
+# query generator (#142): the substring scan for IS NULL/IS NOT NULL ran
+# before the AND/OR top-level split, so "age IS NOT NULL AND city = 'x'"
+# silently dropped the AND clause entirely (returned all rows, not just
+# city='x'), and "age > 5 AND city IS NULL" errored ColumnNotFound.
+check \
+  "WHERE col IS NOT NULL AND another condition (#142)" \
+  "SELECT name FROM '$CSV' WHERE age IS NOT NULL AND city = 'Austin' ORDER BY name, id" \
+  "SELECT name FROM read_csv_auto('$CSV') WHERE age IS NOT NULL AND city = 'Austin' ORDER BY name, id"
+check \
+  "WHERE another condition AND col IS NOT NULL (#142)" \
+  "SELECT name FROM '$CSV' WHERE city = 'Austin' AND age IS NOT NULL ORDER BY name, id" \
+  "SELECT name FROM read_csv_auto('$CSV') WHERE city = 'Austin' AND age IS NOT NULL ORDER BY name, id"
+check \
+  "WHERE col IS NULL OR another condition (#142)" \
+  "SELECT name FROM '$CSV' WHERE department IS NULL OR age > 55 ORDER BY name, id" \
+  "SELECT name FROM read_csv_auto('$CSV') WHERE department IS NULL OR age > 55 ORDER BY name, id"
+
 # ════════════════════════════════════════════════════════════════
 echo ""
 echo "── ORDER BY ────────────────────────────────────────────────"

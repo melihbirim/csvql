@@ -75,6 +75,7 @@ BEGIN {
     srand(seed)
     split("id age salary", numeric_cols, " ")
     split("name city department", string_cols, " ")
+    split("id name age city salary department", all_cols_any, " ")
     split("COUNT SUM AVG MIN MAX", aggs, " ")
     split("= != > >= < <=", numeric_ops, " ")
     split("= !=", string_ops, " ")
@@ -123,13 +124,36 @@ function pick(arr, n) {
 # One "col OP val" predicate — operator set depends on column type.
 function gen_predicate() {
     r = rand()
-    if (r < 0.5) {
+    if (r < 0.15) {
+        # IS NULL / IS NOT NULL — this fixture never has an empty field, so
+        # IS NULL always matches zero rows and IS NOT NULL always matches
+        # all of them, but that still exercises the operator itself: both
+        # engines have to agree on "zero rows" or "every row", not just on
+        # a value comparison.
+        col = pick(all_cols_any, 6)
+        return col ((rand() < 0.5) ? " IS NULL" : " IS NOT NULL")
+    } else if (r < 0.5) {
         col = pick(numeric_cols, 3)
         op = pick(numeric_ops, 6)
         if (col == "id") val = int(rand() * 20000) + 1
         else if (col == "age") val = int(rand() * 50) + 15
         else val = int(rand() * 100000) + 30000
         return col " " op " " val
+    } else if (r < 0.7) {
+        # LIKE against a substring of a real sampled value — prefix,
+        # suffix, or contains wildcard, so it actually matches something
+        # instead of testing only the zero-row case.
+        col = pick(string_cols, 3)
+        nv = n_values[col]
+        if (nv == 0) { val = "nobody" } else { val = values[col, int(rand() * nv) + 1] }
+        vlen = length(val)
+        piece_len = (vlen > 1) ? int(rand() * (vlen - 1)) + 1 : vlen
+        shape = rand()
+        if (shape < 0.34) pattern = substr(val, 1, piece_len) "%"
+        else if (shape < 0.67) pattern = "%" substr(val, vlen - piece_len + 1)
+        else pattern = "%" substr(val, 1, piece_len) "%"
+        gsub(/'"'"'/, "'"'"''"'"'", pattern)  # escape single quotes for SQL
+        return col " LIKE '"'"'" pattern "'"'"'"
     } else {
         col = pick(string_cols, 3)
         op = pick(string_ops, 2)

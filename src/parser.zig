@@ -953,7 +953,37 @@ pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
         return Expression{ .unary = un };
     }
 
-    // IS NULL / IS NOT NULL — check before BETWEEN/AND/OR.
+    // BETWEEN must be detected BEFORE the AND/OR split because
+    // "col BETWEEN 1 AND 5" contains " AND " as syntax, not a logical operator.
+    if (findTopLevelOp(trimmed, "BETWEEN")) |idx| {
+        return parseBetween(allocator, trimmed, idx);
+    }
+
+    // AND/OR must be split before IS NULL/IS NOT NULL (and before LIKE/IN/
+    // operators) so that compound conditions such as "age IS NOT NULL AND
+    // city = 'x'" are split into two predicates first, instead of the plain
+    // substring scan for " IS NOT NULL" below grabbing everything before it
+    // — including the leading "age" *and* a trailing "AND city = 'x'" — as
+    // a single bogus column name/dropped clause (#142). OR has lower
+    // precedence → check it first.
+    if (findTopLevelOp(trimmed, "OR")) |idx| {
+        const left = try parseExpression(allocator, trimmed[0..idx]);
+        const right = try parseExpression(allocator, std.mem.trim(u8, trimmed[idx + 4 ..], &std.ascii.whitespace));
+        const bin = try allocator.create(BinaryExpr);
+        bin.* = .{ .op = .@"or", .left = left, .right = right };
+        return Expression{ .binary = bin };
+    }
+    if (findTopLevelOp(trimmed, "AND")) |idx| {
+        const left = try parseExpression(allocator, trimmed[0..idx]);
+        const right = try parseExpression(allocator, std.mem.trim(u8, trimmed[idx + 5 ..], &std.ascii.whitespace));
+        const bin = try allocator.create(BinaryExpr);
+        bin.* = .{ .op = .@"and", .left = left, .right = right };
+        return Expression{ .binary = bin };
+    }
+
+    // IS NULL / IS NOT NULL — only reached once no top-level AND/OR/BETWEEN
+    // remains, so `trimmed` here is always a single leaf predicate and this
+    // substring scan can't accidentally swallow a sibling predicate.
     if (std.ascii.indexOfIgnoreCase(trimmed, " IS NOT NULL")) |idx| {
         const col_part = std.mem.trim(u8, trimmed[0..idx], &std.ascii.whitespace);
         const col_lower = try allocator.alloc(u8, col_part.len);
@@ -975,31 +1005,6 @@ pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
             .value = try allocator.dupe(u8, ""),
             .numeric_value = null,
         } };
-    }
-
-    // BETWEEN must be detected BEFORE the AND/OR split because
-    // "col BETWEEN 1 AND 5" contains " AND " as syntax, not a logical operator.
-    if (findTopLevelOp(trimmed, "BETWEEN")) |idx| {
-        return parseBetween(allocator, trimmed, idx);
-    }
-
-    // AND/OR must be split before LIKE/IN/operators so that compound conditions
-    // such as "col LIKE 'x%' AND other = 'y'" are not misinterpreted as a single
-    // LIKE expression whose pattern swallows the rest of the string.
-    // OR has lower precedence → check it first.
-    if (findTopLevelOp(trimmed, "OR")) |idx| {
-        const left = try parseExpression(allocator, trimmed[0..idx]);
-        const right = try parseExpression(allocator, std.mem.trim(u8, trimmed[idx + 4 ..], &std.ascii.whitespace));
-        const bin = try allocator.create(BinaryExpr);
-        bin.* = .{ .op = .@"or", .left = left, .right = right };
-        return Expression{ .binary = bin };
-    }
-    if (findTopLevelOp(trimmed, "AND")) |idx| {
-        const left = try parseExpression(allocator, trimmed[0..idx]);
-        const right = try parseExpression(allocator, std.mem.trim(u8, trimmed[idx + 5 ..], &std.ascii.whitespace));
-        const bin = try allocator.create(BinaryExpr);
-        bin.* = .{ .op = .@"and", .left = left, .right = right };
-        return Expression{ .binary = bin };
     }
 
     // Check for ILIKE before LIKE (both before symbol operators since patterns may contain = > <)

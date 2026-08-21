@@ -456,3 +456,42 @@ test "WHERE col % divisor op value filters correctly (#119)" {
     const odd = [_][]const u8{"3"};
     try std.testing.expect(!parser.evaluateDirect(where, &odd, &header));
 }
+
+test "WHERE IS NOT NULL AND another condition — both conditions apply, not just IS NOT NULL (#142)" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(allocator, "SELECT * FROM 'test.csv' WHERE age IS NOT NULL AND city = 'Austin'");
+    defer query.deinit();
+
+    const where = query.where_expr orelse return error.TestUnexpectedNull;
+    const header = [_][]const u8{ "age", "city" };
+
+    // age IS NOT NULL is true for both, so the result must depend entirely
+    // on the city comparison — if the AND clause got silently dropped
+    // (#142), both of these would incorrectly return true.
+    const austin = [_][]const u8{ "30", "Austin" };
+    try std.testing.expect(parser.evaluateDirect(where, &austin, &header));
+
+    const boston = [_][]const u8{ "30", "Boston" };
+    try std.testing.expect(!parser.evaluateDirect(where, &boston, &header));
+}
+
+test "WHERE comparison AND IS NULL — the comparison must still apply, not just IS NULL (#142)" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(allocator, "SELECT * FROM 'test.csv' WHERE age > 5 AND city IS NULL");
+    defer query.deinit();
+
+    const where = query.where_expr orelse return error.TestUnexpectedNull;
+    const header = [_][]const u8{ "age", "city" };
+
+    // city IS NULL (empty) is true for both rows, so the result must depend
+    // entirely on age > 5 — if the parser instead treated "age > 5 AND
+    // city" as a single bogus column name (#142), this would error at
+    // parse time instead of reaching evaluateDirect at all.
+    const old_empty_city = [_][]const u8{ "10", "" };
+    try std.testing.expect(parser.evaluateDirect(where, &old_empty_city, &header));
+
+    const young_empty_city = [_][]const u8{ "3", "" };
+    try std.testing.expect(!parser.evaluateDirect(where, &young_empty_city, &header));
+}

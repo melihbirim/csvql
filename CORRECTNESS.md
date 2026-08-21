@@ -10,7 +10,7 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
 
 ## What is tested
 
-- **88 differential checks** in `bench/verify_correctness.sh` (89 when the optional
+- **91 differential checks** in `bench/verify_correctness.sh` (92 when the optional
   multi-GB taxi fixture is present locally — see below), covering: SELECT/projection,
   every WHERE operator (`=`, comparisons, `LIKE`/`ILIKE`, `BETWEEN`, `IN`/`NOT IN`,
   `IS NULL`, modulo, compound `AND`/`OR`/`NOT`), GROUP BY + all aggregate functions
@@ -26,7 +26,7 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
   diffed raw — see below), scientific notation and negative zero, header-only/
   single-row/single-column files, ragged rows, a zero-byte file, and values near
   i64/f64 limits.
-- **529 unit tests** (`zig build test`) covering internals differential testing can't
+- **531 unit tests** (`zig build test`) covering internals differential testing can't
   reach directly: parser edge cases, arena-buffer offset safety across reallocation,
   overflow handling, TDD regression tests for every numbered bug fix referenced below.
 - **2 platforms in CI**: `ubuntu-latest` (x86_64) and `macos-14` (Apple Silicon,
