@@ -76,6 +76,8 @@ const help_text =
     \\  --no-table              Never render output as a table
     \\  --wrap                  Wrap long cell text across lines instead of dropping columns
     \\  --threads <N>           Worker threads for parallel execution (0 = auto)
+    \\  --strict                Error on a WHERE numeric comparison against a non-numeric
+    \\                          value instead of silently skipping that row
     \\  --schema <file>         Show column names, inferred types, row count, and file size
     \\  --mcp                   Start as an MCP (Model Context Protocol) server
     \\                          Exposes csv_query, csv_schema, csv_list tools
@@ -90,7 +92,44 @@ const help_text =
     \\  csvql "SELECT * FROM 'data.csv' WHERE status = 'active'" > out.csv
     \\  csvql "SELECT email FROM 'users.csv'" | wc -l
     \\
+    \\EXIT CODES:
+    \\  0  success
+    \\  1  uncategorized failure (IO error, internal error, file not found)
+    \\  2  the query is wrong (bad/unsupported SQL, unresolved column) — your bug
+    \\  3  the data defeated csvql (currently: --strict's non-numeric WHERE value)
+    \\
 ;
+
+/// Exit codes, for callers that are shell scripts rather than humans:
+///   0 = success
+///   1 = uncategorized failure (IO error, internal error, file not found)
+///   2 = the query is wrong — bad/unsupported SQL, unresolved column, a
+///       structural mismatch between the query and the file. The user's bug.
+///   3 = the data defeated csvql — currently only --strict's non-numeric
+///       WHERE comparison. A data-quality signal, not a query bug; script
+///       callers may want to route this differently (e.g. quarantine the
+///       file) instead of treating it the same as a typo'd query.
+/// Exact codes are part of the CLI contract — treat changes here as breaking.
+fn exitCodeForError(err: anyerror) u8 {
+    return switch (err) {
+        error.InvalidQuery,
+        error.InvalidOperator,
+        error.UnsupportedJoinType,
+        error.UnsupportedSetOperation,
+        error.SubqueriesNotSupported,
+        error.ColumnNotFound,
+        error.OrderByColumnNotFound,
+        error.MixedAggregateAndNonAggregateSelect,
+        error.NestedFunctionNotSupported,
+        error.PathOutsideAllowedRoot,
+        => 2,
+        error.StrictModeNonNumericValue,
+        error.EmptyFile,
+        error.NoHeader,
+        => 3,
+        else => 1,
+    };
+}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -183,6 +222,8 @@ pub fn main() !void {
             opts.no_input_header = true;
         } else if (std.mem.eql(u8, arg, "--no-table")) {
             opts.table_mode = .off;
+        } else if (std.mem.eql(u8, arg, "--strict")) {
+            opts.strict = true;
         } else if (std.mem.eql(u8, arg, "--threads")) {
             i += 1;
             if (i >= args.len) {
@@ -222,7 +263,7 @@ pub fn main() !void {
         break :blk simple_parser.parseSimple(allocator, clean_args.items[1..]) catch |err| {
             std.debug.print("error: {}\n", .{err});
             std.debug.print("\nRun 'csvql --help' for usage information.\n", .{});
-            std.process.exit(1);
+            std.process.exit(2); // the query is wrong, not csvql
         };
     } else blk: {
         // SQL mode: csvql "SELECT ..."
@@ -232,7 +273,7 @@ pub fn main() !void {
         break :blk parser.parse(allocator, query_text) catch |err| {
             std.debug.print("SQL parse error: {}\n", .{err});
             std.debug.print("\nRun 'csvql --help' for usage information.\n", .{});
-            std.process.exit(1);
+            std.process.exit(2); // the query is wrong, not csvql
         };
     };
     defer query.deinit();
@@ -253,17 +294,17 @@ pub fn main() !void {
         defer out.close();
         engine.execute(allocator, query, out, opts) catch |err| {
             std.debug.print("execution error: {}\n", .{err});
-            std.process.exit(1);
+            std.process.exit(exitCodeForError(err));
         };
     } else if (use_table) {
         renderTableOutput(allocator, query, stdout_file, opts) catch |err| {
             std.debug.print("execution error: {}\n", .{err});
-            std.process.exit(1);
+            std.process.exit(exitCodeForError(err));
         };
     } else {
         engine.execute(allocator, query, stdout_file, opts) catch |err| {
             std.debug.print("execution error: {}\n", .{err});
-            std.process.exit(1);
+            std.process.exit(exitCodeForError(err));
         };
     }
 
@@ -757,4 +798,20 @@ fn parseDelimiter(arg: []const u8) u8 {
     }
     // Fallback: use first byte
     return arg[0];
+}
+
+test "exitCodeForError classifies bad-query, strict-mode, and uncategorized errors distinctly" {
+    // Bad query / unresolved reference — the user's SQL is wrong.
+    try std.testing.expectEqual(@as(u8, 2), exitCodeForError(error.ColumnNotFound));
+    try std.testing.expectEqual(@as(u8, 2), exitCodeForError(error.OrderByColumnNotFound));
+    try std.testing.expectEqual(@as(u8, 2), exitCodeForError(error.SubqueriesNotSupported));
+    try std.testing.expectEqual(@as(u8, 2), exitCodeForError(error.UnsupportedSetOperation));
+    try std.testing.expectEqual(@as(u8, 2), exitCodeForError(error.InvalidQuery));
+
+    // --strict / data-quality signal — the data defeated csvql, not a query bug.
+    try std.testing.expectEqual(@as(u8, 3), exitCodeForError(error.StrictModeNonNumericValue));
+
+    // Anything else falls back to the uncategorized bucket.
+    try std.testing.expectEqual(@as(u8, 1), exitCodeForError(error.FileNotFound));
+    try std.testing.expectEqual(@as(u8, 1), exitCodeForError(error.OutOfMemory));
 }

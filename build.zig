@@ -268,6 +268,18 @@ pub fn build(b: *std.Build) void {
     const run_options_tests = b.addRunArtifact(options_tests);
     test_step.dependOn(&run_options_tests.step);
 
+    // Main tests (exit code classification for --strict / query errors)
+    const main_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("src/main.zig"),
+    });
+    main_test_mod.addImport("zigtable", zigtable_mod);
+    const main_tests = b.addTest(.{ .root_module = main_test_mod });
+    main_tests.linkLibC();
+    const run_main_tests = b.addRunArtifact(main_tests);
+    test_step.dependOn(&run_main_tests.step);
+
     // MCP tests (token guardrails: default row cap)
     const mcp_tests = b.addTest(.{
         .root_module = b.createModule(.{

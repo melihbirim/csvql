@@ -72,6 +72,7 @@ csvql "SELECT email FROM 'users.csv'" | wc -l
 | `--json`             |       | Output as a JSON array (`[{...}, ...]`)             |
 | `--jsonl`            |       | Output as JSONL / NDJSON (one JSON object per line) |
 | `--threads <N>`      |       | Worker threads for parallel execution; `0` uses automatic detection |
+| `--strict`           |       | Error on a WHERE numeric comparison against a non-numeric value instead of silently skipping that row (see [CORRECTNESS.md](CORRECTNESS.md#strict-and-exit-codes)) |
 | `--version`          | `-v`  | Show version                                        |
 | `--help`             | `-h`  | Show help                                           |
 | `--mcp`              |       | Start as an MCP server (stdio JSON-RPC transport)   |

@@ -99,6 +99,7 @@ const WorkerContext = struct {
     allocator: Allocator,
     mutex: *std.Thread.Mutex,
     delimiter: u8,
+    strict: bool,
 };
 
 /// Worker context for ORDER BY — stores lightweight SortLine entries
@@ -112,6 +113,8 @@ const SortWorkerContext = struct {
     result: std.ArrayList(SortLine),
     allocator: Allocator,
     delimiter: u8,
+    strict: bool,
+    err: ?anyerror = null,
 };
 
 /// Parallel memory-mapped CSV processing
@@ -304,11 +307,20 @@ pub fn executeParallelMapped(
                 .result = std.ArrayList(SortLine){},
                 .allocator = allocator,
                 .delimiter = opts.delimiter,
+                .strict = opts.strict,
             };
             threads[i] = try std.Thread.spawn(.{}, sortWorkerThread, .{&sort_contexts[i]});
         }
 
         for (threads) |thread| thread.join();
+
+        // A worker thread error (including --strict's non-numeric WHERE
+        // value) was previously only printed to stderr and dropped — the
+        // query would return exit 0 with a partial/wrong result. Propagate
+        // the first one found instead.
+        for (sort_contexts) |ctx| {
+            if (ctx.err) |e| return e;
+        }
 
         // Merge all sort entries and convert to fast_sort.SortKey
         var total_entries: usize = 0;
@@ -439,6 +451,7 @@ pub fn executeParallelMapped(
                 .allocator = allocator,
                 .mutex = &mutex,
                 .delimiter = opts.delimiter,
+                .strict = opts.strict,
             };
             threads[i] = try std.Thread.spawn(.{}, workerThread, .{&contexts[i]});
         }
@@ -532,7 +545,7 @@ pub fn executeParallelMapped(
 
 fn sortWorkerThread(ctx: *SortWorkerContext) void {
     processSortChunk(ctx) catch |err| {
-        std.debug.print("Sort worker thread error: {}\n", .{err});
+        ctx.err = err;
     };
 }
 
@@ -585,6 +598,7 @@ fn processSortChunk(ctx: *SortWorkerContext) !void {
                             const field_value = eval_buf[col_idx];
                             if (comp.numeric_value) |threshold| {
                                 const val = std.fmt.parseFloat(f64, field_value) catch {
+                                    if (ctx.strict) return error.StrictModeNonNumericValue;
                                     line_start += line_end + 1;
                                     continue;
                                 };
@@ -685,7 +699,10 @@ fn processFields(
                 if (col_idx < fields.len) {
                     const field_value = fields[col_idx];
                     if (comp.numeric_value) |threshold| {
-                        const val = std.fmt.parseFloat(f64, field_value) catch return;
+                        const val = std.fmt.parseFloat(f64, field_value) catch {
+                            if (ctx.strict) return error.StrictModeNonNumericValue;
+                            return;
+                        };
                         const matches = switch (comp.operator) {
                             .equal => val == threshold,
                             .not_equal => val != threshold,

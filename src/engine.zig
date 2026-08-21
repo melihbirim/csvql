@@ -660,6 +660,7 @@ fn executeSequential(
                         if (comp.numeric_value) |threshold| {
                             // Numeric comparison
                             const val = std.fmt.parseFloat(f64, field_value) catch {
+                                if (opts.strict) return error.StrictModeNonNumericValue;
                                 continue; // Skip invalid rows
                             };
                             matches = switch (comp.operator) {
@@ -2157,6 +2158,7 @@ fn executeFromStdin(
                         if (comp.numeric_value) |threshold| {
                             // Numeric comparison
                             const val = std.fmt.parseFloat(f64, field_value) catch {
+                                if (opts.strict) return error.StrictModeNonNumericValue;
                                 continue; // Skip invalid rows
                             };
                             matches = switch (comp.operator) {
@@ -3328,7 +3330,10 @@ fn executeDistinct(
                 const fv = record[cidx];
                 var matches = false;
                 if (comp.numeric_value) |threshold| {
-                    const val = parseNumericFast(fv) catch continue;
+                    const val = parseNumericFast(fv) catch {
+                        if (opts.strict) return error.StrictModeNonNumericValue;
+                        continue;
+                    };
                     matches = switch (comp.operator) {
                         .equal => val == threshold,
                         .not_equal => val != threshold,
@@ -3646,6 +3651,7 @@ fn executeScalarAgg(
                 .where_expr = query.where_expr,
                 .n_aggs = n_aggs,
                 .delimiter = opts.delimiter,
+                .strict = opts.strict,
                 .arena = std.heap.ArenaAllocator.init(allocator),
                 .partial_accum = undefined,
                 .err = null,
@@ -3715,7 +3721,10 @@ fn executeScalarAgg(
                     const fv = record[cidx];
                     var matches = false;
                     if (comp.numeric_value) |threshold| {
-                        const val = parseNumericFast(fv) catch continue;
+                        const val = parseNumericFast(fv) catch {
+                            if (opts.strict) return error.StrictModeNonNumericValue;
+                            continue;
+                        };
                         matches = switch (comp.operator) {
                             .equal => val == threshold,
                             .not_equal => val != threshold,
@@ -3954,6 +3963,7 @@ const GbWorkerCtx = struct {
     where_expr: ?parser.Expression, // shallow copy — read-only
     n_aggs: usize,
     delimiter: u8,
+    strict: bool,
     // Per-thread outputs (all arena-owned, freed together after merge)
     arena: std.heap.ArenaAllocator,
     partial_map: std.StringHashMap(CompactAccum),
@@ -4000,7 +4010,10 @@ fn gbProcessRecordCore(
             if (cidx >= record.len) return;
             const fv = record[cidx];
             if (comp.numeric_value) |threshold| {
-                const val = parseNumericFast(fv) catch return;
+                const val = parseNumericFast(fv) catch {
+                    if (ctx.strict) return error.StrictModeNonNumericValue;
+                    return;
+                };
                 const matches = switch (comp.operator) {
                     .equal => val == threshold,
                     .not_equal => val != threshold,
@@ -4271,6 +4284,7 @@ const ScalarAggWorkerCtx = struct {
     where_expr: ?parser.Expression,
     n_aggs: usize,
     delimiter: u8,
+    strict: bool,
     arena: std.heap.ArenaAllocator,
     partial_accum: CompactAccum,
     err: ?anyerror = null,
@@ -4381,7 +4395,10 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                             const comp = expr.comparison;
                             var matches = false;
                             if (comp.numeric_value) |threshold| {
-                                const val = parseNumericFast(fv) catch continue;
+                                const val = parseNumericFast(fv) catch {
+                                    if (ctx.strict) return error.StrictModeNonNumericValue;
+                                    continue;
+                                };
                                 matches = switch (comp.operator) {
                                     .equal => val == threshold,
                                     .not_equal => val != threshold,
@@ -4432,7 +4449,10 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                     const fv = record[cidx];
                     var matches = false;
                     if (comp.numeric_value) |threshold| {
-                        const val = parseNumericFast(fv) catch continue;
+                        const val = parseNumericFast(fv) catch {
+                            if (ctx.strict) return error.StrictModeNonNumericValue;
+                            continue;
+                        };
                         matches = switch (comp.operator) {
                             .equal => val == threshold,
                             .not_equal => val != threshold,
@@ -5105,6 +5125,7 @@ fn executeGroupBy(
                 .where_expr = query.where_expr,
                 .n_aggs = n_aggs,
                 .delimiter = opts.delimiter,
+                .strict = opts.strict,
                 .arena = std.heap.ArenaAllocator.init(allocator),
                 .partial_map = undefined,
                 .err = null,
@@ -5231,7 +5252,10 @@ fn executeGroupBy(
                     const fv = record[cidx];
                     var matches = false;
                     if (comp.numeric_value) |threshold| {
-                        const val = parseNumericFast(fv) catch continue;
+                        const val = parseNumericFast(fv) catch {
+                            if (opts.strict) return error.StrictModeNonNumericValue;
+                            continue;
+                        };
                         matches = switch (comp.operator) {
                             .equal => val == threshold,
                             .not_equal => val != threshold,
@@ -8321,6 +8345,44 @@ test "WHERE UPPER(col) = ... errors instead of silently returning wrong data on 
         const out_file = try tmp.dir.createFile("out2.csv", .{ .read = true });
         defer out_file.close();
         try std.testing.expectError(error.ColumnNotFound, execute(allocator, query, out_file, .{}));
+    }
+}
+
+test "--strict: WHERE numeric comparison against a non-numeric value errors instead of silently skipping the row" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile("m.csv", .{});
+        defer f.close();
+        try f.writeAll("id,amount\n1,100\n2,abc\n3,200\n");
+    }
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath("m.csv", &path_buf);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT id FROM '{s}' WHERE amount > 50", .{path});
+    defer allocator.free(sql);
+
+    // Default (lenient): the non-numeric row is silently skipped, matches survive.
+    {
+        var query = try parser.parse(allocator, sql);
+        defer query.deinit();
+        const out_file = try tmp.dir.createFile("out_lenient.csv", .{ .read = true });
+        defer out_file.close();
+        try execute(allocator, query, out_file, .{});
+        try out_file.seekTo(0);
+        const out = try out_file.readToEndAlloc(allocator, 4096);
+        defer allocator.free(out);
+        try std.testing.expectEqualStrings("id\n1\n3\n", out);
+    }
+
+    // --strict: the same query errors instead of silently dropping row 2.
+    {
+        var query = try parser.parse(allocator, sql);
+        defer query.deinit();
+        const out_file = try tmp.dir.createFile("out_strict.csv", .{ .read = true });
+        defer out_file.close();
+        try std.testing.expectError(error.StrictModeNonNumericValue, execute(allocator, query, out_file, .{ .strict = true }));
     }
 }
 

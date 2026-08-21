@@ -372,6 +372,7 @@ pub fn executeMapped(
                             var matches = false;
                             if (comp.numeric_value) |threshold| {
                                 const val = std.fmt.parseFloat(f64, field_value) catch {
+                                    if (opts.strict) return error.StrictModeNonNumericValue;
                                     line_start += line_end + 1;
                                     continue;
                                 };

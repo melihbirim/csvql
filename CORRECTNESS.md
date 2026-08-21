@@ -117,3 +117,33 @@ can't silently reappear.
 If you find a case where csvql returns a plausible-looking wrong answer instead of
 erroring, that is the highest-priority class of bug this project tracks — please
 [file an issue](https://github.com/melihbirim/csvql/issues/new).
+
+### `--strict` and exit codes
+
+`--strict` is scoped to *refuse the unknown*, not *refuse the divergent*: it does not
+turn the [documented intentional differences](#known-differences-intentional) from
+DuckDB into errors — those are deliberate design choices, not risk. What it does refuse:
+a `WHERE` numeric comparison (`age > 30`) against a field value that doesn't parse as a
+number. Default behavior (unchanged) silently skips that row, on the theory that CSV
+columns have no enforced type and a stray non-numeric value in an otherwise-numeric
+column is common and usually meant to be filtered out, not fatal. `--strict` is for
+callers who'd rather find out their data has a type mismatch than get a silently-partial
+result.
+
+This is deliberately narrow — it does **not** become a place for a known-wrong bug to
+hide behind an opt-in flag. Anything `--strict` refuses was already merely *risky* under
+the default, never *silently wrong*: if a case is ever found where the default returns
+a plausible-looking wrong answer, the fix is to make the default error (or return the
+right answer), not to gate correctness behind `--strict`.
+
+Exit codes distinguish who's at fault, since the caller of a CLI tool in a pipeline is
+usually a script, not a human:
+
+| Code | Meaning |
+| ---- | ------- |
+| 0 | success |
+| 1 | uncategorized failure (IO error, internal error, file not found) |
+| 2 | the query is wrong — bad/unsupported SQL, unresolved column. The user's bug. |
+| 3 | the data defeated csvql — currently only `--strict`'s non-numeric WHERE value. A data-quality signal, not a query bug; script callers may want to route this differently (e.g. quarantine the file) rather than treating it identically to a typo'd query. |
+
+These codes are part of the CLI contract; changing what maps to which is a breaking change.

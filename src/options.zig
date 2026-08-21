@@ -41,6 +41,14 @@ pub const Options = struct {
     /// Allowed root directories (`--root`). Empty = unrestricted (current behavior).
     /// When set, file access is confined to these trees (see engine.ensurePathAllowed).
     roots: []const []const u8 = &.{},
+    /// Strict mode (`--strict`): a WHERE numeric comparison against a
+    /// non-numeric field value errors instead of silently skipping the row.
+    /// Default (false) matches long-standing behavior — CSV columns have no
+    /// enforced type, so a stray non-numeric value in an otherwise-numeric
+    /// column is common and usually meant to be skipped, not fatal. Strict
+    /// mode is for callers who'd rather find out their data has a type
+    /// mismatch than get a silently-partial result.
+    strict: bool = false,
 };
 
 /// Resolve the configured worker count.
