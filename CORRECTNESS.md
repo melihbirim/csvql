@@ -113,7 +113,7 @@ point.
 | Window functions (`RANK() OVER (...)`, etc.) | [#126](https://github.com/melihbirim/csvql/issues/126) |
 | `OFFSET` clause | [#70](https://github.com/melihbirim/csvql/issues/70) |
 | DuckDB CLI version not pinned in CI (`--version` is whatever `latest` resolves to at run time) | not yet filed |
-| No grammar-based differential fuzzer — the 88 checks are hand-written, so they only find bugs already imagined, not the full space of query combinations. This is how #140 below was found: adding one more hand-written adversarial fixture (mixed date formats), not a fuzzer | not yet filed |
+| No differential query generator — the 88 checks are hand-written, so they only find bugs already imagined, not the full space of query combinations. #140 was found by adding one more hand-written adversarial fixture (mixed date formats), not a generator — proof the hand-written approach still finds real bugs, and that it's slow. Scoped (template-based, single-table, WHERE+aggregates, seeded, no shrinking — a full grammar fuzzer is explicitly out of scope) in the issue | [#141](https://github.com/melihbirim/csvql/issues/141) |
 | Coverage measurement (line coverage per module) not wired up | not yet filed |
 | No Windows-specific adversarial subset in CI (CRLF is tested on macOS/Linux; Windows' own line-ending and path-separator handling isn't independently verified) | not yet filed |
 
