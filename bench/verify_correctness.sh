@@ -609,9 +609,29 @@ check \
   "SELECT id, started_at + INTERVAL 7 DAY FROM read_csv_auto('$DATES') ORDER BY id"
 
 check \
-  "STRFTIME('%Y-%m', started_at) date bucketing (GROUP BY path — plain SELECT tracked in #133)" \
+  "STRFTIME('%Y-%m', started_at) date bucketing (GROUP BY path)" \
   "SELECT STRFTIME('%Y-%m', started_at), COUNT(*) FROM '$DATES' GROUP BY STRFTIME('%Y-%m', started_at) ORDER BY 1" \
   "SELECT strftime(started_at, '%Y-%m'), COUNT(*) FROM read_csv_auto('$DATES') GROUP BY strftime(started_at, '%Y-%m') ORDER BY 1"
+
+check \
+  "plain SELECT STRFTIME(...) without GROUP BY (#133)" \
+  "SELECT id, STRFTIME('%Y-%m', started_at) FROM '$DATES' ORDER BY id" \
+  "SELECT id, strftime(started_at, '%Y-%m') FROM read_csv_auto('$DATES') ORDER BY id"
+
+# Mixed date formats in one column (ISO-8601, US MM/DD/YYYY, EU DD.MM.YYYY) —
+# STRFTIME/DATE_PART silently sliced the wrong bytes for anything that
+# wasn't ISO-8601-shaped until this was fixed (#140).
+MIXDATE="$TMP/mixdate.csv"
+cat > "$MIXDATE" <<'EOF'
+id,d
+1,2026-01-15
+2,01/20/2026
+3,25.01.2026
+EOF
+check \
+  "STRFTIME/DATE_PART on mixed ISO/US/EU date formats in one column (#140)" \
+  "SELECT id, DATE_PART('day', d), DATE_PART('month', d), DATE_PART('year', d) FROM '$MIXDATE' ORDER BY id" \
+  "SELECT id, lpad(date_part('day', CASE WHEN d LIKE '%-%' THEN strptime(d,'%Y-%m-%d') WHEN d LIKE '%/%' THEN strptime(d,'%m/%d/%Y') ELSE strptime(d,'%d.%m.%Y') END)::VARCHAR,2,'0'), lpad(date_part('month', CASE WHEN d LIKE '%-%' THEN strptime(d,'%Y-%m-%d') WHEN d LIKE '%/%' THEN strptime(d,'%m/%d/%Y') ELSE strptime(d,'%d.%m.%Y') END)::VARCHAR,2,'0'), date_part('year', CASE WHEN d LIKE '%-%' THEN strptime(d,'%Y-%m-%d') WHEN d LIKE '%/%' THEN strptime(d,'%m/%d/%Y') ELSE strptime(d,'%d.%m.%Y') END) FROM read_csv_auto('$MIXDATE', types={'d':'VARCHAR'}) ORDER BY id"
 
 # ════════════════════════════════════════════════════════════════
 echo ""
@@ -723,6 +743,150 @@ check_approx \
   "numeric column, no embedded newlines" \
   "SELECT SUM(amount) FROM '$EDGE' WHERE id != 1" \
   "SELECT SUM(amount) FROM read_csv_auto('$EDGE') WHERE id != 1"
+
+# -- CRLF line endings --
+CRLF="$TMP/crlf.csv"
+printf 'id,name\r\n1,alice\r\n2,bob\r\n' > "$CRLF"
+check \
+  "CRLF line endings" \
+  "SELECT id, name FROM '$CRLF' WHERE id = 2" \
+  "SELECT id, name FROM read_csv_auto('$CRLF') WHERE id = 2"
+
+# -- UTF-8 BOM --
+BOMFILE="$TMP/bom.csv"
+printf '\xEF\xBB\xBFid,name\n1,alice\n2,bob\n' > "$BOMFILE"
+check \
+  "UTF-8 BOM in header doesn't glue onto the first column name" \
+  "SELECT id, name FROM '$BOMFILE' WHERE id = 1" \
+  "SELECT id, name FROM read_csv_auto('$BOMFILE') WHERE id = 1"
+
+# -- RTL / emoji / combining marks. Compared via a WHERE LIKE predicate that
+# returns only the (unambiguous, unquoted) id column — DuckDB's CSV writer
+# quotes any field containing non-ASCII bytes while csvql only quotes per
+# RFC 4180 (delimiter/quote/newline present), so diffing the raw unicode
+# field value directly would fail on a quoting-style difference, not a
+# content difference.
+UNI="$TMP/uni.csv"
+cat > "$UNI" <<'EOF'
+id,val
+1,🎉 party
+2,مرحبا بالعالم
+3,café (é as a combining mark: e + ́)
+EOF
+check \
+  "emoji in a field, matched via LIKE" \
+  "SELECT id FROM '$UNI' WHERE val LIKE '%🎉%'" \
+  "SELECT id FROM read_csv_auto('$UNI') WHERE val LIKE '%🎉%'"
+check \
+  "RTL (Arabic) text in a field, matched via LIKE" \
+  "SELECT id FROM '$UNI' WHERE val LIKE '%مرحبا%'" \
+  "SELECT id FROM read_csv_auto('$UNI') WHERE val LIKE '%مرحبا%'"
+check \
+  "combining-mark unicode in a field, matched via LIKE" \
+  "SELECT id FROM '$UNI' WHERE val LIKE '%café%'" \
+  "SELECT id FROM read_csv_auto('$UNI') WHERE val LIKE '%café%'"
+
+# -- Scientific notation / signed-zero numeric forms that DuckDB's own CSV
+# type sniffer also recognizes as numeric (leading zeros like "007" and an
+# explicit leading "+" like "+5" make DuckDB's sniffer fall back to VARCHAR
+# for the whole column, so those two forms are exercised as a csvql-only
+# assertion below instead — see "Known differences" in CORRECTNESS.md).
+NUMFORMS="$TMP/numforms.csv"
+cat > "$NUMFORMS" <<'EOF'
+id,val
+1,1e10
+2,-2.5E-3
+3,-0
+EOF
+check_approx \
+  "scientific notation and negative zero forms" \
+  "SELECT SUM(val) FROM '$NUMFORMS'" \
+  "SELECT SUM(val) FROM read_csv_auto('$NUMFORMS')"
+
+# -- Header-only / single-row / single-column files --
+HEADERONLY="$TMP/headeronly.csv"
+printf "id,name\n" > "$HEADERONLY"
+check_approx \
+  "header-only file (zero data rows)" \
+  "SELECT COUNT(*) FROM '$HEADERONLY'" \
+  "SELECT COUNT(*) FROM read_csv_auto('$HEADERONLY')"
+
+SINGLEROW="$TMP/singlerow.csv"
+printf "id,name\n1,alice\n" > "$SINGLEROW"
+check \
+  "single-row file" \
+  "SELECT id, name FROM '$SINGLEROW'" \
+  "SELECT id, name FROM read_csv_auto('$SINGLEROW')"
+
+SINGLECOL="$TMP/singlecol.csv"
+printf "val\n10\n20\n30\n" > "$SINGLECOL"
+check_approx \
+  "single-column file" \
+  "SELECT SUM(val) FROM '$SINGLECOL'" \
+  "SELECT SUM(val) FROM read_csv_auto('$SINGLECOL')"
+
+# -- csvql-only behavioral locks (no DuckDB oracle comparison): these three
+# fixtures each hit a case where DuckDB's own behavior isn't a meaningful
+# reference — see the corresponding rows in CORRECTNESS.md's "Known
+# differences" table for why. The point here is only to pin down csvql's
+# own current, sane behavior so it can't silently regress.
+TOTAL=$((TOTAL + 1))
+LEADZERO="$TMP/leadzero.csv"
+printf "id,val\n1,007\n2,+5\n3,10\n" > "$LEADZERO"
+leadzero_out=$("$CSVQL" "SELECT SUM(val) FROM '$LEADZERO'" 2>/dev/null | tail -n +2)
+if [[ "$leadzero_out" == "22" ]]; then
+  printf "  ${GREEN}PASS${RESET}  %s\n" "csvql-only: leading-zero (007) and leading-plus (+5) numeric literals parse correctly"
+  PASS=$((PASS + 1))
+else
+  printf "  ${RED}FAIL${RESET}  %s (got %s, want 22)\n" "csvql-only: leading-zero (007) and leading-plus (+5) numeric literals parse correctly" "$leadzero_out"
+  FAIL=$((FAIL + 1))
+fi
+
+TOTAL=$((TOTAL + 1))
+RAGGED="$TMP/ragged.csv"
+printf "id,name,age\n1,alice,30\n2,bob\n3,carol,25,extra\n" > "$RAGGED"
+ragged_out=$("$CSVQL" "SELECT id, name, age FROM '$RAGGED'" 2>/dev/null | tail -n +2)
+ragged_expected=$'1,alice,30\n2,bob,\n3,carol,25'
+if [[ "$ragged_out" == "$ragged_expected" ]]; then
+  printf "  ${GREEN}PASS${RESET}  %s\n" "csvql-only: ragged rows pad-missing/truncate-extra instead of erroring"
+  PASS=$((PASS + 1))
+else
+  printf "  ${RED}FAIL${RESET}  %s\n" "csvql-only: ragged rows pad-missing/truncate-extra instead of erroring"
+  diff <(echo "$ragged_expected") <(echo "$ragged_out") | head -10 | sed 's/^/        /'
+  FAIL=$((FAIL + 1))
+fi
+
+TOTAL=$((TOTAL + 1))
+EMPTYFILE="$TMP/emptyfile.csv"
+: > "$EMPTYFILE"
+"$CSVQL" "SELECT * FROM '$EMPTYFILE'" > /dev/null 2>/dev/null
+empty_rc=$?
+if [[ $empty_rc -eq 3 ]]; then
+  printf "  ${GREEN}PASS${RESET}  %s\n" "csvql-only: zero-byte file errors clearly (exit 3) instead of silently succeeding"
+  PASS=$((PASS + 1))
+else
+  printf "  ${RED}FAIL${RESET}  %s (exit code %d, want 3)\n" "csvql-only: zero-byte file errors clearly (exit 3) instead of silently succeeding" "$empty_rc"
+  FAIL=$((FAIL + 1))
+fi
+
+# Values near i64/f64 limits: a plain SELECT is a pass-through projection, no
+# arithmetic, so csvql preserves the exact source literal. DuckDB's CSV type
+# sniffer infers DOUBLE for these and reformats through IEEE-754 rounding +
+# scientific notation even without any computation — not a meaningful
+# apples-to-apples comparison (see CORRECTNESS.md).
+TOTAL=$((TOTAL + 1))
+LIMITS="$TMP/limits.csv"
+printf "id,val\n1,9223372036854775807\n2,1.7976931348623157e308\n3,-9223372036854775807\n" > "$LIMITS"
+limits_out=$("$CSVQL" "SELECT val FROM '$LIMITS'" 2>/dev/null | tail -n +2)
+limits_expected=$'9223372036854775807\n1.7976931348623157e308\n-9223372036854775807'
+if [[ "$limits_out" == "$limits_expected" ]]; then
+  printf "  ${GREEN}PASS${RESET}  %s\n" "csvql-only: values near i64/f64 limits pass through a plain SELECT unrounded"
+  PASS=$((PASS + 1))
+else
+  printf "  ${RED}FAIL${RESET}  %s\n" "csvql-only: values near i64/f64 limits pass through a plain SELECT unrounded"
+  diff <(echo "$limits_expected") <(echo "$limits_out") | head -10 | sed 's/^/        /'
+  FAIL=$((FAIL + 1))
+fi
 
 # Regression checks for previously-fixed silent-wrong-answer bugs. These stay
 # in the running suite (not excluded) so a regression fails CI instead of

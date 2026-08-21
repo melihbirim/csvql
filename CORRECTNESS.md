@@ -10,7 +10,7 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
 
 ## What is tested
 
-- **73 differential checks** in `bench/verify_correctness.sh` (74 when the optional
+- **88 differential checks** in `bench/verify_correctness.sh` (89 when the optional
   multi-GB taxi fixture is present locally — see below), covering: SELECT/projection,
   every WHERE operator (`=`, comparisons, `LIKE`/`ILIKE`, `BETWEEN`, `IN`/`NOT IN`,
   `IS NULL`, modulo, compound `AND`/`OR`/`NOT`), GROUP BY + all aggregate functions
@@ -19,10 +19,14 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
   LIMIT, every scalar function (`UPPER`/`LOWER`/`TRIM`/`LENGTH`/`SUBSTR`/`REPLACE`/
   `SPLIT_PART`/`GREATEST`/`LEAST`/`ABS`/`CEIL`/`FLOOR`/`MOD`/`ROUND`/`COALESCE`/`CAST`,
   one level of nesting), date/time functions (`DATEDIFF`, `DATEADD`, `STRFTIME`,
-  `DATE_PART`), JOIN (including a 3-table chain and a 50K-row hash probe), table aliases,
-  and an adversarial CSV fixture (embedded commas/newlines/quotes, escaped `""`, unicode,
-  scientific notation).
-- **522 unit tests** (`zig build test`) covering internals differential testing can't
+  `DATE_PART`, including mixed ISO/US/EU date formats in a single column), JOIN
+  (including a 3-table chain and a 50K-row hash probe), table aliases, and a wide
+  adversarial CSV fixture set: embedded commas/newlines/quotes, escaped `""`, CRLF line
+  endings, a UTF-8 BOM, emoji/RTL/combining-mark unicode (matched via `LIKE`, not
+  diffed raw — see below), scientific notation and negative zero, header-only/
+  single-row/single-column files, ragged rows, a zero-byte file, and values near
+  i64/f64 limits.
+- **529 unit tests** (`zig build test`) covering internals differential testing can't
   reach directly: parser edge cases, arena-buffer offset safety across reallocation,
   overflow handling, TDD regression tests for every numbered bug fix referenced below.
 - **2 platforms in CI**: `ubuntu-latest` (x86_64) and `macos-14` (Apple Silicon,
@@ -54,6 +58,17 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
   parse error, anything) — the captured stderr is printed; or both sides return zero
   rows, since an empty-vs-empty "match" on a suite where no check is designed to expect
   an empty result is almost always two broken queries, not a real one.
+- **Unicode fields are compared via a `WHERE ... LIKE` predicate that returns only the
+  id column**, not by diffing the raw field value directly. DuckDB's CSV writer quotes
+  any field containing non-ASCII bytes; csvql only quotes per RFC 4180 (delimiter/quote/
+  newline present). Diffing the quoted-vs-unquoted output directly would fail on that
+  formatting difference, not a content difference.
+- **A few fixtures compare against csvql alone, not DuckDB**, when DuckDB's own behavior
+  isn't a meaningful reference for that specific input (a leading `+`/`0` making DuckDB's
+  CSV sniffer bail to `VARCHAR`, DuckDB reformatting a huge integer through `DOUBLE`
+  rounding on a plain projection, ragged rows confusing DuckDB's header detection
+  entirely, DuckDB silently returning empty for a 0-byte file instead of erroring). These
+  pin down csvql's own current, deliberate behavior instead — see the table below.
 
 ### Float tolerance
 
@@ -75,9 +90,15 @@ examples in the [README](README.md#known-differences-from-duckdb).
 | `LENGTH(col)` on a unicode string | Byte length (UTF-8 bytes) | Character count (codepoints) |
 | Empty CSV field | Stays an empty string | Inferred as `NULL` |
 | `DATEDIFF('hour'/'minute'/etc, a, b)` on a non-exact interval | Fractional (e.g. `8.5`) | Truncated (e.g. `8`) |
+| Numeric literal with a leading `0` (`007`) or `+` (`+5`) | Parses as a number | CSV sniffer infers `VARCHAR` for the whole column, `SUM`/etc then error |
+| A huge integer literal (e.g. `9223372036854775807`) in a plain (non-aggregate) `SELECT` | Passed through unchanged, exact text preserved | CSV sniffer infers `DOUBLE`, reformats via IEEE-754 rounding + scientific notation even with no computation |
+| Ragged rows (fewer/more fields than the header) | Short rows padded with empty fields, long rows truncated to header width | CSV sniffer can lose confidence in the header entirely and re-infer the first row as data (`column0`, `column1`, ...) |
+| A zero-byte input file | `error.EmptyFile` (exit 3) | Returns silently with zero rows, no error |
 
 These are intentionally excluded from the differential suite's pass/fail assertions —
-asserting parity here would be asserting the wrong thing.
+asserting parity here would be asserting the wrong thing. The last four rows are locked
+in as csvql-only regression checks in `bench/verify_correctness.sh` instead of a DuckDB
+diff, since DuckDB's own behavior in each case isn't the property being tested.
 
 ## Known gaps (open issues)
 
@@ -92,9 +113,9 @@ point.
 | Window functions (`RANK() OVER (...)`, etc.) | [#126](https://github.com/melihbirim/csvql/issues/126) |
 | `OFFSET` clause | [#70](https://github.com/melihbirim/csvql/issues/70) |
 | DuckDB CLI version not pinned in CI (`--version` is whatever `latest` resolves to at run time) | not yet filed |
-| No grammar-based differential fuzzer — the 73 checks are hand-written, so they only find bugs already imagined, not the full space of query combinations | not yet filed |
-| Adversarial CSV fixture coverage is partial: no ragged rows, no CRLF/BOM variants, no values near i64/f64 limits, no RTL/combining-mark unicode, no mixed date formats in one file | not yet filed |
+| No grammar-based differential fuzzer — the 88 checks are hand-written, so they only find bugs already imagined, not the full space of query combinations. This is how #140 below was found: adding one more hand-written adversarial fixture (mixed date formats), not a fuzzer | not yet filed |
 | Coverage measurement (line coverage per module) not wired up | not yet filed |
+| No Windows-specific adversarial subset in CI (CRLF is tested on macOS/Linux; Windows' own line-ending and path-separator handling isn't independently verified) | not yet filed |
 
 ## What is not supported
 
