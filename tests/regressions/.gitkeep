@@ -1,0 +1,3 @@
+Failed seeds from bench/query_fuzz.sh (#141) land here permanently — one
+file per mismatch, dumped automatically. Never delete a file in this
+directory once a bug it represents is fixed; it's the regression guard.

@@ -38,6 +38,14 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
   `--threads 1` vs `--threads 0` (auto) and diffed against *itself* — no DuckDB needed,
   catches the parallel-scan-loses-quote-state-across-a-buffer-boundary shape of bug
   directly.
+- **Differential query generator** (`bench/query_fuzz.sh`, #141): template-based, not a
+  full grammar fuzzer — single table, WHERE predicates (numeric + string columns,
+  compound AND/OR) and aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, scalar and
+  `GROUP BY`) against the existing fixture schema. Deterministic seeding (`--seed`) so
+  every mismatch reproduces with one command; failures dump to `tests/regressions/`
+  permanently instead of using a shrinker. Runs at smoke scale in CI (300 queries per
+  run); run locally with a higher `--count` for deeper coverage. No JOINs, no
+  subqueries — out of scope by design, see the issue for why.
 
 ## Oracle methodology
 
@@ -113,7 +121,7 @@ point.
 | Window functions (`RANK() OVER (...)`, etc.) | [#126](https://github.com/melihbirim/csvql/issues/126) |
 | `OFFSET` clause | [#70](https://github.com/melihbirim/csvql/issues/70) |
 | DuckDB CLI version not pinned in CI (`--version` is whatever `latest` resolves to at run time) | not yet filed |
-| No differential query generator — the 88 checks are hand-written, so they only find bugs already imagined, not the full space of query combinations. #140 was found by adding one more hand-written adversarial fixture (mixed date formats), not a generator — proof the hand-written approach still finds real bugs, and that it's slow. Scoped (template-based, single-table, WHERE+aggregates, seeded, no shrinking — a full grammar fuzzer is explicitly out of scope) in the issue | [#141](https://github.com/melihbirim/csvql/issues/141) |
+| Differential query generator (`bench/query_fuzz.sh`, #141) only runs at smoke scale in CI (300 queries) — each query spawns a fresh DuckDB CLI process (~100ms cold start), so hitting the original plan's 10k/PR needs a batched or process-reuse runner first; 1M nightly needs that plus a scheduled job that doesn't exist yet | [#141](https://github.com/melihbirim/csvql/issues/141) |
 | Coverage measurement (line coverage per module) not wired up | not yet filed |
 | No Windows-specific adversarial subset in CI (CRLF is tested on macOS/Linux; Windows' own line-ending and path-separator handling isn't independently verified) | not yet filed |
 

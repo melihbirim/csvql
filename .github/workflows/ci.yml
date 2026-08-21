@@ -136,3 +136,13 @@ jobs:
 
     - name: Run correctness suite (treats DuckDB as oracle)
       run: ./bench/verify_correctness.sh
+
+    # Differential query generator (#141) — smoke-scale (300 queries, ~30s)
+    # rather than the 10k/PR the correctness plan calls for, since each
+    # query spawns a fresh DuckDB CLI process (~100ms cold start); running
+    # at full volume needs a batched/reused-process runner first. Fixed
+    # seed for a reproducible CI run; failures dump to tests/regressions/
+    # and fail the job (not committed automatically — a human reviews and
+    # commits a genuine regression file).
+    - name: Run differential query generator (smoke scale)
+      run: ./bench/query_fuzz.sh --seed 1 --count 300
