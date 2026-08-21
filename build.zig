@@ -95,6 +95,14 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run CSV parsing benchmark");
     bench_step.dependOn(&bench_run.step);
 
+    // One-command correctness reproduction: builds the exe (pass
+    // -Doptimize=ReleaseFast, same as CI) then diffs every query in
+    // bench/verify_correctness.sh against DuckDB. See CORRECTNESS.md.
+    const verify_run = b.addSystemCommand(&.{ "bash", "bench/verify_correctness.sh" });
+    verify_run.step.dependOn(b.getInstallStep());
+    const verify_step = b.step("verify", "Run the DuckDB differential correctness suite (needs duckdb in PATH; pass -Doptimize=ReleaseFast)");
+    verify_step.dependOn(&verify_run.step);
+
     // GROUP BY benchmark — uses named modules so bench/ can reach src/
     const engine_mod = b.createModule(.{
         .root_source_file = b.path("src/engine.zig"),

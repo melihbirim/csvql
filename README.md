@@ -293,7 +293,7 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 | **CAST**      | `SELECT CAST(col AS INTEGER/FLOAT/TEXT)` — type conversion              |
 | **DATEDIFF**  | `DATEDIFF('unit', start_col, end_col)` — duration between two datetime columns. Units: `second`, `minute`, `hour`, `day`, `week`, `month` (≈30 days), `year` (≈365 days). Auto-detects ISO-8601, US (MM/DD/YYYY), EU (DD.MM.YYYY) and mixed formats in the same file |
 | **DATEADD**   | `DATEADD('unit', amount, date_col)` — add/subtract interval from a datetime column. `amount` may be negative. Units: `second`, `minute`, `hour`, `day`, `week`, `month` (≈30 days), `year` (≈365 days). Returns `YYYY-MM-DD HH:MM:SS` |
-| **ORDER BY**  | `ORDER BY col [ASC\|DESC]`, multi-column `ORDER BY col1 ASC, col2 DESC`, alias, or positional (`ORDER BY 1`) |
+| **ORDER BY**  | `ORDER BY col [ASC\|DESC]`, multi-column `ORDER BY col1 ASC, col2 DESC`, alias, positional (`ORDER BY 1`), or a column not in the `SELECT` list (sorts by the raw source/grouping column) |
 | **LIMIT**     | `LIMIT n`                                                               |
 
 ### Known differences from DuckDB
@@ -314,12 +314,9 @@ Not yet supported — these error clearly rather than silently returning wrong d
 
 | Limitation | Tracking |
 | ---------- | -------- |
-| `ORDER BY` on a column not in the `SELECT` list | [#117](https://github.com/melihbirim/csvql/issues/117) |
 | Subqueries (`WHERE col IN (SELECT ...)`, `HAVING x > (SELECT ...)`) | [#124](https://github.com/melihbirim/csvql/issues/124) |
 | `UNION` / `INTERSECT` / `EXCEPT` | [#122](https://github.com/melihbirim/csvql/issues/122), [#127](https://github.com/melihbirim/csvql/issues/127) |
 | Window functions (`RANK() OVER (...)`, etc.) | [#126](https://github.com/melihbirim/csvql/issues/126) |
-| Plain `SELECT STRFTIME(...)` / `DATE_PART(...)` without `GROUP BY` | [#133](https://github.com/melihbirim/csvql/issues/133) |
-| `GREATEST`/`LEAST` with a numeric literal argument (column args only for now) | [#134](https://github.com/melihbirim/csvql/issues/134) |
 | `OFFSET` clause | [#70](https://github.com/melihbirim/csvql/issues/70) |
 
 ### Aggregate Examples
@@ -821,6 +818,7 @@ headers, rows = csvql.query_tuples("SELECT name, age FROM 'employees.csv'")
 
 | Document                                             | Description                                         |
 | ---------------------------------------------------- | --------------------------------------------------- |
+| [CORRECTNESS.md](CORRECTNESS.md)                     | What's tested against DuckDB, how, known gaps, error behaviour |
 | [ARCHITECTURE.md](ARCHITECTURE.md)                   | Engine design, optimization techniques              |
 | [BENCHMARKS.md](BENCHMARKS.md)                       | Detailed performance analysis vs DuckDB, ClickHouse |
 | [SIMPLE_QUERY_LANGUAGE.md](SIMPLE_QUERY_LANGUAGE.md) | Simple mode syntax reference                        |
