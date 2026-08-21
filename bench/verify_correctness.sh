@@ -138,6 +138,57 @@ check() {
   fi
 }
 
+# check_self <label> <sql>
+# Self-differential: runs the same csvql query single-threaded vs auto
+# (multi-threaded) and diffs the two csvql outputs against EACH OTHER — no
+# DuckDB involved. This is the shape that catches the #139 class of bug: a
+# parallel scan losing quote state across an internal IO-buffer boundary,
+# where COUNT(*) still comes out right but a numeric WHERE filter silently
+# undercounts. --threads 1 takes the sequential/mmap path that reads the
+# whole file in one mapping (no buffer-boundary chunking), so any divergence
+# from the auto-threaded run is a real parallel-path bug, not an oracle
+# disagreement.
+check_self() {
+  local label="$1"
+  local sql="$2"
+  TOTAL=$((TOTAL + 1))
+
+  local out1="$TMP/self1_${TOTAL}.txt"
+  local outN="$TMP/selfN_${TOTAL}.txt"
+  local err1="$TMP/self1_err_${TOTAL}.txt"
+  local errN="$TMP/selfN_err_${TOTAL}.txt"
+
+  "$CSVQL" --threads 1 "$sql" 2>"$err1" | tail -n +2 > "$out1"
+  local rc1=${PIPESTATUS[0]}
+  "$CSVQL" --threads 0 "$sql" 2>"$errN" | tail -n +2 > "$outN"
+  local rcN=${PIPESTATUS[0]}
+
+  if [[ $rc1 -ne 0 ]]; then
+    printf "  ${RED}FAIL${RESET}  %s (--threads 1 exited %d)\n" "$label" "$rc1"
+    FAIL=$((FAIL + 1)); sed 's/^/        /' "$err1"; echo ""; return
+  fi
+  if [[ $rcN -ne 0 ]]; then
+    printf "  ${RED}FAIL${RESET}  %s (--threads 0/auto exited %d)\n" "$label" "$rcN"
+    FAIL=$((FAIL + 1)); sed 's/^/        /' "$errN"; echo ""; return
+  fi
+  if [[ ! -s "$out1" && ! -s "$outN" ]]; then
+    printf "  ${RED}FAIL${RESET}  %s (both runs returned zero rows)\n" "$label"
+    FAIL=$((FAIL + 1)); echo ""; return
+  fi
+
+  if diff -q "$out1" "$outN" > /dev/null 2>&1; then
+    printf "  ${GREEN}PASS${RESET}  %s\n" "$label"
+    PASS=$((PASS + 1))
+  else
+    printf "  ${RED}FAIL${RESET}  %s (single-thread vs auto-thread disagree)\n" "$label"
+    FAIL=$((FAIL + 1))
+    diff "$out1" "$outN" | head -25 | sed 's/^/        /' | \
+      sed "s/^        </        ${DIM}threads=1 <${RESET}/" | \
+      sed "s/^        >/        ${BOLD}threads=0 >${RESET}/"
+    echo ""
+  fi
+}
+
 # check_approx <label> <csvql_sql> <duckdb_sql> [decimals=4]
 # For float aggregates (AVG, VARIANCE, STDDEV, SUM of non-integers): rounds
 # every numeric-looking field on both sides to `decimals` places (default 4)
@@ -707,17 +758,58 @@ check_approx \
   "SELECT SUM(amount) FROM read_csv_auto('$EDGE')"
 
 # ════════════════════════════════════════════════════════════════
-# Large-file, quote-heavy regression check (#139): the parallel scalar-agg
-# path's per-2MB-IO-buffer scan lost a record's quote state across reads,
-# so a numeric WHERE filter on a large quoted CSV could silently undercount
-# even though a bare COUNT(*) still came out right. Only ever reproduced
-# with a real multi-GB quoted file, not a synthetic one — gated on the
-# gitignored taxi fixture (bench/bench_taxi.sh downloads it) so CI stays
-# green without that multi-GB download.
+# Large-file, quote-heavy regression check (#139): a parallel scan lost a
+# record's quote state across an internal IO-buffer boundary (2MB), so a
+# numeric WHERE filter on a large quoted CSV could silently undercount even
+# though a bare COUNT(*) still came out right.
+#
+# Primary guard: a synthetic quote-heavy fixture sized well past several
+# 2MB boundaries, with quoted (and some embedded-newline) fields of varying
+# length so row boundaries land at many different offsets relative to each
+# 2MB mark — no multi-GB download needed. Self-differential (threads=1 vs
+# threads=0/auto), so it needs no DuckDB oracle either.
+echo ""
+echo "── Large quote-heavy file, self-differential threads=1 vs auto (#139) ─"
+
+BOUNDARY_CSV="$TMP/boundary.csv"
+awk 'BEGIN{
+  for (i = 1; i <= 90000; i++) {
+    amount = i % 97;
+    # Note length cycles through a set of sizes that share no common factor
+    # with 2MB, so cumulative byte offsets drift across every 2MB boundary
+    # instead of always landing on the same relative position.
+    len = 40 + (i % 53) * 17;
+    note = "";
+    for (j = 0; j < len; j++) note = note "x";
+    if (i % 37 == 0) {
+      # Embedded newline inside the quoted field, the exact shape #139 needs.
+      print i "," amount ",\"" note "\nmore text after the newline\"";
+    } else if (i % 11 == 0) {
+      # Embedded comma inside the quoted field.
+      print i "," amount ",\"" note ", with a comma\"";
+    } else {
+      print i "," amount ",\"" note "\"";
+    }
+  }
+}' > "$TMP/boundary_body.csv"
+{ echo "id,amount,note"; cat "$TMP/boundary_body.csv"; } > "$BOUNDARY_CSV"
+rm -f "$TMP/boundary_body.csv"
+
+check_self \
+  "COUNT(*) WHERE amount > 50 (quote-heavy, crosses many 2MB boundaries)" \
+  "SELECT COUNT(*) FROM '$BOUNDARY_CSV' WHERE amount > 50"
+
+check_self \
+  "SUM(amount) WHERE amount > 50 (quote-heavy, crosses many 2MB boundaries)" \
+  "SELECT SUM(amount) FROM '$BOUNDARY_CSV' WHERE amount > 50"
+
+# Opportunistic real-world check: gated on the gitignored taxi fixture
+# (bench/bench_taxi.sh downloads it), so CI stays green without a multi-GB
+# download but still gets this if the fixture happens to be present locally.
 TAXI_CSV="${SCRIPT_DIR}/bench/.taxi-data/trips.csv"
 if [[ -f "$TAXI_CSV" ]]; then
   echo ""
-  echo "── Large quoted-field file, parallel WHERE (#139) ───────────"
+  echo "── Large quoted-field file, parallel WHERE (#139, real dataset) ─"
   check \
     "COUNT(*) WHERE trip_distance > 5 (taxi dataset, parallel scan)" \
     "SELECT COUNT(*) FROM '$TAXI_CSV' WHERE trip_distance > 5" \
