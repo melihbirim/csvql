@@ -5,6 +5,10 @@
 # Results are sorted before diff so row-order ties (unstable sort) do not cause
 # false failures — the set of result rows must match exactly.
 #
+# A check FAILs (never silently passes) when: either engine exits non-zero,
+# or both sides return zero rows (an empty-vs-empty "match" is almost always
+# two broken queries, not a real one).
+#
 # Usage:
 #   ./bench/verify_correctness.sh [csv_file]
 #
@@ -75,11 +79,37 @@ check() {
 
   local out_csvql="$TMP/csvql_${TOTAL}.txt"
   local out_duck="$TMP/duck_${TOTAL}.txt"
-  local diff_out="$TMP/diff_${TOTAL}.txt"
+  local err_csvql="$TMP/csvql_err_${TOTAL}.txt"
+  local err_duck="$TMP/duck_err_${TOTAL}.txt"
 
-  # Run queries
-  "$CSVQL" "$csvql_sql" 2>/dev/null | tail -n +2 | sort $sort_key > "$out_csvql" || true
-  "$DUCKDB" -csv -noheader -c "$duck_sql" 2>/dev/null | sort $sort_key > "$out_duck" || true
+  # Run queries. Exit codes come from PIPESTATUS[0] (the query engine, not
+  # `tail`/`sort`) so a crash or execution error is never masked into an
+  # empty-vs-empty false pass.
+  "$CSVQL" "$csvql_sql" 2>"$err_csvql" | tail -n +2 | sort $sort_key > "$out_csvql"
+  local csvql_rc=${PIPESTATUS[0]}
+  "$DUCKDB" -csv -noheader -c "$duck_sql" 2>"$err_duck" | sort $sort_key > "$out_duck"
+  local duck_rc=${PIPESTATUS[0]}
+
+  if [[ $csvql_rc -ne 0 ]]; then
+    printf "  ${RED}FAIL${RESET}  %s (csvql exited %d)\n" "$label" "$csvql_rc"
+    FAIL=$((FAIL + 1))
+    sed 's/^/        /' "$err_csvql"
+    echo ""
+    return
+  fi
+  if [[ $duck_rc -ne 0 ]]; then
+    printf "  ${RED}FAIL${RESET}  %s (duckdb exited %d — check the reference query, not csvql)\n" "$label" "$duck_rc"
+    FAIL=$((FAIL + 1))
+    sed 's/^/        /' "$err_duck"
+    echo ""
+    return
+  fi
+  if [[ ! -s "$out_duck" && ! -s "$out_csvql" ]]; then
+    printf "  ${RED}FAIL${RESET}  %s (both sides returned zero rows — likely a broken query, not a real match)\n" "$label"
+    FAIL=$((FAIL + 1))
+    echo ""
+    return
+  fi
 
   # Compare
   if diff -q "$out_duck" "$out_csvql" > /dev/null 2>&1; then
@@ -106,8 +136,10 @@ check_approx() {
 
   local out_csvql="$TMP/csvql_${TOTAL}.txt"
   local out_duck="$TMP/duck_${TOTAL}.txt"
+  local err_csvql="$TMP/csvql_err_${TOTAL}.txt"
+  local err_duck="$TMP/duck_err_${TOTAL}.txt"
 
-  "$CSVQL" "$csvql_sql" 2>/dev/null | tail -n +2 | \
+  "$CSVQL" "$csvql_sql" 2>"$err_csvql" | tail -n +2 | \
     awk -v d="$decimals" '{
       for(i=1;i<=NF;i++) {
         if ($i ~ /^-?[0-9]+(\.[0-9]+)?$/){
@@ -115,9 +147,10 @@ check_approx() {
         } else printf "%s", $i
         printf (i<NF?",":"\n")
       }
-    }' FS=',' OFS=',' | sort > "$out_csvql" || true
+    }' FS=',' OFS=',' | sort > "$out_csvql"
+  local csvql_rc=${PIPESTATUS[0]}
 
-  "$DUCKDB" -csv -noheader -c "$duck_sql" 2>/dev/null | \
+  "$DUCKDB" -csv -noheader -c "$duck_sql" 2>"$err_duck" | \
     awk -v d="$decimals" '{
       for(i=1;i<=NF;i++) {
         if ($i ~ /^-?[0-9]+(\.[0-9]+)?$/){
@@ -125,7 +158,29 @@ check_approx() {
         } else printf "%s", $i
         printf (i<NF?",":"\n")
       }
-    }' FS=',' OFS=',' | sort > "$out_duck" || true
+    }' FS=',' OFS=',' | sort > "$out_duck"
+  local duck_rc=${PIPESTATUS[0]}
+
+  if [[ $csvql_rc -ne 0 ]]; then
+    printf "  ${RED}FAIL${RESET}  %s (csvql exited %d)\n" "$label" "$csvql_rc"
+    FAIL=$((FAIL + 1))
+    sed 's/^/        /' "$err_csvql"
+    echo ""
+    return
+  fi
+  if [[ $duck_rc -ne 0 ]]; then
+    printf "  ${RED}FAIL${RESET}  %s (duckdb exited %d — check the reference query, not csvql)\n" "$label" "$duck_rc"
+    FAIL=$((FAIL + 1))
+    sed 's/^/        /' "$err_duck"
+    echo ""
+    return
+  fi
+  if [[ ! -s "$out_duck" && ! -s "$out_csvql" ]]; then
+    printf "  ${RED}FAIL${RESET}  %s (both sides returned zero rows — likely a broken query, not a real match)\n" "$label"
+    FAIL=$((FAIL + 1))
+    echo ""
+    return
+  fi
 
   if diff -q "$out_duck" "$out_csvql" > /dev/null 2>&1; then
     printf "  ${GREEN}PASS${RESET}  %s\n" "$label"
@@ -594,12 +649,38 @@ check_approx \
   "SELECT SUM(amount) FROM '$EDGE' WHERE id != 1" \
   "SELECT SUM(amount) FROM read_csv_auto('$EDGE') WHERE id != 1"
 
-# Known, tracked gaps — NOT run here so CI stays green on unrelated PRs.
-# Escaped-quote unescaping in the zero-copy scan path: github.com/melihbirim/csvql/issues/89
-# Scientific-notation numeric inference: github.com/melihbirim/csvql/issues/90
-# LENGTH() byte-vs-char count, empty-string-vs-NULL: github.com/melihbirim/csvql/issues/91
-# SUM() silently drops a row's value when a preceding row has an embedded
-# newline in a quoted field (aggregate scan isn't quote-aware about \n): #92
+# Regression checks for previously-fixed silent-wrong-answer bugs. These stay
+# in the running suite (not excluded) so a regression fails CI instead of
+# silently reappearing. #91 (LENGTH byte-vs-char count, empty-string-vs-NULL)
+# is a deliberate, documented difference from DuckDB, not a bug — it is
+# intentionally excluded rather than asserted to match.
+
+ESCQ="$TMP/escq.csv"
+cat > "$ESCQ" <<'EOF'
+id,note
+1,"She said ""hi"" today"
+2,plain
+EOF
+check \
+  "escaped double-quote unescaping (\"\" -> \") in a quoted field (#89)" \
+  "SELECT id, note FROM '$ESCQ' WHERE id = 1" \
+  "SELECT id, note FROM read_csv_auto('$ESCQ') WHERE id = 1"
+
+SCINOT="$TMP/scinot.csv"
+cat > "$SCINOT" <<'EOF'
+id,amount
+1,2.5e3
+2,100
+EOF
+check_approx \
+  "scientific notation (2.5e3) recognized as numeric (#90)" \
+  "SELECT SUM(amount) FROM '$SCINOT'" \
+  "SELECT SUM(amount) FROM read_csv_auto('$SCINOT')"
+
+check_approx \
+  "SUM() across a row with an embedded-newline quoted field before it (#92)" \
+  "SELECT SUM(amount) FROM '$EDGE'" \
+  "SELECT SUM(amount) FROM read_csv_auto('$EDGE')"
 
 # ════════════════════════════════════════════════════════════════
 # Large-file, quote-heavy regression check (#139): the parallel scalar-agg
