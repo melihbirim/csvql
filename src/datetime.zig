@@ -357,7 +357,58 @@ pub fn formatDateTime(allocator: std.mem.Allocator, timestamp: i64) ![]u8 {
 /// Apply a strftime format to an ISO-8601 datetime string (YYYY-MM-DD HH:MM:SS).
 /// Writes the result into `buf` (64 bytes) and returns the filled slice.
 /// Supported specifiers: %Y %m %d %H %M %S; all other characters are copied literally.
+/// Apply a strftime format to a datetime string. Parses `date_str` through
+/// `parseDateTime` first (so ISO-8601, US MM/DD/YYYY, EU DD.MM.YYYY, and
+/// compact YYYYMMDD are all handled correctly, matching DATEDIFF/DATEADD/
+/// EXTRACT's auto-detection) and formats from the resulting DateTime's
+/// fields. Falls back to the old fixed-offset ISO-8601 byte slicing only
+/// when the string doesn't parse as any recognized date format — garbage
+/// input stays garbage-in-garbage-out, but every real supported format now
+/// gets its actual year/month/day, not just ones that happen to be
+/// ISO-8601-shaped (#140: STRFTIME on a US/EU-formatted date silently
+/// returned bytes sliced from the wrong offsets, e.g. "01/20/2026" gave day
+/// "26" instead of "20").
 pub fn applyStrftime(fmt: []const u8, date_str: []const u8, buf: *[64]u8) []const u8 {
+    if (parseDateTime(date_str)) |ts| {
+        return applyStrftimeParsed(fmt, DateTime.fromTimestamp(ts), buf);
+    } else |_| {
+        return applyStrftimeRawFallback(fmt, date_str, buf);
+    }
+}
+
+fn applyStrftimeParsed(fmt: []const u8, dt: DateTime, buf: *[64]u8) []const u8 {
+    var pos: usize = 0;
+    var fi: usize = 0;
+    while (fi < fmt.len and pos + 4 <= buf.len) : (fi += 1) {
+        if (fmt[fi] == '%' and fi + 1 < fmt.len) {
+            fi += 1;
+            const written = switch (fmt[fi]) {
+                'Y' => std.fmt.bufPrint(buf[pos..], "{d:0>4}", .{@as(u32, @intCast(if (dt.year >= 0) dt.year else -dt.year))}) catch "",
+                'm' => std.fmt.bufPrint(buf[pos..], "{d:0>2}", .{dt.month}) catch "",
+                'd' => std.fmt.bufPrint(buf[pos..], "{d:0>2}", .{dt.day}) catch "",
+                'H' => std.fmt.bufPrint(buf[pos..], "{d:0>2}", .{dt.hour}) catch "",
+                'M' => std.fmt.bufPrint(buf[pos..], "{d:0>2}", .{dt.minute}) catch "",
+                'S' => std.fmt.bufPrint(buf[pos..], "{d:0>2}", .{dt.second}) catch "",
+                else => blk: {
+                    if (pos + 2 > buf.len) break :blk "";
+                    buf[pos] = '%';
+                    buf[pos + 1] = fmt[fi];
+                    break :blk buf[pos .. pos + 2];
+                },
+            };
+            pos += written.len;
+        } else {
+            buf[pos] = fmt[fi];
+            pos += 1;
+        }
+    }
+    return buf[0..pos];
+}
+
+/// Original fixed-offset ISO-8601 (YYYY-MM-DD HH:MM:SS) byte slicing —
+/// used only as a fallback when `date_str` doesn't parse as any recognized
+/// date format at all.
+fn applyStrftimeRawFallback(fmt: []const u8, date_str: []const u8, buf: *[64]u8) []const u8 {
     var pos: usize = 0;
     var fi: usize = 0;
     while (fi < fmt.len and pos + 4 <= buf.len) : (fi += 1) {
@@ -517,4 +568,26 @@ test "format datetime" {
     const formatted = try formatDateTime(std.testing.allocator, ts);
     defer std.testing.allocator.free(formatted);
     try std.testing.expectEqualStrings("2026-01-15 09:30:00", formatted);
+}
+
+test "applyStrftime extracts the correct fields from US and EU formatted dates, not just ISO-8601 (#140)" {
+    var buf: [64]u8 = undefined;
+
+    // ISO-8601 — always worked, byte offsets happened to line up.
+    try std.testing.expectEqualStrings("15", applyStrftime("%d", "2026-01-15", &buf));
+    try std.testing.expectEqualStrings("01", applyStrftime("%m", "2026-01-15", &buf));
+    try std.testing.expectEqualStrings("2026", applyStrftime("%Y", "2026-01-15", &buf));
+
+    // US MM/DD/YYYY — day 20, not the "26" the old byte-slicing produced.
+    try std.testing.expectEqualStrings("20", applyStrftime("%d", "01/20/2026", &buf));
+    try std.testing.expectEqualStrings("01", applyStrftime("%m", "01/20/2026", &buf));
+    try std.testing.expectEqualStrings("2026", applyStrftime("%Y", "01/20/2026", &buf));
+
+    // EU DD.MM.YYYY — day 25, not the "26" the old byte-slicing produced.
+    try std.testing.expectEqualStrings("25", applyStrftime("%d", "25.01.2026", &buf));
+    try std.testing.expectEqualStrings("01", applyStrftime("%m", "25.01.2026", &buf));
+    try std.testing.expectEqualStrings("2026", applyStrftime("%Y", "25.01.2026", &buf));
+
+    // Combined format string, EU date with a time component.
+    try std.testing.expectEqualStrings("2026-01-25", applyStrftime("%Y-%m-%d", "25.01.2026 14:30:00", &buf));
 }
