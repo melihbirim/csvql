@@ -992,10 +992,17 @@ TAXI_CSV="${SCRIPT_DIR}/bench/.taxi-data/trips.csv"
 if [[ -f "$TAXI_CSV" ]]; then
   echo ""
   echo "── Large quoted-field file, parallel WHERE (#139, real dataset) ─"
+  # null_padding=true: the raw dataset has at least one genuinely malformed
+  # row (fewer fields than the header) that DuckDB's strict-mode reader
+  # refuses outright by default (CSV Error, wrong column count). csvql pads
+  # a short row with empty fields rather than erroring (documented in
+  # CORRECTNESS.md's ragged-rows difference) — null_padding matches that
+  # semantic on DuckDB's side instead of asserting DuckDB's strict-mode
+  # rejection is the correct behavior to diff against.
   check \
     "COUNT(*) WHERE trip_distance > 5 (taxi dataset, parallel scan)" \
     "SELECT COUNT(*) FROM '$TAXI_CSV' WHERE trip_distance > 5" \
-    "SELECT COUNT(*) FROM read_csv_auto('$TAXI_CSV') WHERE trip_distance > 5"
+    "SELECT COUNT(*) FROM read_csv_auto('$TAXI_CSV', null_padding=true) WHERE trip_distance > 5"
 fi
 
 # ════════════════════════════════════════════════════════════════
