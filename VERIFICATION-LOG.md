@@ -18,3 +18,4 @@ new, not that csvql is bug-free outside this scope.
 | Date | Seed | Queries | Mismatches | csvql | DuckDB | Notes |
 | ---- | ---- | ------- | ---------- | ----- | ------ | ----- |
 <!-- nightly-fuzz.yml appends new rows below this line -->
+| 2026-08-22 | 1897126267 | 50000 | 0 | 2.5.0 | 1.5.5 |  |
