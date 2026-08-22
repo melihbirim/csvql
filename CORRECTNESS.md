@@ -40,12 +40,20 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
   directly.
 - **Differential query generator** (`bench/query_fuzz.sh`, #141): template-based, not a
   full grammar fuzzer — single table, WHERE predicates (numeric + string columns,
-  compound AND/OR) and aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, scalar and
-  `GROUP BY`) against the existing fixture schema. Deterministic seeding (`--seed`) so
-  every mismatch reproduces with one command; failures dump to `tests/regressions/`
-  permanently instead of using a shrinker. Runs at smoke scale in CI (300 queries per
-  run); run locally with a higher `--count` for deeper coverage. No JOINs, no
-  subqueries — out of scope by design, see the issue for why.
+  compound AND/OR, `LIKE`, `IS NULL`/`IS NOT NULL`) and aggregates
+  (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, scalar and `GROUP BY`) against the existing fixture
+  schema. No JOINs, no subqueries, no window functions — out of scope by design, see
+  the issue for why. Deterministic seeding (`--seed`) so every mismatch reproduces with
+  one command; failures dump to `tests/regressions/` permanently instead of using a
+  shrinker. DuckDB's side runs as one batched process (materialized table + all
+  queries in a single `duckdb -f` invocation) rather than one process per query —
+  the difference between hundreds and tens of thousands of queries in the same wall
+  time.
+  - **Per PR**: fixed seed, 300 queries (~15s) — catches a regression before merge.
+  - **Nightly**: random seed, higher volume — this is where the cumulative number
+    comes from. Every run appends one line to [VERIFICATION-LOG.md](VERIFICATION-LOG.md),
+    win or lose; a mismatch stays in the log with its count, not just the zeros.
+  - **Per release tag**: not yet wired up — see Known gaps.
 
 ## Oracle methodology
 
@@ -121,7 +129,7 @@ point.
 | Window functions (`RANK() OVER (...)`, etc.) | [#126](https://github.com/melihbirim/csvql/issues/126) |
 | `OFFSET` clause | [#70](https://github.com/melihbirim/csvql/issues/70) |
 | DuckDB CLI version not pinned in CI (`--version` is whatever `latest` resolves to at run time) | not yet filed |
-| Differential query generator (`bench/query_fuzz.sh`, #141) only runs at smoke scale in CI (300 queries) — each query spawns a fresh DuckDB CLI process (~100ms cold start), so hitting the original plan's 10k/PR needs a batched or process-reuse runner first; 1M nightly needs that plus a scheduled job that doesn't exist yet | [#141](https://github.com/melihbirim/csvql/issues/141) |
+Per-release-tag differential fuzz run (bigger volume than nightly, recorded in the release notes) isn't wired up yet — only per-PR (fixed seed, smoke scale) and nightly (random seed, volume) exist | [#141](https://github.com/melihbirim/csvql/issues/141) |
 | Coverage measurement (line coverage per module) not wired up | not yet filed |
 | No Windows-specific adversarial subset in CI (CRLF is tested on macOS/Linux; Windows' own line-ending and path-separator handling isn't independently verified) | not yet filed |
 

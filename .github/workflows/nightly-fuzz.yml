@@ -1,0 +1,107 @@
+name: Nightly Differential Fuzz
+
+# Volume run of the differential query generator (bench/query_fuzz.sh, #141).
+# Different purpose from the per-PR smoke check in ci.yml: that one uses a
+# fixed seed to catch a regression before merge; this one uses a random seed
+# each run — a fixed seed re-tests the exact same queries forever, which
+# stops finding anything new past the first run. This job is where the
+# cumulative "N queries verified" number actually comes from: results
+# append to VERIFICATION-LOG.md, which accumulates across every run.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"  # 03:17 UTC daily — avoid the top-of-hour stampede
+  workflow_dispatch:
+    inputs:
+      count:
+        description: "Number of queries to generate"
+        required: false
+        default: "50000"
+
+permissions:
+  contents: write
+
+jobs:
+  nightly-fuzz:
+    name: Nightly differential fuzz (volume)
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: 0.15.2
+
+    - name: Build (ReleaseFast)
+      run: zig build -Doptimize=ReleaseFast
+
+    - name: Install DuckDB CLI
+      run: |
+        curl -fsSL https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-linux-amd64.zip -o duckdb.zip
+        unzip -o duckdb.zip -d /usr/local/bin
+        chmod +x /usr/local/bin/duckdb
+
+    - name: Generate fixture CSV
+      run: |
+        awk 'BEGIN{
+          split("Alice Bob Carol Dave Eve Frank Grace Heidi", names, " ");
+          split("Austin Boston Chicago Denver LA NYC SF Seattle", cities, " ");
+          split("Engineering Finance HR Marketing Operations Sales", depts, " ");
+          print "id,name,age,city,salary,department";
+          for (i = 1; i <= 20000; i++) {
+            n = names[(i % 8) + 1]; c = cities[(i % 8) + 1]; d = depts[(i % 6) + 1];
+            age = 20 + (i % 40);
+            salary = 40000 + (i % 80) * 1000;
+            print i","n","age","c","salary","d;
+          }
+        }' > large_test.csv
+
+    - name: Pick a random seed and query count
+      id: params
+      run: |
+        SEED=$RANDOM$RANDOM
+        COUNT="${{ github.event.inputs.count || '50000' }}"
+        echo "seed=$SEED" >> "$GITHUB_OUTPUT"
+        echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+    - name: Run differential query generator at volume
+      id: fuzz
+      run: |
+        set +e
+        ./bench/query_fuzz.sh --seed "${{ steps.params.outputs.seed }}" --count "${{ steps.params.outputs.count }}" \
+          | tee fuzz_output.txt
+        echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+    - name: Append result to VERIFICATION-LOG.md
+      run: |
+        CSVQL_VERSION="$(./zig-out/bin/csvql --version 2>&1 | awk '{print $2}')"
+        DUCKDB_VERSION="$(duckdb --version | awk '{print $1}' | tr -d 'v')"
+        MISMATCHES="$(grep -oE '[0-9]+ mismatches' fuzz_output.txt | awk '{print $1}')"
+        MISMATCHES="${MISMATCHES:-unknown}"
+        NOTES=""
+        if [ "$MISMATCHES" != "0" ] && [ "$MISMATCHES" != "unknown" ]; then
+          NOTES="see tests/regressions/ from this run's artifact"
+        fi
+        echo "| $(date -u +%Y-%m-%d) | ${{ steps.params.outputs.seed }} | ${{ steps.params.outputs.count }} | ${MISMATCHES} | ${CSVQL_VERSION} | ${DUCKDB_VERSION} | ${NOTES} |" >> VERIFICATION-LOG.md
+
+    - name: Commit VERIFICATION-LOG.md
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+        git add VERIFICATION-LOG.md
+        git diff --staged --quiet || git commit -m "chore: nightly differential fuzz result"
+        git push
+
+    - name: Upload regression files (if any)
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: nightly-fuzz-regressions
+        path: tests/regressions/
+        if-no-files-found: ignore
+
+    - name: Fail the job if any mismatch was found
+      run: exit "${{ steps.fuzz.outputs.exit_code }}"

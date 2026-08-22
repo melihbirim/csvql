@@ -180,7 +180,7 @@ function emit_scalar_agg() {
     where = gen_where()
     arg = (agg == "COUNT" && rand() < 0.3) ? "*" : numcol
     csvql_sql = "SELECT " agg "(" arg ") FROM '"'"'" csv "'"'"' WHERE " where
-    duck_sql = "SELECT " agg "(" arg ") FROM read_csv_auto('"'"'" csv "'"'"') WHERE " where
+    duck_sql = "SELECT " agg "(" arg ") FROM __fuzz_csv WHERE " where
     print "scalar_agg\t" csvql_sql "\t" duck_sql
 }
 
@@ -191,7 +191,7 @@ function emit_groupby_agg() {
     where = gen_where()
     arg = (agg == "COUNT" && rand() < 0.3) ? "*" : numcol
     csvql_sql = "SELECT " group_col ", " agg "(" arg ") FROM '"'"'" csv "'"'"' WHERE " where " GROUP BY " group_col " ORDER BY " group_col
-    duck_sql = "SELECT " group_col ", " agg "(" arg ") FROM read_csv_auto('"'"'" csv "'"'"') WHERE " where " GROUP BY " group_col " ORDER BY " group_col
+    duck_sql = "SELECT " group_col ", " agg "(" arg ") FROM __fuzz_csv WHERE " where " GROUP BY " group_col " ORDER BY " group_col
     print "groupby_agg\t" csvql_sql "\t" duck_sql
 }
 
@@ -215,60 +215,89 @@ function emit_projection() {
     # ORDER BY id makes row order deterministic (id is unique) so output
     # can be diffed exactly instead of needing a sort-before-compare step.
     csvql_sql = "SELECT " cols_str " FROM '"'"'" csv "'"'"' WHERE " where " ORDER BY id"
-    duck_sql = "SELECT " cols_str " FROM read_csv_auto('"'"'" csv "'"'"') WHERE " where " ORDER BY id"
+    duck_sql = "SELECT " cols_str " FROM __fuzz_csv WHERE " where " ORDER BY id"
     print "projection\t" csvql_sql "\t" duck_sql
 }
 ' > "$QUERIES_FILE"
 
-# ── Normalize + compare one pair of outputs ─────────────────────────────
-# Rounds numeric-looking fields to 4dp (float formatting tolerance, same as
-# verify_correctness.sh's check_approx) and maps an empty field to NULL,
-# matching the documented empty-string-vs-NULL difference (CORRECTNESS.md)
-# so it isn't reported as a mismatch — that's a known, intentional
-# difference, not something this generator should rediscover every run.
-normalize() {
-  awk '{
-    n = split($0, fields, ",")
-    if (n == 0) {
-      # awk split("", arr, sep) returns 0 fields, not one empty field — a
-      # genuinely empty row (single empty-string column) would otherwise
-      # silently vanish here instead of normalizing to NULL like it should.
-      print "NULL"
-      next
-    }
-    out = ""
-    for (i = 1; i <= n; i++) {
-      f = fields[i]
-      if (f == "" || f == "NULL") f = "NULL"
-      else if (f ~ /^-?[0-9]+(\.[0-9]+)?$/) f = sprintf("%.4f", f)
-      out = (i == 1) ? f : out "," f
-    }
-    print out
-  }'
-}
+# ── Batch the DuckDB side into ONE process ──────────────────────────────
+# csvql's own startup is ~5ms; the DuckDB CLI's is ~85ms (measured) — nearly
+# all of this script's wall time was DuckDB process spawn, not query
+# execution. Running N statements through one `duckdb -f` invocation
+# instead of N separate invocations is the difference between a few hundred
+# queries and tens of thousands in the same wall time.
+#
+# `.bail off` makes DuckDB continue past a statement error instead of
+# aborting the whole batch (default CLI behavior stops at the first error,
+# confirmed by testing — a batch with 300+ generated queries WILL contain
+# at least one DuckDB-side quirk eventually). A BEGIN/END marker row wraps
+# each query so its output block is unambiguous regardless of row count —
+# including zero, which is a legitimate result for some generated queries,
+# not just a marker of failure.
+#
+# CREATE TABLE once instead of read_csv_auto() per statement: the CSV
+# sniffing/type-inference read_csv_auto does on every call turned out to be
+# the dominant cost once process-spawn was eliminated (measured: 300 calls
+# to read_csv_auto() in one duckdb process still took ~17s; against a
+# pre-materialized table, the same 300 queries took ~0.15s). Every
+# generated duck_sql references the fixed table name __fuzz_csv.
+BATCH_SQL="$TMP/batch.sql"
+BATCH_OUT="$TMP/batch_out.txt"
+BATCH_ERR="$TMP/batch_err.txt"
+{
+  echo ".bail off"
+  echo "CREATE TABLE __fuzz_csv AS SELECT * FROM read_csv_auto('${CSV}');"
+  i=0
+  while IFS=$'\t' read -r _kind _csvql_sql duck_sql; do
+    echo "SELECT '@@BEGIN${i}@@' AS m;"
+    echo "$duck_sql;"
+    echo "SELECT '@@END${i}@@' AS m;"
+    i=$((i + 1))
+  done < "$QUERIES_FILE"
+} > "$BATCH_SQL"
 
+"$DUCKDB" -csv -noheader -f "$BATCH_SQL" > "$BATCH_OUT" 2> "$BATCH_ERR"
+
+# Split the one combined DuckDB output back into per-query files, keyed by
+# the BEGIN<i>/END<i> markers.
+awk -v tmp="$TMP" '
+  /^@@BEGIN[0-9]+@@$/ { idx = substr($0, 8, length($0) - 9); out = tmp "/duck_" idx ".txt"; next }
+  /^@@END[0-9]+@@$/ { close(out); out = ""; next }
+  out != "" { print > out }
+' "$BATCH_OUT"
+
+# ── Run csvql (the irreducible per-query cost — this is the thing under
+# test) once per query, raw output only, no pipe through tail/awk/diff. All
+# normalization and comparison happens afterward in ONE awk pass instead of
+# ~4 subprocess spawns per query (tail + 2×normalize + diff) — that
+# bash-loop overhead, not query execution, was the dominant cost once the
+# DuckDB side was batched (measured: ~50ms/query wall time against ~5ms
+# actual csvql runtime).
 total=0
-failed=0
-declare -a failure_paths=()
-
+mkdir -p "$REGRESSIONS_DIR"
+: > "$TMP/csvql_failures.tsv"
+i=0
 while IFS=$'\t' read -r kind csvql_sql duck_sql; do
+  i=$((i + 1))
   total=$((total + 1))
-
-  out_csvql="$TMP/csvql_${total}.txt"
-  out_duck="$TMP/duck_${total}.txt"
-  err_csvql="$TMP/csvql_err_${total}.txt"
-  err_duck="$TMP/duck_err_${total}.txt"
-
-  "$CSVQL" "$csvql_sql" 2>"$err_csvql" | tail -n +2 | normalize > "$out_csvql"
-  csvql_rc=${PIPESTATUS[0]}
-  "$DUCKDB" -csv -noheader -c "$duck_sql" 2>"$err_duck" | normalize > "$out_duck"
-  duck_rc=${PIPESTATUS[0]}
-
+  "$CSVQL" "$csvql_sql" > "$TMP/csvql_${i}.txt" 2> "$TMP/csvql_err_${i}.txt"
+  csvql_rc=$?
   if [[ $csvql_rc -ne 0 ]]; then
-    echo "[seed=$SEED q=$total] csvql exited $csvql_rc: $csvql_sql"
-    sed 's/^/  /' "$err_csvql"
-    dump_path="$REGRESSIONS_DIR/seed${SEED}_q${total}_${kind}.txt"
-    mkdir -p "$REGRESSIONS_DIR"
+    printf '%s\t%s\t%s\t%s\t%s\n' "$i" "$kind" "$csvql_sql" "$duck_sql" "$csvql_rc" >> "$TMP/csvql_failures.tsv"
+    if [[ $STOP_ON_FAIL -eq 1 ]]; then break; fi
+  fi
+done < "$QUERIES_FILE"
+
+declare -a failure_paths=()
+failed=0
+
+# Report csvql-side crashes/errors first (these are always real bugs, never
+# a "DuckDB disagreed" case).
+if [[ -s "$TMP/csvql_failures.tsv" ]]; then
+  while IFS=$'\t' read -r i kind csvql_sql duck_sql csvql_rc; do
+    echo "[seed=$SEED q=$i] csvql exited $csvql_rc: $csvql_sql"
+    sed 's/^/  /' "$TMP/csvql_err_${i}.txt"
+    dump_path="$REGRESSIONS_DIR/seed${SEED}_q${i}_${kind}.txt"
     {
       echo "# Reproduce: ./bench/query_fuzz.sh --seed $SEED --count $COUNT --stop-on-fail"
       echo "kind: $kind"
@@ -276,48 +305,112 @@ while IFS=$'\t' read -r kind csvql_sql duck_sql; do
       echo "duck_sql: $duck_sql"
       echo "csvql_rc: $csvql_rc"
       echo "--- csvql stderr ---"
-      cat "$err_csvql"
+      cat "$TMP/csvql_err_${i}.txt"
     } > "$dump_path"
     failure_paths+=("$dump_path")
     failed=$((failed + 1))
-    [[ $STOP_ON_FAIL -eq 1 ]] && break
-    continue
-  fi
-  if [[ $duck_rc -ne 0 ]]; then
-    # DuckDB itself rejected the query — not a csvql bug, most likely the
-    # generator producing something DuckDB's sniffer can't handle for this
-    # fixture. Report but don't count as a csvql failure.
-    echo "[seed=$SEED q=$total] duckdb exited $duck_rc (not a csvql bug, skipping): $duck_sql"
-    continue
-  fi
+  done < "$TMP/csvql_failures.tsv"
+fi
 
-  if ! diff -q "$out_duck" "$out_csvql" > /dev/null 2>&1; then
-    echo "[seed=$SEED q=$total] MISMATCH ($kind):"
+# One awk pass: normalize + diff every (csvql_i, duck_(i-1)) file pair and
+# report mismatches — replaces what used to be a diff + 2×normalize
+# subprocess spawn per query.
+MISMATCH_REPORT="$TMP/mismatches.tsv"
+awk -v tmp="$TMP" -v total="$total" -v queries_file="$QUERIES_FILE" -v failtsv="$TMP/csvql_failures.tsv" '
+  # macOS one-true-awk quirk: a name used as an array anywhere in the
+  # program (even in an unrelated function-local scope) cannot also be used
+  # as a scalar anywhere else, including a different functions parameter of
+  # the same name. Every identifier below is unique across the whole
+  # script on purpose — do not reuse a short name like "f" or "line" again.
+  function normalize_field(val) {
+    if (val == "" || val == "NULL") return "NULL"
+    if (val ~ /^-?[0-9]+(\.[0-9]+)?$/) return sprintf("%.4f", val)
+    return val
+  }
+  function normalize_row(rawrow,    nfields, colidx, colparts, outrow, normed) {
+    nfields = split(rawrow, colparts, ",")
+    if (nfields == 0) return "NULL"
+    outrow = ""
+    for (colidx = 1; colidx <= nfields; colidx++) {
+      normed = normalize_field(colparts[colidx])
+      outrow = (colidx == 1) ? normed : outrow "," normed
+    }
+    return outrow
+  }
+  function read_rows(path, dest, skip_first,    rowtext, is_header, rowcount) {
+    rowcount = 0
+    is_header = skip_first
+    while ((getline rowtext < path) > 0) {
+      if (is_header) { is_header = 0; continue }
+      dest[rowcount++] = normalize_row(rowtext)
+    }
+    close(path)
+    return rowcount
+  }
+  BEGIN {
+    while ((getline tsvline < failtsv) > 0) {
+      split(tsvline, failparts, "\t")
+      skip_idx[failparts[1]] = 1
+    }
+    close(failtsv)
+
+    qnum = 0
+    while ((getline tsvline < queries_file) > 0) {
+      qnum++
+      if (qnum in skip_idx) continue
+      split(tsvline, qparts, "\t")
+      qkind = qparts[1]; qcsvql_sql = qparts[2]; qduck_sql = qparts[3]
+
+      n_csvql_rows = read_rows(tmp "/csvql_" qnum ".txt", csvql_rows, 1)  # csvql always writes a header row
+      n_duck_rows = read_rows(tmp "/duck_" (qnum - 1) ".txt", duck_rows, 0)  # -noheader: no header row to skip
+
+      row_mismatch = (n_csvql_rows != n_duck_rows)
+      if (!row_mismatch) {
+        for (rowidx = 0; rowidx < n_csvql_rows; rowidx++) {
+          if (csvql_rows[rowidx] != duck_rows[rowidx]) { row_mismatch = 1; break }
+        }
+      }
+      if (row_mismatch) {
+        dumpfile = tmp "/dump_" qnum ".txt"
+        print "kind: " qkind > dumpfile
+        print "csvql_sql: " qcsvql_sql >> dumpfile
+        print "duck_sql: " qduck_sql >> dumpfile
+        print "--- csvql output (normalized) ---" >> dumpfile
+        for (rowidx = 0; rowidx < n_csvql_rows; rowidx++) print csvql_rows[rowidx] >> dumpfile
+        print "--- duckdb output (normalized) ---" >> dumpfile
+        for (rowidx = 0; rowidx < n_duck_rows; rowidx++) print duck_rows[rowidx] >> dumpfile
+        close(dumpfile)
+        print qnum "\t" qkind "\t" qcsvql_sql "\t" qduck_sql
+      }
+    }
+  }
+' > "$MISMATCH_REPORT"
+
+if [[ -s "$MISMATCH_REPORT" ]]; then
+  while IFS=$'\t' read -r i kind csvql_sql duck_sql; do
+    echo "[seed=$SEED q=$i] MISMATCH ($kind):"
     echo "  csvql: $csvql_sql"
     echo "  duck:  $duck_sql"
-    diff "$out_duck" "$out_csvql" | head -10 | sed 's/^/    /' | \
-      sed "s/^    </    ${DIM}duck  <${RESET}/" | \
-      sed "s/^    >/    ${RESET}csvql >${RESET}/"
-    dump_path="$REGRESSIONS_DIR/seed${SEED}_q${total}_${kind}.txt"
-    mkdir -p "$REGRESSIONS_DIR"
+    head -20 "$TMP/dump_${i}.txt" | tail -n +4 | sed 's/^/    /'
+    dump_path="$REGRESSIONS_DIR/seed${SEED}_q${i}_${kind}.txt"
     {
       echo "# Reproduce: ./bench/query_fuzz.sh --seed $SEED --count $COUNT --stop-on-fail"
-      echo "kind: $kind"
-      echo "csvql_sql: $csvql_sql"
-      echo "duck_sql: $duck_sql"
-      echo "--- csvql output ---"
-      cat "$out_csvql"
-      echo "--- duckdb output ---"
-      cat "$out_duck"
+      cat "$TMP/dump_${i}.txt"
     } > "$dump_path"
     echo "  dumped to $dump_path"
     failure_paths+=("$dump_path")
     failed=$((failed + 1))
-    [[ $STOP_ON_FAIL -eq 1 ]] && break
-  fi
-done < "$QUERIES_FILE"
+  done < "$MISMATCH_REPORT"
+fi
 
 echo ""
+if [[ -s "$BATCH_ERR" ]]; then
+  echo "DuckDB reported $(wc -l < "$BATCH_ERR" | tr -d ' ') stderr line(s) somewhere in the batch"
+  echo "(a query the generator produced that DuckDB itself rejected — not"
+  echo "necessarily a csvql bug; if a MISMATCH above looks like this, check"
+  echo "whether the DuckDB output is simply missing for that query):"
+  sed 's/^/  /' "$BATCH_ERR"
+fi
 echo "$total queries run, $failed mismatches, seed=$SEED"
 if [[ $failed -gt 0 ]]; then
   echo "Regression files:"
