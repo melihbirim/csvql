@@ -295,7 +295,7 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 | **DATEDIFF**  | `DATEDIFF('unit', start_col, end_col)` — duration between two datetime columns. Units: `second`, `minute`, `hour`, `day`, `week`, `month` (≈30 days), `year` (≈365 days). Auto-detects ISO-8601, US (MM/DD/YYYY), EU (DD.MM.YYYY) and mixed formats in the same file |
 | **DATEADD**   | `DATEADD('unit', amount, date_col)` — add/subtract interval from a datetime column. `amount` may be negative. Units: `second`, `minute`, `hour`, `day`, `week`, `month` (≈30 days), `year` (≈365 days). Returns `YYYY-MM-DD HH:MM:SS` |
 | **ORDER BY**  | `ORDER BY col [ASC\|DESC]`, multi-column `ORDER BY col1 ASC, col2 DESC`, alias, positional (`ORDER BY 1`), or a column not in the `SELECT` list (sorts by the raw source/grouping column) |
-| **LIMIT**     | `LIMIT n`                                                               |
+| **LIMIT / OFFSET** | `LIMIT n [OFFSET m]` — return up to `n` rows after skipping the first `m` result rows |
 
 ### Known differences from DuckDB
 
@@ -318,7 +318,6 @@ Not yet supported — these error clearly rather than silently returning wrong d
 | Subqueries (`WHERE col IN (SELECT ...)`, `HAVING x > (SELECT ...)`) | [#124](https://github.com/melihbirim/csvql/issues/124) |
 | `UNION` / `INTERSECT` / `EXCEPT` | [#122](https://github.com/melihbirim/csvql/issues/122), [#127](https://github.com/melihbirim/csvql/issues/127) |
 | Window functions (`RANK() OVER (...)`, etc.) | [#126](https://github.com/melihbirim/csvql/issues/126) |
-| `OFFSET` clause | [#70](https://github.com/melihbirim/csvql/issues/70) |
 
 ### Aggregate Examples
 
@@ -860,7 +859,7 @@ headers, rows = csvql.query_tuples("SELECT name, age FROM 'employees.csv'")
 | `REPLACE`, `SPLIT_PART`, `GREATEST`, `LEAST` | [#67](https://github.com/melihbirim/csvql/issues/67) | ✅ shipped (v1.8.0) |
 | `VARIANCE`, `STDDEV`, `MEDIAN`, `GROUP_CONCAT` | [#50](https://github.com/melihbirim/csvql/issues/50) | ✅ shipped (v1.9.0) |
 | HTTP/SSE MCP transport (shared service) | [#60](https://github.com/melihbirim/csvql/issues/60) | planned             |
-| `OFFSET` clause | [#70](https://github.com/melihbirim/csvql/issues/70) | help wanted |
+| `OFFSET` clause | [#70](https://github.com/melihbirim/csvql/issues/70) | ✅ shipped |
 | `--markdown` output | [#72](https://github.com/melihbirim/csvql/issues/72) | help wanted |
 | Shell completions (bash/zsh) | [#73](https://github.com/melihbirim/csvql/issues/73) | help wanted |
 

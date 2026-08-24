@@ -235,6 +235,7 @@ pub const Query = struct {
     having_expr: ?Expression,
     group_by: [][]u8,
     limit: i32,
+    offset: i32,
     order_by: ?OrderBy,
     /// All JOIN clauses in order (empty slice when there is no JOIN).
     joins: []JoinClause,
@@ -504,6 +505,7 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
         .having_expr = null,
         .group_by = undefined,
         .limit = -1,
+        .offset = 0,
         .order_by = null,
         .joins = &.{},
         .allocator = allocator,
@@ -616,7 +618,7 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
             const right_raw = std.mem.trim(u8, cursor[0..on_pos], &std.ascii.whitespace);
             const after_on = cursor[on_pos + 4 ..]; // skip " ON "
 
-            // Find end of ON condition: stop at the next JOIN keyword OR at WHERE/GROUP/ORDER/LIMIT.
+            // Find end of ON condition: stop at the next JOIN keyword OR at WHERE/GROUP/ORDER/LIMIT/OFFSET.
             // We must stop at the *next* JOIN keyword before any clause keyword so that chained
             // joins are parsed left–to–right rather than lumping everything into one condition.
             const next_join_kw = detectJoinKeyword(after_on);
@@ -624,12 +626,14 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
             const on_group = std.ascii.indexOfIgnoreCase(after_on, "GROUP BY");
             const on_order = std.ascii.indexOfIgnoreCase(after_on, "ORDER BY");
             const on_limit = std.ascii.indexOfIgnoreCase(after_on, "LIMIT");
+            const on_offset = std.ascii.indexOfIgnoreCase(after_on, "OFFSET");
             var on_end = after_on.len;
             if (next_join_kw) |njk| on_end = @min(on_end, njk.kw_start);
             if (on_where) |i| on_end = @min(on_end, i);
             if (on_group) |i| on_end = @min(on_end, i);
             if (on_order) |i| on_end = @min(on_end, i);
             if (on_limit) |i| on_end = @min(on_end, i);
+            if (on_offset) |i| on_end = @min(on_end, i);
 
             const on_cond = std.mem.trim(u8, after_on[0..on_end], &std.ascii.whitespace);
 
@@ -694,12 +698,14 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
         const group_by_idx_pre = findClauseKeyword(from_rest, "GROUP BY");
         const order_by_idx_pre = findClauseKeyword(from_rest, "ORDER BY");
         const limit_idx_pre = findClauseKeyword(from_rest, "LIMIT");
+        const offset_idx_pre = findClauseKeyword(from_rest, "OFFSET");
 
         var fend = from_rest.len;
         if (where_idx_pre) |i| fend = @min(fend, i);
         if (group_by_idx_pre) |i| fend = @min(fend, i);
         if (order_by_idx_pre) |i| fend = @min(fend, i);
         if (limit_idx_pre) |i| fend = @min(fend, i);
+        if (offset_idx_pre) |i| fend = @min(fend, i);
 
         const fp_raw = std.mem.trim(u8, from_rest[0..fend], &std.ascii.whitespace);
         const file_alias = try extractFileAndAlias(allocator, fp_raw);
@@ -727,12 +733,13 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
         }
     }
 
-    // Parse the clause keywords (WHERE / GROUP BY / ORDER BY / LIMIT) from `rest`
+    // Parse the clause keywords (WHERE / GROUP BY / ORDER BY / LIMIT / OFFSET) from `rest`
     const where_idx = findClauseKeyword(rest, "WHERE");
     const group_by_idx = findClauseKeyword(rest, "GROUP BY");
     const having_idx = findClauseKeyword(rest, "HAVING");
     const order_by_idx = findClauseKeyword(rest, "ORDER BY");
     const limit_idx = findClauseKeyword(rest, "LIMIT");
+    const offset_idx = findClauseKeyword(rest, "OFFSET");
 
     // Parse WHERE clause if present
     if (where_idx) |idx| {
@@ -743,6 +750,8 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
             where_part = where_part[0..@min(where_part.len, oidx - idx - 5)];
         } else if (limit_idx) |lidx| {
             where_part = where_part[0..@min(where_part.len, lidx - idx - 5)];
+        } else if (offset_idx) |oidx| {
+            where_part = where_part[0..@min(where_part.len, oidx - idx - 5)];
         }
         where_part = std.mem.trim(u8, where_part, &std.ascii.whitespace);
         query.where_expr = try parseExpression(allocator, where_part);
@@ -757,6 +766,8 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
             group_by_part = group_by_part[0..@min(group_by_part.len, oidx - idx - 8)];
         } else if (limit_idx) |lidx| {
             group_by_part = group_by_part[0..@min(group_by_part.len, lidx - idx - 8)];
+        } else if (offset_idx) |oidx| {
+            group_by_part = group_by_part[0..@min(group_by_part.len, oidx - idx - 8)];
         }
         group_by_part = std.mem.trim(u8, group_by_part, &std.ascii.whitespace);
 
@@ -776,6 +787,8 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
             having_part = having_part[0..@min(having_part.len, oidx - idx - 6)];
         } else if (limit_idx) |lidx| {
             having_part = having_part[0..@min(having_part.len, lidx - idx - 6)];
+        } else if (offset_idx) |oidx| {
+            having_part = having_part[0..@min(having_part.len, oidx - idx - 6)];
         }
         having_part = std.mem.trim(u8, having_part, &std.ascii.whitespace);
         query.having_expr = try parseExpression(allocator, having_part);
@@ -786,6 +799,8 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
         var order_by_part = rest[idx + 8 ..];
         if (limit_idx) |lidx| {
             order_by_part = order_by_part[0..@min(order_by_part.len, lidx - idx - 8)];
+        } else if (offset_idx) |oidx| {
+            order_by_part = order_by_part[0..@min(order_by_part.len, oidx - idx - 8)];
         }
         order_by_part = std.mem.trim(u8, order_by_part, &std.ascii.whitespace);
 
@@ -849,10 +864,21 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
     // the query.limit < 0 sentinel used downstream to mean "no LIMIT clause
     // was given at all" (issue #106).
     if (limit_idx) |idx| {
-        const limit_part = std.mem.trim(u8, rest[idx + 5 ..], &std.ascii.whitespace);
+        var limit_part = rest[idx + 5 ..];
+        if (offset_idx) |oidx| {
+            limit_part = limit_part[0..@min(limit_part.len, oidx - idx - 5)];
+        }
+        limit_part = std.mem.trim(u8, limit_part, &std.ascii.whitespace);
         const parsed_limit = try std.fmt.parseInt(i32, limit_part, 10);
         if (parsed_limit < 0) return error.NegativeLimitNotAllowed;
         query.limit = parsed_limit;
+    }
+
+    if (offset_idx) |idx| {
+        const offset_part = std.mem.trim(u8, rest[idx + 6 ..], &std.ascii.whitespace);
+        const parsed_offset = try std.fmt.parseInt(i32, offset_part, 10);
+        if (parsed_offset < 0) return error.NegativeOffsetNotAllowed;
+        query.offset = parsed_offset;
     }
 
     return query;

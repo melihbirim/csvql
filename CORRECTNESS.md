@@ -26,7 +26,7 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
   diffed raw — see below), scientific notation and negative zero, header-only/
   single-row/single-column files, ragged rows, a zero-byte file, and values near
   i64/f64 limits.
-- **531 unit tests** (`zig build test`) covering internals differential testing can't
+- **541 unit tests** (`zig build test`) covering internals differential testing can't
   reach directly: parser edge cases, arena-buffer offset safety across reallocation,
   overflow handling, TDD regression tests for every numbered bug fix referenced below.
 - **2 platforms in CI**: `ubuntu-latest` (x86_64) and `macos-14` (Apple Silicon,
@@ -127,7 +127,6 @@ point.
 | Subqueries (`WHERE col IN (SELECT ...)`, `HAVING x > (SELECT ...)`) | [#124](https://github.com/melihbirim/csvql/issues/124) |
 | `UNION` / `INTERSECT` / `EXCEPT` | [#122](https://github.com/melihbirim/csvql/issues/122), [#127](https://github.com/melihbirim/csvql/issues/127) |
 | Window functions (`RANK() OVER (...)`, etc.) | [#126](https://github.com/melihbirim/csvql/issues/126) |
-| `OFFSET` clause | [#70](https://github.com/melihbirim/csvql/issues/70) |
 | DuckDB CLI version not pinned in CI (`--version` is whatever `latest` resolves to at run time) | not yet filed |
 Per-release-tag differential fuzz run (bigger volume than nightly, recorded in the release notes) isn't wired up yet — only per-PR (fixed seed, smoke scale) and nightly (random seed, volume) exist | [#141](https://github.com/melihbirim/csvql/issues/141) |
 | Coverage measurement (line coverage per module) not wired up | not yet filed |

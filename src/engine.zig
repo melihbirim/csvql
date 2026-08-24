@@ -53,6 +53,22 @@ const appendJsonStringToArena = arena_buffer.appendJsonStringToArena;
 /// Result row for ORDER BY buffering — uses fast_sort SortKey
 const SortEntry = fast_sort.SortKey;
 
+const OutputWindow = struct { start: usize, end: usize };
+
+fn outputWindow(total: usize, offset: i32, limit: i32) OutputWindow {
+    const start = @min(total, @as(usize, @intCast(offset)));
+    const end = if (limit >= 0)
+        @min(total, start + @as(usize, @intCast(limit)))
+    else
+        total;
+    return .{ .start = start, .end = end };
+}
+
+fn sortLimit(offset: i32, limit: i32) ?usize {
+    if (limit < 0) return null;
+    return @as(usize, @intCast(offset)) + @as(usize, @intCast(limit));
+}
+
 /// Stores arena-relative offsets for an ORDER BY row during buffering.
 /// Converted to real slices (SortEntry) AFTER the arena stops growing.
 /// This avoids the dangling-pointer bug where ArenaBuffer.append() can
@@ -416,7 +432,8 @@ pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.Fi
         if (stat_s.size > 10 * 1024 * 1024 and
             query.order_by == null and
             !query.distinct and
-            query.limit < 0)
+            query.limit < 0 and
+            query.offset == 0)
         {
             const nc = options_mod.effectiveThreadCount(opts);
             if (nc > 1) {
@@ -436,7 +453,7 @@ pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.Fi
     const file_stat = try file.stat();
 
     // Use parallel memory-mapped I/O for large files (2+ cores, no LIMIT unless ORDER BY)
-    if (file_stat.size > 10 * 1024 * 1024 and (query.limit < 0 or query.limit > 100000 or query.order_by != null)) {
+    if (query.offset == 0 and file_stat.size > 10 * 1024 * 1024 and (query.limit < 0 or query.limit > 100000 or query.order_by != null)) {
         const num_threads = options_mod.effectiveThreadCount(opts);
         if (num_threads > 1) {
             try parallel_mmap.executeParallelMapped(allocator, query, file, output_file, opts);
@@ -445,7 +462,7 @@ pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.Fi
     }
 
     // Use memory-mapped I/O for medium-large files
-    if (file_stat.size > 5 * 1024 * 1024) {
+    if (query.offset == 0 and file_stat.size > 5 * 1024 * 1024) {
         try mmap_engine.executeMapped(allocator, query, file, output_file, opts);
         return;
     }
@@ -624,6 +641,7 @@ fn executeSequential(
     // Process rows
     var row_count: i32 = 0;
     var rows_written: i32 = 0;
+    var rows_skipped: i32 = 0;
 
     // Pre-allocate output row buffer (reused across all rows)
     var output_row = try allocator.alloc([]const u8, output_specs.items.len);
@@ -770,6 +788,10 @@ fn executeSequential(
             // Write directly (no ORDER BY)
             // LIMIT 0 must stop before the first write, not after it (#111).
             if (query.limit == 0) break;
+            if (rows_skipped < query.offset) {
+                rows_skipped += 1;
+                continue;
+            }
             try writer.writeRecord(output_row);
             rows_written += 1;
 
@@ -800,7 +822,7 @@ fn executeSequential(
                 ));
             }
 
-            const limit: ?usize = if (query.limit >= 0) @intCast(query.limit) else null;
+            const limit = sortLimit(query.offset, query.limit);
 
             // Multi-column ORDER BY: use comparison sort with multi-key context.
             // Single-column: use the hardware-aware fast_sort strategy (radix / heap / comparison).
@@ -810,7 +832,8 @@ fn executeSequential(
                     .delimiter = opts.delimiter,
                 };
                 std.mem.sort(SortEntry, entries.items, ctx, MultiKeyCtx.lessThan);
-                const sorted_items = if (limit) |k| entries.items[0..@min(k, entries.items.len)] else entries.items;
+                const window = outputWindow(entries.items.len, query.offset, query.limit);
+                const sorted_items = entries.items[window.start..window.end];
 
                 var ob_distinct_arena = std.heap.ArenaAllocator.init(allocator);
                 defer ob_distinct_arena.deinit();
@@ -830,6 +853,7 @@ fn executeSequential(
                     order_by.order == .desc,
                     limit,
                 );
+                const window = outputWindow(sorted.len, query.offset, query.limit);
 
                 // Write sorted rows (with optional DISTINCT dedup on the output line)
                 var ob_distinct_arena = std.heap.ArenaAllocator.init(allocator);
@@ -837,7 +861,7 @@ fn executeSequential(
                 var ob_distinct_seen = std.StringHashMap(void).init(allocator);
                 defer ob_distinct_seen.deinit();
 
-                for (sorted) |entry| {
+                for (sorted[window.start..window.end]) |entry| {
                     if (query.distinct) {
                         if (ob_distinct_seen.contains(entry.line)) continue;
                         try ob_distinct_seen.put(try ob_distinct_arena.allocator().dupe(u8, entry.line), {});
@@ -1329,7 +1353,9 @@ const JoinCtx = struct {
     where_expr: ?parser.Expression,
     writer: *csv.RecordWriter,
     rows_written: i32,
+    rows_skipped: i32,
     limit: i32,
+    offset: i32,
     allocator: Allocator, // for complex WHERE row_map only
 };
 
@@ -1369,6 +1395,10 @@ fn expandAndEmit(merged: [][]const u8, filled_w: usize, step_idx: usize, ctx: *J
             }
         }
         if (ctx.limit == 0) return error.LimitReached; // stop before the first write (#111)
+        if (ctx.rows_skipped < ctx.offset) {
+            ctx.rows_skipped += 1;
+            return;
+        }
         for (ctx.output_indices, 0..) |midx, oi| ctx.output_row[oi] = merged[midx];
         try ctx.writer.writeRecord(ctx.output_row);
         ctx.rows_written += 1;
@@ -1443,7 +1473,9 @@ fn joinWorkerRun(w: *JoinWorkerCtx) !void {
         .where_expr = w.where_expr,
         .writer = &writer,
         .rows_written = 0,
+        .rows_skipped = 0,
         .limit = -1, // parallel path is gated to no-LIMIT queries
+        .offset = 0,
         .allocator = wa,
     };
 
@@ -1628,6 +1660,7 @@ fn executeJoinThenAggregate(
         stage1_query.having_expr = null;
         stage1_query.order_by = null;
         stage1_query.limit = -1;
+        stage1_query.offset = 0;
         stage1_query.distinct = false;
         var stage1_opts = opts;
         stage1_opts.no_header = false;
@@ -1901,6 +1934,7 @@ fn executeJoin(
         if (opts.format != .csv) break :parallel;
         if (opts.no_input_header) break :parallel;
         if (query.limit >= 0) break :parallel;
+        if (query.offset > 0) break :parallel;
         const nthreads = options_mod.effectiveThreadCount(opts);
         if (nthreads <= 1) break :parallel;
         const base_size = (base_file.stat() catch break :parallel).size;
@@ -1978,7 +2012,9 @@ fn executeJoin(
         .where_expr = query.where_expr,
         .writer = &writer,
         .rows_written = 0,
+        .rows_skipped = 0,
         .limit = query.limit,
+        .offset = query.offset,
         .allocator = allocator,
     };
 
@@ -2126,6 +2162,7 @@ fn executeFromStdin(
 
     // Process rows
     var rows_written: i32 = 0;
+    var rows_skipped: i32 = 0;
 
     // Process the retained first data row (headerless), then stream the rest.
     // The injected first row is freed by the outer defer, not here.
@@ -2226,6 +2263,10 @@ fn executeFromStdin(
         }
 
         if (query.limit == 0) break; // stop before the first write (#111)
+        if (rows_skipped < query.offset) {
+            rows_skipped += 1;
+            continue;
+        }
         try writer.writeRecord(output_row);
         rows_written += 1;
 
@@ -3907,7 +3948,9 @@ fn executeScalarAgg(
             },
         };
     }
-    try writer.writeRecord(output_row);
+    if (query.limit != 0 and query.offset == 0) {
+        try writer.writeRecord(output_row);
+    }
     try writer.finish();
     try writer.flush();
 }
@@ -5470,6 +5513,7 @@ fn executeGroupBy(
     }
 
     var rows_output: i32 = 0;
+    var rows_skipped: i32 = 0;
     for (sorted_keys) |key| {
         if (query.order_by == null and query.limit >= 0 and rows_output >= query.limit) break;
         const accum = group_map.getPtr(key).?;
@@ -5616,6 +5660,10 @@ fn executeGroupBy(
         }
 
         if (query.order_by == null) {
+            if (rows_skipped < query.offset) {
+                rows_skipped += 1;
+                continue;
+            }
             try writer.writeRecord(output_row);
             rows_output += 1;
         } else {
@@ -5631,7 +5679,8 @@ fn executeGroupBy(
 
     if (query.order_by != null) {
         std.mem.sort([]const []const u8, collected.items, RowSortCtx{ .keys = order_keys.items }, RowSortCtx.lessThan);
-        for (collected.items) |row| {
+        const window = outputWindow(collected.items.len, query.offset, query.limit);
+        for (collected.items[window.start..window.end]) |row| {
             if (query.limit >= 0 and rows_output >= query.limit) break;
             try writer.writeRecord(row[0..out_len]);
             rows_output += 1;
@@ -8413,4 +8462,68 @@ test "plain SELECT DATE_PART(...) without GROUP BY extracts per row (#133)" {
 
     try std.testing.expect(std.mem.indexOf(u8, out, "1,01") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "2,03") != null);
+}
+
+test "OFFSET skips rows before applying LIMIT" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out = try runQueryForTest(
+        allocator,
+        &tmp,
+        "id,name\n1,Alice\n2,Bob\n3,Carol\n4,Dave\n",
+        "SELECT id FROM '{s}' LIMIT 2 OFFSET 1",
+    );
+    defer allocator.free(out);
+
+    try std.testing.expectEqualStrings("id\n2\n3\n", out);
+}
+
+test "OFFSET counts rows after WHERE filtering" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out = try runQueryForTest(
+        allocator,
+        &tmp,
+        "id,score\n1,5\n2,20\n3,10\n4,30\n",
+        "SELECT id FROM '{s}' WHERE score >= 10 LIMIT 1 OFFSET 1",
+    );
+    defer allocator.free(out);
+
+    try std.testing.expectEqualStrings("id\n3\n", out);
+}
+
+test "OFFSET is applied after ORDER BY" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out = try runQueryForTest(
+        allocator,
+        &tmp,
+        "id,score\n1,40\n2,10\n3,30\n4,20\n",
+        "SELECT id, score FROM '{s}' ORDER BY score DESC LIMIT 2 OFFSET 1",
+    );
+    defer allocator.free(out);
+
+    try std.testing.expectEqualStrings("id,score\n3,30\n4,20\n", out);
+}
+
+test "OFFSET skips GROUP BY output before applying LIMIT" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out = try runQueryForTest(
+        allocator,
+        &tmp,
+        "department\nSales\nEngineering\nMarketing\nEngineering\n",
+        "SELECT department, COUNT(*) AS count FROM '{s}' GROUP BY department LIMIT 1 OFFSET 1",
+    );
+    defer allocator.free(out);
+
+    try std.testing.expectEqualStrings("department,count\nMarketing,1\n", out);
 }

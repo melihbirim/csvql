@@ -256,6 +256,28 @@ test "parse JOIN with LIMIT" {
     try std.testing.expectEqual(@as(i32, 5), query.limit);
 }
 
+test "parse LIMIT with OFFSET" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(
+        allocator,
+        "SELECT id FROM 'data.csv' LIMIT 5 OFFSET 10",
+    );
+    defer query.deinit();
+
+    try std.testing.expectEqual(@as(i32, 5), query.limit);
+    try std.testing.expectEqual(@as(i32, 10), query.offset);
+}
+
+test "OFFSET defaults to zero" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(allocator, "SELECT id FROM 'data.csv' LIMIT 5");
+    defer query.deinit();
+
+    try std.testing.expectEqual(@as(i32, 0), query.offset);
+}
+
 test "single-file query still works after JOIN parser changes" {
     const allocator = std.testing.allocator;
 
