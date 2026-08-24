@@ -20,3 +20,4 @@ new, not that csvql is bug-free outside this scope.
 <!-- nightly-fuzz.yml appends new rows below this line -->
 | 2026-08-22 | 1897126267 | 50000 | 0 | 2.5.0 | 1.5.5 |  |
 | 2026-08-23 | 2459520179 | 50000 | 0 | 2.5.0 | 1.5.5 |  |
+| 2026-08-24 | 422312471 | 50000 | 0 | 2.5.0 | 1.5.5 |  |
