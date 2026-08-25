@@ -208,12 +208,17 @@ columns — not "a WHERE clause that happens to run a query first." Measured dir
 (2M-row orders table, `WHERE customer_id IN (SELECT customer_id FROM customers WHERE
 tier = 'gold')`), same result set both engines:
 
-| Subquery result size | csvql | DuckDB |
-| --------------------- | ----- | ------ |
-| Small (6 matching customers — a typical lookup-table filter) | **0.034s** | 0.17s (csvql ~5x faster) |
-| Large (10,000 matching customers) | **0.045s** | 0.17s (csvql ~3.8x faster) |
+| Subquery result size | csvql | DuckDB | Result |
+| --------------------- | ----- | ------ | ------ |
+| 6 (a typical lookup-table filter) | **0.034s** | 0.17s | csvql ~5x faster |
+| 10,000 | **0.045s** | 0.17s | csvql ~3.8x faster |
+| 100,000 | **0.088s** | 0.21s | csvql ~2.3x faster |
+| 1,000,000 | 0.358s | 0.357s | dead even |
 
-The large case was originally **3.5s** (DuckDB ~20x faster) — `Comparison.in_values`
+Correctness held at every step above (identical row counts on both engines, verified
+directly, not just assumed from the query shape matching).
+
+The 10,000 case was originally **3.5s** (DuckDB ~20x faster) — `Comparison.in_values`
 membership testing (`compareValues` in `parser.zig`) was a linear scan per row, fine for a
 literal `IN ('a','b','c')` list (always short, someone typed it by hand) but a genuine
 bottleneck once a subquery could produce a list with thousands of entries. Fixed by
@@ -221,8 +226,14 @@ attaching a `std.StringHashMap(void)` (`Comparison.in_values_set`, built once at
 subquery-resolution time, alongside `in_values`) so membership is O(1) instead of O(n) —
 the same hash-build-then-probe shape csvql's own JOINs already use, not new infrastructure.
 Not built for a literal `IN (...)` list, which is never large enough for the scan to
-matter. The 78x improvement (3.5s → 0.045s) is the semi-join reframing paying off, not a
-one-off tuning trick: any future genuinely-large IN-list — subquery or not — gets it too.
+matter. The 78x improvement (3.5s → 0.045s at 10,000) is the semi-join reframing paying
+off, not a one-off tuning trick: any future genuinely-large IN-list — subquery or not —
+gets it too.
+
+The scaling trend (5x → 3.8x → 2.3x → even, as the resolved list grows from 6 to 1M) is
+the expected shape for a hash-build-then-probe design, not a sign the fix is incomplete:
+building and probing a larger hash set has real, non-zero cost, it's just linear now
+instead of quadratic. No cliff was found up to 1M resolved values.
 
 ## Known gaps (open issues)
 
