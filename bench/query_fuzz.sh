@@ -13,6 +13,14 @@
 # exact command printed alongside it. On a mismatch, the query pair is
 # dumped to tests/regressions/ permanently instead of using a shrinker.
 #
+# That determinism has two other preconditions, both worth stating since
+# they're silent failure modes rather than errors: (1) the CSV fixture must
+# be the same bytes every time — generate it with bench/gen_fixture.sh, not
+# a one-off ad hoc file; (2) csvql and DuckDB must be the same versions the
+# original run used — a replayed seed against different engine versions is
+# a legitimate regression check, not a reproduction of the original result.
+# See CORRECTNESS.md's "Determinism guarantees" section.
+#
 # Usage:
 #   ./bench/query_fuzz.sh --seed 42 --count 2000
 #   ./bench/query_fuzz.sh --seed 42 --count 2000 --csv large_test.csv
@@ -411,7 +419,20 @@ if [[ -s "$BATCH_ERR" ]]; then
   echo "whether the DuckDB output is simply missing for that query):"
   sed 's/^/  /' "$BATCH_ERR"
 fi
-echo "$total queries run, $failed mismatches, seed=$SEED"
+# Distinct query count — the number that tells you when this seed/count
+# combination has stopped finding anything new about the query space
+# (distinct plateauing while count keeps climbing means you're re-running
+# the same shapes, not expanding coverage). Dedup on csvql_sql: it's a 1:1
+# stand-in for duck_sql (same predicate, different table name only).
+distinct="$(awk -F'\t' '{print $2}' "$QUERIES_FILE" | sort -u | wc -l | tr -d ' ')"
+
+CSVQL_VERSION="$("$CSVQL" --version 2>&1 | awk '{print $2}')"
+DUCKDB_VERSION="$("$DUCKDB" --version 2>&1 | awk '{print $1}' | tr -d 'v')"
+
+echo "$total queries run ($distinct distinct), $failed mismatches, seed=$SEED"
+echo "SUMMARY total=$total distinct=$distinct mismatches=$failed seed=$SEED csvql=$CSVQL_VERSION duckdb=$DUCKDB_VERSION"
+echo "Reproduce (after ./bench/gen_fixture.sh, csvql $CSVQL_VERSION, duckdb $DUCKDB_VERSION):"
+echo "  ./bench/query_fuzz.sh --seed $SEED --count $COUNT"
 if [[ $failed -gt 0 ]]; then
   echo "Regression files:"
   for p in "${failure_paths[@]}"; do echo "  $p"; done
