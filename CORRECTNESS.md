@@ -44,8 +44,10 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
   (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, scalar and `GROUP BY`) against the existing fixture
   schema. No JOINs, no subqueries, no window functions — out of scope by design, see
   the issue for why. Deterministic seeding (`--seed`) so every mismatch reproduces with
-  one command; failures dump to `tests/regressions/` permanently instead of using a
-  shrinker. DuckDB's side runs as one batched process (materialized table + all
+  one command — see [Determinism guarantees](#determinism-guarantees) for what that
+  actually rests on and how it's verified, not just asserted; failures dump to
+  `tests/regressions/` permanently instead of using a shrinker. DuckDB's side runs as
+  one batched process (materialized table + all
   queries in a single `duckdb -f` invocation) rather than one process per query —
   the difference between hundreds and tens of thousands of queries in the same wall
   time.
@@ -57,9 +59,9 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
 
 ## Oracle methodology
 
-- **Reference**: DuckDB CLI, `duckdb --version` printed at the top of every suite run
-  (currently `v1.4.2`). Pinned to whatever the CI runner's `duckdb --version` reports —
-  not currently pinned to an exact release, see [Known gaps](#known-gaps-open-issues).
+- **Reference**: DuckDB CLI, `duckdb --version` printed at the top of every suite run.
+  Version is pinned via `bench/DUCKDB_VERSION` (currently `1.5.5`) and bumped
+  deliberately, not tracked to `latest` — see [Determinism guarantees](#determinism-guarantees).
 - **Comparison rule**: exact string equality on row output, *except* for results
   containing a float (`AVG`, `VARIANCE`, `STDDEV`, non-integer `SUM`), which go through
   `check_approx` — see [Float tolerance](#float-tolerance) below.
@@ -85,6 +87,51 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
   rounding on a plain projection, ragged rows confusing DuckDB's header detection
   entirely, DuckDB silently returning empty for a 0-byte file instead of erroring). These
   pin down csvql's own current, deliberate behavior instead — see the table below.
+
+## Determinism guarantees
+
+`bench/query_fuzz.sh` and its `VERIFICATION-LOG.md` are only evidence if a logged row can
+actually be replayed. That rests on three separate guarantees — worth stating explicitly,
+because only some of them are automatic and the others silently stop holding if broken:
+
+- **Same seed → same query stream.** `bench/query_fuzz.sh` seeds its *own* PRNG
+  (`mysrand`/`myrand`, a small MINSTD LCG implemented directly in the awk script) rather
+  than calling awk's built-in `srand()`/`rand()`. This isn't a style preference: it was
+  found, while adding this section, that at least one `mawk` build (compiled against
+  `arc4random` for its rand-funcs backend — visible via `awk -W version`) silently ignores
+  `srand()`'s seed argument and reseeds from OS entropy on every process start, so the
+  *same* `--seed` produced a *different* query stream on every single invocation. Rolling
+  our own seeded LCG removes the dependency on the host's awk build entirely. This is
+  verified continuously, not just asserted: `./bench/query_fuzz.sh --seed N --count M
+  --check-determinism` regenerates the stream twice and diffs them, and runs in CI
+  (`ci.yml`, before either engine is even invoked) on every PR.
+- **Query-space size, honestly.** The template space is bounded (a handful of aggregates,
+  three query shapes, predicates over six columns), so a naive guess is that most of a
+  50,000-query run is duplicates. Measured directly (dedup the generated SQL text) across
+  several real seeds at `--count 50000`: **~82% distinct** (e.g. 41,010 of 50,000 for
+  seed 1), consistent run to run — the space is far less saturated than that guess. This
+  is what `VERIFICATION-LOG.md`'s `Distinct` column reports per run, and it's the signal
+  for when to widen the generator's template set: watch for that percentage trending down
+  as more seeds accumulate, not a one-time guess.
+- **See it without reading awk.** `bench/sample-queries.sql` is 50 real generated queries
+  (`./bench/query_fuzz.sh --seed 1 --count 50 --dump-queries bench/sample-queries.sql`,
+  committed) — regenerate it after any change to the generator's template logic so it
+  stays representative. `--dump-queries` writes the generated SQL and exits without
+  touching either engine.
+- **Same seed → same fixture.** The query stream is generated *against* `large_test.csv`,
+  so reproducing it also requires the fixture to be byte-identical. `bench/gen_fixture.sh`
+  is the single source of truth for that file — it used to be duplicated inline in
+  `ci.yml` and `nightly-fuzz.yml`, which worked only as long as both copies stayed in
+  sync. It's deterministic (no randomness, no timestamps: pure modulo arithmetic over a
+  row index), so `./bench/gen_fixture.sh` always produces the same bytes.
+- **Same versions → same result.** A replayed seed against a *different* csvql or DuckDB
+  version is a legitimate regression check, not a reproduction of the original logged
+  result — the whole point of running new code against an old query set. DuckDB is
+  pinned via `bench/DUCKDB_VERSION` (bumped deliberately, not tracked to `latest`) so the
+  oracle a log row names is the oracle that actually ran; csvql's version is whatever's
+  checked out. Every `VERIFICATION-LOG.md` row records both, plus the exact `Command` to
+  run, so a row is self-contained: check out the named csvql version, install the named
+  DuckDB version, run `gen_fixture.sh`, then the row's `Command` verbatim.
 
 ### Float tolerance
 
@@ -128,8 +175,7 @@ point.
 | `UNION` / `INTERSECT` / `EXCEPT` | [#122](https://github.com/melihbirim/csvql/issues/122), [#127](https://github.com/melihbirim/csvql/issues/127) |
 | Window functions (`RANK() OVER (...)`, etc.) | [#126](https://github.com/melihbirim/csvql/issues/126) |
 | `OFFSET` clause | [#70](https://github.com/melihbirim/csvql/issues/70) |
-| DuckDB CLI version not pinned in CI (`--version` is whatever `latest` resolves to at run time) | not yet filed |
-Per-release-tag differential fuzz run (bigger volume than nightly, recorded in the release notes) isn't wired up yet — only per-PR (fixed seed, smoke scale) and nightly (random seed, volume) exist | [#141](https://github.com/melihbirim/csvql/issues/141) |
+| Per-release-tag differential fuzz run (bigger volume than nightly, recorded in the release notes) isn't wired up yet — only per-PR (fixed seed, smoke scale) and nightly (random seed, volume) exist | [#141](https://github.com/melihbirim/csvql/issues/141) |
 | Coverage measurement (line coverage per module) not wired up | not yet filed |
 | No Windows-specific adversarial subset in CI (CRLF is tested on macOS/Linux; Windows' own line-ending and path-separator handling isn't independently verified) | not yet filed |
 

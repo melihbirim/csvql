@@ -38,26 +38,18 @@ jobs:
     - name: Build (ReleaseFast)
       run: zig build -Doptimize=ReleaseFast
 
+    # Pinned via bench/DUCKDB_VERSION, not "latest" — a nightly log row is
+    # only reproducible if the oracle version it names is the version that
+    # actually ran. See CORRECTNESS.md's "Determinism guarantees" section.
     - name: Install DuckDB CLI
       run: |
-        curl -fsSL https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-linux-amd64.zip -o duckdb.zip
+        DUCKDB_VERSION="$(cat bench/DUCKDB_VERSION)"
+        curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip" -o duckdb.zip
         unzip -o duckdb.zip -d /usr/local/bin
         chmod +x /usr/local/bin/duckdb
 
     - name: Generate fixture CSV
-      run: |
-        awk 'BEGIN{
-          split("Alice Bob Carol Dave Eve Frank Grace Heidi", names, " ");
-          split("Austin Boston Chicago Denver LA NYC SF Seattle", cities, " ");
-          split("Engineering Finance HR Marketing Operations Sales", depts, " ");
-          print "id,name,age,city,salary,department";
-          for (i = 1; i <= 20000; i++) {
-            n = names[(i % 8) + 1]; c = cities[(i % 8) + 1]; d = depts[(i % 6) + 1];
-            age = 20 + (i % 40);
-            salary = 40000 + (i % 80) * 1000;
-            print i","n","age","c","salary","d;
-          }
-        }' > large_test.csv
+      run: ./bench/gen_fixture.sh
 
     - name: Pick a random seed and query count
       id: params
@@ -77,15 +69,25 @@ jobs:
 
     - name: Append result to VERIFICATION-LOG.md
       run: |
-        CSVQL_VERSION="$(./zig-out/bin/csvql --version 2>&1 | awk '{print $2}')"
-        DUCKDB_VERSION="$(duckdb --version | awk '{print $1}' | tr -d 'v')"
-        MISMATCHES="$(grep -oE '[0-9]+ mismatches' fuzz_output.txt | awk '{print $1}')"
+        # Parsed from query_fuzz.sh's own "SUMMARY ..." line — that script is
+        # the single source of truth for its own run's stats and the engine
+        # versions it actually ran against, rather than re-deriving them here
+        # and risking the two drifting apart.
+        SUMMARY_LINE="$(grep '^SUMMARY ' fuzz_output.txt || true)"
+        DISTINCT="$(echo "$SUMMARY_LINE" | grep -oE 'distinct=[0-9]+' | cut -d= -f2)"
+        MISMATCHES="$(echo "$SUMMARY_LINE" | grep -oE 'mismatches=[0-9]+' | cut -d= -f2)"
+        CSVQL_VERSION="$(echo "$SUMMARY_LINE" | grep -oE 'csvql=[^ ]+' | cut -d= -f2)"
+        DUCKDB_VERSION="$(echo "$SUMMARY_LINE" | grep -oE 'duckdb=[^ ]+' | cut -d= -f2)"
+        DISTINCT="${DISTINCT:-unknown}"
         MISMATCHES="${MISMATCHES:-unknown}"
+        CSVQL_VERSION="${CSVQL_VERSION:-unknown}"
+        DUCKDB_VERSION="${DUCKDB_VERSION:-unknown}"
+        COMMAND="./bench/query_fuzz.sh --seed ${{ steps.params.outputs.seed }} --count ${{ steps.params.outputs.count }}"
         NOTES=""
         if [ "$MISMATCHES" != "0" ] && [ "$MISMATCHES" != "unknown" ]; then
           NOTES="see tests/regressions/ from this run's artifact"
         fi
-        echo "| $(date -u +%Y-%m-%d) | ${{ steps.params.outputs.seed }} | ${{ steps.params.outputs.count }} | ${MISMATCHES} | ${CSVQL_VERSION} | ${DUCKDB_VERSION} | ${NOTES} |" >> VERIFICATION-LOG.md
+        echo "| $(date -u +%Y-%m-%d) | ${{ steps.params.outputs.seed }} | ${{ steps.params.outputs.count }} | ${DISTINCT} | ${MISMATCHES} | ${CSVQL_VERSION} | ${DUCKDB_VERSION} | \`${COMMAND}\` | ${NOTES} |" >> VERIFICATION-LOG.md
 
     - name: Commit VERIFICATION-LOG.md
       run: |
