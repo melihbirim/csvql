@@ -10,10 +10,11 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
 
 ## What is tested
 
-- **91 differential checks** in `bench/verify_correctness.sh` (92 when the optional
+- **95 differential checks** in `bench/verify_correctness.sh` (96 when the optional
   multi-GB taxi fixture is present locally — see below), covering: SELECT/projection,
-  every WHERE operator (`=`, comparisons, `LIKE`/`ILIKE`, `BETWEEN`, `IN`/`NOT IN`,
-  `IS NULL`, modulo, compound `AND`/`OR`/`NOT`), GROUP BY + all aggregate functions
+  every WHERE operator (`=`, comparisons, `LIKE`/`ILIKE`, `BETWEEN`, `IN`/`NOT IN`
+  (literal list and `IN (SELECT ...)` subquery, #124), `IS NULL`, modulo, compound
+  `AND`/`OR`/`NOT`), GROUP BY + all aggregate functions
   (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `VARIANCE`, `STDDEV`, `MEDIAN`, `GROUP_CONCAT`,
   `COUNT(DISTINCT)`), HAVING, DISTINCT, ORDER BY (single/multi-column, positional, alias),
   LIMIT, every scalar function (`UPPER`/`LOWER`/`TRIM`/`LENGTH`/`SUBSTR`/`REPLACE`/
@@ -26,7 +27,7 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
   diffed raw — see below), scientific notation and negative zero, header-only/
   single-row/single-column files, ragged rows, a zero-byte file, and values near
   i64/f64 limits.
-- **531 unit tests** (`zig build test`) covering internals differential testing can't
+- **550 unit tests** (`zig build test`) covering internals differential testing can't
   reach directly: parser edge cases, arena-buffer offset safety across reallocation,
   overflow handling, TDD regression tests for every numbered bug fix referenced below.
 - **2 platforms in CI**: `ubuntu-latest` (x86_64) and `macos-14` (Apple Silicon,
@@ -163,6 +164,60 @@ asserting parity here would be asserting the wrong thing. The last four rows are
 in as csvql-only regression checks in `bench/verify_correctness.sh` instead of a DuckDB
 diff, since DuckDB's own behavior in each case isn't the property being tested.
 
+## Subqueries
+
+The one supported shape is `col IN (SELECT ...)` / `col NOT IN (SELECT ...)` (#124) —
+non-correlated (the subquery has no access to the outer row) and single-column (the
+subquery must project exactly one column). It's resolved once, before the outer query
+runs: the inner query executes as a complete, ordinary csvql query in its own right —
+its own `WHERE`, `GROUP BY`/`HAVING`, `ORDER BY`, `DISTINCT`, `LIMIT` all work normally —
+and its output column becomes the membership list for the outer `IN`/`NOT IN`. A
+correlated subquery (referencing the outer table's column) isn't silently wrong: the
+inner query simply doesn't have that column, so it fails with a clear `ColumnNotFound`
+rather than an incorrect result. Every other subquery shape — `FROM (SELECT ...)`, a
+scalar subquery in the `SELECT` list, `HAVING agg > (SELECT ...)` — is still a clear
+`error.SubqueriesNotSupported`, not a silent misparse.
+
+Three real bugs were found and fixed while adding this (TDD + differential testing
+against DuckDB doing exactly what they're for):
+- `bench/verify_correctness.sh` caught a **segfault** on `col IN (SELECT ...) AND
+  other_condition` — `Expression`'s `.binary`/`.unary` variants hold heap pointers shared
+  across every copy of a `Query`, while `.comparison` is stored inline and copied by
+  value. Resolving a subquery through a copy handled those two cases in exactly the
+  wrong way (double-free for the shared/compound case, a leak for the bare-comparison
+  case). Fixed by resolving on the caller's one addressable `Query`, before it's ever
+  copied — see `resolveInSubqueries` in `engine.zig` for the detailed reasoning.
+- A subquery with its own `GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT` — e.g. `col IN (SELECT
+  ... GROUP BY ... HAVING ...)` — was parsed wrong: `findClauseKeyword` located the
+  *outer* query's clause boundaries with a scan that wasn't parenthesis-depth-aware, so
+  it matched those same keywords *inside* the subquery's own parens. Not reachable before
+  subqueries existed (nothing else could put `GROUP BY`/`HAVING` text inside a WHERE
+  clause's parens), so it was a latent bug this feature was the first thing to expose.
+- `zig build test`'s leak checker caught a **pre-existing, unrelated** leak in
+  `executeGroupBy`: a `HAVING COUNT(*) >= N` referencing an aggregate not also in
+  `SELECT` allocates `having_extra_aggs`/`comparisons` bookkeeping that was never freed.
+  Reproduces on a plain `GROUP BY ... HAVING COUNT(*) >= N` query with no subquery
+  involved at all — simply never exercised by an existing test before one of the new
+  subquery tests happened to hit that exact shape.
+
+### Performance vs. DuckDB
+
+Measured directly (2M-row orders table, `WHERE customer_id IN (SELECT customer_id FROM
+customers WHERE tier = 'gold')`), same result set both engines:
+
+| Subquery result size | csvql | DuckDB | 
+| --------------------- | ----- | ------ |
+| Small (6 matching customers — a typical lookup-table filter) | **0.034s** | 0.17s (csvql ~5x faster) |
+| Large (10,000 matching customers) | 3.5s | **0.17s** (DuckDB ~20x faster) |
+
+Root cause, not just a number: `Comparison.in_values` membership testing (`compareValues`
+in `parser.zig`) is a linear scan per row — fine for a literal `IN ('a','b','c')` list,
+which is always short because someone typed it by hand, but a genuine bottleneck once a
+subquery can produce a list with thousands of entries. This is a real, scoped follow-up
+(a hash-set membership check instead of a linear scan) rather than something papered over
+here — csvql wins the common case (small lookup lists) by a wide margin today, and loses
+on large ones for a well-understood, fixable reason.
+
 ## Known gaps (open issues)
 
 Not yet supported. All of these **error clearly** rather than silently returning wrong
@@ -171,7 +226,7 @@ point.
 
 | Gap | Tracking |
 | --- | -------- |
-| Subqueries (`WHERE col IN (SELECT ...)`, `HAVING x > (SELECT ...)`) | [#124](https://github.com/melihbirim/csvql/issues/124) |
+| Subqueries other than `col IN (SELECT ...)` / `col NOT IN (SELECT ...)` — correlated subqueries, subqueries in `FROM`/`SELECT`-list/`HAVING`-comparison position | [#124](https://github.com/melihbirim/csvql/issues/124) |
 | `UNION` / `INTERSECT` / `EXCEPT` | [#122](https://github.com/melihbirim/csvql/issues/122), [#127](https://github.com/melihbirim/csvql/issues/127) |
 | Window functions (`RANK() OVER (...)`, etc.) | [#126](https://github.com/melihbirim/csvql/issues/126) |
 | `OFFSET` clause | [#70](https://github.com/melihbirim/csvql/issues/70) |

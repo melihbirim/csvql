@@ -417,10 +417,15 @@ test "evaluateDirect: NOT negates condition" {
     try std.testing.expect(parser.evaluateDirect(where, &fields_la, &header));
 }
 
-test "subquery in WHERE IN errors clearly instead of silently misparsing (#124)" {
+// col IN (SELECT ...) is now the one supported subquery shape (#124) — see
+// the "WHERE col IN (SELECT ...)" tests further down for its parsing, and
+// engine.zig for the resolved, end-to-end behavior. Every other subquery
+// shape (FROM, SELECT list, HAVING) is still a clear error, covered below.
+test "subquery in WHERE IN parses and captures the inner query, no longer errors (#124)" {
     const allocator = std.testing.allocator;
-    const result = parser.parse(allocator, "SELECT name FROM 't.csv' WHERE dept IN (SELECT dept FROM 't.csv' WHERE salary > 80000)");
-    try std.testing.expectError(error.SubqueriesNotSupported, result);
+    var query = try parser.parse(allocator, "SELECT name FROM 't.csv' WHERE dept IN (SELECT dept FROM 't.csv' WHERE salary > 80000)");
+    defer query.deinit();
+    try std.testing.expectEqualStrings("SELECT dept FROM 't.csv' WHERE salary > 80000", query.where_expr.?.comparison.in_subquery_sql.?);
 }
 
 test "subquery in HAVING errors clearly instead of silently misparsing (#124)" {
@@ -495,3 +500,68 @@ test "WHERE comparison AND IS NULL — the comparison must still apply, not just
     const young_empty_city = [_][]const u8{ "3", "" };
     try std.testing.expect(!parser.evaluateDirect(where, &young_empty_city, &header));
 }
+
+// TDD: WHERE col IN (SELECT ...) is the one supported subquery shape (#124).
+// The parser only captures the inner SELECT's raw text here — it can't run
+// it (no file I/O at parse time); the engine resolves in_subquery_sql into
+// in_values before evaluation. See engine.zig's "IN (SELECT ...)" tests for
+// the resolved, end-to-end behavior.
+test "WHERE col IN (SELECT ...) captures the inner query text, not a literal list" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(allocator, "SELECT * FROM 'a.csv' WHERE id IN (SELECT id FROM 'b.csv')");
+    defer query.deinit();
+
+    const comp = query.where_expr.?.comparison;
+    try std.testing.expectEqualStrings("id", comp.column);
+    try std.testing.expect(comp.in_values == null);
+    try std.testing.expect(!comp.in_negate);
+    try std.testing.expectEqualStrings("SELECT id FROM 'b.csv'", comp.in_subquery_sql.?);
+}
+
+test "WHERE col NOT IN (SELECT ...) sets in_negate and captures the inner query" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(allocator, "SELECT * FROM 'a.csv' WHERE id NOT IN (SELECT id FROM 'b.csv' WHERE active = 'y')");
+    defer query.deinit();
+
+    const comp = query.where_expr.?.comparison;
+    try std.testing.expect(comp.in_negate);
+    try std.testing.expect(comp.in_values == null);
+    try std.testing.expectEqualStrings("SELECT id FROM 'b.csv' WHERE active = 'y'", comp.in_subquery_sql.?);
+}
+
+// A subquery whose own WHERE clause contains AND/parens must be captured
+// whole, not split by the outer AND/OR splitter (#124) — findTopLevelOp is
+// paren-depth-aware, so this exercises that the IN-subquery path relies on
+// that correctly rather than re-deriving its own paren matching.
+test "WHERE col IN (SELECT ...) with AND inside the subquery's own WHERE is captured whole" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(allocator, "SELECT * FROM 'a.csv' WHERE id IN (SELECT id FROM 'b.csv' WHERE x = 1 AND y = 2)");
+    defer query.deinit();
+
+    const comp = query.where_expr.?.comparison;
+    try std.testing.expectEqualStrings("SELECT id FROM 'b.csv' WHERE x = 1 AND y = 2", comp.in_subquery_sql.?);
+}
+
+// Every OTHER subquery shape stays a clear error (#124) — only col IN
+// (SELECT ...) / col NOT IN (SELECT ...) is supported.
+test "subquery in FROM clause still errors clearly" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.SubqueriesNotSupported,
+        parser.parse(allocator, "SELECT * FROM (SELECT * FROM 'a.csv')"),
+    );
+}
+
+test "scalar subquery in SELECT list still errors clearly" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.SubqueriesNotSupported,
+        parser.parse(allocator, "SELECT (SELECT 1) FROM 'a.csv'"),
+    );
+}
+
+// (HAVING subquery coverage already exists above: "subquery in HAVING
+// errors clearly instead of silently misparsing (#124)".)

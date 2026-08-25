@@ -149,6 +149,14 @@ pub const Comparison = struct {
     in_values: ?[][]u8 = null,
     /// true for NOT IN (...) — negates the in_values membership check.
     in_negate: bool = false,
+    /// Non-null when this is IN (SELECT ...) / NOT IN (SELECT ...) — holds the
+    /// raw inner query text (#124), not yet executed. The parser can't run it
+    /// (no file I/O at parse time); the engine resolves this into in_values
+    /// before evaluation, then clears this field. If a query is never
+    /// executed (e.g. parse-only validation), this stays set and in_values
+    /// stays null — evaluation must treat that as "not yet resolved", never
+    /// as "matches nothing".
+    in_subquery_sql: ?[]u8 = null,
     /// BETWEEN: upper bound string (value field holds lower bound)
     between_high: ?[]u8 = null,
     /// BETWEEN: upper bound as f64 (null if non-numeric)
@@ -163,6 +171,7 @@ pub const Comparison = struct {
             for (vals) |v| allocator.free(v);
             allocator.free(vals);
         }
+        if (self.in_subquery_sql) |sql| allocator.free(sql);
         if (self.between_high) |h| allocator.free(h);
     }
 };
@@ -293,6 +302,47 @@ fn containsKeywordOutsideQuotes(s: []const u8, needle: []const u8) bool {
         }
         if (i + needle.len <= s.len and std.ascii.eqlIgnoreCase(s[i..][0..needle.len], needle)) {
             return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+fn isSubqueryIdentChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+/// True if the '(' at `paren_idx` in `s` is immediately preceded (ignoring
+/// whitespace) by the standalone word "IN" — i.e. this opens the supported
+/// `col IN (SELECT ...)` / `col NOT IN (SELECT ...)` shape rather than some
+/// other "(SELECT" occurrence (FROM subquery, scalar subquery in SELECT
+/// list, HAVING, etc.). Checking for "IN" alone (not "NOT IN") is enough:
+/// "NOT IN (" also ends in the word "IN" immediately before the paren.
+fn isInSubqueryParen(s: []const u8, paren_idx: usize) bool {
+    var i = paren_idx;
+    while (i > 0 and std.ascii.isWhitespace(s[i - 1])) : (i -= 1) {}
+    const word_end = i;
+    var word_start = word_end;
+    while (word_start > 0 and isSubqueryIdentChar(s[word_start - 1])) : (word_start -= 1) {}
+    return std.ascii.eqlIgnoreCase(s[word_start..word_end], "IN");
+}
+
+/// True if `s` contains a "(SELECT" (outside quotes) that is NOT the
+/// supported `col IN (SELECT ...)` / `col NOT IN (SELECT ...)` shape (#124).
+fn containsUnsupportedSubquery(s: []const u8) bool {
+    const needle = "(SELECT";
+    var i: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '\'') {
+            i += 1;
+            while (i < s.len and s[i] != '\'') : (i += 1) {}
+            if (i < s.len) i += 1;
+            continue;
+        }
+        if (i + needle.len <= s.len and std.ascii.eqlIgnoreCase(s[i..][0..needle.len], needle)) {
+            if (!isInSubqueryParen(s, i)) return true;
+            i += needle.len;
+            continue;
         }
         i += 1;
     }
@@ -521,16 +571,19 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
 
     var trimmed = std.mem.trim(u8, input, &std.ascii.whitespace);
 
-    // Set operators (UNION/INTERSECT/EXCEPT) and subqueries aren't supported.
-    // Erroring clearly here is far better than silently misparsing into wrong
-    // results (#124, #127) — e.g. a bare "INTERSECT" would otherwise just
-    // become garbage trailing text on whatever clause precedes it, and
-    // "(SELECT ...)" inside WHERE/HAVING would silently fail column lookup
-    // or match nothing instead of raising an error.
+    // Set operators (UNION/INTERSECT/EXCEPT) and most subqueries aren't
+    // supported. Erroring clearly here is far better than silently
+    // misparsing into wrong results (#124, #127) — e.g. a bare "INTERSECT"
+    // would otherwise just become garbage trailing text on whatever clause
+    // precedes it, and "(SELECT ...)" inside HAVING/SELECT/FROM would
+    // silently fail column lookup or match nothing instead of raising an
+    // error. The one shape that IS supported, `col IN (SELECT ...)` / `col
+    // NOT IN (SELECT ...)`, is non-correlated and single-column only — see
+    // containsUnsupportedSubquery below and CORRECTNESS.md.
     inline for ([_][]const u8{ " UNION ", " INTERSECT ", " EXCEPT " }) |kw| {
         if (containsKeywordOutsideQuotes(trimmed, kw)) return error.UnsupportedSetOperation;
     }
-    if (containsKeywordOutsideQuotes(trimmed, "(SELECT")) return error.SubqueriesNotSupported;
+    if (containsUnsupportedSubquery(trimmed)) return error.SubqueriesNotSupported;
 
     // Extract SELECT clause
     const select_idx = std.ascii.indexOfIgnoreCase(trimmed, "SELECT") orelse return error.InvalidQuery;
@@ -863,8 +916,14 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
 ///   - preceded by whitespace or start-of-string, and
 ///   - followed by whitespace or end-of-string.
 /// Returns the byte index of the start of `keyword` in `s`, or null.
+/// Finds a top-level clause keyword (GROUP BY / HAVING / ORDER BY / LIMIT)
+/// in `s`, skipping quoted strings AND anything inside parentheses — the
+/// latter matters since a `col IN (SELECT ... GROUP BY ... HAVING ...)`
+/// subquery (#124) can contain these same keywords in its own clauses, and
+/// those must not be mistaken for the outer query's clause boundaries.
 fn findClauseKeyword(s: []const u8, keyword: []const u8) ?usize {
     var i: usize = 0;
+    var depth: usize = 0;
     while (i < s.len) {
         if (s[i] == '\'') {
             i += 1;
@@ -872,7 +931,17 @@ fn findClauseKeyword(s: []const u8, keyword: []const u8) ?usize {
             if (i < s.len) i += 1;
             continue;
         }
-        if (i + keyword.len <= s.len and
+        if (s[i] == '(') {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if (s[i] == ')') {
+            if (depth > 0) depth -= 1;
+            i += 1;
+            continue;
+        }
+        if (depth == 0 and i + keyword.len <= s.len and
             std.ascii.eqlIgnoreCase(s[i .. i + keyword.len], keyword))
         {
             const pre_ok = (i == 0) or std.ascii.isWhitespace(s[i - 1]);
@@ -1103,6 +1172,25 @@ fn parseInComparison(allocator: Allocator, input: []const u8, in_idx: usize, neg
     const close_paren = std.mem.lastIndexOfScalar(u8, after_in, ')') orelse return error.InvalidExpression;
     if (close_paren <= open_paren) return error.InvalidExpression;
     const inner = std.mem.trim(u8, after_in[open_paren + 1 .. close_paren], &std.ascii.whitespace);
+
+    // col IN (SELECT ...) / col NOT IN (SELECT ...) (#124) — capture the raw
+    // inner query text; the engine resolves it into in_values before
+    // evaluation (parsing can't execute a query — no file I/O here).
+    if (inner.len >= 6 and std.ascii.eqlIgnoreCase(inner[0..6], "SELECT")) {
+        const column_lower = try allocator.alloc(u8, column_part.len);
+        errdefer allocator.free(column_lower);
+        _ = std.ascii.lowerString(column_lower, column_part);
+        return Expression{
+            .comparison = Comparison{
+                .column = column_lower,
+                .operator = .equal,
+                .value = try allocator.dupe(u8, ""),
+                .numeric_value = null,
+                .in_subquery_sql = try allocator.dupe(u8, inner),
+                .in_negate = negate,
+            },
+        };
+    }
 
     // Parse comma-separated values, trimming quotes from each
     var values = std.ArrayListUnmanaged([]u8){};

@@ -729,6 +729,30 @@ check \
 
 # ════════════════════════════════════════════════════════════════
 echo ""
+echo "── WHERE col IN (SELECT ...) — non-correlated subqueries (#124) ─"
+
+check \
+  "IN (SELECT ...) — departments in the West region" \
+  "SELECT name FROM '$CSV' WHERE department IN (SELECT dept_name FROM '$DEPTS' WHERE region = 'West')" \
+  "SELECT name FROM read_csv_auto('$CSV') WHERE department IN (SELECT dept_name FROM read_csv_auto('$DEPTS') WHERE region = 'West')"
+
+check \
+  "NOT IN (SELECT ...) — departments outside the West region" \
+  "SELECT name FROM '$CSV' WHERE department NOT IN (SELECT dept_name FROM '$DEPTS' WHERE region = 'West')" \
+  "SELECT name FROM read_csv_auto('$CSV') WHERE department NOT IN (SELECT dept_name FROM read_csv_auto('$DEPTS') WHERE region = 'West')"
+
+check \
+  "IN (SELECT ...) combined with an outer AND condition" \
+  "SELECT name FROM '$CSV' WHERE department IN (SELECT dept_name FROM '$DEPTS' WHERE region = 'West') AND salary > 80000" \
+  "SELECT name FROM read_csv_auto('$CSV') WHERE department IN (SELECT dept_name FROM read_csv_auto('$DEPTS') WHERE region = 'West') AND salary > 80000"
+
+check \
+  "IN (SELECT ... GROUP BY ... HAVING ...) — aggregate subquery" \
+  "SELECT name FROM '$CSV' WHERE department IN (SELECT department FROM '$CSV' GROUP BY department HAVING COUNT(*) > 5)" \
+  "SELECT name FROM read_csv_auto('$CSV') WHERE department IN (SELECT department FROM read_csv_auto('$CSV') GROUP BY department HAVING COUNT(*) > 5)"
+
+# ════════════════════════════════════════════════════════════════
+echo ""
 echo "── Adversarial CSV fixtures ─────────────────────────────────"
 
 EDGE="$TMP/edge.csv"
