@@ -202,21 +202,27 @@ against DuckDB doing exactly what they're for):
 
 ### Performance vs. DuckDB
 
-Measured directly (2M-row orders table, `WHERE customer_id IN (SELECT customer_id FROM
-customers WHERE tier = 'gold')`), same result set both engines:
+`col IN (SELECT ...)` is semantically a semi-join — probe a hash table built from the
+right side (the subquery), keep only left rows that match, project only left-side
+columns — not "a WHERE clause that happens to run a query first." Measured directly
+(2M-row orders table, `WHERE customer_id IN (SELECT customer_id FROM customers WHERE
+tier = 'gold')`), same result set both engines:
 
-| Subquery result size | csvql | DuckDB | 
+| Subquery result size | csvql | DuckDB |
 | --------------------- | ----- | ------ |
 | Small (6 matching customers — a typical lookup-table filter) | **0.034s** | 0.17s (csvql ~5x faster) |
-| Large (10,000 matching customers) | 3.5s | **0.17s** (DuckDB ~20x faster) |
+| Large (10,000 matching customers) | **0.045s** | 0.17s (csvql ~3.8x faster) |
 
-Root cause, not just a number: `Comparison.in_values` membership testing (`compareValues`
-in `parser.zig`) is a linear scan per row — fine for a literal `IN ('a','b','c')` list,
-which is always short because someone typed it by hand, but a genuine bottleneck once a
-subquery can produce a list with thousands of entries. This is a real, scoped follow-up
-(a hash-set membership check instead of a linear scan) rather than something papered over
-here — csvql wins the common case (small lookup lists) by a wide margin today, and loses
-on large ones for a well-understood, fixable reason.
+The large case was originally **3.5s** (DuckDB ~20x faster) — `Comparison.in_values`
+membership testing (`compareValues` in `parser.zig`) was a linear scan per row, fine for a
+literal `IN ('a','b','c')` list (always short, someone typed it by hand) but a genuine
+bottleneck once a subquery could produce a list with thousands of entries. Fixed by
+attaching a `std.StringHashMap(void)` (`Comparison.in_values_set`, built once at
+subquery-resolution time, alongside `in_values`) so membership is O(1) instead of O(n) —
+the same hash-build-then-probe shape csvql's own JOINs already use, not new infrastructure.
+Not built for a literal `IN (...)` list, which is never large enough for the scan to
+matter. The 78x improvement (3.5s → 0.045s) is the semi-join reframing paying off, not a
+one-off tuning trick: any future genuinely-large IN-list — subquery or not — gets it too.
 
 ## Known gaps (open issues)
 

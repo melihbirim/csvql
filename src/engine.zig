@@ -439,6 +439,23 @@ fn resolveInSubqueries(allocator: Allocator, expr: *parser.Expression, opts: opt
                 allocator.free(sql);
                 c.in_subquery_sql = null;
                 c.in_values = values;
+
+                // A subquery's result can be arbitrarily large — unlike a
+                // hand-typed literal IN (...) list, which is always short
+                // enough that in_values' linear scan is fine. Build a hash
+                // set alongside it so compareValues does O(1) membership
+                // instead of O(n) per row (measured ~20x slower than DuckDB
+                // at 10,000 resolved values before this; see CORRECTNESS.md).
+                // Heap-allocated (not stored by value) so every copy of this
+                // Comparison shares the one set — same reasoning as why this
+                // whole function must run on the caller's real Query, not a
+                // copy: see the doc comment above.
+                const set = try allocator.create(std.StringHashMap(void));
+                errdefer allocator.destroy(set);
+                set.* = std.StringHashMap(void).init(allocator);
+                errdefer set.deinit();
+                for (values) |v| try set.put(v, {});
+                c.in_values_set = set;
             }
         },
         .scalar_comparison => {},

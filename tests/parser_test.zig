@@ -565,3 +565,34 @@ test "scalar subquery in SELECT list still errors clearly" {
 
 // (HAVING subquery coverage already exists above: "subquery in HAVING
 // errors clearly instead of silently misparsing (#124)".)
+
+// TDD: IN (SELECT ...) is a semi-join, and a large resolved result set
+// should be an O(1) hash lookup, not an O(n) scan over in_values (a real
+// ~20x slowdown was measured at 10,000 resolved values — see
+// CORRECTNESS.md's "Performance vs. DuckDB"). in_values_set is a pointer
+// (not stored by value) so every copy of a Comparison shares the same
+// underlying set, for the same reason resolveInSubqueries in engine.zig
+// must resolve on the caller's one addressable Query rather than a copy.
+test "compareValues uses in_values_set (hash lookup) when present, and honors in_negate" {
+    const allocator = std.testing.allocator;
+    var set = std.StringHashMap(void).init(allocator);
+    defer set.deinit();
+    try set.put("10", {});
+    try set.put("20", {});
+
+    const comp = parser.Comparison{
+        .column = @constCast("id"),
+        .operator = .equal,
+        .value = @constCast(""),
+        .numeric_value = null,
+        .in_values_set = &set,
+    };
+    try std.testing.expect(parser.compareValues(comp, "10"));
+    try std.testing.expect(parser.compareValues(comp, "20"));
+    try std.testing.expect(!parser.compareValues(comp, "15"));
+
+    var comp_negated = comp;
+    comp_negated.in_negate = true;
+    try std.testing.expect(!parser.compareValues(comp_negated, "10"));
+    try std.testing.expect(parser.compareValues(comp_negated, "15"));
+}

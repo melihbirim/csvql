@@ -149,6 +149,15 @@ pub const Comparison = struct {
     in_values: ?[][]u8 = null,
     /// true for NOT IN (...) — negates the in_values membership check.
     in_negate: bool = false,
+    /// Optional hash-set mirror of in_values, for O(1) membership instead of
+    /// in_values' O(n) linear scan. A pointer (not stored by value) so it's
+    /// shared correctly across every copy of this Comparison regardless of
+    /// how deep in an Expression tree it sits — see the ownership note on
+    /// resolveInSubqueries in engine.zig for why that distinction matters
+    /// here specifically. Built once, at subquery-resolution time, from a
+    /// subquery's result (#124); never built for a literal IN (...) list,
+    /// which is always short enough that the linear scan is already fine.
+    in_values_set: ?*std.StringHashMap(void) = null,
     /// Non-null when this is IN (SELECT ...) / NOT IN (SELECT ...) — holds the
     /// raw inner query text (#124), not yet executed. The parser can't run it
     /// (no file I/O at parse time); the engine resolves this into in_values
@@ -170,6 +179,10 @@ pub const Comparison = struct {
         if (self.in_values) |vals| {
             for (vals) |v| allocator.free(v);
             allocator.free(vals);
+        }
+        if (self.in_values_set) |set| {
+            set.deinit();
+            allocator.destroy(set);
         }
         if (self.in_subquery_sql) |sql| allocator.free(sql);
         if (self.between_high) |h| allocator.free(h);
@@ -1711,6 +1724,15 @@ pub fn compareValues(comp: Comparison, candidate: []const u8) bool {
             .less_equal => remainder <= expected,
             .like, .ilike, .between, .is_null, .is_not_null => unreachable,
         };
+    }
+
+    // IN (SELECT ...) / NOT IN (SELECT ...) resolved to a hash set (#124
+    // follow-up): O(1) membership instead of in_values' O(n) scan below —
+    // the two are mutually exclusive (a resolved subquery sets in_values_set
+    // AND in_values together, see resolveInSubqueries in engine.zig, but
+    // this check always wins when present since it's strictly faster).
+    if (comp.in_values_set) |set| {
+        return set.contains(candidate) != comp.in_negate;
     }
 
     // IN (...) / NOT IN (...) — check membership against the list of values
