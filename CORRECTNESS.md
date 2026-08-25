@@ -235,6 +235,8 @@ the expected shape for a hash-build-then-probe design, not a sign the fix is inc
 building and probing a larger hash set has real, non-zero cost, it's just linear now
 instead of quadratic. No cliff was found up to 1M resolved values.
 
+Reproduce: [`bench/bench_insubquery.sh`](bench/bench_insubquery.sh).
+
 ## Known gaps (open issues)
 
 Not yet supported. All of these **error clearly** rather than silently returning wrong
