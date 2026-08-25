@@ -48,6 +48,7 @@ const help_text =
     \\           numeric values: age > 30
     \\           LIKE / ILIKE pattern matching: name LIKE 'A%'
     \\           IN list: status IN ('active', 'pending')
+    \\           IN subquery: id IN (SELECT id FROM 'other.csv' WHERE ...)
     \\           BETWEEN range: age BETWEEN 18 AND 65
     \\           IS NULL / IS NOT NULL
     \\  GROUP BY column grouping with aggregate functions
@@ -60,7 +61,9 @@ const help_text =
     \\  JOIN     inner join: SELECT ... FROM 'a.csv' JOIN 'b.csv' ON a.id = b.id
     \\
     \\NOT SUPPORTED:
-    \\  subqueries, multiple ORDER BY columns,
+    \\  correlated subqueries, subqueries in FROM/SELECT-list/HAVING-comparison
+    \\  (col IN (SELECT ...) is the one supported subquery shape, single column,
+    \\  non-correlated — see CORRECTNESS.md), multiple ORDER BY columns,
     \\  UNION, INTERSECT, EXCEPT, INSERT/UPDATE/DELETE
     \\
     \\OPTIONS:
@@ -117,6 +120,8 @@ fn exitCodeForError(err: anyerror) u8 {
         error.UnsupportedJoinType,
         error.UnsupportedSetOperation,
         error.SubqueriesNotSupported,
+        error.SubqueryMustSelectOneColumn,
+        error.InvalidSubquery,
         error.ColumnNotFound,
         error.OrderByColumnNotFound,
         error.MixedAggregateAndNonAggregateSelect,
@@ -277,6 +282,16 @@ pub fn main() !void {
         };
     };
     defer query.deinit();
+
+    // Resolve any `col IN (SELECT ...)` / `col NOT IN (SELECT ...)` (#124)
+    // against `query` itself — the one addressable, canonical copy — before
+    // any of execute()'s several call sites below run. Must happen here,
+    // not inside execute(), since execute() only ever sees a by-value copy;
+    // see engine.zig's resolveInSubqueries for why that distinction matters.
+    engine.resolveQuery(allocator, &query, opts) catch |err| {
+        std.debug.print("execution error: {}\n", .{err});
+        std.process.exit(exitCodeForError(err));
+    };
 
     // Determine whether to render as a table
     const use_table = opts.format == .csv and !opts.no_header and switch (opts.table_mode) {
@@ -805,6 +820,8 @@ test "exitCodeForError classifies bad-query, strict-mode, and uncategorized erro
     try std.testing.expectEqual(@as(u8, 2), exitCodeForError(error.ColumnNotFound));
     try std.testing.expectEqual(@as(u8, 2), exitCodeForError(error.OrderByColumnNotFound));
     try std.testing.expectEqual(@as(u8, 2), exitCodeForError(error.SubqueriesNotSupported));
+    try std.testing.expectEqual(@as(u8, 2), exitCodeForError(error.SubqueryMustSelectOneColumn));
+    try std.testing.expectEqual(@as(u8, 2), exitCodeForError(error.InvalidSubquery));
     try std.testing.expectEqual(@as(u8, 2), exitCodeForError(error.UnsupportedSetOperation));
     try std.testing.expectEqual(@as(u8, 2), exitCodeForError(error.InvalidQuery));
 

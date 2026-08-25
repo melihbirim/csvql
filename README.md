@@ -263,6 +263,7 @@ See [BENCHMARKS.md](BENCHMARKS.md) for the complete analysis.
 | **ILIKE**     | `WHERE col ILIKE 'pattern'` — same as LIKE but case-insensitive         |
 | **BETWEEN**   | `WHERE col BETWEEN low AND high` — inclusive numeric or string range    |
 | **IN / NOT IN** | `WHERE col IN ('a', 'b', 'c')`, `WHERE col NOT IN ('a', 'b')` — membership test and its negation |
+| **IN (subquery)** | `WHERE col IN (SELECT col FROM 'other.csv' WHERE ...)` — non-correlated, subquery must select exactly one column (also `NOT IN`); see [CORRECTNESS.md](CORRECTNESS.md#subqueries) |
 | **IS NULL**   | `WHERE col IS NULL` / `WHERE col IS NOT NULL` — empty-field test; also usable as a SELECT expression (`SELECT col IS NOT NULL AS has_val`), returns `true`/`false` |
 | **NOT**       | `WHERE NOT expr` — logical negation of any condition                    |
 | **AND / OR**  | `WHERE cond1 AND cond2` / `WHERE cond1 OR cond2` — compound conditions  |
@@ -315,7 +316,7 @@ Not yet supported — these error clearly rather than silently returning wrong d
 
 | Limitation | Tracking |
 | ---------- | -------- |
-| Subqueries (`WHERE col IN (SELECT ...)`, `HAVING x > (SELECT ...)`) | [#124](https://github.com/melihbirim/csvql/issues/124) |
+| Subqueries other than `col IN (SELECT ...)` / `col NOT IN (SELECT ...)` (non-correlated, single-column — see [CORRECTNESS.md](CORRECTNESS.md#subqueries)) | [#124](https://github.com/melihbirim/csvql/issues/124) |
 | `UNION` / `INTERSECT` / `EXCEPT` | [#122](https://github.com/melihbirim/csvql/issues/122), [#127](https://github.com/melihbirim/csvql/issues/127) |
 | Window functions (`RANK() OVER (...)`, etc.) | [#126](https://github.com/melihbirim/csvql/issues/126) |
 | `OFFSET` clause | [#70](https://github.com/melihbirim/csvql/issues/70) |

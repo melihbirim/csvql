@@ -344,6 +344,139 @@ pub fn ensurePathAllowed(allocator: Allocator, path: []const u8, roots: []const 
     return error.PathOutsideAllowedRoot;
 }
 
+/// Runs the non-correlated subquery `sql` (the raw text captured by
+/// parseInComparison for `col IN (SELECT ...)`, #124) and returns its single
+/// output column's values, owned by `allocator` — the caller attaches this
+/// directly to Comparison.in_values. Reuses the full `execute()` (so
+/// aggregates/GROUP BY/HAVING/ORDER BY/DISTINCT inside the subquery all just
+/// work) by materializing its output to a temp file and reading it back —
+/// the same stage-to-temp-file pattern executeJoinThenAggregate already uses
+/// below, not a special case invented for this.
+// Explicit anyerror (not inferred): this function calls resolveQuery() (to
+// resolve a nested IN-subquery inside this subquery, if any) which calls
+// resolveInSubqueries() which calls this function right back — a self
+// recursive cycle for nested subqueries. An inferred error set on any one
+// of these closes a loop the compiler can't resolve; note this is a
+// DIFFERENT cycle from the one execute() used to be part of (see the
+// comment in executeJoinThenAggregate) — execute() itself no longer
+// participates in subquery resolution at all (see resolveInSubqueries).
+fn runSubqueryForInList(allocator: Allocator, sql: []const u8, opts: options_mod.Options) anyerror![][]u8 {
+    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer scratch.deinit();
+    const sa = scratch.allocator();
+
+    var subquery = parser.parse(allocator, sql) catch return error.InvalidSubquery;
+    defer subquery.deinit();
+    if (subquery.all_columns or subquery.columns.len != 1) return error.SubqueryMustSelectOneColumn;
+    // Resolve any subquery nested inside THIS subquery (e.g. `col IN (SELECT
+    // ... WHERE other_col IN (SELECT ...))`) before running it — subquery
+    // itself is the sole, addressable owner here, so this is safe for the
+    // same reason resolveQuery must be called on the caller's own Query
+    // rather than a copy (see resolveInSubqueries).
+    try resolveQuery(allocator, &subquery, opts);
+
+    const tmp_dir: []const u8 = (if (builtin.os.tag == .windows)
+        std.process.getEnvVarOwned(sa, "TEMP")
+    else
+        std.process.getEnvVarOwned(sa, "TMPDIR")) catch (if (builtin.os.tag == .windows) "." else "/tmp");
+    const stamp = std.time.nanoTimestamp();
+    const tmp_path = try std.fmt.allocPrint(sa, "{s}{c}csvql_insubq_{d}.tmp", .{ tmp_dir, std.fs.path.sep, stamp });
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    const captured = blk: {
+        const tmp_file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true, .read = true });
+        defer tmp_file.close();
+        var sub_opts = opts;
+        sub_opts.no_header = false; // always emit a header so the skip below is reliable
+        try execute(allocator, subquery, tmp_file, sub_opts);
+        try tmp_file.seekTo(0);
+        break :blk try tmp_file.readToEndAlloc(sa, 64 * 1024 * 1024);
+    };
+
+    var values = std.ArrayListUnmanaged([]u8){};
+    errdefer {
+        for (values.items) |v| allocator.free(v);
+        values.deinit(allocator);
+    }
+    const trimmed_out = std.mem.trim(u8, captured, "\n");
+    if (trimmed_out.len > 0) {
+        var lines = std.mem.splitScalar(u8, trimmed_out, '\n');
+        _ = lines.next(); // header row (forced on above)
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            try values.append(allocator, try allocator.dupe(u8, line));
+        }
+    }
+    return values.toOwnedSlice(allocator);
+}
+
+/// Walks a WHERE/HAVING expression tree resolving every `col IN (SELECT
+/// ...)` / `col NOT IN (SELECT ...)` comparison (in_subquery_sql set) into a
+/// concrete in_values list, in place, before the expression is evaluated.
+/// Non-correlated by construction: the subquery has no access to the outer
+/// row, so a query that would need one (e.g. referencing the outer table's
+/// column) fails with a clear ColumnNotFound-style error from the subquery
+/// itself rather than silently producing wrong results.
+///
+/// MUST be called on the caller's own addressable Query (via resolveQuery,
+/// e.g. `&query` where `var query = try parser.parse(...)`), never on a
+/// by-value copy such as execute()'s own `query` parameter. Expression's
+/// `.comparison` variant is stored inline (copied whenever the enclosing
+/// Query/Expression is copied), but `.binary`/`.unary` hold heap pointers
+/// that are shared across every copy — resolving through a copy would
+/// therefore mutate the caller's original data for compound (AND/OR/NOT)
+/// conditions but silently miss it for a single bare comparison, which is
+/// exactly backwards for freeing later: the shared case (unfixed) would
+/// double-free once both the temp copy's cleanup and the original's
+/// deinit() ran, and the unshared case would leak. Resolving in place, once,
+/// on the one real owner, and leaving in_values for Comparison.deinit() to
+/// free as it already does — normally — sidesteps both failure modes.
+fn resolveInSubqueries(allocator: Allocator, expr: *parser.Expression, opts: options_mod.Options) anyerror!void {
+    switch (expr.*) {
+        .comparison => |*c| {
+            if (c.in_subquery_sql) |sql| {
+                const values = try runSubqueryForInList(allocator, sql, opts);
+                allocator.free(sql);
+                c.in_subquery_sql = null;
+                c.in_values = values;
+
+                // A subquery's result can be arbitrarily large — unlike a
+                // hand-typed literal IN (...) list, which is always short
+                // enough that in_values' linear scan is fine. Build a hash
+                // set alongside it so compareValues does O(1) membership
+                // instead of O(n) per row (measured ~20x slower than DuckDB
+                // at 10,000 resolved values before this; see CORRECTNESS.md).
+                // Heap-allocated (not stored by value) so every copy of this
+                // Comparison shares the one set — same reasoning as why this
+                // whole function must run on the caller's real Query, not a
+                // copy: see the doc comment above.
+                const set = try allocator.create(std.StringHashMap(void));
+                errdefer allocator.destroy(set);
+                set.* = std.StringHashMap(void).init(allocator);
+                errdefer set.deinit();
+                for (values) |v| try set.put(v, {});
+                c.in_values_set = set;
+            }
+        },
+        .scalar_comparison => {},
+        .binary => |b| {
+            try resolveInSubqueries(allocator, &b.left, opts);
+            try resolveInSubqueries(allocator, &b.right, opts);
+        },
+        .unary => |u| try resolveInSubqueries(allocator, &u.expr, opts),
+    }
+}
+
+/// Public entry point: resolves every `col IN (SELECT ...)` / `col NOT IN
+/// (SELECT ...)` in `query`'s WHERE and HAVING clauses (#124), in place.
+/// Callers must invoke this on their own addressable Query — right after
+/// parser.parse() and before execute() — never on a copy; see
+/// resolveInSubqueries for why that distinction matters here specifically.
+pub fn resolveQuery(allocator: Allocator, query: *parser.Query, opts: options_mod.Options) !void {
+    if (query.where_expr) |*we| try resolveInSubqueries(allocator, we, opts);
+    if (query.having_expr) |*he| try resolveInSubqueries(allocator, he, opts);
+}
+
 pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.File, opts: options_mod.Options) !void {
     // --root sandbox: reject any file outside the allowed trees before opening.
     try ensurePathAllowed(allocator, query.file_path, opts.roots);
@@ -4990,8 +5123,13 @@ fn executeGroupBy(
     // comparisons), not just a single top-level comparison (#117-having),
     // since e.g. "HAVING COUNT(*) >= 3 AND MAX(salary) > 80000" needs both.
     var having_extra_aggs = std.ArrayListUnmanaged(struct { idx: usize, text: []const u8 }){};
+    defer {
+        for (having_extra_aggs.items) |ea| allocator.free(ea.text);
+        having_extra_aggs.deinit(allocator);
+    }
     if (query.having_expr) |hexpr| {
         var comparisons = std.ArrayListUnmanaged(parser.Comparison){};
+        defer comparisons.deinit(allocator);
         collectComparisons(hexpr, &comparisons, allocator) catch {};
         // HAVING comparing two aggregate expressions (e.g. "HAVING COUNT(*)
         // = COUNT(*)") isn't supported — only "aggregate OP literal". The
@@ -8413,4 +8551,266 @@ test "plain SELECT DATE_PART(...) without GROUP BY extracts per row (#133)" {
 
     try std.testing.expect(std.mem.indexOf(u8, out, "1,01") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "2,03") != null);
+}
+
+// ── WHERE col IN (SELECT ...) — non-correlated, single-column subqueries (#124) ──
+// Parsing is covered in tests/parser_test.zig; these are the end-to-end
+// resolution + execution tests, since resolving in_subquery_sql into
+// in_values requires actually running the inner query against a real file.
+
+fn writeFile(dir: std.fs.Dir, name: []const u8, content: []const u8) !void {
+    const f = try dir.createFile(name, .{});
+    defer f.close();
+    try f.writeAll(content);
+}
+
+test "WHERE col IN (SELECT ...) filters using the inner query's result (#124)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "orders.csv", "id,customer_id,amount\n1,10,50\n2,20,75\n3,30,20\n");
+    try writeFile(tmp.dir, "vip.csv", "customer_id\n10\n30\n");
+
+    var ob: [std.fs.max_path_bytes]u8 = undefined;
+    var vb: [std.fs.max_path_bytes]u8 = undefined;
+    const op = try tmp.dir.realpath("orders.csv", &ob);
+    const vp = try tmp.dir.realpath("vip.csv", &vb);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT id FROM '{s}' WHERE customer_id IN (SELECT customer_id FROM '{s}') ORDER BY id",
+        .{ op, vp },
+    );
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+    try resolveQuery(allocator, &query, .{});
+
+    const out_file = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out_file.close();
+    try execute(allocator, query, out_file, .{});
+    try out_file.seekTo(0);
+    const out = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(out);
+
+    const body = std.mem.trim(u8, out, "\n");
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    _ = lines.next(); // header
+    try std.testing.expectEqualStrings("1", lines.next().?);
+    try std.testing.expectEqualStrings("3", lines.next().?);
+    try std.testing.expect(lines.next() == null);
+}
+
+test "WHERE col NOT IN (SELECT ...) excludes the inner query's result" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "orders.csv", "id,customer_id,amount\n1,10,50\n2,20,75\n3,30,20\n");
+    try writeFile(tmp.dir, "vip.csv", "customer_id\n10\n30\n");
+
+    var ob: [std.fs.max_path_bytes]u8 = undefined;
+    var vb: [std.fs.max_path_bytes]u8 = undefined;
+    const op = try tmp.dir.realpath("orders.csv", &ob);
+    const vp = try tmp.dir.realpath("vip.csv", &vb);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT id FROM '{s}' WHERE customer_id NOT IN (SELECT customer_id FROM '{s}') ORDER BY id",
+        .{ op, vp },
+    );
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+    try resolveQuery(allocator, &query, .{});
+
+    const out_file = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out_file.close();
+    try execute(allocator, query, out_file, .{});
+    try out_file.seekTo(0);
+    const out = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(out);
+
+    const body = std.mem.trim(u8, out, "\n");
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    _ = lines.next(); // header
+    try std.testing.expectEqualStrings("2", lines.next().?);
+    try std.testing.expect(lines.next() == null);
+}
+
+test "WHERE col IN (SELECT ... WHERE ...) — the subquery's own WHERE clause is honored" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "orders.csv", "id,customer_id\n1,10\n2,20\n3,30\n");
+    try writeFile(tmp.dir, "customers.csv", "customer_id,tier\n10,gold\n20,silver\n30,gold\n");
+
+    var ob: [std.fs.max_path_bytes]u8 = undefined;
+    var cb: [std.fs.max_path_bytes]u8 = undefined;
+    const op = try tmp.dir.realpath("orders.csv", &ob);
+    const cp = try tmp.dir.realpath("customers.csv", &cb);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT id FROM '{s}' WHERE customer_id IN (SELECT customer_id FROM '{s}' WHERE tier = 'gold') ORDER BY id",
+        .{ op, cp },
+    );
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+    try resolveQuery(allocator, &query, .{});
+
+    const out_file = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out_file.close();
+    try execute(allocator, query, out_file, .{});
+    try out_file.seekTo(0);
+    const out = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(out);
+
+    const body = std.mem.trim(u8, out, "\n");
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    _ = lines.next(); // header
+    try std.testing.expectEqualStrings("1", lines.next().?);
+    try std.testing.expectEqualStrings("3", lines.next().?);
+    try std.testing.expect(lines.next() == null);
+}
+
+test "WHERE col IN (SELECT ...) with a zero-row subquery result matches nothing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "orders.csv", "id,customer_id\n1,10\n2,20\n");
+    try writeFile(tmp.dir, "vip.csv", "customer_id\n999\n");
+
+    var ob: [std.fs.max_path_bytes]u8 = undefined;
+    var vb: [std.fs.max_path_bytes]u8 = undefined;
+    const op = try tmp.dir.realpath("orders.csv", &ob);
+    const vp = try tmp.dir.realpath("vip.csv", &vb);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT id FROM '{s}' WHERE customer_id IN (SELECT customer_id FROM '{s}' WHERE customer_id = 12345) ORDER BY id",
+        .{ op, vp },
+    );
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+    try resolveQuery(allocator, &query, .{});
+
+    const out_file = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out_file.close();
+    try execute(allocator, query, out_file, .{});
+    try out_file.seekTo(0);
+    const out = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(out);
+
+    const body = std.mem.trim(u8, out, "\n");
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    _ = lines.next(); // header
+    try std.testing.expect(lines.next() == null);
+}
+
+test "WHERE col IN (SELECT a, b ...) — a subquery selecting more than one column errors clearly" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "orders.csv", "id,customer_id\n1,10\n");
+    try writeFile(tmp.dir, "vip.csv", "customer_id,tier\n10,gold\n");
+
+    var ob: [std.fs.max_path_bytes]u8 = undefined;
+    var vb: [std.fs.max_path_bytes]u8 = undefined;
+    const op = try tmp.dir.realpath("orders.csv", &ob);
+    const vp = try tmp.dir.realpath("vip.csv", &vb);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT id FROM '{s}' WHERE customer_id IN (SELECT customer_id, tier FROM '{s}')",
+        .{ op, vp },
+    );
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+    try std.testing.expectError(error.SubqueryMustSelectOneColumn, resolveQuery(allocator, &query, .{}));
+}
+
+test "WHERE col IN (SELECT ... GROUP BY ... HAVING ...) — an aggregate subquery is resolved like any other" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "orders.csv", "id,customer_id\n1,10\n2,20\n3,30\n");
+    try writeFile(tmp.dir, "line_items.csv", "customer_id,qty\n10,1\n10,1\n10,1\n20,1\n30,1\n30,1\n30,1\n30,1\n");
+
+    var ob: [std.fs.max_path_bytes]u8 = undefined;
+    var lb: [std.fs.max_path_bytes]u8 = undefined;
+    const op = try tmp.dir.realpath("orders.csv", &ob);
+    const lp = try tmp.dir.realpath("line_items.csv", &lb);
+
+    // Customers with 3+ line items: 10 (3) and 30 (4), not 20 (1).
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT id FROM '{s}' WHERE customer_id IN (SELECT customer_id FROM '{s}' GROUP BY customer_id HAVING COUNT(*) >= 3) ORDER BY id",
+        .{ op, lp },
+    );
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+    try resolveQuery(allocator, &query, .{});
+
+    const out_file = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out_file.close();
+    try execute(allocator, query, out_file, .{});
+    try out_file.seekTo(0);
+    const out = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(out);
+
+    const body = std.mem.trim(u8, out, "\n");
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    _ = lines.next(); // header
+    try std.testing.expectEqualStrings("1", lines.next().?);
+    try std.testing.expectEqualStrings("3", lines.next().?);
+    try std.testing.expect(lines.next() == null);
+}
+
+// Regression test for a real bug found via bench/verify_correctness.sh:
+// Expression.binary/.unary hold heap pointers shared across every copy of
+// the Query struct, unlike .comparison (stored inline, copied by value).
+// Resolving a subquery reached through an AND/OR — as here — mutates that
+// SHARED node; resolving one reached as a bare top-level comparison does
+// not propagate to the caller's own Query at all. An implementation that
+// only handles one of those two cases either double-frees in_values (this
+// shape) or leaks it (the bare-comparison shape). See resolveInSubqueries.
+test "WHERE col IN (SELECT ...) AND other_condition — subquery inside a compound WHERE" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeFile(tmp.dir, "orders.csv", "id,customer_id,amount\n1,10,50\n2,10,150\n3,20,150\n4,30,150\n");
+    try writeFile(tmp.dir, "vip.csv", "customer_id\n10\n30\n");
+
+    var ob: [std.fs.max_path_bytes]u8 = undefined;
+    var vb: [std.fs.max_path_bytes]u8 = undefined;
+    const op = try tmp.dir.realpath("orders.csv", &ob);
+    const vp = try tmp.dir.realpath("vip.csv", &vb);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT id FROM '{s}' WHERE customer_id IN (SELECT customer_id FROM '{s}') AND amount > 100 ORDER BY id",
+        .{ op, vp },
+    );
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+    try resolveQuery(allocator, &query, .{});
+
+    const out_file = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out_file.close();
+    try execute(allocator, query, out_file, .{});
+    try out_file.seekTo(0);
+    const out = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(out);
+
+    const body = std.mem.trim(u8, out, "\n");
+    var lines = std.mem.splitScalar(u8, body, '\n');
+    _ = lines.next(); // header
+    try std.testing.expectEqualStrings("2", lines.next().?);
+    try std.testing.expectEqualStrings("4", lines.next().?);
+    try std.testing.expect(lines.next() == null);
 }
