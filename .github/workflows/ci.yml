@@ -128,6 +128,14 @@ jobs:
     - name: Generate fixture CSV
       run: ./bench/gen_fixture.sh
 
+    # Cheap, real verification of the "same seed -> same query stream"
+    # guarantee (see CORRECTNESS.md) — needs neither csvql nor DuckDB, so it
+    # runs before either. Not theoretical: this caught a real bug where a
+    # mawk build (compiled against arc4random for rand-funcs) silently
+    # ignored srand()'s argument, making every --seed non-reproducible.
+    - name: Verify query generator determinism
+      run: ./bench/query_fuzz.sh --seed 1 --count 300 --check-determinism
+
     - name: Run correctness suite (treats DuckDB as oracle)
       run: ./bench/verify_correctness.sh
 

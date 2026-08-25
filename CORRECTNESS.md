@@ -44,8 +44,10 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
   (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`, scalar and `GROUP BY`) against the existing fixture
   schema. No JOINs, no subqueries, no window functions — out of scope by design, see
   the issue for why. Deterministic seeding (`--seed`) so every mismatch reproduces with
-  one command; failures dump to `tests/regressions/` permanently instead of using a
-  shrinker. DuckDB's side runs as one batched process (materialized table + all
+  one command — see [Determinism guarantees](#determinism-guarantees) for what that
+  actually rests on and how it's verified, not just asserted; failures dump to
+  `tests/regressions/` permanently instead of using a shrinker. DuckDB's side runs as
+  one batched process (materialized table + all
   queries in a single `duckdb -f` invocation) rather than one process per query —
   the difference between hundreds and tens of thousands of queries in the same wall
   time.
@@ -92,9 +94,30 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
 actually be replayed. That rests on three separate guarantees — worth stating explicitly,
 because only some of them are automatic and the others silently stop holding if broken:
 
-- **Same seed → same query stream.** The awk PRNG is seeded with `--seed`, so a given seed
-  always generates the same sequence of generated SQL. Holds unconditionally as long as
-  the generator's own template logic is unchanged.
+- **Same seed → same query stream.** `bench/query_fuzz.sh` seeds its *own* PRNG
+  (`mysrand`/`myrand`, a small MINSTD LCG implemented directly in the awk script) rather
+  than calling awk's built-in `srand()`/`rand()`. This isn't a style preference: it was
+  found, while adding this section, that at least one `mawk` build (compiled against
+  `arc4random` for its rand-funcs backend — visible via `awk -W version`) silently ignores
+  `srand()`'s seed argument and reseeds from OS entropy on every process start, so the
+  *same* `--seed` produced a *different* query stream on every single invocation. Rolling
+  our own seeded LCG removes the dependency on the host's awk build entirely. This is
+  verified continuously, not just asserted: `./bench/query_fuzz.sh --seed N --count M
+  --check-determinism` regenerates the stream twice and diffs them, and runs in CI
+  (`ci.yml`, before either engine is even invoked) on every PR.
+- **Query-space size, honestly.** The template space is bounded (a handful of aggregates,
+  three query shapes, predicates over six columns), so a naive guess is that most of a
+  50,000-query run is duplicates. Measured directly (dedup the generated SQL text) across
+  several real seeds at `--count 50000`: **~82% distinct** (e.g. 41,010 of 50,000 for
+  seed 1), consistent run to run — the space is far less saturated than that guess. This
+  is what `VERIFICATION-LOG.md`'s `Distinct` column reports per run, and it's the signal
+  for when to widen the generator's template set: watch for that percentage trending down
+  as more seeds accumulate, not a one-time guess.
+- **See it without reading awk.** `bench/sample-queries.sql` is 50 real generated queries
+  (`./bench/query_fuzz.sh --seed 1 --count 50 --dump-queries bench/sample-queries.sql`,
+  committed) — regenerate it after any change to the generator's template logic so it
+  stays representative. `--dump-queries` writes the generated SQL and exits without
+  touching either engine.
 - **Same seed → same fixture.** The query stream is generated *against* `large_test.csv`,
   so reproducing it also requires the fixture to be byte-identical. `bench/gen_fixture.sh`
   is the single source of truth for that file — it used to be duplicated inline in
