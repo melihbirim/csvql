@@ -191,6 +191,17 @@ Run the benchmark yourself: [`bench/bench_all.sh --section like`](bench/bench_al
 
 The base table is memory-mapped, split into line-aligned chunks, and probed against the right-side hash maps across all cores in parallel — output order in a join is undefined, so each worker streams its matches straight out with no merge step. Combined with cat-speed CSV reading (DuckDB spends most of a join parsing the CSV), joins that used to be roughly on par are now a clear win. Byte-for-byte verified against DuckDB in [`bench/verify_correctness.sh`](bench/verify_correctness.sh).
 
+**2M-row orders table, cloud VM (Intel Xeon, 4 cores) — different hardware from the tables above, not directly comparable across sections** — `WHERE col IN (SELECT ...)` (#124), which is really a semi-join: build a hash table from the subquery's result, probe it per outer row. Resolved-list size varied by how selective the lookup table's own filter is:
+
+| Resolved subquery result size | csvql | DuckDB | Speedup |
+| ------------------------------ | ---------- | ------ | ------- |
+| 6 (a typical lookup-table filter) | **0.034s** | 0.17s  | **~5x** |
+| 10,000                          | **0.045s** | 0.17s  | **~3.8x** |
+| 100,000                         | **0.088s** | 0.21s  | **~2.3x** |
+| 1,000,000                       | 0.358s     | 0.357s | even    |
+
+Row counts verified identical to DuckDB at every size. This was originally a ~20x *loss* at 10,000 resolved values (a linear-scan membership check, fine for a hand-typed literal list, not for a subquery-sized one) — found via differential testing, root-caused, and fixed with a hash-set semi-join. Full story, including the crossover point and why it flattens rather than staying ahead forever: [`CORRECTNESS.md#performance-vs-duckdb`](CORRECTNESS.md#performance-vs-duckdb).
+
 **NYC Taxi benchmark — 20M rows, 8 GB CSV, Apple M-series** — the canonical [Billion-Taxi-Rides](https://github.com/pdet/taxi-benchmark) queries on [DuckDB's own dataset](https://duckdb.org/2024/10/16/driving-csv-performance-benchmarking-duckdb-with-the-nyc-taxi-dataset). Both engines query the raw uncompressed CSV **directly** (no preload into a native store), cold per run, best-of-5, warm OS cache:
 
 | Query                                                       | csvql     | DuckDB | Speedup  |
