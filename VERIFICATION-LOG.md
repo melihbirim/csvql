@@ -37,3 +37,4 @@ has changed since. `Command` is backfilled — it's fully determined by the `See
 | 2026-08-23 | 2459520179 | 50000 |  | 0 | 2.5.0 | 1.5.5 | `./bench/query_fuzz.sh --seed 2459520179 --count 50000` |  |
 | 2026-08-24 | 422312471 | 50000 |  | 0 | 2.5.0 | 1.5.5 | `./bench/query_fuzz.sh --seed 422312471 --count 50000` |  |
 | 2026-08-25 | 3027931993 | 50000 |  | 0 | 2.5.0 | 1.5.5 | `./bench/query_fuzz.sh --seed 3027931993 --count 50000` |  |
+| 2026-08-26 | 880127841 | 50000 | 40707 | 0 | 2.5.0 | 1.5.5 | `./bench/query_fuzz.sh --seed 880127841 --count 50000` |  |
