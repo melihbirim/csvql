@@ -1,17 +1,22 @@
 {
   "name": "csvql-query",
   "version": "2.5.0",
-  "description": "Fast SQL queries on CSV files — Zig/SIMD engine via N-API",
+  "description": "SQL on CSV files in place — no import, no database. Zig/SIMD engine for Node and AI agents (MCP). Read-only by design.",
   "main": "index.js",
   "types": "index.d.ts",
+  "bin": {
+    "csvql-query": "cli.js"
+  },
   "files": [
     "index.js",
     "index.d.ts",
+    "cli.js",
     "binaries/"
   ],
   "scripts": {
     "build": "zig build node -Doptimize=ReleaseFast && mkdir -p binaries && cp ../zig-out/lib/csvql.node binaries/$(node -p \"process.platform + '-' + process.arch\").node",
     "test": "node test.js",
+    "test:cli": "node test_cli.js",
     "bench": "node bench.js"
   },
   "keywords": [
@@ -24,7 +29,12 @@
     "parser",
     "agent",
     "ai",
-    "mcp"
+    "mcp",
+    "llm",
+    "cli",
+    "duckdb",
+    "analytics",
+    "dataframe"
   ],
   "license": "MIT",
   "repository": {

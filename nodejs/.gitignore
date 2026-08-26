@@ -1,2 +1,4 @@
 csvql.node
 node_modules/
+binaries/
+*.tgz
