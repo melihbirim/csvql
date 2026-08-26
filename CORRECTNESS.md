@@ -10,7 +10,7 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
 
 ## What is tested
 
-- **95 differential checks** in `bench/verify_correctness.sh` (96 when the optional
+- **97 differential checks** in `bench/verify_correctness.sh` (98 when the optional
   multi-GB taxi fixture is present locally — see below), covering: SELECT/projection,
   every WHERE operator (`=`, comparisons, `LIKE`/`ILIKE`, `BETWEEN`, `IN`/`NOT IN`
   (literal list and `IN (SELECT ...)` subquery, #124), `IS NULL`, modulo, compound
@@ -27,7 +27,7 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
   diffed raw — see below), scientific notation and negative zero, header-only/
   single-row/single-column files, ragged rows, a zero-byte file, and values near
   i64/f64 limits.
-- **550 unit tests** (`zig build test`) covering internals differential testing can't
+- **553 unit tests** (`zig build test`) covering internals differential testing can't
   reach directly: parser edge cases, arena-buffer offset safety across reallocation,
   overflow handling, TDD regression tests for every numbered bug fix referenced below.
 - **2 platforms in CI**: `ubuntu-latest` (x86_64) and `macos-14` (Apple Silicon,
@@ -106,14 +106,23 @@ because only some of them are automatic and the others silently stop holding if 
   verified continuously, not just asserted: `./bench/query_fuzz.sh --seed N --count M
   --check-determinism` regenerates the stream twice and diffs them, and runs in CI
   (`ci.yml`, before either engine is even invoked) on every PR.
-- **Query-space size, honestly.** The template space is bounded (a handful of aggregates,
-  three query shapes, predicates over six columns), so a naive guess is that most of a
-  50,000-query run is duplicates. Measured directly (dedup the generated SQL text) across
-  several real seeds at `--count 50000`: **~82% distinct** (e.g. 41,010 of 50,000 for
-  seed 1), consistent run to run — the space is far less saturated than that guess. This
-  is what `VERIFICATION-LOG.md`'s `Distinct` column reports per run, and it's the signal
-  for when to widen the generator's template set: watch for that percentage trending down
-  as more seeds accumulate, not a one-time guess.
+- **Query-space size, honestly.** Two numbers, because deduping on SQL *text* and deduping
+  on query *shape* answer different questions, and only the second one is a coverage
+  signal. Text: **~82% distinct** at `--count 50000`, consistent run to run — but that
+  number is dominated by the randomly-drawn literals (`WHERE salary != 90483` vs `WHERE
+  salary != 4122` are two distinct queries exercising one code path), and it never
+  saturates: still 66.3% distinct at `--count 400000`, climbing near-linearly throughout.
+  It reads ~82% at `--count 50000` whether the templates are narrow or wide, so it cannot
+  signal saturation — an earlier version of this section claimed it could, and read that
+  ~82% as evidence of a rich query space when it was really measuring the randomness of
+  the literals. Shape (literals normalized, columns collapsed to their type class):
+  **~8,900 templates total**, a property of the generator rather than the seed
+  (8424 / 8434 / 8466 at `--count 200000` for seeds 99 / 12345 / 7), and it does plateau —
+  `--count 50000` reaches ~6,300 of them (~71%), `--count 200000` reaches ~8,400 (~95%),
+  and another 200,000 queries past that buys only ~450 more. Both are reported per run in
+  `VERIFICATION-LOG.md` (`Distinct` and `Templates`); `Templates` is the one to watch
+  against the SQL surface csvql actually supports — see that file for the list of
+  supported shapes this generator still emits zero of.
 - **See it without reading awk.** `bench/sample-queries.sql` is 50 real generated queries
   (`./bench/query_fuzz.sh --seed 1 --count 50 --dump-queries bench/sample-queries.sql`,
   committed) — regenerate it after any change to the generator's template logic so it
@@ -149,13 +158,38 @@ Found via differential testing, kept as deliberate design choices rather than "f
 documented so they don't surprise anyone migrating queries from DuckDB. Full detail and
 examples in the [README](README.md#known-differences-from-duckdb).
 
+**Audited 2026-08-26** against csvql 2.5.0 / DuckDB 1.5.5 by running every row. A table
+like this is the load-bearing honesty claim in this file — it's what someone migrating
+from DuckDB relies on — so it's worth re-running rather than trusting. Five of the seven
+rows then present reproduced exactly as written. Two did not, and both have been corrected
+above:
+
+- **"Empty CSV field → stays an empty string" was wrong**, and it understated csvql.
+  csvql treats an empty field as `NULL` everywhere it matters and *agrees* with DuckDB on
+  `IS NULL`, `IS NOT NULL`, `COUNT(col)`, `SUM`, `AVG`, and `COALESCE` — `COALESCE(name,
+  'MISSING')` returns `MISSING` on both engines, which is csvql's own model saying the
+  cell is `NULL`. The audit did find one real inconsistency behind that row: `LENGTH` was
+  the sole scalar function that did not propagate `NULL`, returning `0` for a missing
+  value while `UPPER`, `LOWER`, `TRIM`, `SUBSTR`, `REPLACE`, `ABS`, `CEIL`, `FLOOR`,
+  `ROUND` and `CAST` all already returned empty. That was
+  [#147](https://github.com/melihbirim/csvql/issues/147), **now fixed** — there was no
+  design decision to make, since the engine had already made it everywhere else. What
+  remains is one genuine behavioral difference (`col = ''` matching an empty field) and
+  one rendering convention (how a `NULL` is written to CSV), both listed above.
+- **The huge-integer row's example didn't trigger its own claim.** It cited
+  `9223372036854775807` — exactly `BIGINT` max, which DuckDB stores and prints
+  exactly, so anyone reproducing from the doc would have found no difference and
+  concluded the doc was wrong. The behavior is real but starts one past that value,
+  at `9223372036854775808`; the row now cites a value that actually reproduces.
+
 | Behavior | csvql | DuckDB |
 | -------- | ----- | ------ |
 | `LENGTH(col)` on a unicode string | Byte length (UTF-8 bytes) | Character count (codepoints) |
-| Empty CSV field | Stays an empty string | Inferred as `NULL` |
+| Empty CSV field, compared as a **value** (`col = ''`) | Matches the empty field | No match (`NULL = ''` is not true) |
+| How a `NULL` result is written to CSV output | An empty field (RFC 4180 — survives a round-trip back into csvql as `NULL`) | The DuckDB CLI's CSV mode writes the literal text `NULL` |
 | `DATEDIFF('hour'/'minute'/etc, a, b)` on a non-exact interval | Fractional (e.g. `8.5`) | Truncated (e.g. `8`) |
-| Numeric literal with a leading `0` (`007`) or `+` (`+5`) | Parses as a number | CSV sniffer infers `VARCHAR` for the whole column, `SUM`/etc then error |
-| A huge integer literal (e.g. `9223372036854775807`) in a plain (non-aggregate) `SELECT` | Passed through unchanged, exact text preserved | CSV sniffer infers `DOUBLE`, reformats via IEEE-754 rounding + scientific notation even with no computation |
+| Numeric literal with a leading `0` (`007`) or `+` (`+5`) | Parses as a number (`SUM` works) | CSV sniffer infers `VARCHAR` for the whole column, `SUM`/etc then error |
+| An integer literal **too large for `BIGINT`** (e.g. `9223372036854775808`) in a plain (non-aggregate) `SELECT` | Passed through unchanged, exact text preserved | CSV sniffer infers `DOUBLE`, reformats via IEEE-754 rounding + scientific notation even with no computation — and reformats the column's *other* values too (`123` → `123.0`) |
 | Ragged rows (fewer/more fields than the header) | Short rows padded with empty fields, long rows truncated to header width | CSV sniffer can lose confidence in the header entirely and re-infer the first row as data (`column0`, `column1`, ...) |
 | A zero-byte input file | `error.EmptyFile` (exit 3) | Returns silently with zero rows, no error |
 

@@ -74,11 +74,13 @@ jobs:
         # versions it actually ran against, rather than re-deriving them here
         # and risking the two drifting apart.
         SUMMARY_LINE="$(grep '^SUMMARY ' fuzz_output.txt || true)"
-        DISTINCT="$(echo "$SUMMARY_LINE" | grep -oE 'distinct=[0-9]+' | cut -d= -f2)"
+        DISTINCT="$(echo "$SUMMARY_LINE" | grep -oE '(^| )distinct=[0-9]+' | cut -d= -f2)"
+        TEMPLATES="$(echo "$SUMMARY_LINE" | grep -oE 'templates=[0-9]+' | cut -d= -f2)"
         MISMATCHES="$(echo "$SUMMARY_LINE" | grep -oE 'mismatches=[0-9]+' | cut -d= -f2)"
         CSVQL_VERSION="$(echo "$SUMMARY_LINE" | grep -oE 'csvql=[^ ]+' | cut -d= -f2)"
         DUCKDB_VERSION="$(echo "$SUMMARY_LINE" | grep -oE 'duckdb=[^ ]+' | cut -d= -f2)"
         DISTINCT="${DISTINCT:-unknown}"
+        TEMPLATES="${TEMPLATES:-unknown}"
         MISMATCHES="${MISMATCHES:-unknown}"
         CSVQL_VERSION="${CSVQL_VERSION:-unknown}"
         DUCKDB_VERSION="${DUCKDB_VERSION:-unknown}"
@@ -87,7 +89,7 @@ jobs:
         if [ "$MISMATCHES" != "0" ] && [ "$MISMATCHES" != "unknown" ]; then
           NOTES="see tests/regressions/ from this run's artifact"
         fi
-        echo "| $(date -u +%Y-%m-%d) | ${{ steps.params.outputs.seed }} | ${{ steps.params.outputs.count }} | ${DISTINCT} | ${MISMATCHES} | ${CSVQL_VERSION} | ${DUCKDB_VERSION} | \`${COMMAND}\` | ${NOTES} |" >> VERIFICATION-LOG.md
+        echo "| $(date -u +%Y-%m-%d) | ${{ steps.params.outputs.seed }} | ${{ steps.params.outputs.count }} | ${DISTINCT} | ${TEMPLATES} | ${MISMATCHES} | ${CSVQL_VERSION} | ${DUCKDB_VERSION} | \`${COMMAND}\` | ${NOTES} |" >> VERIFICATION-LOG.md
 
     - name: Commit VERIFICATION-LOG.md
       run: |
