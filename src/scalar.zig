@@ -793,6 +793,13 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
         },
         .length => |cidx| {
             const v = field(record, cidx);
+            // An empty field is NULL (what IS NULL / COUNT(col) / COALESCE
+            // all treat it as), and NULL has no length — propagate it
+            // instead of reporting 0, which is a real length and would turn
+            // a missing value into a present one. Every other scalar
+            // function here already short-circuits empty this way; LENGTH
+            // was the sole outlier. See #147.
+            if (v.len == 0) return v;
             const buf = arena.alloc(u8, 20) catch return "0";
             return std.fmt.bufPrint(buf, "{d}", .{v.len}) catch "0";
         },

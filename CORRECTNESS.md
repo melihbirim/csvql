@@ -27,7 +27,7 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
   diffed raw — see below), scientific notation and negative zero, header-only/
   single-row/single-column files, ragged rows, a zero-byte file, and values near
   i64/f64 limits.
-- **551 unit tests** (`zig build test`) covering internals differential testing can't
+- **553 unit tests** (`zig build test`) covering internals differential testing can't
   reach directly: parser edge cases, arena-buffer offset safety across reallocation,
   overflow handling, TDD regression tests for every numbered bug fix referenced below.
 - **2 platforms in CI**: `ubuntu-latest` (x86_64) and `macos-14` (Apple Silicon,
@@ -168,10 +168,14 @@ above:
   csvql treats an empty field as `NULL` everywhere it matters and *agrees* with DuckDB on
   `IS NULL`, `IS NOT NULL`, `COUNT(col)`, `SUM`, `AVG`, and `COALESCE` — `COALESCE(name,
   'MISSING')` returns `MISSING` on both engines, which is csvql's own model saying the
-  cell is `NULL`. The divergence is confined to the two narrow paths now listed: scalar
-  functions, and comparing the cell as a value. The scalar-function half is an
-  inconsistency rather than a design choice (see [#147](https://github.com/melihbirim/csvql/issues/147)),
-  and it is listed here to describe today's behavior, not to defend it.
+  cell is `NULL`. The audit did find one real inconsistency behind that row: `LENGTH` was
+  the sole scalar function that did not propagate `NULL`, returning `0` for a missing
+  value while `UPPER`, `LOWER`, `TRIM`, `SUBSTR`, `REPLACE`, `ABS`, `CEIL`, `FLOOR`,
+  `ROUND` and `CAST` all already returned empty. That was
+  [#147](https://github.com/melihbirim/csvql/issues/147), **now fixed** — there was no
+  design decision to make, since the engine had already made it everywhere else. What
+  remains is one genuine behavioral difference (`col = ''` matching an empty field) and
+  one rendering convention (how a `NULL` is written to CSV), both listed above.
 - **The huge-integer row's example didn't trigger its own claim.** It cited
   `9223372036854775807` — exactly `BIGINT` max, which DuckDB stores and prints
   exactly, so anyone reproducing from the doc would have found no difference and
@@ -181,8 +185,8 @@ above:
 | Behavior | csvql | DuckDB |
 | -------- | ----- | ------ |
 | `LENGTH(col)` on a unicode string | Byte length (UTF-8 bytes) | Character count (codepoints) |
-| Empty CSV field, passed to a **scalar function** | `LENGTH('')` → `0`, `UPPER('')` → empty | `NULL` (functions propagate `NULL`) |
 | Empty CSV field, compared as a **value** (`col = ''`) | Matches the empty field | No match (`NULL = ''` is not true) |
+| How a `NULL` result is written to CSV output | An empty field (RFC 4180 — survives a round-trip back into csvql as `NULL`) | The DuckDB CLI's CSV mode writes the literal text `NULL` |
 | `DATEDIFF('hour'/'minute'/etc, a, b)` on a non-exact interval | Fractional (e.g. `8.5`) | Truncated (e.g. `8`) |
 | Numeric literal with a leading `0` (`007`) or `+` (`+5`) | Parses as a number (`SUM` works) | CSV sniffer infers `VARCHAR` for the whole column, `SUM`/etc then error |
 | An integer literal **too large for `BIGINT`** (e.g. `9223372036854775808`) in a plain (non-aggregate) `SELECT` | Passed through unchanged, exact text preserved | CSV sniffer infers `DOUBLE`, reformats via IEEE-754 rounding + scientific notation even with no computation — and reformats the column's *other* values too (`123` → `123.0`) |

@@ -884,13 +884,16 @@ else
   FAIL=$((FAIL + 1))
 fi
 
-# Empty-field NULL semantics. Both halves are pinned deliberately: the
-# CORRECTNESS.md row describing this drifted out of sync with the engine
-# (it claimed an empty field "stays an empty string", which is false in
-# every path below except LENGTH) precisely because nothing tested it. The
-# second check pins today's *inconsistent* behavior rather than the desired
-# behavior, so that fixing #147 fails this check and forces the doc row to
-# be updated in the same change — which is the coupling that was missing.
+# Empty-field NULL semantics. The CORRECTNESS.md row describing this had
+# drifted out of sync with the engine (it claimed an empty field "stays an
+# empty string", false in every path here) precisely because nothing tested
+# it — hence these locks.
+#
+# The second check previously pinned the *inconsistent* behavior so that
+# fixing #147 would fail it and force the doc to be updated in the same
+# change. That worked: #147 is fixed, this check failed, and the row was
+# corrected. It now pins the consistent behavior — every scalar function
+# propagates NULL, LENGTH included.
 TOTAL=$((TOTAL + 1))
 BLANKS="$TMP/blanks.csv"
 printf "id,name,city\n1,Alice,NYC\n2,,Boston\n3,Carol,\n" > "$BLANKS"
@@ -908,12 +911,14 @@ fi
 
 TOTAL=$((TOTAL + 1))
 blank_len=$("$CSVQL" "SELECT id, LENGTH(name) FROM '$BLANKS' WHERE name IS NULL" 2>/dev/null | tail -n +2)
-if [[ "$blank_len" == "2,0" ]]; then
-  printf "  ${GREEN}PASS${RESET}  %s\n" "csvql-only: scalar functions do NOT propagate NULL — LENGTH(empty) is 0 (known inconsistency, #147)"
+blank_upper=$("$CSVQL" "SELECT id, UPPER(name) FROM '$BLANKS' WHERE name IS NULL" 2>/dev/null | tail -n +2)
+blank_substr=$("$CSVQL" "SELECT id, SUBSTR(name, 1, 2) FROM '$BLANKS' WHERE name IS NULL" 2>/dev/null | tail -n +2)
+if [[ "$blank_len" == "2," && "$blank_upper" == "2," && "$blank_substr" == "2," ]]; then
+  printf "  ${GREEN}PASS${RESET}  %s\n" "csvql-only: scalar functions propagate NULL on an empty field — LENGTH/UPPER/SUBSTR (#147)"
   PASS=$((PASS + 1))
 else
-  printf "  ${RED}FAIL${RESET}  %s (got %s, want 2,0 — if #147 was fixed, update the CORRECTNESS.md row too)\n" \
-    "csvql-only: scalar functions do NOT propagate NULL — LENGTH(empty) is 0 (known inconsistency, #147)" "$blank_len"
+  printf "  ${RED}FAIL${RESET}  %s (LENGTH=%s UPPER=%s SUBSTR=%s, each want '2,')\n" \
+    "csvql-only: scalar functions propagate NULL on an empty field — LENGTH/UPPER/SUBSTR (#147)" "$blank_len" "$blank_upper" "$blank_substr"
   FAIL=$((FAIL + 1))
 fi
 
