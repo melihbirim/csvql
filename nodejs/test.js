@@ -16,8 +16,10 @@ fs.writeFileSync(csv, [
 ].join('\n') + '\n');
 
 let passed = 0;
+let total = 0;
 
 function check(label, actual, expected) {
+    total++;
     const ok = JSON.stringify(actual) === JSON.stringify(expected);
     console.log(`${ok ? '✓' : '✗'} ${label}`);
     if (!ok) {
@@ -91,6 +93,7 @@ check('find: AND + orderBy + limit', find_and[0].name, 'Carol');
 const find_or = csvql.find(csv, { columns: 'name,city', where: 'city=Austin OR city=Boston' });
 check('find: OR condition', find_or.length, 4);
 
-console.log(`\n${passed}/15 tests passed`);
+// Counted, not hard-coded: the literal 15 here was stale (18 checks run).
+console.log(`\n${passed}/${total} tests passed`);
 
 fs.unlinkSync(csv);

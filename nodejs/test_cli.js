@@ -8,14 +8,14 @@
 // change from 3 to 2 would be invisible in the output but would break every
 // caller that distinguishes "your file is missing" from "your SQL is wrong".
 //
-// KNOWN FAILURE (#149): the first two checks below currently fail — not
-// because of the CLI, but because the N-API binding aborts on
+// The first two checks are the regression test for #149, where the N-API
+// binding aborted the whole process on
 //   SELECT <one column> FROM 'f.csv' WHERE <a different column> <op> <val>
-// whenever at least one row is filtered out. The engine produces the right
-// bytes and then the process dies freeing them. These two assertions are
-// the acceptance test for that fix, which is why they assert correct
-// behavior rather than pinning the crash. Run via `npm run test:cli`; it is
-// deliberately not part of `npm test` until #149 is closed.
+// producing the correct bytes and then dying while freeing them. Two
+// independent faults were behind it — a Zig GPA that does not work inside a
+// dlopen()ed library, and the engine's multi-megabyte stack frames on a host
+// thread too small for them. Both are fixed in node_binding.zig; these
+// assertions keep them fixed.
 
 const { execFileSync, spawnSync } = require('child_process');
 const path = require('path');

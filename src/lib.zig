@@ -6,7 +6,7 @@
 ///   csvql_free        — release memory returned by the above
 ///
 /// Caller contract:
-///   - The returned pointer is null-terminated and heap-allocated by the Zig GPA.
+///   - The returned pointer is null-terminated and heap-allocated by libc malloc.
 ///   - Always call csvql_free() on a non-null result, even after an error.
 ///   - Return code 0 = success, non-zero = error (message in *out_ptr).
 const std = @import("std");
@@ -15,15 +15,61 @@ const parser = @import("parser.zig");
 const engine = @import("engine.zig");
 const options_mod = @import("options.zig");
 
-/// Thread-safe GPA for all lib allocations.
-/// A single instance is fine — each call is independent and frees everything
-/// before returning via the arena trick below.
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+/// Allocator for all lib allocations (#149).
+///
+/// libc malloc, not `GeneralPurposeAllocator`. This is a shared library
+/// loaded into a host process (the Python binding dlopen()s it), and Zig's
+/// GPA does not survive that: it manages its own page buckets via
+/// `PageAllocator`, which faults inside the loaded library the moment a
+/// fresh page is needed rather than an existing bucket being reused. The
+/// N-API addon hit exactly this and crashed the host on ordinary queries —
+/// see the matching comment in node_binding.zig for the full story.
+///
+/// libc malloc is thread-safe, already present in the host, and makes no
+/// assumptions about page size or address-space layout.
+const gpa_alloc = std.heap.c_allocator;
+
+/// Stack for the thread the engine actually runs on (#149).
+///
+/// The engine's sequential path is designed around large stack buffers —
+/// `csv.CsvWriter` embeds a 1 MB write buffer by value, `JsonWriter` another
+/// 1 MB, the readers 256 KB each. The standalone binary starts on the
+/// process main stack and has room. A host that dlopen()s this library does
+/// not necessarily: the caller's thread may already be deep, or have been
+/// created with a small stack, and the engine then walks off the end of it.
+///
+/// Sizing our own thread removes the dependency on the host's stack. This is
+/// an address-space reserve, not a commitment — only touched pages are ever
+/// backed by real memory.
+const engine_stack_size = 64 * 1024 * 1024;
+
+/// Run `runQuery` on a thread with a stack big enough for the engine.
+fn runQueryOwnStack(sql: []const u8, format: options_mod.OutputFormat) ![*:0]u8 {
+    const Ctx = struct {
+        sql: []const u8,
+        format: options_mod.OutputFormat,
+        result: ?[*:0]u8 = null,
+        err: ?anyerror = null,
+        fn run(ctx: *@This()) void {
+            ctx.result = runQuery(ctx.sql, ctx.format) catch |e| {
+                ctx.err = e;
+                return;
+            };
+        }
+    };
+    var ctx = Ctx{ .sql = sql, .format = format };
+    // Never fall back to running on the caller's stack — that is the crash
+    // this exists to prevent.
+    const t = try std.Thread.spawn(.{ .stack_size = engine_stack_size }, Ctx.run, .{&ctx});
+    t.join();
+    if (ctx.err) |e| return e;
+    return ctx.result.?;
+}
 
 /// Internal: run SQL and write output to an ArrayList, then return a
 /// heap-allocated null-terminated copy the caller must free via csvql_free.
 fn runQuery(sql: []const u8, format: options_mod.OutputFormat) ![*:0]u8 {
-    const allocator = gpa.allocator();
+    const allocator = gpa_alloc;
 
     // Parse the SQL string.
     var query = try parser.parse(allocator, sql);
@@ -102,8 +148,8 @@ fn runQuery(sql: []const u8, format: options_mod.OutputFormat) ![*:0]u8 {
 /// @return         0 on success, non-zero on error.
 export fn csvql_query_json(sql: [*:0]const u8, out_ptr: *[*:0]u8) c_int {
     const sql_slice = std.mem.sliceTo(sql, 0);
-    const result = runQuery(sql_slice, .json) catch |err| {
-        const allocator = gpa.allocator();
+    const result = runQueryOwnStack(sql_slice, .json) catch |err| {
+        const allocator = gpa_alloc;
         const plain = std.fmt.allocPrint(allocator, "error: {s}", .{@errorName(err)}) catch
             return 2;
         const msg = allocator.dupeZ(u8, plain) catch return 2;
@@ -122,8 +168,8 @@ export fn csvql_query_json(sql: [*:0]const u8, out_ptr: *[*:0]u8) c_int {
 /// @return         0 on success, non-zero on error.
 export fn csvql_query_csv(sql: [*:0]const u8, out_ptr: *[*:0]u8) c_int {
     const sql_slice = std.mem.sliceTo(sql, 0);
-    const result = runQuery(sql_slice, .csv) catch |err| {
-        const allocator = gpa.allocator();
+    const result = runQueryOwnStack(sql_slice, .csv) catch |err| {
+        const allocator = gpa_alloc;
         const plain = std.fmt.allocPrint(allocator, "error: {s}", .{@errorName(err)}) catch
             return 2;
         const msg = allocator.dupeZ(u8, plain) catch return 2;
@@ -139,7 +185,7 @@ export fn csvql_query_csv(sql: [*:0]const u8, out_ptr: *[*:0]u8) c_int {
 /// Safe to call with a null pointer.
 export fn csvql_free(ptr: ?*anyopaque) void {
     if (ptr) |p| {
-        const allocator = gpa.allocator();
+        const allocator = gpa_alloc;
         const typed: [*:0]u8 = @ptrCast(p);
         const len = std.mem.len(typed);
         allocator.free(typed[0 .. len + 1]);

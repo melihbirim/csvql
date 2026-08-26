@@ -12,12 +12,83 @@ const options_mod = @import("options.zig");
 
 const napi = @cImport(@cInclude("node_api.h"));
 
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+/// Allocator for everything this addon does (#149).
+///
+/// Deliberately libc malloc, NOT `GeneralPurposeAllocator`. This addon is a
+/// shared object dlopen()ed into Node, and Zig's GPA does not survive that
+/// context: it manages its own page buckets through `PageAllocator`, and
+/// inside the loaded library that backing allocator faults — a SIGSEGV in
+/// `PageAllocator.map` the moment the GPA needs a fresh page rather than
+/// serving from an existing bucket.
+///
+/// That page boundary is why this looked like a bizarre query-shape bug.
+/// `SELECT name FROM t WHERE salary > 100000` crossed it and died;
+/// `SELECT name, city FROM t WHERE ...` did not and passed. Nothing about
+/// projection or filtering was ever involved — those shapes just allocate
+/// slightly different amounts. In ReleaseFast the same fault surfaced later
+/// and much more confusingly, as "Invalid free" while releasing a result
+/// buffer that held the completely correct answer.
+///
+/// libc malloc is also simply the right choice here: the host process
+/// already has one, it is thread-safe, and it makes no assumptions about
+/// page size or address-space layout that a dlopen()ed library can violate.
+const gpa_alloc = std.heap.c_allocator;
+
+/// Stack for the thread the engine actually runs on (#149).
+///
+/// The engine's sequential path puts megabytes on the stack by design —
+/// `csv.CsvWriter` alone embeds a 1 MB write buffer by value
+/// (`buffer: [1048576]u8`), `JsonWriter` another 1 MB, and the readers carry
+/// 256 KB each. That is fine in the standalone binary, which starts on the
+/// process's main stack (8 MB by default) and does nothing else with it.
+///
+/// It is NOT fine here. An N-API method runs on whatever stack Node hands
+/// us, already partly consumed by V8 frames, and the engine walked straight
+/// off the end of it: a SIGSEGV in `RecordWriter.init`'s prologue in Debug,
+/// and — worse — in ReleaseFast a silent write past the guard that produced
+/// the *right answer* and then aborted with "Invalid free" when the result
+/// buffer was released. Correct output followed by a corrupted heap is the
+/// dangerous failure mode, because it looks like a heap bug and is not one.
+///
+/// Running the query on a thread we size ourselves removes the dependency on
+/// the host's stack entirely, the same way seeding our own PRNG in
+/// query_fuzz.sh removed the dependency on the host's awk. This is a reserve,
+/// not a commitment — only touched pages are ever backed by memory.
+const engine_stack_size = 64 * 1024 * 1024;
+
+/// Run `runQuery` on a thread with a stack big enough for the engine.
+/// Both branches of runQuery (POSIX pipe, Windows temp file) call into the
+/// engine, so the guard belongs here, around all of it, rather than around
+/// one branch.
+fn runQueryOwnStack(sql: []const u8, format: options_mod.OutputFormat) ![]u8 {
+    const Ctx = struct {
+        sql: []const u8,
+        format: options_mod.OutputFormat,
+        result: ?[]u8 = null,
+        err: ?anyerror = null,
+        fn run(ctx: *@This()) void {
+            ctx.result = runQuery(ctx.sql, ctx.format) catch |e| {
+                ctx.err = e;
+                return;
+            };
+        }
+    };
+    var ctx = Ctx{ .sql = sql, .format = format };
+    const t = std.Thread.spawn(.{ .stack_size = engine_stack_size }, Ctx.run, .{&ctx}) catch |e| {
+        // If the thread can't be spawned we must not fall back to running on
+        // the caller's stack — that is exactly the crash this exists to
+        // prevent. Surface it instead.
+        return e;
+    };
+    t.join();
+    if (ctx.err) |e| return e;
+    return ctx.result.?;
+}
 
 // ── Core query (same pipe+drain pattern as lib.zig) ───────────────────────────
 
 fn runQuery(sql: []const u8, format: options_mod.OutputFormat) ![]u8 {
-    const allocator = gpa.allocator();
+    const allocator = gpa_alloc;
     var q = try parser.parse(allocator, sql);
     defer q.deinit();
 
@@ -103,12 +174,12 @@ fn getSql(env: napi.napi_env, info: napi.napi_callback_info, allocator: std.mem.
 // ── Exported JS functions ─────────────────────────────────────────────────────
 
 fn napiQueryJson(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
-    const allocator = gpa.allocator();
+    const allocator = gpa_alloc;
 
     const sql = getSql(env, info, allocator) catch return napiFail(env, "out of memory");
     defer allocator.free(sql);
 
-    const result = runQuery(sql, .json) catch |err| {
+    const result = runQueryOwnStack(sql, .json) catch |err| {
         var msg: [128]u8 = undefined;
         const m = std.fmt.bufPrintZ(&msg, "{s}", .{@errorName(err)}) catch "QueryFailed";
         return napiFail(env, m.ptr);
@@ -121,12 +192,12 @@ fn napiQueryJson(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c)
 }
 
 fn napiQueryCsv(env: napi.napi_env, info: napi.napi_callback_info) callconv(.c) napi.napi_value {
-    const allocator = gpa.allocator();
+    const allocator = gpa_alloc;
 
     const sql = getSql(env, info, allocator) catch return napiFail(env, "out of memory");
     defer allocator.free(sql);
 
-    const result = runQuery(sql, .csv) catch |err| {
+    const result = runQueryOwnStack(sql, .csv) catch |err| {
         var msg: [128]u8 = undefined;
         const m = std.fmt.bufPrintZ(&msg, "{s}", .{@errorName(err)}) catch "QueryFailed";
         return napiFail(env, m.ptr);
