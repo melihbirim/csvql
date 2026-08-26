@@ -10,7 +10,7 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
 
 ## What is tested
 
-- **95 differential checks** in `bench/verify_correctness.sh` (96 when the optional
+- **97 differential checks** in `bench/verify_correctness.sh` (98 when the optional
   multi-GB taxi fixture is present locally — see below), covering: SELECT/projection,
   every WHERE operator (`=`, comparisons, `LIKE`/`ILIKE`, `BETWEEN`, `IN`/`NOT IN`
   (literal list and `IN (SELECT ...)` subquery, #124), `IS NULL`, modulo, compound
@@ -27,7 +27,7 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
   diffed raw — see below), scientific notation and negative zero, header-only/
   single-row/single-column files, ragged rows, a zero-byte file, and values near
   i64/f64 limits.
-- **550 unit tests** (`zig build test`) covering internals differential testing can't
+- **551 unit tests** (`zig build test`) covering internals differential testing can't
   reach directly: parser edge cases, arena-buffer offset safety across reallocation,
   overflow handling, TDD regression tests for every numbered bug fix referenced below.
 - **2 platforms in CI**: `ubuntu-latest` (x86_64) and `macos-14` (Apple Silicon,
@@ -158,13 +158,34 @@ Found via differential testing, kept as deliberate design choices rather than "f
 documented so they don't surprise anyone migrating queries from DuckDB. Full detail and
 examples in the [README](README.md#known-differences-from-duckdb).
 
+**Audited 2026-08-26** against csvql 2.5.0 / DuckDB 1.5.5 by running every row. A table
+like this is the load-bearing honesty claim in this file — it's what someone migrating
+from DuckDB relies on — so it's worth re-running rather than trusting. Five of the seven
+rows then present reproduced exactly as written. Two did not, and both have been corrected
+above:
+
+- **"Empty CSV field → stays an empty string" was wrong**, and it understated csvql.
+  csvql treats an empty field as `NULL` everywhere it matters and *agrees* with DuckDB on
+  `IS NULL`, `IS NOT NULL`, `COUNT(col)`, `SUM`, `AVG`, and `COALESCE` — `COALESCE(name,
+  'MISSING')` returns `MISSING` on both engines, which is csvql's own model saying the
+  cell is `NULL`. The divergence is confined to the two narrow paths now listed: scalar
+  functions, and comparing the cell as a value. The scalar-function half is an
+  inconsistency rather than a design choice (see [#147](https://github.com/melihbirim/csvql/issues/147)),
+  and it is listed here to describe today's behavior, not to defend it.
+- **The huge-integer row's example didn't trigger its own claim.** It cited
+  `9223372036854775807` — exactly `BIGINT` max, which DuckDB stores and prints
+  exactly, so anyone reproducing from the doc would have found no difference and
+  concluded the doc was wrong. The behavior is real but starts one past that value,
+  at `9223372036854775808`; the row now cites a value that actually reproduces.
+
 | Behavior | csvql | DuckDB |
 | -------- | ----- | ------ |
 | `LENGTH(col)` on a unicode string | Byte length (UTF-8 bytes) | Character count (codepoints) |
-| Empty CSV field | Stays an empty string | Inferred as `NULL` |
+| Empty CSV field, passed to a **scalar function** | `LENGTH('')` → `0`, `UPPER('')` → empty | `NULL` (functions propagate `NULL`) |
+| Empty CSV field, compared as a **value** (`col = ''`) | Matches the empty field | No match (`NULL = ''` is not true) |
 | `DATEDIFF('hour'/'minute'/etc, a, b)` on a non-exact interval | Fractional (e.g. `8.5`) | Truncated (e.g. `8`) |
-| Numeric literal with a leading `0` (`007`) or `+` (`+5`) | Parses as a number | CSV sniffer infers `VARCHAR` for the whole column, `SUM`/etc then error |
-| A huge integer literal (e.g. `9223372036854775807`) in a plain (non-aggregate) `SELECT` | Passed through unchanged, exact text preserved | CSV sniffer infers `DOUBLE`, reformats via IEEE-754 rounding + scientific notation even with no computation |
+| Numeric literal with a leading `0` (`007`) or `+` (`+5`) | Parses as a number (`SUM` works) | CSV sniffer infers `VARCHAR` for the whole column, `SUM`/etc then error |
+| An integer literal **too large for `BIGINT`** (e.g. `9223372036854775808`) in a plain (non-aggregate) `SELECT` | Passed through unchanged, exact text preserved | CSV sniffer infers `DOUBLE`, reformats via IEEE-754 rounding + scientific notation even with no computation — and reformats the column's *other* values too (`123` → `123.0`) |
 | Ragged rows (fewer/more fields than the header) | Short rows padded with empty fields, long rows truncated to header width | CSV sniffer can lose confidence in the header entirely and re-infer the first row as data (`column0`, `column1`, ...) |
 | A zero-byte input file | `error.EmptyFile` (exit 3) | Returns silently with zero rows, no error |
 

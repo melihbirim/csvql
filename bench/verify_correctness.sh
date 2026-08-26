@@ -884,6 +884,39 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+# Empty-field NULL semantics. Both halves are pinned deliberately: the
+# CORRECTNESS.md row describing this drifted out of sync with the engine
+# (it claimed an empty field "stays an empty string", which is false in
+# every path below except LENGTH) precisely because nothing tested it. The
+# second check pins today's *inconsistent* behavior rather than the desired
+# behavior, so that fixing #147 fails this check and forces the doc row to
+# be updated in the same change — which is the coupling that was missing.
+TOTAL=$((TOTAL + 1))
+BLANKS="$TMP/blanks.csv"
+printf "id,name,city\n1,Alice,NYC\n2,,Boston\n3,Carol,\n" > "$BLANKS"
+blank_isnull=$("$CSVQL" "SELECT id FROM '$BLANKS' WHERE name IS NULL" 2>/dev/null | tail -n +2)
+blank_count=$("$CSVQL" "SELECT COUNT(name) FROM '$BLANKS'" 2>/dev/null | tail -n +2)
+blank_coalesce=$("$CSVQL" "SELECT COALESCE(name, 'MISSING') FROM '$BLANKS'" 2>/dev/null | tail -n +2 | tr '\n' '|')
+if [[ "$blank_isnull" == "2" && "$blank_count" == "2" && "$blank_coalesce" == "Alice|MISSING|Carol|" ]]; then
+  printf "  ${GREEN}PASS${RESET}  %s\n" "csvql-only: empty field behaves as NULL for IS NULL, COUNT(col), COALESCE"
+  PASS=$((PASS + 1))
+else
+  printf "  ${RED}FAIL${RESET}  %s (IS NULL=%s want 2; COUNT=%s want 2; COALESCE=%s want Alice|MISSING|Carol|)\n" \
+    "csvql-only: empty field behaves as NULL for IS NULL, COUNT(col), COALESCE" "$blank_isnull" "$blank_count" "$blank_coalesce"
+  FAIL=$((FAIL + 1))
+fi
+
+TOTAL=$((TOTAL + 1))
+blank_len=$("$CSVQL" "SELECT id, LENGTH(name) FROM '$BLANKS' WHERE name IS NULL" 2>/dev/null | tail -n +2)
+if [[ "$blank_len" == "2,0" ]]; then
+  printf "  ${GREEN}PASS${RESET}  %s\n" "csvql-only: scalar functions do NOT propagate NULL — LENGTH(empty) is 0 (known inconsistency, #147)"
+  PASS=$((PASS + 1))
+else
+  printf "  ${RED}FAIL${RESET}  %s (got %s, want 2,0 — if #147 was fixed, update the CORRECTNESS.md row too)\n" \
+    "csvql-only: scalar functions do NOT propagate NULL — LENGTH(empty) is 0 (known inconsistency, #147)" "$blank_len"
+  FAIL=$((FAIL + 1))
+fi
+
 TOTAL=$((TOTAL + 1))
 RAGGED="$TMP/ragged.csv"
 printf "id,name,age\n1,alice,30\n2,bob\n3,carol,25,extra\n" > "$RAGGED"

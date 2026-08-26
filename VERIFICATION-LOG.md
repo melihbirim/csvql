@@ -36,6 +36,20 @@ compound AND/OR, LIKE, IS NULL/IS NOT NULL) and five aggregates (COUNT/SUM/AVG/M
 scalar and GROUP BY) against a fixed 6-column schema. Nine operators in total: `=`, `!=`,
 `<`, `<=`, `>`, `>=`, `LIKE`, `IS NULL`, `IS NOT NULL`.
 
+**`IS NULL` / `IS NOT NULL` are emitted but not meaningfully tested, and listing them
+above without this caveat overstated what these runs prove.** `gen_fixture.sh` produces no
+empty fields, so on this fixture `IS NULL` matches zero rows and `IS NOT NULL` matches
+every row, always — the two engines are being asked to agree on a constant, not on NULL
+semantics. That is 15% of every generated predicate (`query_fuzz.sh`'s `gen_predicate`
+picks them at `r < 0.15`; measured 84,442 of 560,070 predicate occurrences across 400,000
+queries). Three-valued logic — `NULL` inside `AND`/`OR` chains, `COUNT(col)` vs
+`COUNT(*)`, `GROUP BY` over a nullable column, aggregates skipping nulls — is
+**not covered by any of the rows in this log**. It is covered only by hand-written checks
+in `bench/verify_correctness.sh`. Fixing this needs empty fields in the fixture, which
+needs fixture versioning first: these rows' replay contract is "run `gen_fixture.sh`, then
+the `Command` cell", so changing that script's schema silently invalidates every row above
+it.
+
 What that leaves untested by *this* generator, counted directly over 400,000 generated
 queries — every one of these appeared exactly **zero** times, and every one of them is
 SQL csvql supports: `JOIN`, `DISTINCT`, `LIMIT`, `BETWEEN`, `IN` / `NOT IN` (literal or
