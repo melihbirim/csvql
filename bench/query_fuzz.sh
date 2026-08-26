@@ -498,18 +498,75 @@ if [[ -s "$BATCH_ERR" ]]; then
   echo "whether the DuckDB output is simply missing for that query):"
   sed 's/^/  /' "$BATCH_ERR"
 fi
-# Distinct query count — the number that tells you when this seed/count
-# combination has stopped finding anything new about the query space
-# (distinct plateauing while count keeps climbing means you're re-running
-# the same shapes, not expanding coverage). Dedup on csvql_sql: it's a 1:1
-# stand-in for duck_sql (same predicate, different table name only).
+# Two coverage numbers, measuring genuinely different things. Both dedup on
+# csvql_sql (column 2): it's a 1:1 stand-in for duck_sql (same predicate,
+# different table name only).
+#
+# `distinct` — unique query TEXT. Includes the randomly-drawn literals, so
+# it mostly measures literal churn, not coverage: `WHERE salary != 90483`
+# and `WHERE salary != 4122` are two distinct queries testing one code
+# path. It does NOT saturate (measured: 81.5% distinct at count=50000,
+# still 66.3% at 400000, climbing near-linearly throughout) because the
+# numeric literals are drawn from wide ranges. Kept because it's the
+# denominator-free "how much repetition was in this run" number, but it is
+# NOT the saturation signal — it reads ~81% at count=50000 regardless of
+# how wide the generator's templates are.
+#
+# `templates` — unique query SHAPE: literals normalized away and column
+# names collapsed to their type class, leaving just the SQL surface being
+# exercised. This is the number that actually plateaus, so it's the one
+# that answers "has this seed/count stopped finding new query shapes, and
+# does the generator need widening?". Measured: ~8,900 templates total,
+# stable across seeds (8424/8434/8466 at count=200000 for seeds
+# 99/12345/7); count=50000 reaches ~6,300 of them (~71%; 6311 and 6214 on
+# two real seeds), count=200000 reaches ~8,400 (~95%), and +200000 more
+# queries past that buys only ~450 new templates. A templates number that stops growing while the SQL
+# surface csvql supports keeps growing is the signal to widen the
+# templates — see VERIFICATION-LOG.md.
 distinct="$(awk -F'\t' '{print $2}' "$QUERIES_FILE" | sort -u | wc -l | tr -d ' ')"
+
+# The column names below are the fixture's schema (bench/gen_fixture.sh):
+# change that schema and this list has to change with it, or shapes stop
+# collapsing and the templates number silently inflates.
+templates="$(awk -F'\t' -v q="'" '
+function xform(t) {
+  if (t == "id" || t == "age" || t == "salary") return "NUM"
+  if (t == "name" || t == "city" || t == "department") return "STR"
+  if (t ~ /^[0-9]+$/) return "N"
+  return t
+}
+{
+  s = $2
+  # 1. Collapse quoted literals — the CSV path and every sampled string
+  #    value — before tokenizing, so their contents (arbitrary text from
+  #    the fixture) can never be mistaken for identifiers.
+  out = ""
+  while (match(s, q "[^" q "]*" q)) {
+    lit = substr(s, RSTART, RLENGTH)
+    out = out substr(s, 1, RSTART - 1) (index(lit, ".csv") ? "CSV" : "LIT")
+    s = substr(s, RSTART + RLENGTH)
+  }
+  s = out s
+  # 2. Token-level normalization, walking characters rather than using a
+  #    word-boundary regex: those are not portable (GNU sed/awk spell them
+  #    \b or \y, BSD spells them [[:<:]]/[[:>:]], and neither accepts the
+  #    other), and this script runs on both ubuntu-latest and macos-14 in
+  #    CI. A \b here would silently stop matching on macOS and report a
+  #    different templates count for the same seed.
+  res = ""; tok = ""
+  n = length(s)
+  for (i = 1; i <= n; i++) {
+    c = substr(s, i, 1)
+    if (c ~ /[A-Za-z0-9_]/) { tok = tok c } else { res = res xform(tok) c; tok = "" }
+  }
+  print res xform(tok)
+}' "$QUERIES_FILE" | sort -u | wc -l | tr -d ' ')"
 
 CSVQL_VERSION="$("$CSVQL" --version 2>&1 | awk '{print $2}')"
 DUCKDB_VERSION="$("$DUCKDB" --version 2>&1 | awk '{print $1}' | tr -d 'v')"
 
-echo "$total queries run ($distinct distinct), $failed mismatches, seed=$SEED"
-echo "SUMMARY total=$total distinct=$distinct mismatches=$failed seed=$SEED csvql=$CSVQL_VERSION duckdb=$DUCKDB_VERSION"
+echo "$total queries run ($distinct distinct text, $templates distinct templates), $failed mismatches, seed=$SEED"
+echo "SUMMARY total=$total distinct=$distinct templates=$templates mismatches=$failed seed=$SEED csvql=$CSVQL_VERSION duckdb=$DUCKDB_VERSION"
 echo "Reproduce (after ./bench/gen_fixture.sh, csvql $CSVQL_VERSION, duckdb $DUCKDB_VERSION):"
 echo "  ./bench/query_fuzz.sh --seed $SEED --count $COUNT"
 if [[ $failed -gt 0 ]]; then

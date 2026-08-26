@@ -106,14 +106,23 @@ because only some of them are automatic and the others silently stop holding if 
   verified continuously, not just asserted: `./bench/query_fuzz.sh --seed N --count M
   --check-determinism` regenerates the stream twice and diffs them, and runs in CI
   (`ci.yml`, before either engine is even invoked) on every PR.
-- **Query-space size, honestly.** The template space is bounded (a handful of aggregates,
-  three query shapes, predicates over six columns), so a naive guess is that most of a
-  50,000-query run is duplicates. Measured directly (dedup the generated SQL text) across
-  several real seeds at `--count 50000`: **~82% distinct** (e.g. 41,010 of 50,000 for
-  seed 1), consistent run to run — the space is far less saturated than that guess. This
-  is what `VERIFICATION-LOG.md`'s `Distinct` column reports per run, and it's the signal
-  for when to widen the generator's template set: watch for that percentage trending down
-  as more seeds accumulate, not a one-time guess.
+- **Query-space size, honestly.** Two numbers, because deduping on SQL *text* and deduping
+  on query *shape* answer different questions, and only the second one is a coverage
+  signal. Text: **~82% distinct** at `--count 50000`, consistent run to run — but that
+  number is dominated by the randomly-drawn literals (`WHERE salary != 90483` vs `WHERE
+  salary != 4122` are two distinct queries exercising one code path), and it never
+  saturates: still 66.3% distinct at `--count 400000`, climbing near-linearly throughout.
+  It reads ~82% at `--count 50000` whether the templates are narrow or wide, so it cannot
+  signal saturation — an earlier version of this section claimed it could, and read that
+  ~82% as evidence of a rich query space when it was really measuring the randomness of
+  the literals. Shape (literals normalized, columns collapsed to their type class):
+  **~8,900 templates total**, a property of the generator rather than the seed
+  (8424 / 8434 / 8466 at `--count 200000` for seeds 99 / 12345 / 7), and it does plateau —
+  `--count 50000` reaches ~6,300 of them (~71%), `--count 200000` reaches ~8,400 (~95%),
+  and another 200,000 queries past that buys only ~450 more. Both are reported per run in
+  `VERIFICATION-LOG.md` (`Distinct` and `Templates`); `Templates` is the one to watch
+  against the SQL surface csvql actually supports — see that file for the list of
+  supported shapes this generator still emits zero of.
 - **See it without reading awk.** `bench/sample-queries.sql` is 50 real generated queries
   (`./bench/query_fuzz.sh --seed 1 --count 50 --dump-queries bench/sample-queries.sql`,
   committed) — regenerate it after any change to the generator's template logic so it
