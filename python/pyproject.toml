@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "csvql-query"
-version = "1.1.1"
+version = "2.6.0"
 description = "Fast CSV querying from Python — powered by a Zig/SIMD engine"
 readme = "README.md"
 license = { text = "MIT" }
