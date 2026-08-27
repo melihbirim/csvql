@@ -191,21 +191,36 @@ jobs:
 
     # The Windows Node toolcache ships without the C headers the addon needs,
     # so fetch them explicitly (same approach as release.yml).
-    - name: Fetch Node.js headers (Windows)
+    # Windows needs two things the other platforms do not: the C headers
+    # (absent from the Node toolcache) and node.lib, the import library that
+    # resolves napi_* at link time. A Windows DLL cannot leave symbols
+    # undefined the way a .so can — without node.lib the addon links with
+    # warnings, produces a DLL, and segfaults on first call.
+    - name: Fetch Node.js headers and node.lib (Windows)
       if: runner.os == 'Windows'
       shell: bash
       run: |
         NODE_VER=$(node -e "console.log(process.versions.node)")
         curl -fsSL "https://nodejs.org/dist/v${NODE_VER}/node-v${NODE_VER}-headers.tar.gz" -o node-headers.tar.gz
         tar -xzf node-headers.tar.gz
+        curl -fsSL "https://nodejs.org/dist/v${NODE_VER}/win-x64/node.lib" -o node.lib
         echo "NODE_INCLUDE=node-v${NODE_VER}/include/node" >> $GITHUB_ENV
+        echo "NODE_LIB=$(pwd)/node.lib" >> $GITHUB_ENV
 
     - name: Build the addon
       shell: bash
       run: |
         EXTRA=""
         [ -n "$NODE_INCLUDE" ] && EXTRA="\"-Dnode-include=$NODE_INCLUDE\""
-        eval zig build node -Doptimize=ReleaseFast $EXTRA
+        [ -n "$NODE_LIB" ] && EXTRA="$EXTRA \"-Dnode-lib=$NODE_LIB\""
+        eval zig build node -Doptimize=ReleaseFast $EXTRA 2>&1 | tee build.log
+        # An undefined napi_* symbol is only a warning to lld, and produced a
+        # DLL that segfaulted on Windows. Treat it as fatal so it can never
+        # pass silently again.
+        if grep -q "undefined symbol: napi_" build.log; then
+          echo "FAIL: addon linked with undefined N-API symbols — it will crash at runtime"
+          exit 1
+        fi
 
     # Library surface: query(), queryCsv(), find().
     - name: Run library tests
