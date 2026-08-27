@@ -256,6 +256,64 @@ test "parse JOIN with LIMIT" {
     try std.testing.expectEqual(@as(i32, 5), query.limit);
 }
 
+test "parse LIMIT with OFFSET" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(
+        allocator,
+        "SELECT id FROM 'data.csv' LIMIT 5 OFFSET 10",
+    );
+    defer query.deinit();
+
+    try std.testing.expectEqual(@as(i32, 5), query.limit);
+    try std.testing.expectEqual(@as(i32, 10), query.offset);
+}
+
+test "parse OFFSET before LIMIT" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(
+        allocator,
+        "SELECT id FROM 'data.csv' OFFSET 10 LIMIT 5",
+    );
+    defer query.deinit();
+
+    try std.testing.expectEqual(@as(i32, 5), query.limit);
+    try std.testing.expectEqual(@as(i32, 10), query.offset);
+}
+
+test "OFFSET before LIMIT bounds preceding clauses without underflow" {
+    const allocator = std.testing.allocator;
+
+    var where_query = try parser.parse(
+        allocator,
+        "SELECT id FROM 'data.csv' WHERE score > 10 OFFSET 2 LIMIT 3",
+    );
+    defer where_query.deinit();
+    try std.testing.expectEqual(@as(i32, 3), where_query.limit);
+    try std.testing.expectEqual(@as(i32, 2), where_query.offset);
+
+    var group_query = try parser.parse(
+        allocator,
+        "SELECT dept, COUNT(*) FROM 'data.csv' GROUP BY dept HAVING COUNT(*) > 1 ORDER BY dept OFFSET 1 LIMIT 2",
+    );
+    defer group_query.deinit();
+    try std.testing.expectEqualStrings("dept", group_query.group_by[0]);
+    try std.testing.expect(group_query.having_expr != null);
+    try std.testing.expectEqualStrings("dept", group_query.order_by.?.column);
+    try std.testing.expectEqual(@as(i32, 2), group_query.limit);
+    try std.testing.expectEqual(@as(i32, 1), group_query.offset);
+}
+
+test "OFFSET defaults to zero" {
+    const allocator = std.testing.allocator;
+
+    var query = try parser.parse(allocator, "SELECT id FROM 'data.csv' LIMIT 5");
+    defer query.deinit();
+
+    try std.testing.expectEqual(@as(i32, 0), query.offset);
+}
+
 test "single-file query still works after JOIN parser changes" {
     const allocator = std.testing.allocator;
 

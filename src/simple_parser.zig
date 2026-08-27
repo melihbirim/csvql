@@ -18,6 +18,7 @@ pub fn parseSimple(allocator: Allocator, args: []const []const u8) !parser.Query
         .having_expr = null,
         .group_by = undefined,
         .limit = 10, // Default limit is 10
+        .offset = 0,
         .order_by = null,
         .joins = &.{},
         .allocator = allocator,
