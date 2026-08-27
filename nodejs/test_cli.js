@@ -20,9 +20,14 @@
 const { execFileSync, spawnSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
+
+// See the note in test.js: forward slashes so the path survives being
+// embedded in a SQL string on Windows.
+const tmp = (name) => path.join(os.tmpdir(), name).replace(/\\/g, '/');
 
 const CLI = path.join(__dirname, 'cli.js');
-const csv = '/tmp/csvql_cli_test.csv';
+const csv = tmp('csvql_cli_test.csv');
 
 fs.writeFileSync(csv, [
     'id,name,city,salary',
@@ -31,7 +36,7 @@ fs.writeFileSync(csv, [
     '3,Carol,Austin,150000',
 ].join('\n') + '\n');
 
-const tsv = '/tmp/csvql_cli_test.tsv';
+const tsv = tmp('csvql_cli_test.tsv');
 fs.writeFileSync(tsv, 'a\tb\n1\t2\n');
 
 let passed = 0;
@@ -51,7 +56,11 @@ function check(label, actual, expected) {
 
 function run(...args) {
     const r = spawnSync(process.execPath, [CLI, ...args], { encoding: 'utf8' });
-    return { code: r.status, out: r.stdout, err: r.stderr };
+    // Strip CR so the line-splitting comparisons below behave identically on
+    // Windows. csvql writes LF only, but the shell and Node layers in between
+    // are not worth trusting on this.
+    const clean = (v) => (v || '').replace(/\r/g, '');
+    return { code: r.status, out: clean(r.stdout), err: clean(r.stderr) };
 }
 
 // -- output --------------------------------------------------------------
@@ -73,7 +82,7 @@ const tsvOut = run('-d', '\\t', `SELECT * FROM '${tsv}'`);
 check('--delimiter tab', tsvOut.out.trim().split('\n'), ['a,b', '1,2']);
 
 // -- exit codes (the agent-facing contract) ------------------------------
-check('missing file exits 3', run(`SELECT * FROM '/tmp/nope_does_not_exist.csv'`).code, 3);
+check('missing file exits 3', run(`SELECT * FROM '${tmp('nope_does_not_exist.csv')}'`).code, 3);
 check('bad SQL exits 2', run(`SELEKT * FROM '${csv}'`).code, 2);
 check('unknown column exits 2', run(`SELECT nocol FROM '${csv}'`).code, 2);
 check('unknown flag exits 1', run('--bogus', 'SELECT 1').code, 1);
