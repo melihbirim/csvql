@@ -10,7 +10,7 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
 
 ## What is tested
 
-- **97 differential checks** in `bench/verify_correctness.sh` (98 when the optional
+- **102 differential checks** in `bench/verify_correctness.sh` (103 when the optional
   multi-GB taxi fixture is present locally — see below), covering: SELECT/projection,
   every WHERE operator (`=`, comparisons, `LIKE`/`ILIKE`, `BETWEEN`, `IN`/`NOT IN`
   (literal list and `IN (SELECT ...)` subquery, #124), `IS NULL`, modulo, compound
@@ -27,7 +27,7 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
   diffed raw — see below), scientific notation and negative zero, header-only/
   single-row/single-column files, ragged rows, a zero-byte file, and values near
   i64/f64 limits.
-- **553 unit tests** (`zig build test`) covering internals differential testing can't
+- **567 unit tests** (`zig build test`) covering internals differential testing can't
   reach directly: parser edge cases, arena-buffer offset safety across reallocation,
   overflow handling, TDD regression tests for every numbered bug fix referenced below.
 - **2 platforms in CI**: `ubuntu-latest` (x86_64) and `macos-14` (Apple Silicon,
@@ -282,7 +282,6 @@ point.
 | Subqueries other than `col IN (SELECT ...)` / `col NOT IN (SELECT ...)` — correlated subqueries, subqueries in `FROM`/`SELECT`-list/`HAVING`-comparison position | [#124](https://github.com/melihbirim/csvql/issues/124) |
 | `UNION` / `INTERSECT` / `EXCEPT` | [#122](https://github.com/melihbirim/csvql/issues/122), [#127](https://github.com/melihbirim/csvql/issues/127) |
 | Window functions (`RANK() OVER (...)`, etc.) | [#126](https://github.com/melihbirim/csvql/issues/126) |
-| `OFFSET` clause | [#70](https://github.com/melihbirim/csvql/issues/70) |
 | Per-release-tag differential fuzz run (bigger volume than nightly, recorded in the release notes) isn't wired up yet — only per-PR (fixed seed, smoke scale) and nightly (random seed, volume) exist | [#141](https://github.com/melihbirim/csvql/issues/141) |
 | Coverage measurement (line coverage per module) not wired up | not yet filed |
 | No Windows-specific adversarial subset in CI (CRLF is tested on macOS/Linux; Windows' own line-ending and path-separator handling isn't independently verified) | not yet filed |
