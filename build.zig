@@ -167,6 +167,25 @@ pub fn build(b: *std.Build) void {
         "Path to Node.js include dir containing node_api.h (auto-detected if omitted)",
     ) orelse detectNodeInclude(b.allocator);
 
+    // Windows-only: path to node.lib, the import library that resolves the
+    // napi_* symbols at link time.
+    //
+    // On Linux and macOS a shared object may leave those symbols undefined —
+    // the loader binds them from the host process at dlopen(). Windows has no
+    // such thing: a DLL must resolve every symbol when it is linked. Without
+    // node.lib, lld emits "undefined symbol: napi_..." as a *warning* (see
+    // linker_allow_shlib_undefined below), produces a DLL anyway, and that
+    // DLL segfaults the moment Node calls into it.
+    //
+    // node.lib is not part of the headers tarball; it is a separate download
+    // (nodejs.org/dist/v<ver>/win-x64/node.lib). See the Windows steps in
+    // ci.yml and release.yml.
+    const node_lib = b.option(
+        []const u8,
+        "node-lib",
+        "Path to node.lib (Windows only — resolves napi_* at link time)",
+    );
+
     if (node_include) |inc| {
         const node_addon = b.addLibrary(.{
             .name = "csvql_node",
@@ -179,8 +198,13 @@ pub fn build(b: *std.Build) void {
         });
         node_addon.linkLibC();
         node_addon.addIncludePath(.{ .cwd_relative = inc });
-        // N-API symbols are resolved by Node.js at dlopen() time, not at link time.
+        // On POSIX, N-API symbols are resolved by Node.js at dlopen() time
+        // rather than at link time. Windows cannot do that — it needs the
+        // import library instead (see the -Dnode-lib comment above).
         node_addon.linker_allow_shlib_undefined = true;
+        if (node_lib) |nlib| {
+            node_addon.addObjectFile(.{ .cwd_relative = nlib });
+        }
 
         const install_node = b.addInstallFileWithDir(
             node_addon.getEmittedBin(),

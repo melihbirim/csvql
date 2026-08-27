@@ -138,14 +138,20 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Fetch Node.js headers (Windows toolcache lacks them)
+      # Windows needs the headers (absent from the toolcache) AND node.lib,
+      # the import library resolving napi_* at link time. Without node.lib the
+      # DLL links with warnings and segfaults on first call — every Windows
+      # addon published before this was broken that way.
+      - name: Fetch Node.js headers and node.lib (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
           NODE_VER=$(node -e "console.log(process.versions.node)")
           curl -fsSL "https://nodejs.org/dist/v${NODE_VER}/node-v${NODE_VER}-headers.tar.gz" -o node-headers.tar.gz
           tar -xzf node-headers.tar.gz
+          curl -fsSL "https://nodejs.org/dist/v${NODE_VER}/win-x64/node.lib" -o node.lib
           echo "NODE_INCLUDE=node-v${NODE_VER}/include/node" >> $GITHUB_ENV
+          echo "NODE_LIB=$(pwd)/node.lib" >> $GITHUB_ENV
 
       - name: Build native addon
         shell: bash
@@ -154,7 +160,13 @@ jobs:
           EXTRA=""
           [ -n "$TARGET" ] && EXTRA="-Dtarget=$TARGET"
           [ -n "$NODE_INCLUDE" ] && EXTRA="$EXTRA \"-Dnode-include=$NODE_INCLUDE\""
-          eval zig build node -Doptimize=ReleaseFast $EXTRA
+          [ -n "$NODE_LIB" ] && EXTRA="$EXTRA \"-Dnode-lib=$NODE_LIB\""
+          eval zig build node -Doptimize=ReleaseFast $EXTRA 2>&1 | tee build.log
+          # Never publish an addon with unresolved N-API symbols.
+          if grep -q "undefined symbol: napi_" build.log; then
+            echo "FAIL: addon linked with undefined N-API symbols — refusing to publish"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:

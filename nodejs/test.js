@@ -3,9 +3,15 @@
 const csvql = require('./index.js');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
+
+// Forward slashes even on Windows: the path is embedded in SQL, and
+// os.tmpdir() there returns backslashes. Windows accepts '/' at the API
+// level, so this sidesteps any escaping ambiguity in the query string.
+const tmp = (name) => path.join(os.tmpdir(), name).replace(/\\/g, '/');
 
 // Generate a tiny test CSV in /tmp
-const csv = '/tmp/csvql_test.csv';
+const csv = tmp('csvql_test.csv');
 fs.writeFileSync(csv, [
     'id,name,age,city,salary,department',
     '1,Alice,30,Austin,120000,Engineering',
@@ -56,14 +62,14 @@ check('queryCsv returns string with header', csv_out.startsWith('name'), true);
 
 // Error handling
 try {
-    csvql.query('SELECT * FROM \'/tmp/no_such_file.csv\'');
+    csvql.query(`SELECT * FROM '${tmp('no_such_file.csv')}'`);
     check('missing file throws', false, true);
 } catch (e) {
     check('missing file throws', true, true);
 }
 
 // Custom delimiter (TSV)
-const tsv = '/tmp/csvql_test.tsv';
+const tsv = tmp('csvql_test.tsv');
 fs.writeFileSync(tsv, 'id\tname\tscore\n1\tAlice\t95\n2\tBob\t87\n3\tCarol\t92\n');
 const tsv_rows = csvql.query(`SELECT * FROM '${tsv}'`, { delimiter: '\t' });
 check('TSV: row count', tsv_rows.length, 3);
@@ -72,7 +78,7 @@ check('TSV: WHERE works after conversion', csvql.query(`SELECT name FROM '${tsv}
 fs.unlinkSync(tsv);
 
 // Comment + skipEmptyLines
-const dirty = '/tmp/csvql_test_dirty.csv';
+const dirty = tmp('csvql_test_dirty.csv');
 fs.writeFileSync(dirty, '# header comment\nid,name\n\n1,Alice\n# mid comment\n2,Bob\n');
 const clean_rows = csvql.query(`SELECT * FROM '${dirty}'`, { comment: '#', skipEmptyLines: true });
 check('comment: # rows stripped', clean_rows.length, 2);
