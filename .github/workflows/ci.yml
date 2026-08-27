@@ -149,3 +149,90 @@ jobs:
     # commits a genuine regression file).
     - name: Run differential query generator (smoke scale)
       run: ./bench/query_fuzz.sh --seed 1 --count 300
+
+  # The N-API addon — built AND executed on every platform we publish for.
+  #
+  # This job exists because of #149: the npm package shipped a binding that
+  # aborted the host process on `SELECT <col> FROM <file> WHERE <other> > <n>`,
+  # and nothing caught it. Two faults, both reachable only from a dlopen()ed
+  # library (Zig's GeneralPurposeAllocator faulting inside a loaded .so, and
+  # the engine's multi-megabyte stack frames on a host thread too small for
+  # them), so the standalone binary and the MCP server were clean throughout
+  # and every check we had stayed green.
+  #
+  # release.yml already *builds* the addon for all five targets, but a build
+  # cannot catch either fault — both are runtime-only. Nothing ever ran
+  # `require('csvql-query')` before publishing. That is the gap.
+  #
+  # nodejs/index.js falls back to zig-out/lib/csvql.node when no bundled
+  # binary is present, so building in place is enough for the tests to find
+  # it — no need to stage binaries/ the way release.yml does.
+  node-addon:
+    name: Node addon (${{ matrix.os }})
+    strategy:
+      fail-fast: false   # a Windows-only failure must not hide a macOS one
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: 0.15.2
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: "22"
+
+    # The Windows Node toolcache ships without the C headers the addon needs,
+    # so fetch them explicitly (same approach as release.yml).
+    - name: Fetch Node.js headers (Windows)
+      if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        NODE_VER=$(node -e "console.log(process.versions.node)")
+        curl -fsSL "https://nodejs.org/dist/v${NODE_VER}/node-v${NODE_VER}-headers.tar.gz" -o node-headers.tar.gz
+        tar -xzf node-headers.tar.gz
+        echo "NODE_INCLUDE=node-v${NODE_VER}/include/node" >> $GITHUB_ENV
+
+    - name: Build the addon
+      shell: bash
+      run: |
+        EXTRA=""
+        [ -n "$NODE_INCLUDE" ] && EXTRA="\"-Dnode-include=$NODE_INCLUDE\""
+        eval zig build node -Doptimize=ReleaseFast $EXTRA
+
+    # Library surface: query(), queryCsv(), find().
+    - name: Run library tests
+      shell: bash
+      working-directory: nodejs
+      run: node test.js
+
+    # CLI surface: `npx csvql-query`, including the exit-code contract
+    # (0 success / 1 usage / 2 query error / 3 file-IO) that a script or an
+    # agent branches on. Two of these checks are the #149 regression test.
+    - name: Run CLI tests
+      shell: bash
+      working-directory: nodejs
+      run: node test_cli.js
+
+    # Belt and braces: the exact #149 shape, asserted inline so a failure
+    # here names the bug rather than showing up as an opaque abort.
+    - name: Regression — #149 crash shape
+      shell: bash
+      run: |
+        printf 'id,name,city,salary\n1,Alice,Austin,120000\n2,Bob,Boston,80000\n3,Carol,Austin,150000\n' > ci_149.csv
+        node -e "
+          const c = require('./nodejs/index.js');
+          process.stdout.write(c.queryCsv(\"SELECT name FROM 'ci_149.csv' WHERE salary > 100000\"));
+        " > got_149.txt
+        printf 'name\nAlice\nCarol\n' > want_149.txt
+        diff want_149.txt got_149.txt || {
+          echo "FAIL: #149 regression - wrong output, or the process died before writing"
+          exit 1
+        }
