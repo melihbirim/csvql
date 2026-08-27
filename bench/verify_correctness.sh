@@ -514,6 +514,35 @@ check \
 
 # ════════════════════════════════════════════════════════════════
 echo ""
+echo "── OFFSET ──────────────────────────────────────────────────"
+
+check \
+  "LIMIT then OFFSET" \
+  "SELECT id, name FROM '$CSV' ORDER BY id LIMIT 5 OFFSET 5" \
+  "SELECT id, name FROM read_csv_auto('$CSV') ORDER BY id LIMIT 5 OFFSET 5"
+
+check \
+  "OFFSET then LIMIT" \
+  "SELECT id, name FROM '$CSV' ORDER BY id OFFSET 5 LIMIT 5" \
+  "SELECT id, name FROM read_csv_auto('$CSV') ORDER BY id OFFSET 5 LIMIT 5"
+
+check \
+  "bare OFFSET" \
+  "SELECT id, name FROM '$CSV' ORDER BY id OFFSET 5" \
+  "SELECT id, name FROM read_csv_auto('$CSV') ORDER BY id OFFSET 5"
+
+check \
+  "GROUP BY with ORDER BY and OFFSET" \
+  "SELECT department, COUNT(*) FROM '$CSV' GROUP BY department ORDER BY department LIMIT 2 OFFSET 1" \
+  "SELECT department, COUNT(*) FROM read_csv_auto('$CSV') GROUP BY department ORDER BY department LIMIT 2 OFFSET 1"
+
+check \
+  "DISTINCT with ORDER BY and OFFSET" \
+  "SELECT DISTINCT city FROM '$CSV' ORDER BY city LIMIT 2 OFFSET 1" \
+  "SELECT DISTINCT city FROM read_csv_auto('$CSV') ORDER BY city LIMIT 2 OFFSET 1"
+
+# ════════════════════════════════════════════════════════════════
+echo ""
 echo "── SELECT * / Projection ───────────────────────────────────"
 
 check \

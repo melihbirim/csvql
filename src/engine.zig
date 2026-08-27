@@ -8480,6 +8480,22 @@ test "OFFSET skips rows before applying LIMIT" {
     try std.testing.expectEqualStrings("id\n2\n3\n", out);
 }
 
+test "OFFSET before LIMIT uses the same output window" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const out = try runQueryForTest(
+        allocator,
+        &tmp,
+        "id,name\n1,Alice\n2,Bob\n3,Carol\n4,Dave\n",
+        "SELECT id FROM '{s}' OFFSET 1 LIMIT 2",
+    );
+    defer allocator.free(out);
+
+    try std.testing.expectEqualStrings("id\n2\n3\n", out);
+}
+
 test "OFFSET counts rows after WHERE filtering" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

@@ -744,15 +744,20 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
     // Parse WHERE clause if present
     if (where_idx) |idx| {
         var where_part = rest[idx + 5 ..];
+        var where_end = where_part.len;
         if (group_by_idx) |gidx| {
-            where_part = where_part[0..@min(where_part.len, gidx - idx - 5)];
-        } else if (order_by_idx) |oidx| {
-            where_part = where_part[0..@min(where_part.len, oidx - idx - 5)];
-        } else if (limit_idx) |lidx| {
-            where_part = where_part[0..@min(where_part.len, lidx - idx - 5)];
-        } else if (offset_idx) |oidx| {
-            where_part = where_part[0..@min(where_part.len, oidx - idx - 5)];
+            if (gidx > idx) where_end = @min(where_end, gidx - idx - 5);
         }
+        if (order_by_idx) |oidx| {
+            if (oidx > idx) where_end = @min(where_end, oidx - idx - 5);
+        }
+        if (limit_idx) |lidx| {
+            if (lidx > idx) where_end = @min(where_end, lidx - idx - 5);
+        }
+        if (offset_idx) |oidx| {
+            if (oidx > idx) where_end = @min(where_end, oidx - idx - 5);
+        }
+        where_part = where_part[0..where_end];
         where_part = std.mem.trim(u8, where_part, &std.ascii.whitespace);
         query.where_expr = try parseExpression(allocator, where_part);
     }
@@ -760,15 +765,20 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
     // Parse GROUP BY clause if present
     if (group_by_idx) |idx| {
         var group_by_part = rest[idx + 8 ..];
+        var group_by_end = group_by_part.len;
         if (having_idx) |hidx| {
-            group_by_part = group_by_part[0..@min(group_by_part.len, hidx - idx - 8)];
-        } else if (order_by_idx) |oidx| {
-            group_by_part = group_by_part[0..@min(group_by_part.len, oidx - idx - 8)];
-        } else if (limit_idx) |lidx| {
-            group_by_part = group_by_part[0..@min(group_by_part.len, lidx - idx - 8)];
-        } else if (offset_idx) |oidx| {
-            group_by_part = group_by_part[0..@min(group_by_part.len, oidx - idx - 8)];
+            if (hidx > idx) group_by_end = @min(group_by_end, hidx - idx - 8);
         }
+        if (order_by_idx) |oidx| {
+            if (oidx > idx) group_by_end = @min(group_by_end, oidx - idx - 8);
+        }
+        if (limit_idx) |lidx| {
+            if (lidx > idx) group_by_end = @min(group_by_end, lidx - idx - 8);
+        }
+        if (offset_idx) |oidx| {
+            if (oidx > idx) group_by_end = @min(group_by_end, oidx - idx - 8);
+        }
+        group_by_part = group_by_part[0..group_by_end];
         group_by_part = std.mem.trim(u8, group_by_part, &std.ascii.whitespace);
 
         // Use paren/quote-aware splitter so STRFTIME('%Y-%m', col) stays as one token.
@@ -783,13 +793,17 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
     // Parse HAVING clause if present (filter on aggregated results, evaluated post-GROUP-BY)
     if (having_idx) |idx| {
         var having_part = rest[idx + 6 ..];
+        var having_end = having_part.len;
         if (order_by_idx) |oidx| {
-            having_part = having_part[0..@min(having_part.len, oidx - idx - 6)];
-        } else if (limit_idx) |lidx| {
-            having_part = having_part[0..@min(having_part.len, lidx - idx - 6)];
-        } else if (offset_idx) |oidx| {
-            having_part = having_part[0..@min(having_part.len, oidx - idx - 6)];
+            if (oidx > idx) having_end = @min(having_end, oidx - idx - 6);
         }
+        if (limit_idx) |lidx| {
+            if (lidx > idx) having_end = @min(having_end, lidx - idx - 6);
+        }
+        if (offset_idx) |oidx| {
+            if (oidx > idx) having_end = @min(having_end, oidx - idx - 6);
+        }
+        having_part = having_part[0..having_end];
         having_part = std.mem.trim(u8, having_part, &std.ascii.whitespace);
         query.having_expr = try parseExpression(allocator, having_part);
     }
@@ -797,11 +811,14 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
     // Parse ORDER BY clause if present
     if (order_by_idx) |idx| {
         var order_by_part = rest[idx + 8 ..];
+        var order_by_end = order_by_part.len;
         if (limit_idx) |lidx| {
-            order_by_part = order_by_part[0..@min(order_by_part.len, lidx - idx - 8)];
-        } else if (offset_idx) |oidx| {
-            order_by_part = order_by_part[0..@min(order_by_part.len, oidx - idx - 8)];
+            if (lidx > idx) order_by_end = @min(order_by_end, lidx - idx - 8);
         }
+        if (offset_idx) |oidx| {
+            if (oidx > idx) order_by_end = @min(order_by_end, oidx - idx - 8);
+        }
+        order_by_part = order_by_part[0..order_by_end];
         order_by_part = std.mem.trim(u8, order_by_part, &std.ascii.whitespace);
 
         // Parse all comma-separated ORDER BY keys
@@ -866,7 +883,7 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
     if (limit_idx) |idx| {
         var limit_part = rest[idx + 5 ..];
         if (offset_idx) |oidx| {
-            limit_part = limit_part[0..@min(limit_part.len, oidx - idx - 5)];
+            if (oidx > idx) limit_part = limit_part[0..@min(limit_part.len, oidx - idx - 5)];
         }
         limit_part = std.mem.trim(u8, limit_part, &std.ascii.whitespace);
         const parsed_limit = try std.fmt.parseInt(i32, limit_part, 10);
@@ -875,7 +892,11 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
     }
 
     if (offset_idx) |idx| {
-        const offset_part = std.mem.trim(u8, rest[idx + 6 ..], &std.ascii.whitespace);
+        var offset_part = rest[idx + 6 ..];
+        if (limit_idx) |lidx| {
+            if (lidx > idx) offset_part = offset_part[0..@min(offset_part.len, lidx - idx - 6)];
+        }
+        offset_part = std.mem.trim(u8, offset_part, &std.ascii.whitespace);
         const parsed_offset = try std.fmt.parseInt(i32, offset_part, 10);
         if (parsed_offset < 0) return error.NegativeOffsetNotAllowed;
         query.offset = parsed_offset;
