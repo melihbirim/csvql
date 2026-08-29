@@ -41,7 +41,9 @@ pub fn build(b: *std.Build) void {
 
     // Shared library — C ABI for Python ctypes and other FFI callers.
     // Build: zig build lib -Doptimize=ReleaseFast
-    // Output: zig-out/lib/libcsvql.dylib (macOS) or libcsvql.so (Linux)
+    // Output: zig-out/lib/libcsvql.{dylib,so} on macOS/Linux; on Windows the
+    // DLL goes to zig-out/bin/csvql.dll and only the import library
+    // csvql.lib lands in lib/ (python/csvql/_loader.py checks both).
     const lib = b.addLibrary(.{
         .name = "csvql",
         .linkage = .dynamic,
@@ -55,7 +57,10 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(lib);
 
     const lib_step = b.step("lib", "Build shared library (libcsvql)");
-    lib_step.dependOn(&lib.step);
+    // Depend on the *install* step, not the compile step: depending on
+    // lib.step compiled the library but never copied it into zig-out, so
+    // `zig build lib` silently produced nothing you could load.
+    lib_step.dependOn(&b.addInstallArtifact(lib, .{}).step);
 
     // Run command
     const run_cmd = b.addRunArtifact(exe);

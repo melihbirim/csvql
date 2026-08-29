@@ -251,3 +251,56 @@ jobs:
           echo "FAIL: #149 regression - wrong output, or the process died before writing"
           exit 1
         }
+
+  # The Python/C shared library — built AND executed, same reasoning as the
+  # node-addon job above.
+  #
+  # src/lib.zig carried both #149 faults (a Zig GPA that does not work inside
+  # a dlopen()ed library, and the engine's multi-megabyte stack frames on a
+  # host thread too small for them) and was fixed the same way as the N-API
+  # addon. Nothing executed it before publishing to PyPI, exactly as nothing
+  # executed the addon before publishing to npm.
+  #
+  # Runs against BOTH build modes deliberately. Verified while writing this:
+  # with the #149 fix reverted, the suite still PASSES in ReleaseFast and
+  # segfaults (139) in Debug. A ReleaseFast-only job would have shipped the
+  # bug again — the same false green that let 2.5.0 out.
+  #
+  # Covers every platform the wheels are published for: linux x64/arm64,
+  # macos, windows. _loader.py resolves csvql.dll on Windows and looks in
+  # zig-out/bin as well as zig-out/lib, since Zig installs a DLL beside the
+  # executables rather than into lib/.
+  python-binding:
+    name: Python binding (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: 0.15.2
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    # Debug first: it is the mode that actually catches the #149 class.
+    - name: Build shared library (Debug) and test
+      shell: bash
+      run: |
+        zig build
+        python python/test_csvql.py
+
+    - name: Build shared library (ReleaseFast) and test
+      shell: bash
+      run: |
+        zig build -Doptimize=ReleaseFast
+        python python/test_csvql.py
