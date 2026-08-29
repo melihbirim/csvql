@@ -251,3 +251,53 @@ jobs:
           echo "FAIL: #149 regression - wrong output, or the process died before writing"
           exit 1
         }
+
+  # The Python/C shared library — built AND executed, same reasoning as the
+  # node-addon job above.
+  #
+  # src/lib.zig carried both #149 faults (a Zig GPA that does not work inside
+  # a dlopen()ed library, and the engine's multi-megabyte stack frames on a
+  # host thread too small for them) and was fixed the same way as the N-API
+  # addon. Nothing executed it before publishing to PyPI, exactly as nothing
+  # executed the addon before publishing to npm.
+  #
+  # Runs against BOTH build modes deliberately. Verified while writing this:
+  # with the #149 fix reverted, the suite still PASSES in ReleaseFast and
+  # segfaults (139) in Debug. A ReleaseFast-only job would have shipped the
+  # bug again — the same false green that let 2.5.0 out.
+  #
+  # Windows is absent on purpose: python/csvql/_loader.py has no Windows
+  # branch (_lib_name returns libcsvql.so there), so the binding does not
+  # support Windows at all. Adding it is a feature, not a CI gap.
+  python-binding:
+    name: Python binding (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Zig
+      uses: goto-bus-stop/setup-zig@v2
+      with:
+        version: 0.15.2
+
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
+
+    # Debug first: it is the mode that actually catches the #149 class.
+    - name: Build shared library (Debug) and test
+      run: |
+        zig build
+        python3 python/test_csvql.py
+
+    - name: Build shared library (ReleaseFast) and test
+      run: |
+        zig build -Doptimize=ReleaseFast
+        python3 python/test_csvql.py
