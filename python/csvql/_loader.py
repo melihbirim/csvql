@@ -1,9 +1,9 @@
 """
-Locates and loads libcsvql (.dylib on macOS, .so on Linux).
+Locates and loads libcsvql (.dll on Windows, .dylib on macOS, .so elsewhere).
 
 Search order:
   1. Same directory as this file (installed wheel — lib bundled alongside .py)
-  2. zig-out/lib/ relative to the repo root (development build)
+  2. zig-out/ relative to the repo root (development build)
   3. Directories listed in CSVQL_LIB_PATH environment variable
 """
 
@@ -16,6 +16,9 @@ _lib_cache: ctypes.CDLL | None = None
 
 
 def _lib_name() -> str:
+    if sys.platform == "win32":
+        # Zig names the Windows shared library csvql.dll — no "lib" prefix.
+        return "csvql.dll"
     if sys.platform == "darwin":
         return "libcsvql.dylib"
     return "libcsvql.so"
@@ -27,11 +30,16 @@ def _candidate_dirs() -> list[Path]:
     # 1. Next to this .py file (wheel install)
     dirs.append(Path(__file__).parent)
 
-    # 2. zig-out/lib/ — walk up from this file looking for build.zig
+    # 2. zig-out/ — walk up from this file looking for build.zig.
+    #    Zig installs a .so/.dylib into zig-out/lib, but puts a Windows DLL
+    #    in zig-out/bin alongside the executables (only the import library
+    #    csvql.lib lands in lib/). Check both so a development build is
+    #    found on every platform.
     here = Path(__file__).resolve()
     for parent in here.parents:
         if (parent / "build.zig").exists():
             dirs.append(parent / "zig-out" / "lib")
+            dirs.append(parent / "zig-out" / "bin")
             break
 
     # 3. CSVQL_LIB_PATH env override

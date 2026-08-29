@@ -316,16 +316,21 @@ jobs:
     runs-on: ${{ matrix.os }}
     if: startsWith(github.ref, 'refs/tags/')
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             plat: manylinux_2_17_x86_64
+          - os: ubuntu-24.04-arm
+            plat: manylinux_2_17_aarch64
           - os: macos-14
             arch: x86_64
             plat: macosx_12_0_x86_64
           - os: macos-14
             arch: arm64
             plat: macosx_12_0_arm64
+          - os: windows-latest
+            plat: win_amd64
 
     steps:
       - uses: actions/checkout@v4
@@ -343,14 +348,26 @@ jobs:
       - name: Build Zig shared library
         run: zig build -Doptimize=ReleaseFast
 
+      # Zig installs the shared library into zig-out/lib on POSIX, but puts a
+      # Windows DLL in zig-out/bin (only the import library csvql.lib goes to
+      # lib/). _loader.py knows both locations; this staging step has to too.
       - name: Copy library into package
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             cp zig-out/lib/libcsvql.dylib python/csvql/libcsvql.dylib
+          elif [[ "$RUNNER_OS" == "Windows" ]]; then
+            cp zig-out/bin/csvql.dll python/csvql/csvql.dll
           else
             cp zig-out/lib/libcsvql.so python/csvql/libcsvql.so
           fi
+
+      # Never ship a wheel whose library does not load. This is the PyPI-side
+      # equivalent of the node-addon check — a built artifact proves nothing
+      # about whether it runs (see #149).
+      - name: Smoke-test the staged library
+        shell: bash
+        run: python python/test_csvql.py
 
       - name: Build wheel
         working-directory: python

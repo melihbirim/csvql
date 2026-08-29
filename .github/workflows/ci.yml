@@ -266,15 +266,16 @@ jobs:
   # segfaults (139) in Debug. A ReleaseFast-only job would have shipped the
   # bug again — the same false green that let 2.5.0 out.
   #
-  # Windows is absent on purpose: python/csvql/_loader.py has no Windows
-  # branch (_lib_name returns libcsvql.so there), so the binding does not
-  # support Windows at all. Adding it is a feature, not a CI gap.
+  # Covers every platform the wheels are published for: linux x64/arm64,
+  # macos, windows. _loader.py resolves csvql.dll on Windows and looks in
+  # zig-out/bin as well as zig-out/lib, since Zig installs a DLL beside the
+  # executables rather than into lib/.
   python-binding:
     name: Python binding (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -293,11 +294,13 @@ jobs:
 
     # Debug first: it is the mode that actually catches the #149 class.
     - name: Build shared library (Debug) and test
+      shell: bash
       run: |
         zig build
-        python3 python/test_csvql.py
+        python python/test_csvql.py
 
     - name: Build shared library (ReleaseFast) and test
+      shell: bash
       run: |
         zig build -Doptimize=ReleaseFast
-        python3 python/test_csvql.py
+        python python/test_csvql.py
