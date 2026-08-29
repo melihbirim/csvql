@@ -53,10 +53,10 @@ def check(label, actual, expected):
     global passed, total
     total += 1
     if actual == expected:
-        print(f"✓ {label}")
+        print(f"PASS  {label}")
         passed += 1
     else:
-        print(f"✗ {label}\n    expected: {expected!r}\n    actual:   {actual!r}")
+        print(f"FAIL  {label}\n    expected: {expected!r}\n    actual:   {actual!r}")
 
 
 def check_raises(label, fn, exc=RuntimeError):
@@ -65,12 +65,12 @@ def check_raises(label, fn, exc=RuntimeError):
     try:
         fn()
     except exc:
-        print(f"✓ {label}")
+        print(f"PASS  {label}")
         passed += 1
     except Exception as e:  # noqa: BLE001
-        print(f"✗ {label}\n    wrong exception: {type(e).__name__}: {e}")
+        print(f"FAIL  {label}\n    wrong exception: {type(e).__name__}: {e}")
     else:
-        print(f"✗ {label}\n    no exception raised")
+        print(f"FAIL  {label}\n    no exception raised")
 
 
 # ── #149 regression ──────────────────────────────────────────────────────
@@ -146,10 +146,10 @@ try:
         csvql.query(f"SELECT name FROM '{P}' WHERE salary > {100000 + i}")
     total += 1
     passed += 1
-    print("✓ 200 consecutive queries (crosses allocator page boundaries)")
+    print("PASS  200 consecutive queries (crosses allocator page boundaries)")
 except Exception:  # noqa: BLE001
     total += 1
-    print("✗ 200 consecutive queries — failed partway")
+    print("FAIL  200 consecutive queries - failed partway")
     traceback.print_exc()
 
 print(f"\n{passed}/{total} Python binding tests passed")
