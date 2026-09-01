@@ -371,6 +371,7 @@ jobs:
 
       - name: Build wheel
         working-directory: python
+        shell: bash
         run: |
           pip install --upgrade setuptools build wheel
           # Set version from git tag (strips leading 'v')
