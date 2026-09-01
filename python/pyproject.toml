@@ -36,4 +36,4 @@ where = ["."]
 include = ["csvql*"]
 
 [tool.setuptools.package-data]
-csvql = ["*.so", "*.dylib"]
+csvql = ["*.so", "*.dylib", "*.dll"]
