@@ -149,7 +149,7 @@ BEGIN {
     split("id age salary", numeric_cols, " ")
     split("name city department", string_cols, " ")
     split("id name age city salary department", all_cols_any, " ")
-    split("COUNT SUM AVG MIN MAX", aggs, " ")
+    split("COUNT SUM AVG MIN MAX VARIANCE STDDEV MEDIAN", aggs, " ")
     split("= != > >= < <=", numeric_ops, " ")
     split("= !=", string_ops, " ")
 
@@ -180,12 +180,16 @@ BEGIN {
 
     for (q = 0; q < count; q++) {
         kind_roll = myrand()
-        if (kind_roll < 0.34) {
+        if (kind_roll < 0.26) {
             emit_scalar_agg()
-        } else if (kind_roll < 0.67) {
+        } else if (kind_roll < 0.52) {
             emit_groupby_agg()
-        } else {
+        } else if (kind_roll < 0.74) {
             emit_projection()
+        } else if (kind_roll < 0.87) {
+            emit_limit_offset()
+        } else {
+            emit_in_subquery()
         }
     }
 }
@@ -194,10 +198,27 @@ function pick(arr, n) {
     return arr[int(myrand() * n) + 1]
 }
 
+function rand_numeric_val(col) {
+    if (col == "id") return int(myrand() * 20000) + 1
+    else if (col == "age") return int(myrand() * 50) + 15
+    else return int(myrand() * 100000) + 30000
+}
+
+function rand_string_val(col,    nv) {
+    nv = n_values[col]
+    if (nv == 0) return "nobody"
+    return values[col, int(myrand() * nv) + 1]
+}
+
+function sql_quote(val) {
+    gsub(/'"'"'/, "'"'"''"'"'", val)  # escape single quotes for SQL
+    return "'"'"'" val "'"'"'"
+}
+
 # One "col OP val" predicate — operator set depends on column type.
 function gen_predicate() {
     r = myrand()
-    if (r < 0.15) {
+    if (r < 0.12) {
         # IS NULL / IS NOT NULL — this fixture never has an empty field, so
         # IS NULL always matches zero rows and IS NOT NULL always matches
         # all of them, but that still exercises the operator itself: both
@@ -205,50 +226,69 @@ function gen_predicate() {
         # a value comparison.
         col = pick(all_cols_any, 6)
         return col ((myrand() < 0.5) ? " IS NULL" : " IS NOT NULL")
-    } else if (r < 0.5) {
+    } else if (r < 0.38) {
         col = pick(numeric_cols, 3)
         op = pick(numeric_ops, 6)
-        if (col == "id") val = int(myrand() * 20000) + 1
-        else if (col == "age") val = int(myrand() * 50) + 15
-        else val = int(myrand() * 100000) + 30000
-        return col " " op " " val
-    } else if (r < 0.7) {
-        # LIKE against a substring of a real sampled value — prefix,
-        # suffix, or contains wildcard, so it actually matches something
-        # instead of testing only the zero-row case.
+        return col " " op " " rand_numeric_val(col)
+    } else if (r < 0.48) {
+        # BETWEEN low AND high (inclusive numeric range).
+        col = pick(numeric_cols, 3)
+        v1 = rand_numeric_val(col); v2 = rand_numeric_val(col)
+        lo = (v1 < v2) ? v1 : v2; hi = (v1 < v2) ? v2 : v1
+        return col " BETWEEN " lo " AND " hi
+    } else if (r < 0.62) {
+        # LIKE / ILIKE against a substring of a real sampled value —
+        # prefix, suffix, or contains wildcard, so it actually matches
+        # something instead of testing only the zero-row case.
         col = pick(string_cols, 3)
-        nv = n_values[col]
-        if (nv == 0) { val = "nobody" } else { val = values[col, int(myrand() * nv) + 1] }
+        val = rand_string_val(col)
         vlen = length(val)
         piece_len = (vlen > 1) ? int(myrand() * (vlen - 1)) + 1 : vlen
         shape = myrand()
         if (shape < 0.34) pattern = substr(val, 1, piece_len) "%"
         else if (shape < 0.67) pattern = "%" substr(val, vlen - piece_len + 1)
         else pattern = "%" substr(val, 1, piece_len) "%"
-        gsub(/'"'"'/, "'"'"''"'"'", pattern)  # escape single quotes for SQL
-        return col " LIKE '"'"'" pattern "'"'"'"
+        kw = (myrand() < 0.5) ? "LIKE" : "ILIKE"
+        return col " " kw " " sql_quote(pattern)
+    } else if (r < 0.75) {
+        col = pick(string_cols, 3)
+        op = pick(string_ops, 2)
+        return col " " op " " sql_quote(rand_string_val(col))
+    } else if (r < 0.87) {
+        # IN / NOT IN over a literal list — numeric or string column.
+        if (myrand() < 0.5) {
+            col = pick(numeric_cols, 3)
+            n = int(myrand() * 3) + 2
+            list = ""
+            for (k = 0; k < n; k++) list = (list == "") ? rand_numeric_val(col) : list ", " rand_numeric_val(col)
+        } else {
+            col = pick(string_cols, 3)
+            n = int(myrand() * 3) + 2
+            list = ""
+            for (k = 0; k < n; k++) list = (list == "") ? sql_quote(rand_string_val(col)) : list ", " sql_quote(rand_string_val(col))
+        }
+        kw = (myrand() < 0.5) ? "IN" : "NOT IN"
+        return col " " kw " (" list ")"
     } else {
         col = pick(string_cols, 3)
         op = pick(string_ops, 2)
-        nv = n_values[col]
-        if (nv == 0) { val = "nobody" } else { val = values[col, int(myrand() * nv) + 1] }
-        gsub(/'"'"'/, "'"'"''"'"'", val)  # escape single quotes for SQL
-        return col " " op " '"'"'" val "'"'"'"
+        return col " " op " " sql_quote(rand_string_val(col))
     }
 }
 
-# A single predicate, or two joined with AND/OR.
+# A single predicate, or two joined with AND/OR, optionally wrapped in NOT.
 function gen_where() {
     w = gen_predicate()
     if (myrand() < 0.4) {
         joiner = (myrand() < 0.5) ? "AND" : "OR"
         w = w " " joiner " " gen_predicate()
     }
+    if (myrand() < 0.1) w = "NOT (" w ")"
     return w
 }
 
 function emit_scalar_agg() {
-    agg = pick(aggs, 5)
+    agg = pick(aggs, 8)
     numcol = pick(numeric_cols, 3)
     where = gen_where()
     arg = (agg == "COUNT" && myrand() < 0.3) ? "*" : numcol
@@ -259,13 +299,82 @@ function emit_scalar_agg() {
 
 function emit_groupby_agg() {
     group_col = pick(string_cols, 3)
-    agg = pick(aggs, 5)
+    # Occasionally group by a second, distinct string column too.
+    group_col2 = ""
+    if (myrand() < 0.3) {
+        do { group_col2 = pick(string_cols, 3) } while (group_col2 == group_col)
+    }
+    group_cols = (group_col2 == "") ? group_col : group_col ", " group_col2
+
+    agg = pick(aggs, 8)
     numcol = pick(numeric_cols, 3)
     where = gen_where()
     arg = (agg == "COUNT" && myrand() < 0.3) ? "*" : numcol
-    csvql_sql = "SELECT " group_col ", " agg "(" arg ") FROM '"'"'" csv "'"'"' WHERE " where " GROUP BY " group_col " ORDER BY " group_col
-    duck_sql = "SELECT " group_col ", " agg "(" arg ") FROM __fuzz_csv WHERE " where " GROUP BY " group_col " ORDER BY " group_col
+
+    # Occasionally filter groups post-aggregation with HAVING, using a
+    # second (possibly different) aggregate — exercises the aggregate
+    # re-evaluation path independent of the SELECT list.
+    having = ""
+    if (myrand() < 0.3) {
+        having_agg = pick(aggs, 8)
+        having_col = pick(numeric_cols, 3)
+        having_arg = (having_agg == "COUNT" && myrand() < 0.3) ? "*" : having_col
+        having_op = pick(numeric_ops, 6)
+        having_val = rand_numeric_val(having_col)
+        having = " HAVING " having_agg "(" having_arg ") " having_op " " having_val
+    }
+
+    csvql_sql = "SELECT " group_cols ", " agg "(" arg ") FROM '"'"'" csv "'"'"' WHERE " where " GROUP BY " group_cols having " ORDER BY " group_cols
+    duck_sql = "SELECT " group_cols ", " agg "(" arg ") FROM __fuzz_csv WHERE " where " GROUP BY " group_cols having " ORDER BY " group_cols
     print "groupby_agg\t" csvql_sql "\t" duck_sql
+}
+
+# LIMIT n [OFFSET m] over a deterministic ORDER BY id — exercises pagination.
+function emit_limit_offset() {
+    all_cols_n = 6
+    split("id name age city salary department", all_cols, " ")
+    n = int(myrand() * 3) + 1
+    delete chosen
+    cols_str = ""
+    got = 0
+    while (got < n) {
+        c = all_cols[int(myrand() * all_cols_n) + 1]
+        if (!(c in chosen)) {
+            chosen[c] = 1
+            cols_str = (cols_str == "") ? c : cols_str ", " c
+            got++
+        }
+    }
+    where = gen_where()
+    lim = int(myrand() * 200) + 1
+    off = int(myrand() * 500)
+    tail = (myrand() < 0.5) ? ("LIMIT " lim " OFFSET " off) : ("OFFSET " off " LIMIT " lim)
+    csvql_sql = "SELECT " cols_str " FROM '"'"'" csv "'"'"' WHERE " where " ORDER BY id " tail
+    duck_sql = "SELECT " cols_str " FROM __fuzz_csv WHERE " where " ORDER BY id " tail
+    print "limit_offset\t" csvql_sql "\t" duck_sql
+}
+
+# WHERE col IN/NOT IN (SELECT col FROM <same fixture> WHERE ...) — a
+# non-correlated semi-join subquery (#124) against the same table, since
+# the generator only knows one fixture schema.
+function emit_in_subquery() {
+    # outer_col must not be named "col" — gen_where()/gen_predicate() below
+    # write the GLOBAL awk variable "col" as a side effect, which would
+    # silently clobber it before its second use here (a fuzz-generator bug, not a csvql bug — no GitHub issue).
+    outer_col = pick(numeric_cols, 3)
+    sub_where = gen_where()
+    kw = (myrand() < 0.7) ? "IN" : "NOT IN"
+    where = outer_col " " kw " (SELECT " outer_col " FROM '"'"'" csv "'"'"' WHERE " sub_where ")"
+    duck_where = outer_col " " kw " (SELECT " outer_col " FROM __fuzz_csv WHERE " sub_where ")"
+    # LIMIT caps the outer result: a loose inner predicate (e.g. IS NOT
+    # NULL) can resolve to nearly the whole fixture, and an unbounded outer
+    # match then makes the awk diff pass compare thousands of rows per
+    # query — with enough such queries in one run that dominates wall time
+    # without adding real coverage beyond what a capped comparison already
+    # exercises.
+    csvql_sql = "SELECT id, " outer_col " FROM '"'"'" csv "'"'"' WHERE " where " ORDER BY id LIMIT 200"
+    duck_sql = "SELECT id, " outer_col " FROM __fuzz_csv WHERE " duck_where " ORDER BY id LIMIT 200"
+    print "in_subquery\t" csvql_sql "\t" duck_sql
 }
 
 function emit_projection() {
@@ -409,9 +518,21 @@ awk -v tmp="$TMP" -v total="$total" -v queries_file="$QUERIES_FILE" -v failtsv="
   # as a scalar anywhere else, including a different functions parameter of
   # the same name. Every identifier below is unique across the whole
   # script on purpose — do not reuse a short name like "f" or "line" again.
-  function normalize_field(val) {
+  function normalize_field(val,    n, mag, dec) {
     if (val == "" || val == "NULL") return "NULL"
-    if (val ~ /^-?[0-9]+(\.[0-9]+)?$/) return sprintf("%.4f", val)
+    if (val ~ /^-?[0-9]+(\.[0-9]+)?$/) {
+      n = val + 0
+      mag = (n < 0) ? -n : n
+      # Large-magnitude floats (VARIANCE/STDDEV over a big column sum
+      # squares into the hundreds of millions) accumulate float64
+      # summation-order noise well before the 4th decimal place once the
+      # integer part alone has 7+ digits. Rounding tighter than the
+      # precision floor of the value itself produces false-positive
+      # mismatches, not real bugs -- same reasoning as
+      # verify_correctness.sh check_approx `decimals` parameter.
+      dec = (mag >= 1000000) ? 0 : 4
+      return sprintf("%.*f", dec, n)
+    }
     return val
   }
   function normalize_row(rawrow,    nfields, colidx, colparts, outrow, normed) {

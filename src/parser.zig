@@ -1014,6 +1014,42 @@ fn findClauseKeyword(s: []const u8, keyword: []const u8) ?usize {
     return null;
 }
 
+/// Case-insensitive substring search for `needle`, skipping over
+/// single-quoted strings and anything inside parentheses (depth > 0) — so a
+/// `col IN (SELECT ... WHERE other_col LIKE '...')` subquery's own LIKE/IS
+/// NULL/IN keywords are never mistaken for the outer predicate's operator
+/// (#155). Returns the index of the start of `needle` in `s`, or null.
+fn findTopLevelSubstr(s: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0 or s.len < needle.len) return null;
+    var i: usize = 0;
+    var depth: usize = 0;
+    while (i < s.len) {
+        if (s[i] == '\'') {
+            i += 1;
+            while (i < s.len and s[i] != '\'') : (i += 1) {}
+            if (i < s.len) i += 1;
+            continue;
+        }
+        if (s[i] == '(') {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if (s[i] == ')') {
+            if (depth > 0) depth -= 1;
+            i += 1;
+            continue;
+        }
+        if (depth == 0 and i + needle.len <= s.len and
+            std.ascii.eqlIgnoreCase(s[i .. i + needle.len], needle))
+        {
+            return i;
+        }
+        i += 1;
+    }
+    return null;
+}
+
 /// Scan `s` for " KEYWORD " (case-insensitive, with a space on each side) while
 /// skipping over single-quoted strings and nested parentheses.
 /// Returns the index of the leading space.
@@ -1050,6 +1086,30 @@ fn findTopLevelOp(s: []const u8, keyword: []const u8) ?usize {
     return null;
 }
 
+/// Same as findTopLevelOp but only searches s[start..], returning an
+/// absolute index into s (or null).
+fn findTopLevelOpFrom(s: []const u8, keyword: []const u8, start: usize) ?usize {
+    if (start > s.len) return null;
+    if (findTopLevelOp(s[start..], keyword)) |rel| return start + rel;
+    return null;
+}
+
+/// Locates the top-level logical AND that splits two predicates, skipping
+/// over a BETWEEN clause's own "low AND high" separator — which contains
+/// " AND " as syntax, not a logical operator. See the call site (#154) for
+/// why this can't just be findTopLevelOp(s, "AND").
+fn findLogicalAndIdx(s: []const u8) ?usize {
+    var search_start: usize = 0;
+    while (findTopLevelOpFrom(s, "AND", search_start)) |and_idx| {
+        if (findTopLevelOp(s[search_start..and_idx], "BETWEEN") != null) {
+            search_start = and_idx + 5; // past " AND ", resume after BETWEEN's own AND
+            continue;
+        }
+        return and_idx;
+    }
+    return null;
+}
+
 pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
     const trimmed = std.mem.trim(u8, input, &std.ascii.whitespace);
 
@@ -1082,19 +1142,16 @@ pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
         return Expression{ .unary = un };
     }
 
-    // BETWEEN must be detected BEFORE the AND/OR split because
-    // "col BETWEEN 1 AND 5" contains " AND " as syntax, not a logical operator.
-    if (findTopLevelOp(trimmed, "BETWEEN")) |idx| {
-        return parseBetween(allocator, trimmed, idx);
-    }
-
-    // AND/OR must be split before IS NULL/IS NOT NULL (and before LIKE/IN/
-    // operators) so that compound conditions such as "age IS NOT NULL AND
-    // city = 'x'" are split into two predicates first, instead of the plain
-    // substring scan for " IS NOT NULL" below grabbing everything before it
-    // — including the leading "age" *and* a trailing "AND city = 'x'" — as
-    // a single bogus column name/dropped clause (#142). OR has lower
-    // precedence → check it first.
+    // AND/OR must be split before BETWEEN, IS NULL/IS NOT NULL (and before
+    // LIKE/IN/operators) so that compound conditions such as "age IS NOT
+    // NULL AND city = 'x'" are split into two predicates first, instead of
+    // the plain substring scan for " IS NOT NULL" below grabbing everything
+    // before it — including the leading "age" *and* a trailing "AND city =
+    // 'x'" — as a single bogus column name/dropped clause (#142). OR has
+    // lower precedence → check it first.
+    //
+    // OR is always safe to split on here: BETWEEN's own grammar ("col
+    // BETWEEN low AND high") never contains the word OR.
     if (findTopLevelOp(trimmed, "OR")) |idx| {
         const left = try parseExpression(allocator, trimmed[0..idx]);
         const right = try parseExpression(allocator, std.mem.trim(u8, trimmed[idx + 4 ..], &std.ascii.whitespace));
@@ -1102,7 +1159,13 @@ pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
         bin.* = .{ .op = .@"or", .left = left, .right = right };
         return Expression{ .binary = bin };
     }
-    if (findTopLevelOp(trimmed, "AND")) |idx| {
+    // AND is trickier: "col BETWEEN low AND high" contains " AND " as
+    // BETWEEN syntax, not a logical operator, so a naive first-match split
+    // on "id BETWEEN 1 AND 5 AND city = 'x'" would split at BETWEEN's own
+    // AND, leaving "5 AND city = 'x'" as BETWEEN's (garbage) high bound and
+    // silently dropping the second predicate entirely (#154). Skip past a
+    // BETWEEN clause's own AND to find the real logical split point.
+    if (findLogicalAndIdx(trimmed)) |idx| {
         const left = try parseExpression(allocator, trimmed[0..idx]);
         const right = try parseExpression(allocator, std.mem.trim(u8, trimmed[idx + 5 ..], &std.ascii.whitespace));
         const bin = try allocator.create(BinaryExpr);
@@ -1110,10 +1173,17 @@ pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
         return Expression{ .binary = bin };
     }
 
+    // BETWEEN — only reached once no top-level OR and no top-level logical
+    // AND remains, so any top-level AND still in `trimmed` here is
+    // BETWEEN's own "low AND high" separator.
+    if (findTopLevelOp(trimmed, "BETWEEN")) |idx| {
+        return parseBetween(allocator, trimmed, idx);
+    }
+
     // IS NULL / IS NOT NULL — only reached once no top-level AND/OR/BETWEEN
     // remains, so `trimmed` here is always a single leaf predicate and this
     // substring scan can't accidentally swallow a sibling predicate.
-    if (std.ascii.indexOfIgnoreCase(trimmed, " IS NOT NULL")) |idx| {
+    if (findTopLevelSubstr(trimmed, " IS NOT NULL")) |idx| {
         const col_part = std.mem.trim(u8, trimmed[0..idx], &std.ascii.whitespace);
         const col_lower = try allocator.alloc(u8, col_part.len);
         _ = std.ascii.lowerString(col_lower, col_part);
@@ -1124,7 +1194,7 @@ pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
             .numeric_value = null,
         } };
     }
-    if (std.ascii.indexOfIgnoreCase(trimmed, " IS NULL")) |idx| {
+    if (findTopLevelSubstr(trimmed, " IS NULL")) |idx| {
         const col_part = std.mem.trim(u8, trimmed[0..idx], &std.ascii.whitespace);
         const col_lower = try allocator.alloc(u8, col_part.len);
         _ = std.ascii.lowerString(col_lower, col_part);
@@ -1137,17 +1207,17 @@ pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
     }
 
     // Check for ILIKE before LIKE (both before symbol operators since patterns may contain = > <)
-    if (std.ascii.indexOfIgnoreCase(trimmed, " ILIKE ")) |idx| {
+    if (findTopLevelSubstr(trimmed, " ILIKE ")) |idx| {
         return parseILikeComparison(allocator, trimmed, idx);
     }
-    if (std.ascii.indexOfIgnoreCase(trimmed, " LIKE ")) |idx| {
+    if (findTopLevelSubstr(trimmed, " LIKE ")) |idx| {
         return parseLikeComparison(allocator, trimmed, idx);
     }
 
     // Check for NOT IN (...) before IN (...) — "col NOT IN (" contains " IN ("
     // as a substring starting after "NOT", so NOT IN must be checked first or
     // it gets misparsed as a plain IN with "col NOT" as the column name (#115).
-    if (std.ascii.indexOfIgnoreCase(trimmed, " NOT IN (")) |idx| {
+    if (findTopLevelSubstr(trimmed, " NOT IN (")) |idx| {
         const col_candidate = std.mem.trim(u8, trimmed[0..idx], &std.ascii.whitespace);
         if (std.mem.indexOfAny(u8, col_candidate, "=<>!'\"(") == null) {
             // idx (before " NOT IN (") is correct for both ends: column_part
@@ -1158,7 +1228,7 @@ pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
     }
 
     // Check for IN (...) operator before = (so "col IN (...)" doesn't match the = path)
-    if (std.ascii.indexOfIgnoreCase(trimmed, " IN (")) |idx| {
+    if (findTopLevelSubstr(trimmed, " IN (")) |idx| {
         const col_candidate = std.mem.trim(u8, trimmed[0..idx], &std.ascii.whitespace);
         // Only treat as IN if the left-hand side looks like a plain identifier (no operators/quotes)
         if (std.mem.indexOfAny(u8, col_candidate, "=<>!'\"(") == null) {

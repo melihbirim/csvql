@@ -204,16 +204,18 @@ Row counts verified identical to DuckDB at every size. This was originally a ~20
 
 Reproduce: [`bench/bench_insubquery.sh`](bench/bench_insubquery.sh)
 
-**NYC Taxi benchmark — 20M rows, 8 GB CSV, Apple M-series** — the canonical [Billion-Taxi-Rides](https://github.com/pdet/taxi-benchmark) queries on [DuckDB's own dataset](https://duckdb.org/2024/10/16/driving-csv-performance-benchmarking-duckdb-with-the-nyc-taxi-dataset). Both engines query the raw uncompressed CSV **directly** (no preload into a native store), cold per run, best-of-5, warm OS cache:
+**NYC Taxi benchmark — 20M rows, 8 GB CSV, Apple M-series** — the canonical [Billion-Taxi-Rides](https://github.com/pdet/taxi-benchmark) queries on [DuckDB's own dataset](https://duckdb.org/2024/10/16/driving-csv-performance-benchmarking-duckdb-with-the-nyc-taxi-dataset). Both engines query the raw uncompressed CSV **directly** (no preload into a native store), cold per run, best-of-3, warm OS cache:
+
+Engine versions: csvql **2.6.0**, DuckDB **1.5.5**.
 
 | Query                                                       | csvql     | DuckDB | Speedup  |
 | ----------------------------------------------------------- | --------- | ------ | -------- |
-| Q01 `COUNT(*) GROUP BY cab_type`                            | **1.29s** | 3.55s  | **2.8x** |
-| Q02 `AVG(total_amount) GROUP BY passenger_count`            | **1.41s** | 3.81s  | **2.7x** |
-| Q03 `COUNT(*) GROUP BY passenger_count, year`               | **1.36s** | 4.01s  | **2.9x** |
-| Q04 `GROUP BY passenger_count, year, ROUND(distance) ...`   | **1.38s** | 3.99s  | **2.9x** |
+| Q01 `COUNT(*) GROUP BY cab_type`                            | **1.42s** | 4.70s  | **3.3x** |
+| Q02 `AVG(total_amount) GROUP BY passenger_count`            | **1.39s** | 4.61s  | **3.3x** |
+| Q03 `COUNT(*) GROUP BY passenger_count, year`               | **1.39s** | 4.71s  | **3.4x** |
+| Q04 `GROUP BY passenger_count, year, ROUND(distance) ...`   | **1.52s** | 4.70s  | **3.1x** |
 
-Results verified identical to DuckDB. The gap **widens on smaller files** — ~10x on the 417 MB / 1M-row sample, where DuckDB's process and CSV-reader startup dominate; on 8 GB the actual parse+aggregate work dominates and csvql holds a clean ~2.8x.
+Results verified identical to DuckDB. The gap **widens on smaller files** — ~10x on the 417 MB / 1M-row sample, where DuckDB's process and CSV-reader startup dominate; on 8 GB the actual parse+aggregate work dominates and csvql holds a clean ~3.2x.
 
 Reproduce: [`bench/bench_taxi.sh`](bench/bench_taxi.sh) — `./bench/bench_taxi.sh --sample` (417 MB, quick) or `./bench/bench_taxi.sh 1` (full 20M rows, ~8 GB download).
 
@@ -221,16 +223,16 @@ Reproduce: [`bench/bench_taxi.sh`](bench/bench_taxi.sh) — `./bench/bench_taxi.
 
 | Query | csvql peak | DuckDB peak |
 | ----- | ---------- | ----------- |
-| Q01   | **29 MB**  | 178 MB      |
-| Q02   | **30 MB**  | 210 MB      |
-| Q03   | **34 MB**  | 208 MB      |
-| Q04   | **38 MB**  | 219 MB      |
+| Q01   | **29 MB**  | 177 MB      |
+| Q02   | **30 MB**  | 209 MB      |
+| Q03   | **34 MB**  | 213 MB      |
+| Q04   | **38 MB**  | 217 MB      |
 
-**~6x less memory** — and csvql needs **0 bytes of extra storage**: it queries the CSV in place via mmap, no ingest. DuckDB's fast "with storage" path first materializes a **2.1 GB native store (21.7 s one-time ingest)** before it can reach comparable query times; querying the raw CSV directly (as csvql does), it uses ~6x the memory and stays ~2.8x slower.
+**~6x less memory** — and csvql needs **0 bytes of extra storage**: it queries the CSV in place via mmap, no ingest. DuckDB's fast "with storage" path first materializes a **2.1 GB native store (25.8 s one-time ingest)** before it can reach comparable query times; querying the raw CSV directly (as csvql does), it uses ~6x the memory and stays ~3x slower.
 
 Reproduce: `./bench/bench_taxi.sh --resources 1` (or `--resources --sample`).
 
-**At scale, csvql reads raw CSV about as fast as your OS can hand it the bytes.** On the 8 GB file, `SELECT COUNT(*)`, `GROUP BY cab_type`, and `GROUP BY + AVG` all run in **~1.31 s** — the same time as `cat file > /dev/null` (~1.30 s) on the same machine. The parsing, grouping, and aggregation are effectively free; the whole query is bounded by the file read itself. There is no meaningful parsing overhead left to remove — csvql is already at the read ceiling, which is why the raw-CSV gap over DuckDB (which does more work per byte) holds at ~2.8x.
+**At scale, csvql reads raw CSV faster than a plain `cat` of the same file.** On the 8 GB file (best-of-3, warm cache), `cat file > /dev/null` takes **1.92s**; csvql's `SELECT COUNT(*)` takes **1.05s**, and `GROUP BY cab_type` / `GROUP BY + AVG` both land at **~1.32s** — parallel mmap reads across cores beat a single-threaded sequential `cat`. The parsing, grouping, and aggregation add next to nothing on top of the read itself, which is why the raw-CSV gap over DuckDB (which does more work per byte, single-process) holds at ~3.2x.
 
 Run the full suite (all sections): [`bench/bench_all.sh`](bench/bench_all.sh)
 
