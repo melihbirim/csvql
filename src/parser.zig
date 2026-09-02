@@ -1014,16 +1014,47 @@ fn findClauseKeyword(s: []const u8, keyword: []const u8) ?usize {
     return null;
 }
 
-/// Case-insensitive substring search for `needle`, skipping over
-/// single-quoted strings and anything inside parentheses (depth > 0) — so a
-/// `col IN (SELECT ... WHERE other_col LIKE '...')` subquery's own LIKE/IS
-/// NULL/IN keywords are never mistaken for the outer predicate's operator
-/// (#155). Returns the index of the start of `needle` in `s`, or null.
-fn findTopLevelSubstr(s: []const u8, needle: []const u8) ?usize {
-    if (needle.len == 0 or s.len < needle.len) return null;
+const LeafOpKind = enum { is_not_null, is_null, ilike, like, not_in, in_kw, percent, ge, le, ne, eq, gt, lt, none };
+
+/// Single left-to-right, quote/paren-depth-aware scan of an already-isolated
+/// leaf predicate (parseExpression's OR/AND/BETWEEN splitting above
+/// guarantees no top-level AND/OR/BETWEEN remains by the time this runs) for
+/// the first leaf-level operator/keyword. Replaces what used to be up to
+/// eight independent full-string re-scans — one per candidate operator, in a
+/// fixed and easy-to-get-wrong priority order that depended on which `if`
+/// happened to run first in source order (that's exactly how #154 and #155
+/// slipped through) — with one pass whose priority is data (the order of
+/// `candidates` below), not code position: adding operator #9 means adding
+/// a table row, not finding the right place in a growing if-cascade.
+///
+/// NOT IN is checked before IN, and IS NOT NULL before IS NULL, for the same
+/// reason the old cascade needed that order: the shorter pattern's text is a
+/// substring of the longer one's, so checking short-before-long here would
+/// match the wrong one first (#115).
+///
+/// IN / NOT IN carry a guard: the text before the match must not itself
+/// contain an operator/quote/paren character, otherwise this "IN (" isn't
+/// really the outer predicate's IN — it's part of something else on the
+/// left-hand side. On a guard failure the scan does not stop; it keeps
+/// going past that position, mirroring the old cascade's behavior of simply
+/// falling through to the next check when a candidate didn't pan out.
+fn scanLeafOperator(s: []const u8) struct { op: LeafOpKind, idx: usize } {
+    const Candidate = struct { pat: []const u8, op: LeafOpKind };
+    const candidates = [_]Candidate{
+        .{ .pat = " IS NOT NULL", .op = .is_not_null },
+        .{ .pat = " IS NULL", .op = .is_null },
+        .{ .pat = " NOT IN (", .op = .not_in },
+        .{ .pat = " ILIKE ", .op = .ilike },
+        .{ .pat = " LIKE ", .op = .like },
+        .{ .pat = " IN (", .op = .in_kw },
+        .{ .pat = " % ", .op = .percent },
+        .{ .pat = ">=", .op = .ge },
+        .{ .pat = "<=", .op = .le },
+        .{ .pat = "!=", .op = .ne },
+    };
     var i: usize = 0;
     var depth: usize = 0;
-    while (i < s.len) {
+    scan: while (i < s.len) {
         if (s[i] == '\'') {
             i += 1;
             while (i < s.len and s[i] != '\'') : (i += 1) {}
@@ -1040,14 +1071,26 @@ fn findTopLevelSubstr(s: []const u8, needle: []const u8) ?usize {
             i += 1;
             continue;
         }
-        if (depth == 0 and i + needle.len <= s.len and
-            std.ascii.eqlIgnoreCase(s[i .. i + needle.len], needle))
-        {
-            return i;
+        if (depth == 0) {
+            for (candidates) |c| {
+                if (i + c.pat.len <= s.len and std.ascii.eqlIgnoreCase(s[i .. i + c.pat.len], c.pat)) {
+                    if (c.op == .not_in or c.op == .in_kw) {
+                        const col_candidate = std.mem.trim(u8, s[0..i], &std.ascii.whitespace);
+                        if (std.mem.indexOfAny(u8, col_candidate, "=<>!'\"(") != null) {
+                            i += 1;
+                            continue :scan; // guard failed — keep scanning past this position
+                        }
+                    }
+                    return .{ .op = c.op, .idx = i };
+                }
+            }
+            if (s[i] == '=') return .{ .op = .eq, .idx = i };
+            if (s[i] == '>') return .{ .op = .gt, .idx = i };
+            if (s[i] == '<') return .{ .op = .lt, .idx = i };
         }
         i += 1;
     }
-    return null;
+    return .{ .op = .none, .idx = 0 };
 }
 
 /// Scan `s` for " KEYWORD " (case-insensitive, with a space on each side) while
@@ -1180,94 +1223,48 @@ pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
         return parseBetween(allocator, trimmed, idx);
     }
 
-    // IS NULL / IS NOT NULL — only reached once no top-level AND/OR/BETWEEN
-    // remains, so `trimmed` here is always a single leaf predicate and this
-    // substring scan can't accidentally swallow a sibling predicate.
-    if (findTopLevelSubstr(trimmed, " IS NOT NULL")) |idx| {
-        const col_part = std.mem.trim(u8, trimmed[0..idx], &std.ascii.whitespace);
-        const col_lower = try allocator.alloc(u8, col_part.len);
-        _ = std.ascii.lowerString(col_lower, col_part);
-        return Expression{ .comparison = Comparison{
-            .column = col_lower,
-            .operator = .is_not_null,
-            .value = try allocator.dupe(u8, ""),
-            .numeric_value = null,
-        } };
-    }
-    if (findTopLevelSubstr(trimmed, " IS NULL")) |idx| {
-        const col_part = std.mem.trim(u8, trimmed[0..idx], &std.ascii.whitespace);
-        const col_lower = try allocator.alloc(u8, col_part.len);
-        _ = std.ascii.lowerString(col_lower, col_part);
-        return Expression{ .comparison = Comparison{
-            .column = col_lower,
-            .operator = .is_null,
-            .value = try allocator.dupe(u8, ""),
-            .numeric_value = null,
-        } };
+    // Everything below here is a single leaf predicate (no top-level
+    // AND/OR/BETWEEN remains) — classified in one pass instead of the old
+    // cascade of independent scans. See scanLeafOperator.
+    const leaf = scanLeafOperator(trimmed);
+    switch (leaf.op) {
+        .is_not_null, .is_null => {
+            const col_part = std.mem.trim(u8, trimmed[0..leaf.idx], &std.ascii.whitespace);
+            const col_lower = try allocator.alloc(u8, col_part.len);
+            _ = std.ascii.lowerString(col_lower, col_part);
+            return Expression{ .comparison = Comparison{
+                .column = col_lower,
+                .operator = if (leaf.op == .is_not_null) .is_not_null else .is_null,
+                .value = try allocator.dupe(u8, ""),
+                .numeric_value = null,
+            } };
+        },
+        .ilike => return parseILikeComparison(allocator, trimmed, leaf.idx),
+        .like => return parseLikeComparison(allocator, trimmed, leaf.idx),
+        .not_in, .in_kw => return parseInComparison(allocator, trimmed, leaf.idx, leaf.op == .not_in),
+        else => {},
     }
 
-    // Check for ILIKE before LIKE (both before symbol operators since patterns may contain = > <)
-    if (findTopLevelSubstr(trimmed, " ILIKE ")) |idx| {
-        return parseILikeComparison(allocator, trimmed, idx);
-    }
-    if (findTopLevelSubstr(trimmed, " LIKE ")) |idx| {
-        return parseLikeComparison(allocator, trimmed, idx);
-    }
-
-    // Check for NOT IN (...) before IN (...) — "col NOT IN (" contains " IN ("
-    // as a substring starting after "NOT", so NOT IN must be checked first or
-    // it gets misparsed as a plain IN with "col NOT" as the column name (#115).
-    if (findTopLevelSubstr(trimmed, " NOT IN (")) |idx| {
-        const col_candidate = std.mem.trim(u8, trimmed[0..idx], &std.ascii.whitespace);
-        if (std.mem.indexOfAny(u8, col_candidate, "=<>!'\"(") == null) {
-            // idx (before " NOT IN (") is correct for both ends: column_part
-            // uses input[0..idx] (just the column), and the paren search in
-            // input[idx..] finds '(' regardless of the "NOT IN" text before it.
-            return parseInComparison(allocator, trimmed, idx, true);
-        }
-    }
-
-    // Check for IN (...) operator before = (so "col IN (...)" doesn't match the = path)
-    if (findTopLevelSubstr(trimmed, " IN (")) |idx| {
-        const col_candidate = std.mem.trim(u8, trimmed[0..idx], &std.ascii.whitespace);
-        // Only treat as IN if the left-hand side looks like a plain identifier (no operators/quotes)
-        if (std.mem.indexOfAny(u8, col_candidate, "=<>!'\"(") == null) {
-            return parseInComparison(allocator, trimmed, idx, false);
-        }
-    }
-
-    // Check for scalar function as LHS: DATEDIFF(...) op rhs, DATEADD(...) op rhs,
-    // EXTRACT(... FROM ...) op rhs.  Must come before the bare-operator checks below
-    // so that e.g. DATEDIFF(...) > 5 is not parsed as a plain `>` comparison.
+    // Scalar function as LHS: DATEDIFF(...) op rhs, DATEADD(...) op rhs,
+    // EXTRACT(... FROM ...) op rhs. Every remaining leaf.op case above ends
+    // in a bare comparison operator (or nothing, for a bare function call),
+    // never IS NULL/LIKE/IN — so this can't misfire against those.
     if (try parseScalarWhereComparison(allocator, trimmed)) |expr| return expr;
 
-    // "col % divisor op value" (#119) — must come before the bare-operator
-    // checks below so "id % 2 = 0" isn't parsed as column "id % 2".
-    if (std.mem.indexOf(u8, trimmed, " % ")) |mod_idx| {
-        if (try parseModComparison(allocator, trimmed, mod_idx)) |expr| return expr;
+    // "col % divisor op value" (#119).
+    if (leaf.op == .percent) {
+        if (try parseModComparison(allocator, trimmed, leaf.idx)) |expr| return expr;
     }
 
-    // Check for operators (simple case - no parentheses)
-    if (std.mem.indexOf(u8, trimmed, ">=")) |idx| {
-        return parseComparison(allocator, trimmed, ">=", idx);
-    }
-    if (std.mem.indexOf(u8, trimmed, "<=")) |idx| {
-        return parseComparison(allocator, trimmed, "<=", idx);
-    }
-    if (std.mem.indexOf(u8, trimmed, "!=")) |idx| {
-        return parseComparison(allocator, trimmed, "!=", idx);
-    }
-    if (std.mem.indexOf(u8, trimmed, "=")) |idx| {
-        return parseComparison(allocator, trimmed, "=", idx);
-    }
-    if (std.mem.indexOf(u8, trimmed, ">")) |idx| {
-        return parseComparison(allocator, trimmed, ">", idx);
-    }
-    if (std.mem.indexOf(u8, trimmed, "<")) |idx| {
-        return parseComparison(allocator, trimmed, "<", idx);
-    }
-
-    return error.InvalidExpression;
+    return switch (leaf.op) {
+        .ge => parseComparison(allocator, trimmed, ">=", leaf.idx),
+        .le => parseComparison(allocator, trimmed, "<=", leaf.idx),
+        .ne => parseComparison(allocator, trimmed, "!=", leaf.idx),
+        .eq => parseComparison(allocator, trimmed, "=", leaf.idx),
+        .gt => parseComparison(allocator, trimmed, ">", leaf.idx),
+        .lt => parseComparison(allocator, trimmed, "<", leaf.idx),
+        else => error.InvalidExpression,
+    };
 }
 
 fn parseBetween(allocator: Allocator, input: []const u8, between_idx: usize) !Expression {

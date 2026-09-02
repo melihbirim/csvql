@@ -135,6 +135,28 @@ pub fn build(b: *std.Build) void {
     const groupby_bench_step = b.step("bench-groupby", "Run GROUP BY benchmark");
     groupby_bench_step.dependOn(&groupby_bench_run.step);
 
+    // WHERE-expression parser benchmark
+    const parser_bench_mod = b.addModule("parser", .{
+        .root_source_file = b.path("src/parser.zig"),
+    });
+    const parser_bench_root = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("bench/parser_bench.zig"),
+    });
+    parser_bench_root.addImport("parser", parser_bench_mod);
+    const parser_bench_exe = b.addExecutable(.{
+        .name = "parser_bench",
+        .root_module = parser_bench_root,
+    });
+    parser_bench_exe.linkLibC();
+    b.installArtifact(parser_bench_exe);
+
+    const parser_bench_run = b.addRunArtifact(parser_bench_exe);
+    parser_bench_run.step.dependOn(b.getInstallStep());
+    const parser_bench_step = b.step("bench-parser", "Run WHERE-expression parser benchmark");
+    parser_bench_step.dependOn(&parser_bench_run.step);
+
     // Example executables for library users
     const csv_example = b.addExecutable(.{
         .name = "csv_reader_example",
@@ -248,6 +270,20 @@ pub fn build(b: *std.Build) void {
     parser_tests.root_module.addImport("parser", parser_module);
     const run_parser_tests = b.addRunArtifact(parser_tests);
     test_step.dependOn(&run_parser_tests.step);
+
+    // WHERE-expression precedence/grammar tests (#154, #155 regressions +
+    // tokenizer/recursive-descent rewrite acceptance criteria)
+    const where_expr_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("tests/where_expr_precedence_test.zig"),
+        }),
+    });
+    where_expr_tests.linkLibC();
+    where_expr_tests.root_module.addImport("parser", parser_module);
+    const run_where_expr_tests = b.addRunArtifact(where_expr_tests);
+    test_step.dependOn(&run_where_expr_tests.step);
 
     // CSV tests
     const csv_tests = b.addTest(.{
