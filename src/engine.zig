@@ -292,7 +292,7 @@ pub const parseQuery = parser.parse;
 pub const Query = parser.Query;
 
 /// Return true when any SELECT column is a scalar function that needs per-row
-/// evaluation (UPPER, LOWER, TRIM, LENGTH, SUBSTR, ABS, CEIL, FLOOR, MOD,
+/// evaluation (UPPER, LOWER, TRIM, LENGTH, SUBSTR, ABS, SIGN, CEIL, FLOOR, MOD,
 /// COALESCE, CAST, STRFTIME).  Aggregate functions, SUBSTR-as-GROUP-BY-key,
 /// and CASE WHEN are handled by their own dedicated paths and are excluded.
 fn hasScalarSelectFunctions(query: parser.Query) bool {
@@ -2773,6 +2773,7 @@ fn evalScalarOnSingleValue(spec: scalar.ScalarSpec, value: []const u8, arena: Al
         .trim => |*ci| ci.* = 0,
         .length => |*ci| ci.* = 0,
         .abs => |*ci| ci.* = 0,
+        .sign => |*ci| ci.* = 0,
         .ceil => |*ci| ci.* = 0,
         .floor => |*ci| ci.* = 0,
         .cast_int => |*ci| ci.* = 0,
@@ -7561,7 +7562,7 @@ test "LENGTH: returns string length as integer" {
 // #147 — LENGTH was the one scalar function that did not propagate NULL.
 // An empty CSV field is csvql's NULL (that is what IS NULL, COUNT(col) and
 // COALESCE all agree on), and every other scalar function already returns
-// empty for it — UPPER, LOWER, TRIM, SUBSTR, REPLACE, ABS, CEIL, FLOOR,
+// empty for it — UPPER, LOWER, TRIM, SUBSTR, REPLACE, ABS, SIGN, CEIL, FLOOR,
 // ROUND, CAST. LENGTH alone measured the empty string and returned "0",
 // turning a missing value into a real one.
 test "LENGTH: empty field propagates NULL (empty), not 0 (#147)" {
@@ -7657,6 +7658,35 @@ test "ABS: returns absolute value of negative numbers" {
     try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "5"));
     // negative sign must be gone
     try std.testing.expect(!std.mem.containsAtLeast(u8, data, 1, "-42"));
+}
+
+test "SIGN: returns -1, 0, or 1" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("n\n-42.5\n0\n7.25\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT SIGN(n) FROM '{s}'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expectEqualStrings("SIGN(n)\n-1\n0\n1\n", data);
 }
 
 test "CEIL: rounds up and emits .0 suffix" {

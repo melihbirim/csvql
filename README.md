@@ -213,7 +213,7 @@ The query cost is **flat** — it's the SQL plus a few result rows, independent 
 
 **Full WHERE clause support:** `=`, `!=`, `>`, `>=`, `<`, `<=`, `LIKE`, `BETWEEN`, `IN`, `IS NULL`, `IS NOT NULL`, `NOT`, `AND`, `OR`
 
-**Full SELECT support:** column projections, `AS` aliases, `DISTINCT`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`VARIANCE`/`STDDEV`/`MEDIAN`/`GROUP_CONCAT`, `GROUP BY`, `HAVING`, `ORDER BY` (by name, alias, or position), `LIMIT`, `STRFTIME()`, `DATE_PART()`, `JOIN`, `UPPER`/`LOWER`/`TRIM`/`LENGTH`/`SUBSTR`/`REPLACE`/`SPLIT_PART`/`GREATEST`/`LEAST`, `ABS`/`CEIL`/`FLOOR`/`MOD`/`ROUND`, `COALESCE`, `CAST`, `DATEDIFF`, `DATEADD`, `EXTRACT`
+**Full SELECT support:** column projections, `AS` aliases, `DISTINCT`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`VARIANCE`/`STDDEV`/`MEDIAN`/`GROUP_CONCAT`, `GROUP BY`, `HAVING`, `ORDER BY` (by name, alias, or position), `LIMIT`, `STRFTIME()`, `DATE_PART()`, `JOIN`, `UPPER`/`LOWER`/`TRIM`/`LENGTH`/`SUBSTR`/`REPLACE`/`SPLIT_PART`/`GREATEST`/`LEAST`, `ABS`/`SIGN`/`CEIL`/`FLOOR`/`MOD`/`ROUND`, `COALESCE`, `CAST`, `DATEDIFF`, `DATEADD`, `EXTRACT`
 
 ### Setup
 
@@ -320,7 +320,7 @@ Full API, options (delimiter/comment/skip-empty-lines), memory comparisons again
 | `CASE WHEN` inside aggregates       |                                                      | ✅ shipped          |
 | `ILIKE` in WHERE                    |                                                      | ✅ shipped          |
 | `UPPER`, `LOWER`, `TRIM`, `LENGTH`, `SUBSTR` in SELECT |                             | ✅ shipped          |
-| `ABS`, `CEIL`, `FLOOR`, `MOD` in SELECT |                                                 | ✅ shipped          |
+| `ABS`, `SIGN`, `CEIL`, `FLOOR`, `MOD` in SELECT |                                         | ✅ shipped          |
 | `ROUND(col)` / `ROUND(col, n)` in SELECT |                                               | ✅ shipped          |
 | `COALESCE` in SELECT                |                                                      | ✅ shipped          |
 | `CAST` in SELECT                    |                                                      | ✅ shipped          |
