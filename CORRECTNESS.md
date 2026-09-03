@@ -156,7 +156,7 @@ digits (`2600` vs `2600.0`), which isn't a correctness bug.
 
 Found via differential testing, kept as deliberate design choices rather than "fixed" —
 documented so they don't surprise anyone migrating queries from DuckDB. Full detail and
-examples in the [README](README.md#known-differences-from-duckdb).
+examples in [SQL_REFERENCE.md](SQL_REFERENCE.md#known-differences-from-duckdb).
 
 **Audited 2026-08-26** against csvql 2.5.0 / DuckDB 1.5.5 by running every row. A table
 like this is the load-bearing honesty claim in this file — it's what someone migrating
@@ -288,7 +288,7 @@ point.
 
 ## What is not supported
 
-Anything not listed under "Supported" in the [README's SQL Reference](README.md#supported)
+Anything not listed under "Supported" in [SQL_REFERENCE.md](SQL_REFERENCE.md#supported)
 is not supported. `INSERT`/`UPDATE`/`DELETE` — csvql is read-only by design, it queries
 CSV files, it does not mutate them.
 
