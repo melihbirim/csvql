@@ -7,6 +7,7 @@ const options_mod = @import("options.zig");
 const mcp = @import("mcp.zig");
 const install = @import("install.zig");
 const audit = @import("audit.zig");
+const memfile = @import("memfile.zig");
 const zigtable = @import("zigtable");
 const Allocator = std.mem.Allocator;
 
@@ -331,22 +332,14 @@ pub fn main() !void {
     }
 }
 
-/// Run the engine into a temp file, read back, parse CSV, render via zigtable.
+/// Run the engine into a memory-backed scratch file, read back, parse CSV,
+/// render via zigtable.
 fn renderTableOutput(allocator: Allocator, query: parser.Query, stdout_file: std.fs.File, opts: options_mod.Options) !void {
-    // Write CSV to a temp file
-    var tmp_buf: [128]u8 = undefined;
-    const tmp_path = try std.fmt.bufPrint(&tmp_buf, "/tmp/csvql_{d}.tmp", .{std.time.milliTimestamp()});
-    {
-        const tmp_file = try std.fs.createFileAbsolute(tmp_path, .{ .truncate = true });
-        defer tmp_file.close();
-        try engine.execute(allocator, query, tmp_file, opts);
-    }
-    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
-
-    // Read back
-    const tmp_read = try std.fs.openFileAbsolute(tmp_path, .{});
-    defer tmp_read.close();
-    const csv_data = try tmp_read.readToEndAlloc(allocator, 4 * 1024 * 1024 * 1024);
+    const tmp_file = try memfile.createMemoryBackedFile(allocator, "table");
+    defer tmp_file.close();
+    try engine.execute(allocator, query, tmp_file, opts);
+    try tmp_file.seekTo(0);
+    const csv_data = try tmp_file.readToEndAlloc(allocator, 4 * 1024 * 1024 * 1024);
     defer allocator.free(csv_data);
 
     // Use a quote-aware record iterator so multiline quoted fields are not split prematurely.

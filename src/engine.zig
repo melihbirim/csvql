@@ -11,6 +11,7 @@ const options_mod = @import("options.zig");
 const scalar = @import("scalar.zig");
 const datetime = @import("datetime.zig");
 const arena_buffer = @import("arena_buffer.zig");
+const memfile = @import("memfile.zig");
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 
@@ -391,16 +392,8 @@ fn runSubqueryForInList(allocator: Allocator, sql: []const u8, opts: options_mod
     // rather than a copy (see resolveInSubqueries).
     try resolveQuery(allocator, &subquery, opts);
 
-    const tmp_dir: []const u8 = (if (builtin.os.tag == .windows)
-        std.process.getEnvVarOwned(sa, "TEMP")
-    else
-        std.process.getEnvVarOwned(sa, "TMPDIR")) catch (if (builtin.os.tag == .windows) "." else "/tmp");
-    const stamp = std.time.nanoTimestamp();
-    const tmp_path = try std.fmt.allocPrint(sa, "{s}{c}csvql_insubq_{d}.tmp", .{ tmp_dir, std.fs.path.sep, stamp });
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
-
     const captured = blk: {
-        const tmp_file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true, .read = true });
+        const tmp_file = try memfile.createMemoryBackedFile(sa, "insubq");
         defer tmp_file.close();
         var sub_opts = opts;
         sub_opts.no_header = false; // always emit a header so the skip below is reliable
@@ -1568,7 +1561,7 @@ const JoinWorkerCtx = struct {
     output_indices: []const usize,
     where_merged_idx: ?usize,
     where_expr: ?parser.Expression,
-    tmp_path: []const u8,
+    file: std.fs.File,
     opts: options_mod.Options,
     parent_allocator: Allocator,
     err: ?anyerror = null,
@@ -1581,8 +1574,10 @@ fn joinWorker(w: *JoinWorkerCtx) void {
 }
 
 fn joinWorkerRun(w: *JoinWorkerCtx) !void {
-    const out = try std.fs.cwd().createFile(w.tmp_path, .{ .truncate = true });
-    defer out.close();
+    // Owned and closed by the main thread after it reads this worker's rows
+    // back (seekTo(0) + read on this same handle) — not here, and not by
+    // path, since w.file may be an anonymous memfd with no real path.
+    const out = w.file;
     var writer = csv.RecordWriter.init(out, w.opts);
     defer writer.deinit();
 
@@ -1775,17 +1770,17 @@ fn executeJoinThenAggregate(
     }
 
     // ── Stage 1: materialize the joined+filtered rows (SELECT *, no LIMIT) ──
-    const tmp_dir: []const u8 = (if (builtin.os.tag == .windows)
-        std.process.getEnvVarOwned(aa, "TEMP")
-    else
-        std.process.getEnvVarOwned(aa, "TMPDIR")) catch (if (builtin.os.tag == .windows) "." else "/tmp");
-    const stamp = std.time.nanoTimestamp();
-    const tmp_path = try std.fmt.allocPrint(aa, "{s}{c}csvql_joinagg_{d}.tmp", .{ tmp_dir, std.fs.path.sep, stamp });
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+    const staged = try memfile.createMemoryBackedFileWithPath(aa, "joinagg");
+    defer staged.cleanup(aa);
+    // Kept open through stage 2, not just stage 1: on Linux, staged.path is
+    // /proc/self/fd/N, which only resolves while fd N is still open in this
+    // process — closing it right after stage 1 would make stage 2's reopen
+    // of that path fail with ENOENT.
+    defer staged.file.close();
+    const tmp_path = staged.path;
 
     {
-        const tmp_file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
-        defer tmp_file.close();
+        const tmp_file = staged.file;
         var stage1_query = query;
         stage1_query.all_columns = true;
         stage1_query.columns = &[_][]u8{};
@@ -2078,16 +2073,10 @@ fn executeJoin(
         const header_nl = std.mem.indexOfScalar(u8, base_data, '\n') orelse break :parallel;
         const chunks = try splitLineChunks(base_data, header_nl + 1, nthreads, aa, opts.delimiter);
 
-        const tmp_dir: []const u8 = (if (builtin.os.tag == .windows)
-            std.process.getEnvVarOwned(aa, "TEMP")
-        else
-            std.process.getEnvVarOwned(aa, "TMPDIR")) catch (if (builtin.os.tag == .windows) "." else "/tmp");
-        const stamp = std.time.nanoTimestamp();
-
         const workers = try aa.alloc(JoinWorkerCtx, nthreads);
         const threads = try aa.alloc(std.Thread, nthreads);
         for (0..nthreads) |i| {
-            const tmp_path = try std.fmt.allocPrint(aa, "{s}{c}csvql_join_{d}_{d}.tmp", .{ tmp_dir, std.fs.path.sep, stamp, i });
+            const wfile = try memfile.createMemoryBackedFile(aa, "join");
             workers[i] = .{
                 .data = base_data,
                 .chunk_start = chunks[i][0],
@@ -2103,7 +2092,7 @@ fn executeJoin(
                 .output_indices = output_indices.items,
                 .where_merged_idx = where_merged_idx,
                 .where_expr = query.where_expr,
-                .tmp_path = tmp_path,
+                .file = wfile,
                 .opts = opts,
                 .parent_allocator = allocator,
             };
@@ -2116,11 +2105,9 @@ fn executeJoin(
         try writer.flush();
         var copy_buf: [64 * 1024]u8 = undefined;
         for (workers) |wk| {
-            const tf = try std.fs.cwd().openFile(wk.tmp_path, .{});
-            defer {
-                tf.close();
-                std.fs.cwd().deleteFile(wk.tmp_path) catch {};
-            }
+            const tf = wk.file;
+            defer tf.close();
+            try tf.seekTo(0);
             while (true) {
                 const n = try tf.read(&copy_buf);
                 if (n == 0) break;
