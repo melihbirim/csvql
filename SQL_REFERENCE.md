@@ -41,7 +41,7 @@ Full syntax reference and runnable examples for every SQL feature csvql supports
 | **REPLACE**   | `SELECT REPLACE(col, 'from', 'to')` — replace all occurrences of a substring |
 | **SPLIT_PART**| `SELECT SPLIT_PART(col, 'delim', n)` — n-th field (1-based) after splitting on delim |
 | **GREATEST / LEAST** | `SELECT GREATEST(a, b, ...)`, `LEAST(a, b, ...)` — row-wise max/min (numeric or lexicographic) |
-| **ABS / CEIL / FLOOR** | `SELECT ABS(col), CEIL(col), FLOOR(col)` — numeric functions  |
+| **ABS / SIGN / CEIL / FLOOR** | `SELECT ABS(col), SIGN(col), CEIL(col), FLOOR(col)` — numeric functions; `SIGN` returns `-1`, `0`, or `1` |
 | **MOD**       | `SELECT MOD(col, n)` — modulo by a numeric literal                      |
 | **ROUND**     | `SELECT ROUND(col)` — round to integer; `ROUND(col, n)` — round to `n` decimal places |
 | **COALESCE**  | `SELECT COALESCE(col, 'default')` — replace empty/null with fallback    |
@@ -109,7 +109,7 @@ csvql "SELECT UPPER(name), LOWER(city), TRIM(notes) FROM 'data.csv'"
 csvql "SELECT name, LENGTH(name), SUBSTR(name, 1, 3) FROM 'data.csv'"
 
 # Numeric functions
-csvql "SELECT name, ABS(balance), CEIL(score), FLOOR(score) FROM 'data.csv'"
+csvql "SELECT name, ABS(balance), SIGN(balance), CEIL(score), FLOOR(score) FROM 'data.csv'"
 csvql "SELECT name, MOD(age, 10) AS age_decade FROM 'data.csv'"
 csvql "SELECT name, ROUND(price) AS rounded, ROUND(price, 2) AS price_2dp FROM 'data.csv'"
 

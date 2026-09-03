@@ -1,7 +1,7 @@
 /// scalar.zig — Scalar function evaluation for SELECT columns.
 ///
 /// Supports: UPPER, LOWER, TRIM, LENGTH, SUBSTR/SUBSTRING,
-///           ABS, CEIL, FLOOR, MOD, COALESCE, CAST(col AS type), REPLACE,
+///           ABS, SIGN, CEIL, FLOOR, MOD, COALESCE, CAST(col AS type), REPLACE,
 ///           SPLIT_PART, GREATEST, LEAST
 ///
 /// Usage:
@@ -26,6 +26,7 @@ pub const ScalarSpec = union(enum) {
     length: usize, // LENGTH(col) — returns character count as string
     substr: SubstrArgs, // SUBSTR(col, start[, len]) — 1-based SQL semantics
     abs: usize, // ABS(col)
+    sign: usize, // SIGN(col)
     ceil: usize, // CEIL(col)
     floor: usize, // FLOOR(col)
     mod_op: ModArgs, // MOD(col, divisor)
@@ -169,7 +170,7 @@ pub const ScalarSpec = union(enum) {
     /// Return the primary column index this spec operates on.
     pub fn colIdx(self: ScalarSpec) usize {
         return switch (self) {
-            .upper, .lower, .trim, .length, .abs, .ceil, .floor, .cast_int, .cast_float, .cast_text => |i| i,
+            .upper, .lower, .trim, .length, .abs, .sign, .ceil, .floor, .cast_int, .cast_float, .cast_text => |i| i,
             .substr => |a| a.col_idx,
             .mod_op => |a| a.col_idx,
             .coalesce => |a| a.cols()[0],
@@ -255,6 +256,7 @@ pub fn tryParseScalar(
         std.mem.eql(u8, fn_lower, "trim") or
         std.mem.eql(u8, fn_lower, "length") or
         std.mem.eql(u8, fn_lower, "abs") or
+        std.mem.eql(u8, fn_lower, "sign") or
         std.mem.eql(u8, fn_lower, "ceil") or
         std.mem.eql(u8, fn_lower, "ceiling") or
         std.mem.eql(u8, fn_lower, "floor");
@@ -289,6 +291,7 @@ pub fn tryParseScalar(
         if (std.mem.eql(u8, fn_lower, "trim")) return .{ .trim = cidx };
         if (std.mem.eql(u8, fn_lower, "length")) return .{ .length = cidx };
         if (std.mem.eql(u8, fn_lower, "abs")) return .{ .abs = cidx };
+        if (std.mem.eql(u8, fn_lower, "sign")) return .{ .sign = cidx };
         if (std.mem.eql(u8, fn_lower, "ceil") or std.mem.eql(u8, fn_lower, "ceiling")) return .{ .ceil = cidx };
         if (std.mem.eql(u8, fn_lower, "floor")) return .{ .floor = cidx };
     }
@@ -822,6 +825,11 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
             const n = std.fmt.parseFloat(f64, v) catch return v;
             const buf = arena.alloc(u8, 32) catch return v;
             return fmtNum(buf, @abs(n));
+        },
+        .sign => |cidx| {
+            const v = field(record, cidx);
+            const n = std.fmt.parseFloat(f64, v) catch return v;
+            return if (n < 0) "-1" else if (n > 0) "1" else "0";
         },
         .ceil => |cidx| {
             const v = field(record, cidx);
