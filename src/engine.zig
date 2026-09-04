@@ -4251,7 +4251,13 @@ fn gbProcessRecordCore(
     accum.count += 1;
     for (ctx.agg_specs, 0..) |spec, i| {
         switch (spec.func_type) {
-            .count => {},
+            .count => {
+                if (spec.col_idx) |cidx| {
+                    if (cidx < record.len and record[cidx].len > 0) {
+                        accum.sum_counts[i] += 1;
+                    }
+                }
+            },
             .count_distinct => {
                 if (spec.col_idx) |cidx| {
                     if (cidx < record.len) {
@@ -4639,7 +4645,13 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
             ctx.partial_accum.count += 1;
             for (ctx.agg_specs, 0..) |spec, i| {
                 switch (spec.func_type) {
-                    .count => {},
+                    .count => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len and record[cidx].len > 0) {
+                                ctx.partial_accum.sum_counts[i] += 1;
+                            }
+                        }
+                    },
                     .count_distinct => {
                         if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
@@ -4751,7 +4763,13 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
             ctx.partial_accum.count += 1;
             for (ctx.agg_specs, 0..) |spec, i| {
                 switch (spec.func_type) {
-                    .count => {},
+                    .count => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len and record[cidx].len > 0) {
+                                ctx.partial_accum.sum_counts[i] += 1;
+                            }
+                        }
+                    },
                     .count_distinct => {
                         if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
