@@ -116,6 +116,27 @@ Reproduce: `./bench/bench_taxi.sh --resources 1` (or `--resources --sample`).
 
 Run the full suite (all sections): [`bench/bench_all.sh`](bench/bench_all.sh)
 
+## Apache DataFusion (Apache Arrow's own SQL engine)
+
+Raw `pyarrow` has no SQL/`GROUP BY` layer of its own to compare against — [DataFusion](https://arrow.apache.org/datafusion/) is the fair "Apache Arrow" comparison: an Arrow subproject, SQL executed natively over Arrow's own columnar in-memory format, comparable in scope to csvql's own feature set (unlike DuckDB, which isn't part of the Arrow project).
+
+**1M rows, 405 MB CSV (the same NYC Taxi sample used above), Apple M-series** — same raw-CSV-direct, cold-per-run, best-of-5 discipline as the DuckDB comparison:
+
+Engine versions: csvql **2.6.0**, DataFusion **52.1.0**.
+
+| Query                                             | csvql      | DataFusion | Speedup   |
+| -------------------------------------------------- | ---------- | ---------- | --------- |
+| Q01 `COUNT(*) GROUP BY cab_type`                  | **0.052s** | 0.100s     | **1.9x**  |
+| Q02 `AVG(total_amount) GROUP BY passenger_count`  | **0.054s** | 0.103s     | **1.9x**  |
+
+Peak memory, single cold run: **28.6-29.2MB** (csvql) vs **161.3-162.8MB** (DataFusion), ~5.6x less.
+
+**Only 2 of the 4 canonical queries are published here — Q03/Q04 (`GROUP BY ... year`, parsed from `pickup_datetime`) are deliberately excluded, not forgotten.** This fixture has genuinely mixed datetime formats in one column (`2012-08-31 22:00:00` and `2011-04-01T05:47:46`) — real, messy source data, not a benchmark artifact. csvql and DuckDB are both schema-less/string-based for this column and handle both formats identically (verified byte-for-byte). DataFusion's CSV reader infers `pickup_datetime` as a native `Timestamp(s)` column from a sample (`DESCRIBE` confirms this), and rows in whichever format didn't match that inferred schema silently vanish from `GROUP BY` output — confirmed via `diff` against csvql's output: real missing year groups, not a formatting difference. This is a genuine DataFusion behavior on messy real-world data, not a csvql bug — and not yet root-caused deeply enough to call DataFusion "wrong" either, just different from DuckDB's more forgiving (VARCHAR-until-cast) inference. Publishing a speed number for a query where the two engines don't agree on the answer would be comparing a wrong result's speed to a right one's, which this project's own [`CORRECTNESS.md`](CORRECTNESS.md) discipline rules out.
+
+Only ~1.9x on speed here (vs ~3.3-10x against DuckDB) is the expected, honest result — DataFusion is a mature, well-optimized vectorized engine, a much closer fight than DuckDB's own CSV path on the same queries. The bigger, more consistent gap is memory, matching the same fixed-per-process-overhead pattern found when comparing libscanio (a sibling project) against `pyarrow`/`pyarrow.dataset`: Arrow-ecosystem engines carry buffer-pool/schema-inference/vectorized-operator scaffolding that a schema-less, mmap-based scanner never needs to pay for.
+
+Reproduce: [`bench/bench_datafusion.sh --sample`](bench/bench_datafusion.sh) (`--resources` for memory, `N=5` for more runs). Needs `datafusion-cli` (`cargo install datafusion-cli`) and the fixture already cached by `bench_taxi.sh --sample`.
+
 ## How is csvql so fast?
 
 - **Memory-mapped I/O** — zero-copy reading at 1.4 GB/sec
