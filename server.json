@@ -1,0 +1,37 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.melihbirim/csvql",
+  "title": "csvql",
+  "description": "Query CSV files with SQL via MCP. Fast, local, zero-config, read-only, sandboxable with --root.",
+  "repository": {
+    "url": "https://github.com/melihbirim/csvql",
+    "source": "github"
+  },
+  "version": "2.6.2",
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/melihbirim/csvql/releases/download/v2.6.2/csvql-macos-aarch64.mcpb",
+      "fileSha256": "28a3410eb0a6137ccd71431fa4056e698851c7446f2c9ecb5cdc3904e3af66f7",
+      "transport": { "type": "stdio" }
+    },
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/melihbirim/csvql/releases/download/v2.6.2/csvql-macos-x86_64.mcpb",
+      "fileSha256": "c107d1201f388eaa68a6a607687224af0393d1edf115eaf335148de0b503c500",
+      "transport": { "type": "stdio" }
+    },
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/melihbirim/csvql/releases/download/v2.6.2/csvql-linux-x86_64.mcpb",
+      "fileSha256": "e0157afff03616d5ae43ada2c440b0f6a46e36817746032998a4e78b39c89a58",
+      "transport": { "type": "stdio" }
+    },
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/melihbirim/csvql/releases/download/v2.6.2/csvql-windows-x86_64.mcpb",
+      "fileSha256": "390ca1a8365cb0cfaa6feb2c1afe2824a88a39f79efeeb7c0427895715a28e58",
+      "transport": { "type": "stdio" }
+    }
+  ]
+}
