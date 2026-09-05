@@ -310,6 +310,61 @@ jobs:
               sha:     current.sha,
             });
 
+  publish-mcp-registry:
+    name: Publish to MCP Registry
+    needs: release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      id-token: write # OIDC auth to registry.modelcontextprotocol.io
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait for release assets to be available
+        run: sleep 15
+
+      - name: Update server.json for this release
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          BASE="https://github.com/melihbirim/csvql/releases/download/${GITHUB_REF_NAME}"
+          for a in csvql-macos-aarch64.mcpb csvql-macos-x86_64.mcpb csvql-linux-x86_64.mcpb csvql-windows-x86_64.mcpb; do
+            curl -fsSL -o "$a" "${BASE}/${a}"
+          done
+          python3 - "$VERSION" "$GITHUB_REF_NAME" <<'PY'
+          import json, subprocess, sys
+          version, tag = sys.argv[1], sys.argv[2]
+          def sha(f):
+              return subprocess.check_output(["sha256sum", f]).split()[0].decode()
+          hashes = {
+              "csvql-macos-aarch64.mcpb": sha("csvql-macos-aarch64.mcpb"),
+              "csvql-macos-x86_64.mcpb": sha("csvql-macos-x86_64.mcpb"),
+              "csvql-linux-x86_64.mcpb": sha("csvql-linux-x86_64.mcpb"),
+              "csvql-windows-x86_64.mcpb": sha("csvql-windows-x86_64.mcpb"),
+          }
+          with open("server.json") as f:
+              doc = json.load(f)
+          doc["version"] = version
+          for pkg in doc["packages"]:
+              name = pkg["identifier"].rsplit("/", 1)[-1]
+              pkg["identifier"] = f"https://github.com/melihbirim/csvql/releases/download/{tag}/{name}"
+              pkg["fileSha256"] = hashes[name]
+          with open("server.json", "w") as f:
+              json.dump(doc, f, indent=2)
+              f.write("\n")
+          PY
+
+      - name: Install mcp-publisher
+        run: |
+          curl -L "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+
+      - name: Authenticate to MCP Registry
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish server to MCP Registry
+        run: ./mcp-publisher publish
+
   publish-pypi:
     name: Publish Python wheels to PyPI
     needs: release
