@@ -35,6 +35,7 @@ Full syntax reference and runnable examples for every SQL feature csvql supports
 | **DATE_PART** | `DATE_PART('year', col)` — extract `year`/`month`/`day`/`hour`/`minute`/`second`; alias for `STRFTIME` in `SELECT` and `GROUP BY` |
 | **UPPER / LOWER** | `SELECT UPPER(col), LOWER(col)` — case conversion; one level of nesting supported, e.g. `LOWER(TRIM(col))` |
 | **TRIM**      | `SELECT TRIM(col)` — strip leading and trailing whitespace; nestable, e.g. `TRIM(UPPER(col))` |
+| **REVERSE**   | `SELECT REVERSE(col)` — reverse a string by Unicode code point; nestable, e.g. `REVERSE(TRIM(col))` |
 | **LENGTH**    | `SELECT LENGTH(col)` — byte length of the value; nestable, e.g. `LENGTH(TRIM(col))` |
 | **CONCAT**    | `SELECT CONCAT(col1, '-', col2, ...)` — concatenate columns and/or string literals |
 | **SUBSTR**    | `SELECT SUBSTR(col, start, len)` — substring (1-based, `len` optional)  |
