@@ -137,6 +137,21 @@ Only ~1.9x on speed here (vs ~3.3-10x against DuckDB) is the expected, honest re
 
 Reproduce: [`bench/bench_datafusion.sh --sample`](bench/bench_datafusion.sh) (`--resources` for memory, `N=5` for more runs). Needs `datafusion-cli` (`cargo install datafusion-cli`) and the fixture already cached by `bench_taxi.sh --sample`.
 
+## Polars 2.0.0-rc.1 (pre-release, pinned — not a stable-release comparison)
+
+Polars 2.0 reached release-candidate stage on 2 September 2026, defaulting SQL execution to its new streaming engine. This is a **pre-release** result, pinned to `polars==2.0.0rc1` in an isolated venv (`bench/.venv-polars`) — kept separate from the stable-competitor numbers above because rc builds can change before final release. Re-run before citing against a different Polars version.
+
+Same 2 canonical queries, same fixture (405 MB NYC Taxi sample), same cold-per-run best-of-5 discipline. Polars queries the raw CSV directly via `pl.scan_csv` + `SQLContext`, streaming engine, no separate load step — same rule as the DuckDB/DataFusion comparisons.
+
+Engine versions: csvql **2.6.2**, Polars **2.0.0-rc.1**.
+
+| Query                                             | csvql      | Polars     | Speedup   |
+| -------------------------------------------------- | ---------- | ---------- | --------- |
+| Q01 `COUNT(*) GROUP BY cab_type`                  | **0.040s** | 0.100s     | **2.5x**  |
+| Q02 `AVG(total_amount) GROUP BY passenger_count`  | **0.044s** | 0.099s     | **2.2x**  |
+
+Reproduce: `bench/.venv-polars/bin/python3 bench/bench_polars.py` (needs the fixture already cached by `bench_taxi.sh --sample`).
+
 ## How is csvql so fast?
 
 - **Memory-mapped I/O** — zero-copy reading at 1.4 GB/sec

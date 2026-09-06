@@ -37,6 +37,7 @@ __pycache__/
 
 # Benchmark data downloads
 bench/.taxi-data/
+bench/.venv-polars/
 
 # MCP bundle build artifact
 csvql.mcpb
