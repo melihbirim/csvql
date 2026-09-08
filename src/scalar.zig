@@ -1,6 +1,6 @@
 /// scalar.zig — Scalar function evaluation for SELECT columns.
 ///
-/// Supports: UPPER, LOWER, TRIM, LENGTH, SUBSTR/SUBSTRING,
+/// Supports: UPPER, LOWER, TRIM, REVERSE, LENGTH, SUBSTR/SUBSTRING,
 ///           ABS, SIGN, CEIL, FLOOR, MOD, COALESCE, CAST(col AS type), REPLACE,
 ///           SPLIT_PART, GREATEST, LEAST
 ///
@@ -23,6 +23,7 @@ pub const ScalarSpec = union(enum) {
     upper: usize, // UPPER(col)
     lower: usize, // LOWER(col)
     trim: usize, // TRIM(col)
+    reverse: usize, // REVERSE(col)
     length: usize, // LENGTH(col) — returns character count as string
     substr: SubstrArgs, // SUBSTR(col, start[, len]) — 1-based SQL semantics
     abs: usize, // ABS(col)
@@ -144,7 +145,7 @@ pub const ScalarSpec = union(enum) {
     /// same record. Heap-allocated (query-lifetime allocator) since ScalarSpec
     /// can't hold itself by value.
     pub const NestedArgs = struct {
-        pub const OuterFn = enum { upper, lower, trim, length };
+        pub const OuterFn = enum { upper, lower, trim, reverse, length };
         outer_fn: OuterFn,
         inner: *const ScalarSpec,
     };
@@ -170,7 +171,7 @@ pub const ScalarSpec = union(enum) {
     /// Return the primary column index this spec operates on.
     pub fn colIdx(self: ScalarSpec) usize {
         return switch (self) {
-            .upper, .lower, .trim, .length, .abs, .sign, .ceil, .floor, .cast_int, .cast_float, .cast_text => |i| i,
+            .upper, .lower, .trim, .reverse, .length, .abs, .sign, .ceil, .floor, .cast_int, .cast_float, .cast_text => |i| i,
             .substr => |a| a.col_idx,
             .mod_op => |a| a.col_idx,
             .coalesce => |a| a.cols()[0],
@@ -192,12 +193,31 @@ pub const ScalarSpec = union(enum) {
             .nested => |a| a.inner.colIdx(),
         };
     }
+
+    /// Release query-lifetime allocations owned by this spec.
+    pub fn deinit(self: *ScalarSpec, allocator: Allocator) void {
+        switch (self.*) {
+            .nested => |args| {
+                const inner = @constCast(args.inner);
+                inner.deinit(allocator);
+                allocator.destroy(inner);
+            },
+            else => {},
+        }
+    }
 };
 
 /// A SELECT output column: either a direct field pass-through or a scalar transform.
 pub const OutputColSpec = union(enum) {
     column: usize,
     scalar: ScalarSpec,
+
+    pub fn deinit(self: *OutputColSpec, allocator: Allocator) void {
+        switch (self.*) {
+            .scalar => |*spec| spec.deinit(allocator),
+            .column => {},
+        }
+    }
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -254,6 +274,7 @@ pub fn tryParseScalar(
     const single_arg_fn = std.mem.eql(u8, fn_lower, "upper") or
         std.mem.eql(u8, fn_lower, "lower") or
         std.mem.eql(u8, fn_lower, "trim") or
+        std.mem.eql(u8, fn_lower, "reverse") or
         std.mem.eql(u8, fn_lower, "length") or
         std.mem.eql(u8, fn_lower, "abs") or
         std.mem.eql(u8, fn_lower, "sign") or
@@ -274,12 +295,15 @@ pub fn tryParseScalar(
                 .lower
             else if (std.mem.eql(u8, fn_lower, "trim"))
                 .trim
+            else if (std.mem.eql(u8, fn_lower, "reverse"))
+                .reverse
             else if (std.mem.eql(u8, fn_lower, "length"))
                 .length
             else
                 return error.NestedFunctionNotSupported;
-            const inner_spec = try tryParseScalar(args_str, column_map, allocator) orelse
+            var inner_spec = try tryParseScalar(args_str, column_map, allocator) orelse
                 return error.ColumnNotFound;
+            errdefer inner_spec.deinit(allocator);
             const inner_ptr = try allocator.create(ScalarSpec);
             inner_ptr.* = inner_spec;
             return .{ .nested = .{ .outer_fn = outer_fn, .inner = inner_ptr } };
@@ -289,6 +313,7 @@ pub fn tryParseScalar(
         if (std.mem.eql(u8, fn_lower, "upper")) return .{ .upper = cidx };
         if (std.mem.eql(u8, fn_lower, "lower")) return .{ .lower = cidx };
         if (std.mem.eql(u8, fn_lower, "trim")) return .{ .trim = cidx };
+        if (std.mem.eql(u8, fn_lower, "reverse")) return .{ .reverse = cidx };
         if (std.mem.eql(u8, fn_lower, "length")) return .{ .length = cidx };
         if (std.mem.eql(u8, fn_lower, "abs")) return .{ .abs = cidx };
         if (std.mem.eql(u8, fn_lower, "sign")) return .{ .sign = cidx };
@@ -722,6 +747,29 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
         .trim => |cidx| {
             return std.mem.trim(u8, field(record, cidx), &std.ascii.whitespace);
         },
+        .reverse => |cidx| {
+            const v = field(record, cidx);
+            if (v.len == 0) return v;
+            const buf = arena.alloc(u8, v.len) catch return v;
+            if (!std.unicode.utf8ValidateSlice(v)) {
+                @memcpy(buf, v);
+                std.mem.reverse(u8, buf);
+                return buf;
+            }
+            var src_end = v.len;
+            var dst_start: usize = 0;
+            while (src_end > 0) {
+                var src_start = src_end - 1;
+                while (src_start > 0 and v[src_start] & 0xc0 == 0x80) {
+                    src_start -= 1;
+                }
+                const codepoint = v[src_start..src_end];
+                @memcpy(buf[dst_start .. dst_start + codepoint.len], codepoint);
+                dst_start += codepoint.len;
+                src_end = src_start;
+            }
+            return buf;
+        },
         .replace => |args| {
             const v = field(record, args.col_idx);
             if (args.from.len == 0 or std.mem.indexOf(u8, v, args.from) == null) return v;
@@ -746,6 +794,7 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
                 .upper => eval(.{ .upper = 0 }, &inner_rec, arena),
                 .lower => eval(.{ .lower = 0 }, &inner_rec, arena),
                 .trim => eval(.{ .trim = 0 }, &inner_rec, arena),
+                .reverse => eval(.{ .reverse = 0 }, &inner_rec, arena),
                 .length => eval(.{ .length = 0 }, &inner_rec, arena),
             };
         },
@@ -1121,6 +1170,34 @@ test "COALESCE 2-arg backwards compat" {
     try std.testing.expectEqualStrings("unknown", eval(spec, &.{""}, fba.allocator()));
     fba.reset();
     try std.testing.expectEqualStrings("Alice", eval(spec, &.{"Alice"}, fba.allocator()));
+}
+
+test "REVERSE supports direct and nested string transforms" {
+    var parse_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer parse_arena.deinit();
+    const allocator = parse_arena.allocator();
+
+    var column_map = std.StringHashMap(usize).init(allocator);
+    try column_map.put("word", 0);
+
+    var direct = (try tryParseScalar("REVERSE(word)", column_map, allocator)).?;
+    defer direct.deinit(allocator);
+    var outer = (try tryParseScalar("REVERSE(UPPER(word))", column_map, allocator)).?;
+    defer outer.deinit(allocator);
+    var inner = (try tryParseScalar("TRIM(REVERSE(word))", column_map, allocator)).?;
+    defer inner.deinit(allocator);
+
+    var buf: [128]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    try std.testing.expectEqualStrings("éfac", eval(direct, &.{"café"}, fba.allocator()));
+    fba.reset();
+    try std.testing.expectEqualStrings("éFAC", eval(outer, &.{"café"}, fba.allocator()));
+    fba.reset();
+    try std.testing.expectEqualStrings("cba", eval(inner, &.{" abc "}, fba.allocator()));
+    fba.reset();
+    const invalid = [_]u8{ 0xff, 'a', 0xc0 };
+    const expected_invalid = [_]u8{ 0xc0, 'a', 0xff };
+    try std.testing.expectEqualSlices(u8, expected_invalid[0..], eval(direct, &.{invalid[0..]}, fba.allocator()));
 }
 
 test "COALESCE 3-arg returns first non-empty column" {

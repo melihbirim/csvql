@@ -292,7 +292,7 @@ pub const parseQuery = parser.parse;
 pub const Query = parser.Query;
 
 /// Return true when any SELECT column is a scalar function that needs per-row
-/// evaluation (UPPER, LOWER, TRIM, LENGTH, SUBSTR, ABS, SIGN, CEIL, FLOOR, MOD,
+/// evaluation (UPPER, LOWER, TRIM, REVERSE, LENGTH, SUBSTR, ABS, SIGN, CEIL, FLOOR, MOD,
 /// COALESCE, CAST, STRFTIME).  Aggregate functions, SUBSTR-as-GROUP-BY-key,
 /// and CASE WHEN are handled by their own dedicated paths and are excluded.
 fn hasScalarSelectFunctions(query: parser.Query) bool {
@@ -657,7 +657,10 @@ fn executeSequential(
 
     // Determine output columns
     var output_specs = std.ArrayListUnmanaged(scalar.OutputColSpec){};
-    defer output_specs.deinit(allocator);
+    defer {
+        for (output_specs.items) |*spec| spec.deinit(allocator);
+        output_specs.deinit(allocator);
+    }
 
     var output_header = std.ArrayList([]const u8){};
     defer output_header.deinit(allocator);
@@ -673,9 +676,13 @@ fn executeSequential(
             const expr = sa.expr;
 
             // Try scalar function first (UPPER, LOWER, TRIM, etc.)
-            if (try scalar.tryParseScalar(expr, column_map, allocator)) |sc_spec| {
-                try output_specs.append(allocator, .{ .scalar = sc_spec });
-                try output_header.append(allocator, if (sa.alias) |a| a else expr);
+            if (try scalar.tryParseScalar(expr, column_map, allocator)) |parsed_spec| {
+                var sc_spec = parsed_spec;
+                {
+                    errdefer sc_spec.deinit(allocator);
+                    try output_header.append(allocator, if (sa.alias) |a| a else expr);
+                    try output_specs.append(allocator, .{ .scalar = sc_spec });
+                }
                 continue;
             }
 
@@ -1247,7 +1254,10 @@ fn executeParallelScalar(
 
     // Build output_specs + output header names
     var output_specs_list = std.ArrayListUnmanaged(scalar.OutputColSpec){};
-    defer output_specs_list.deinit(allocator);
+    defer {
+        for (output_specs_list.items) |*spec| spec.deinit(allocator);
+        output_specs_list.deinit(allocator);
+    }
     var output_header = std.ArrayList([]const u8){};
     defer output_header.deinit(allocator);
 
@@ -1260,9 +1270,13 @@ fn executeParallelScalar(
         for (query.columns) |col| {
             const sa = splitAlias(col);
             const expr = sa.expr;
-            if (try scalar.tryParseScalar(expr, column_map, allocator)) |sc_spec| {
-                try output_specs_list.append(allocator, .{ .scalar = sc_spec });
-                try output_header.append(allocator, if (sa.alias) |a| a else expr);
+            if (try scalar.tryParseScalar(expr, column_map, allocator)) |parsed_spec| {
+                var sc_spec = parsed_spec;
+                {
+                    errdefer sc_spec.deinit(allocator);
+                    try output_header.append(allocator, if (sa.alias) |a| a else expr);
+                    try output_specs_list.append(allocator, .{ .scalar = sc_spec });
+                }
                 continue;
             }
             const lower_col = try allocator.alloc(u8, expr.len);
@@ -2215,7 +2229,10 @@ fn executeFromStdin(
 
     // Determine output columns
     var output_specs = std.ArrayListUnmanaged(scalar.OutputColSpec){};
-    defer output_specs.deinit(allocator);
+    defer {
+        for (output_specs.items) |*spec| spec.deinit(allocator);
+        output_specs.deinit(allocator);
+    }
 
     var output_header = std.ArrayList([]const u8){};
     defer output_header.deinit(allocator);
@@ -2231,9 +2248,13 @@ fn executeFromStdin(
             const expr = sa.expr;
 
             // Try scalar function first (UPPER, LOWER, TRIM, etc.)
-            if (try scalar.tryParseScalar(expr, column_map, allocator)) |sc_spec| {
-                try output_specs.append(allocator, .{ .scalar = sc_spec });
-                try output_header.append(allocator, if (sa.alias) |a| a else expr);
+            if (try scalar.tryParseScalar(expr, column_map, allocator)) |parsed_spec| {
+                var sc_spec = parsed_spec;
+                {
+                    errdefer sc_spec.deinit(allocator);
+                    try output_header.append(allocator, if (sa.alias) |a| a else expr);
+                    try output_specs.append(allocator, .{ .scalar = sc_spec });
+                }
                 continue;
             }
 
@@ -2411,6 +2432,14 @@ const ColKind = union(enum) {
     /// group at output time against agg_results[agg_idx] (#113), e.g.
     /// SELECT dept, CASE WHEN AVG(salary) > 80000 THEN 'high' ELSE 'low' END.
     agg_case: struct { agg_idx: usize, spec: scalar.ScalarSpec },
+
+    fn deinit(self: *ColKind, allocator: Allocator) void {
+        switch (self.*) {
+            .group_key_scalar => |*value| value.spec.deinit(allocator),
+            .agg_case => |*value| value.spec.deinit(allocator),
+            else => {},
+        }
+    }
 };
 
 /// Describes a STRFTIME('%Y-%m', col) GROUP BY / SELECT expression.
@@ -2761,6 +2790,7 @@ fn evalScalarOnSingleValue(spec: scalar.ScalarSpec, value: []const u8, arena: Al
             .upper => scalar.eval(.{ .upper = 0 }, &inner_rec, arena),
             .lower => scalar.eval(.{ .lower = 0 }, &inner_rec, arena),
             .trim => scalar.eval(.{ .trim = 0 }, &inner_rec, arena),
+            .reverse => scalar.eval(.{ .reverse = 0 }, &inner_rec, arena),
             .length => scalar.eval(.{ .length = 0 }, &inner_rec, arena),
         };
     }
@@ -2771,6 +2801,7 @@ fn evalScalarOnSingleValue(spec: scalar.ScalarSpec, value: []const u8, arena: Al
         .upper => |*ci| ci.* = 0,
         .lower => |*ci| ci.* = 0,
         .trim => |*ci| ci.* = 0,
+        .reverse => |*ci| ci.* = 0,
         .length => |*ci| ci.* = 0,
         .abs => |*ci| ci.* = 0,
         .sign => |*ci| ci.* = 0,
@@ -3648,7 +3679,10 @@ fn executeScalarAgg(
 
     // -- Resolve SELECT into ColKind + AggSpec lists --
     var col_kinds = std.ArrayListUnmanaged(ColKind){};
-    defer col_kinds.deinit(allocator);
+    defer {
+        for (col_kinds.items) |*kind| kind.deinit(allocator);
+        col_kinds.deinit(allocator);
+    }
     var agg_specs = std.ArrayListUnmanaged(AggSpec){};
     defer {
         for (agg_specs.items) |spec| {
@@ -4966,7 +5000,10 @@ fn executeGroupBy(
 
     // -- Resolve SELECT columns into ColKind + AggSpec lists ---------------
     var col_kinds = std.ArrayListUnmanaged(ColKind){};
-    defer col_kinds.deinit(allocator);
+    defer {
+        for (col_kinds.items) |*kind| kind.deinit(allocator);
+        col_kinds.deinit(allocator);
+    }
 
     var agg_specs = std.ArrayListUnmanaged(AggSpec){};
     defer {
@@ -5138,21 +5175,25 @@ fn executeGroupBy(
                     } else {
                         // Try scalar function applied to a plain GROUP BY column
                         // e.g. SELECT UPPER(city), COUNT(*) FROM x GROUP BY city
-                        if (try scalar.tryParseScalar(effective_col, column_map, allocator)) |sc_spec| {
-                            // Find which group_spec slot contains this column
-                            const sc_col_idx = sc_spec.colIdx();
-                            var sc_gi: ?usize = null;
-                            for (group_specs, 0..) |spec, gi| {
-                                if (spec == .column and spec.column == sc_col_idx) {
-                                    sc_gi = gi;
-                                    break;
+                        if (try scalar.tryParseScalar(effective_col, column_map, allocator)) |parsed_spec| {
+                            var sc_spec = parsed_spec;
+                            {
+                                errdefer sc_spec.deinit(allocator);
+                                // Find which group_spec slot contains this column
+                                const sc_col_idx = sc_spec.colIdx();
+                                var sc_gi: ?usize = null;
+                                for (group_specs, 0..) |spec, gi| {
+                                    if (spec == .column and spec.column == sc_col_idx) {
+                                        sc_gi = gi;
+                                        break;
+                                    }
                                 }
-                            }
-                            if (sc_gi) |gi| {
-                                try col_kinds.append(allocator, .{ .group_key_scalar = .{ .gi = gi, .spec = sc_spec } });
-                                try out_header_list.append(allocator, if (sa.alias) |a| a else effective_col);
-                            } else {
-                                return columnLookupError(effective_col);
+                                if (sc_gi) |gi| {
+                                    try out_header_list.append(allocator, if (sa.alias) |a| a else effective_col);
+                                    try col_kinds.append(allocator, .{ .group_key_scalar = .{ .gi = gi, .spec = sc_spec } });
+                                } else {
+                                    return columnLookupError(effective_col);
+                                }
                             }
                         } else {
                             return columnLookupError(effective_col);
@@ -7545,6 +7586,47 @@ test "TRIM: strips leading and trailing whitespace" {
     try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "world"));
     // whitespace must not surround the values in the output
     try std.testing.expect(!std.mem.containsAtLeast(u8, data, 1, "  hello  "));
+}
+
+test "REVERSE: reverses string values" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("word\nabc\nstressed\ncafé\n한글\n\" padded \"\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT REVERSE(word), REVERSE(UPPER(word)), TRIM(REVERSE(word)) FROM '{s}'",
+        .{p},
+    );
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expectEqualStrings(
+        "REVERSE(word),REVERSE(UPPER(word)),TRIM(REVERSE(word))\n" ++
+            "cba,CBA,cba\n" ++
+            "desserts,DESSERTS,desserts\n" ++
+            "éfac,éFAC,éfac\n" ++
+            "글한,글한,글한\n" ++
+            " deddap , DEDDAP ,deddap\n",
+        data,
+    );
 }
 
 test "LENGTH: returns string length as integer" {
