@@ -128,6 +128,7 @@ fn exitCodeForError(err: anyerror) u8 {
         error.MixedAggregateAndNonAggregateSelect,
         error.NestedFunctionNotSupported,
         error.PathOutsideAllowedRoot,
+        error.UnterminatedQuotedValue,
         => 2,
         error.StrictModeNonNumericValue,
         error.EmptyFile,

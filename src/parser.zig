@@ -1549,6 +1549,15 @@ fn parseComparison(allocator: Allocator, input: []const u8, op_str: []const u8, 
 
     const operator = Operator.fromString(op_str) orelse return error.InvalidOperator;
 
+    // A value starting with a quote must be a complete, properly terminated
+    // quoted literal — reject trailing garbage like "'x' IN (1,2)" (#163)
+    // rather than silently comparing against the raw, unquoted-looking text.
+    if (value_part.len >= 1 and (value_part[0] == '\'' or value_part[0] == '"')) {
+        const q = value_part[0];
+        if (value_part.len < 2 or value_part[value_part.len - 1] != q) {
+            return error.UnterminatedQuotedValue;
+        }
+    }
     const value_clean = trimQuotes(value_part);
     const numeric_value = std.fmt.parseFloat(f64, value_clean) catch null;
 
@@ -1936,6 +1945,28 @@ test "parse simple query" {
     try std.testing.expectEqualStrings("age", query.columns[1]);
     try std.testing.expectEqualStrings("data.csv", query.file_path);
     try std.testing.expectEqual(@as(i32, 10), query.limit);
+}
+
+test "malformed WHERE with trailing content after quoted value errors (#163)" {
+    // parse() error paths leak the partially-built Query on failure (a
+    // separate, pre-existing bug, not introduced here) — use an arena so
+    // this test verifies the error without tripping that unrelated leak.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    try std.testing.expectError(
+        error.UnterminatedQuotedValue,
+        parse(allocator, "SELECT * FROM 'data.csv' WHERE name = 'x' IN (1,2)"),
+    );
+    try std.testing.expectError(
+        error.UnterminatedQuotedValue,
+        parse(allocator, "SELECT * FROM 'data.csv' WHERE name = 'x"),
+    );
+
+    // Well-formed quoted comparisons still parse fine.
+    var query = try parse(allocator, "SELECT * FROM 'data.csv' WHERE name = 'x'");
+    defer query.deinit();
 }
 
 test "parse distinct aggregate query" {
