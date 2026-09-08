@@ -11,7 +11,7 @@ const memfile = @import("memfile.zig");
 const zigtable = @import("zigtable");
 const Allocator = std.mem.Allocator;
 
-const version = "2.6.2";
+const version = "2.6.3";
 
 const help_text =
     \\csvql — the world's fastest CSV query engine
