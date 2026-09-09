@@ -5703,68 +5703,73 @@ fn executeGroupBy(
         if (query.order_by == null and query.limit >= 0 and rows_output >= query.limit) break;
         const accum = group_map.getPtr(key).?;
 
-        // Format aggregate results (handful of groups, negligible cost)
-        var agg_allocs = std.ArrayListUnmanaged([]u8){};
-        defer {
-            for (agg_allocs.items) |s| allocator.free(s);
-            agg_allocs.deinit(allocator);
-        }
-        var agg_results = try allocator.alloc([]const u8, n_aggs);
-        defer allocator.free(agg_results);
+        // Per-row scratch arena, reset once at the top of each iteration:
+        // aggregate formatting below and column/scalar formatting further
+        // down both allocate from it. Previously aggregate formatting used
+        // `allocator` directly (a per-call alloc/free each row) under the
+        // comment "handful of groups, negligible cost" -- true for typical
+        // low-cardinality GROUP BY, false at high cardinality (e.g.
+        // grouping by a near-unique column): 1M output rows meant 1M+
+        // syscall-backed alloc/free cycles through the debug allocator,
+        // measured as the actual bottleneck (24s of 31s wall time, ~8M
+        // page reclaims) via `sample` on a real high-cardinality query --
+        // not the scan or hash-merge, which finished in the first ~3s.
+        _ = gb_scalar_arena.reset(.retain_capacity);
+        const sra = gb_scalar_arena.allocator();
+
+        var agg_results = try sra.alloc([]const u8, n_aggs);
 
         for (agg_specs.items, 0..) |spec, i| {
             const s: []u8 = switch (spec.func_type) {
                 .count => if (spec.col_idx != null)
                     // COUNT(col): only non-empty values were counted into sum_counts[i]
-                    try std.fmt.allocPrint(allocator, "{d}", .{accum.sum_counts[i]})
+                    try std.fmt.allocPrint(sra, "{d}", .{accum.sum_counts[i]})
                 else
                     // COUNT(*): all rows
-                    try std.fmt.allocPrint(allocator, "{d}", .{accum.count}),
+                    try std.fmt.allocPrint(sra, "{d}", .{accum.count}),
                 .count_distinct => blk: {
                     const cnt: u32 = if (accum.distinct_sets[i]) |ds| ds.count() else 0;
-                    break :blk try std.fmt.allocPrint(allocator, "{d}", .{cnt});
+                    break :blk try std.fmt.allocPrint(sra, "{d}", .{cnt});
                 },
                 .sum => blk: {
                     // SQL semantics: SUM over zero matching rows is NULL, not 0 (issue #104).
                     break :blk if (accum.sum_counts[i] > 0)
-                        try fmtAggrF64(allocator, accum.sums[i], spec.round_digits)
+                        try fmtAggrF64(sra, accum.sums[i], spec.round_digits)
                     else
-                        try allocator.dupe(u8, "");
+                        try sra.dupe(u8, "");
                 },
                 .avg => blk: {
                     const cnt = accum.sum_counts[i];
                     break :blk if (cnt > 0)
-                        try fmtAggrF64(allocator, accum.sums[i] / @as(f64, @floatFromInt(cnt)), spec.round_digits)
+                        try fmtAggrF64(sra, accum.sums[i] / @as(f64, @floatFromInt(cnt)), spec.round_digits)
                     else
-                        try allocator.dupe(u8, "");
+                        try sra.dupe(u8, "");
                 },
                 .min => blk: {
                     const v = accum.mins[i];
                     break :blk if (v < std.math.inf(f64))
-                        try fmtAggrF64(allocator, v, spec.round_digits)
+                        try fmtAggrF64(sra, v, spec.round_digits)
                     else
-                        try allocator.dupe(u8, "");
+                        try sra.dupe(u8, "");
                 },
                 .max => blk: {
                     const v = accum.maxs[i];
                     break :blk if (v > -std.math.inf(f64))
-                        try fmtAggrF64(allocator, v, spec.round_digits)
+                        try fmtAggrF64(sra, v, spec.round_digits)
                     else
-                        try allocator.dupe(u8, "");
+                        try sra.dupe(u8, "");
                 },
-                .variance => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], false, false, spec.round_digits),
-                .stddev => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], true, false, spec.round_digits),
-                .variance_samp => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], false, true, spec.round_digits),
-                .stddev_samp => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], true, true, spec.round_digits),
-                .median => try fmtMedian(allocator, accum.value_lists[i], spec.round_digits),
+                .variance => try fmtVarStd(sra, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], false, false, spec.round_digits),
+                .stddev => try fmtVarStd(sra, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], true, false, spec.round_digits),
+                .variance_samp => try fmtVarStd(sra, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], false, true, spec.round_digits),
+                .stddev_samp => try fmtVarStd(sra, accum.sum_sqs[i], accum.sums[i], accum.sum_counts[i], true, true, spec.round_digits),
+                .median => try fmtMedian(sra, accum.value_lists[i], spec.round_digits),
 
-                .group_concat => try fmtGroupConcat(allocator, accum.concat_lists[i], spec.sep),
+                .group_concat => try fmtGroupConcat(sra, accum.concat_lists[i], spec.sep),
             };
-            try agg_allocs.append(allocator, s);
             agg_results[i] = s;
         }
 
-        _ = gb_scalar_arena.reset(.retain_capacity);
         for (col_kinds.items, 0..) |kind, i| {
             output_row[i] = switch (kind) {
                 .regular => |cidx| blk: {
