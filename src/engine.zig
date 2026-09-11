@@ -3128,6 +3128,7 @@ fn parseCaseWithAggCondition(
 
     const split = splitCaseCondAtOp(cond_str) orelse return null;
     const agg_func = try aggregation.parseAggregateFunc(allocator, split.left) orelse return null;
+    errdefer agg_func.deinit(allocator);
 
     const placeholder_map_key = "__agg0__";
     var placeholder_map = std.StringHashMap(usize).init(allocator);
@@ -3139,7 +3140,14 @@ fn parseCaseWithAggCondition(
     });
     defer allocator.free(rewritten);
 
-    const spec = (try scalar.tryParseScalar(rewritten, placeholder_map, allocator)) orelse return null;
+    // THEN/ELSE values referencing a real column (not the aggregate
+    // placeholder) fail to resolve here — tryParseScalar only sees
+    // placeholder_map, not the query's actual columns — so this is the
+    // common case that would otherwise leak agg_func (#173 follow-up).
+    const spec = (try scalar.tryParseScalar(rewritten, placeholder_map, allocator)) orelse {
+        agg_func.deinit(allocator);
+        return null;
+    };
     _ = column_map; // condition's own column refs (if any beyond the aggregate) aren't supported — matches this codebase's single-comparison CASE scope
     return .{ .agg_func = agg_func, .spec = spec };
 }
@@ -3729,6 +3737,8 @@ fn executeScalarAgg(
             if (try parseCaseWithAggCondition(allocator, effective_col, column_map)) |result| {
                 var agg_func = result.agg_func;
                 errdefer agg_func.deinit(allocator);
+                var case_spec = result.spec;
+                errdefer case_spec.deinit(allocator);
                 const agg_idx = agg_specs.items.len;
                 var col_idx: ?usize = null;
                 if (agg_func.column) |agg_col| {
@@ -3749,7 +3759,7 @@ fn executeScalarAgg(
                     .round_digits = null,
                     .sep = gc_sep,
                 });
-                try col_kinds.append(allocator, .{ .agg_case = .{ .agg_idx = agg_idx, .spec = result.spec } });
+                try col_kinds.append(allocator, .{ .agg_case = .{ .agg_idx = agg_idx, .spec = case_spec } });
                 try out_header_list.append(allocator, display_alias);
                 continue;
             }
@@ -5079,6 +5089,8 @@ fn executeGroupBy(
                 if (try parseCaseWithAggCondition(allocator, effective_col, column_map)) |result| {
                     var agg_func = result.agg_func;
                     errdefer agg_func.deinit(allocator);
+                    var case_spec = result.spec;
+                    errdefer case_spec.deinit(allocator);
                     const agg_idx = agg_specs.items.len;
                     var col_idx: ?usize = null;
                     if (agg_func.column) |agg_col| {
@@ -5099,7 +5111,7 @@ fn executeGroupBy(
                         .round_digits = null,
                         .sep = gc_sep,
                     });
-                    try col_kinds.append(allocator, .{ .agg_case = .{ .agg_idx = agg_idx, .spec = result.spec } });
+                    try col_kinds.append(allocator, .{ .agg_case = .{ .agg_idx = agg_idx, .spec = case_spec } });
                     try out_header_list.append(allocator, display_alias);
                     continue;
                 }
@@ -7632,6 +7644,60 @@ test "REVERSE: reverses string values" {
             " deddap , DEDDAP ,deddap\n",
         data,
     );
+}
+
+test "CASE WHEN aggregate condition with nested scalar spec doesn't leak on column error (#173)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("dept,salary\nA,100\nB,200\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT dept, CASE WHEN AVG(nosuchcol) > 80000 THEN REVERSE(TRIM(dept)) ELSE 'low' END FROM '{s}' GROUP BY dept",
+        .{p},
+    );
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try std.testing.expectError(error.ColumnNotFound, execute(allocator, q, out, .{}));
+}
+
+test "CASE WHEN aggregate condition with literal THEN/ELSE doesn't leak when the aggregate's own column is missing (#173)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("dept,salary\nA,100\nB,200\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT dept, CASE WHEN AVG(nosuchcol) > 80000 THEN 'high' ELSE 'low' END FROM '{s}' GROUP BY dept",
+        .{p},
+    );
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try std.testing.expectError(error.ColumnNotFound, execute(allocator, q, out, .{}));
 }
 
 test "LENGTH: returns string length as integer" {

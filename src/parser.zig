@@ -557,22 +557,27 @@ fn splitCommaTerms(allocator: Allocator, input: []const u8) !std.ArrayList([]u8)
 
 /// Parse a SQL query string
 pub fn parse(allocator: Allocator, input: []const u8) !Query {
-    // FIXED: Use undefined instead of static slices for initialization
-    // These will all be properly allocated before the function returns
+    // Every slice field starts as a valid empty slice (safe to free as a
+    // no-op) rather than `undefined`, so the single errdefer below can call
+    // query.deinit() from here on regardless of which fields have actually
+    // been populated yet when a later parse step fails (#174) — every field
+    // this function assigns to on its way to a real value is otherwise
+    // leaked on any error after that assignment.
     var query = Query{
-        .columns = undefined,
+        .columns = &.{},
         .all_columns = false,
         .distinct = false,
-        .file_path = undefined,
+        .file_path = &.{},
         .where_expr = null,
         .having_expr = null,
-        .group_by = undefined,
+        .group_by = &.{},
         .limit = -1,
         .offset = 0,
         .order_by = null,
         .joins = &.{},
         .allocator = allocator,
     };
+    errdefer query.deinit();
 
     // This is a simplified parser - full implementation would use proper regex or parser combinator
     // For now, we'll do basic string parsing
@@ -629,11 +634,7 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
         defer col_list.deinit(allocator);
         query.columns = try col_list.toOwnedSlice(allocator);
     }
-    // Ensure query.columns is freed on any error path from here on.
-    errdefer {
-        for (query.columns) |col| allocator.free(col);
-        allocator.free(query.columns);
-    }
+    // query.columns is now covered by the top-level `errdefer query.deinit()`.
 
     // Extract file path (and optional JOIN clauses) from FROM clause.
     // Supports chained JOINs:  FROM a JOIN b ON ... JOIN c ON ... WHERE ...
@@ -661,10 +662,11 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
         // Left file + optional alias is everything before the first JOIN keyword.
         const first_left_raw = std.mem.trim(u8, from_rest[0..first_jk.kw_start], &std.ascii.whitespace);
         const first_left_info = try extractFileAndAlias(allocator, first_left_raw);
-        errdefer {
-            allocator.free(first_left_info.file);
-            allocator.free(first_left_info.alias);
-        }
+        // first_left_info.file transfers to query.file_path immediately below —
+        // covered by the top-level errdefer query.deinit() from here on. Only
+        // .alias (not yet owned by query; becomes current_left_alias) needs
+        // its own cleanup until a JoinClause takes ownership of it.
+        errdefer allocator.free(first_left_info.alias);
         query.file_path = first_left_info.file;
 
         // Walk the remaining string, collecting one JoinClause per JOIN keyword.
@@ -1948,12 +1950,7 @@ test "parse simple query" {
 }
 
 test "malformed WHERE with trailing content after quoted value errors (#163)" {
-    // parse() error paths leak the partially-built Query on failure (a
-    // separate, pre-existing bug, not introduced here) — use an arena so
-    // this test verifies the error without tripping that unrelated leak.
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
+    const allocator = std.testing.allocator;
 
     try std.testing.expectError(
         error.UnterminatedQuotedValue,
@@ -1967,6 +1964,31 @@ test "malformed WHERE with trailing content after quoted value errors (#163)" {
     // Well-formed quoted comparisons still parse fine.
     var query = try parse(allocator, "SELECT * FROM 'data.csv' WHERE name = 'x'");
     defer query.deinit();
+}
+
+test "parse() does not leak the partially-built Query on error (#174)" {
+    const allocator = std.testing.allocator;
+
+    // Fails deep in WHERE-clause parsing, well after columns/file_path/joins
+    // are already populated on the Query — every field set before the
+    // failure point must be freed by the top-level errdefer.
+    try std.testing.expectError(
+        error.InvalidExpression,
+        parse(allocator, "SELECT a, b FROM 'data.csv' WHERE age ~~ 5"),
+    );
+
+    // Same, but with a JOIN already parsed before the WHERE clause fails —
+    // exercises the file_path/alias hand-off path in the JOIN branch.
+    try std.testing.expectError(
+        error.InvalidExpression,
+        parse(allocator, "SELECT * FROM 'a.csv' JOIN 'b.csv' ON a.id = b.id WHERE age ~~ 5"),
+    );
+
+    // Fails in GROUP BY parsing, after WHERE already succeeded.
+    try std.testing.expectError(
+        error.NegativeLimitNotAllowed,
+        parse(allocator, "SELECT a FROM 'data.csv' WHERE age > 1 GROUP BY a LIMIT -1"),
+    );
 }
 
 test "parse distinct aggregate query" {
