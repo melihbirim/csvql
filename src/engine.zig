@@ -502,10 +502,56 @@ pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.Fi
     const is_stdin = std.mem.eql(u8, query.file_path, "-") or std.mem.eql(u8, query.file_path, "stdin");
 
     if (is_stdin) {
+        // Aggregates/GROUP BY need the same mmap-backed dispatch every file
+        // query uses (executeScalarAgg/executeGroupBy) — executeFromStdin
+        // never implemented them (#175). Spool stdin into a memory-backed
+        // file (memfd on Linux — see memfile.zig for the documented
+        // platform-by-platform guarantee) and fall through to the normal
+        // file dispatch, instead of a second parallel aggregate implementation.
+        // Plain SELECT/WHERE-only stdin queries keep streaming through
+        // executeFromStdin in constant memory — spooling those too would
+        // regress exactly the large-pipe case this path exists for.
+        if (hasAggregates(query) or query.group_by.len > 0) {
+            // query.file_path ("-"/"stdin") is owned by the caller (freed via
+            // its own query.deinit()) — execute() only borrows query, so the
+            // spooled path below is a separate allocation, not a replacement
+            // of that one, freed here rather than left for the caller.
+            var spooled = query;
+            const fwp = try memfile.createMemoryBackedFileWithPath(allocator, "stdin_spool");
+            defer fwp.cleanup(allocator);
+            try spoolStdinTo(fwp.file);
+            spooled.file_path = try allocator.dupe(u8, fwp.path);
+            defer allocator.free(spooled.file_path);
+            try executeFileBased(allocator, spooled, output_file, opts);
+            return;
+        }
         try executeFromStdin(allocator, query, output_file, opts);
         return;
     }
 
+    try executeFileBased(allocator, query, output_file, opts);
+}
+
+/// Copy all of stdin into `dest` (a memory-backed scratch file), unbuffered
+/// beyond a plain read/write loop — this is a byte copy, not CSV parsing.
+fn spoolStdinTo(dest: std.fs.File) !void {
+    const stdin = if (builtin.os.tag == .windows)
+        std.fs.File{ .handle = try std.os.windows.GetStdHandle(std.os.windows.STD_INPUT_HANDLE) }
+    else
+        std.fs.File{ .handle = std.posix.STDIN_FILENO };
+    var buf: [1024 * 1024]u8 = undefined;
+    while (true) {
+        const n = try stdin.read(&buf);
+        if (n == 0) break;
+        try dest.writeAll(buf[0..n]);
+    }
+    try dest.seekTo(0);
+}
+
+/// File-backed dispatch: every query whose source is a real (or spooled)
+/// file on disk goes through here, whether it arrived via a normal FROM
+/// clause or was just spooled from stdin for aggregate support (#175).
+fn executeFileBased(allocator: Allocator, query: parser.Query, output_file: std.fs.File, opts: options_mod.Options) !void {
     // JOIN query: load right table into hash map, probe with left table.
     // If it also has an aggregate/GROUP BY/HAVING, that's not something
     // executeJoin can do — materialize and delegate instead (#112).
@@ -7610,6 +7656,73 @@ test "TRIM: strips leading and trailing whitespace" {
     try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "world"));
     // whitespace must not surround the values in the output
     try std.testing.expect(!std.mem.containsAtLeast(u8, data, 1, "  hello  "));
+}
+
+/// Redirects real stdin (fd 0) to `content` for the duration of `run`, then
+/// restores the original fd — used to test the FROM '-' path in-process
+/// without spawning the actual binary.
+fn withStdinContent(content: []const u8, comptime run: anytype, args: anytype) !void {
+    if (builtin.os.tag == .windows) return; // dup2/POSIX fds only; stdin path untested on Windows here.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const f = try tmp.dir.createFile("stdin_src", .{ .read = true });
+    defer f.close();
+    try f.writeAll(content);
+    try f.seekTo(0);
+
+    const saved_stdin = try std.posix.dup(std.posix.STDIN_FILENO);
+    defer std.posix.close(saved_stdin);
+    try std.posix.dup2(f.handle, std.posix.STDIN_FILENO);
+    defer std.posix.dup2(saved_stdin, std.posix.STDIN_FILENO) catch {};
+
+    try @call(.auto, run, args);
+}
+
+test "aggregates over stdin (FROM '-') now work via spool-to-memfd (#175)" {
+    const allocator = std.testing.allocator;
+    const Ctx = struct {
+        fn go(alloc: Allocator) !void {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var q = try parser.parse(alloc, "SELECT e, COUNT(*), SUM(e) FROM '-' GROUP BY e");
+            defer q.deinit();
+
+            const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+            defer out.close();
+            try execute(alloc, q, out, .{});
+
+            try out.seekTo(0);
+            const data = try out.readToEndAlloc(alloc, 4096);
+            defer alloc.free(data);
+            try std.testing.expectEqualStrings(
+                "e,COUNT(*),SUM(e)\n0,1,0\n1,1,1\n3,2,6\n",
+                data,
+            );
+        }
+    };
+    try withStdinContent("id,e\n1,0\n2,1\n3,3\n4,3\n", Ctx.go, .{allocator});
+}
+
+test "plain SELECT/WHERE over stdin still streams (no aggregate, no spool)" {
+    const allocator = std.testing.allocator;
+    const Ctx = struct {
+        fn go(alloc: Allocator) !void {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            var q = try parser.parse(alloc, "SELECT id FROM '-' WHERE e = 3");
+            defer q.deinit();
+
+            const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+            defer out.close();
+            try execute(alloc, q, out, .{});
+
+            try out.seekTo(0);
+            const data = try out.readToEndAlloc(alloc, 4096);
+            defer alloc.free(data);
+            try std.testing.expectEqualStrings("id\n3\n4\n", data);
+        }
+    };
+    try withStdinContent("id,e\n1,0\n2,1\n3,3\n4,3\n", Ctx.go, .{allocator});
 }
 
 test "REVERSE: reverses string values" {
