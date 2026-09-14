@@ -505,24 +505,26 @@ pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.Fi
         // Aggregates/GROUP BY need the same mmap-backed dispatch every file
         // query uses (executeScalarAgg/executeGroupBy) — executeFromStdin
         // never implemented them (#175). Spool stdin into a memory-backed
-        // file (memfd on Linux — see memfile.zig for the documented
-        // platform-by-platform guarantee) and fall through to the normal
-        // file dispatch, instead of a second parallel aggregate implementation.
-        // Plain SELECT/WHERE-only stdin queries keep streaming through
+        // scratch file (memfd on Linux; an immediately-unlinked temp file
+        // elsewhere — see memfile.zig — so no named file is ever left behind
+        // even under SIGKILL, #177) and pass the open handle straight to the
+        // aggregate dispatch instead of a path: nothing downstream ever
+        // reopens by path for this case, so the unlink is safe. Plain
+        // SELECT/WHERE-only stdin queries keep streaming through
         // executeFromStdin in constant memory — spooling those too would
-        // regress exactly the large-pipe case this path exists for.
+        // regress exactly the large-pipe case that path exists for.
+        // (Materializing the whole input here still isn't the end state —
+        // see #176 for genuinely streaming aggregation with no spool at all.)
         if (hasAggregates(query) or query.group_by.len > 0) {
-            // query.file_path ("-"/"stdin") is owned by the caller (freed via
-            // its own query.deinit()) — execute() only borrows query, so the
-            // spooled path below is a separate allocation, not a replacement
-            // of that one, freed here rather than left for the caller.
-            var spooled = query;
-            const fwp = try memfile.createMemoryBackedFileWithPath(allocator, "stdin_spool");
-            defer fwp.cleanup(allocator);
-            try spoolStdinTo(fwp.file);
-            spooled.file_path = try allocator.dupe(u8, fwp.path);
-            defer allocator.free(spooled.file_path);
-            try executeFileBased(allocator, spooled, output_file, opts);
+            const spool = try memfile.createMemoryBackedFile(allocator, "stdin_spool");
+            defer spool.close();
+            try spoolStdinTo(spool);
+            if (query.group_by.len == 0 and hasAggregates(query)) {
+                if (hasRegularColumns(query)) return error.MixedAggregateAndNonAggregateSelect;
+                try executeScalarAgg(allocator, query, output_file, opts, spool);
+            } else {
+                try executeGroupBy(allocator, query, output_file, opts, spool);
+            }
             return;
         }
         try executeFromStdin(allocator, query, output_file, opts);
@@ -567,13 +569,13 @@ fn executeFileBased(allocator: Allocator, query: parser.Query, output_file: std.
     // Scalar aggregate (no GROUP BY): SELECT COUNT(*)/SUM/AVG/MIN/MAX
     if (query.group_by.len == 0 and hasAggregates(query)) {
         if (hasRegularColumns(query)) return error.MixedAggregateAndNonAggregateSelect;
-        try executeScalarAgg(allocator, query, output_file, opts);
+        try executeScalarAgg(allocator, query, output_file, opts, null);
         return;
     }
 
     // Check for GROUP BY - requires sequential processing
     if (query.group_by.len > 0) {
-        try executeGroupBy(allocator, query, output_file, opts);
+        try executeGroupBy(allocator, query, output_file, opts, null);
         return;
     }
 
@@ -590,7 +592,7 @@ fn executeFileBased(allocator: Allocator, query: parser.Query, output_file: std.
         var dq = query;
         dq.distinct = false;
         dq.group_by = synth_gb;
-        try executeGroupBy(allocator, dq, output_file, opts);
+        try executeGroupBy(allocator, dq, output_file, opts, null);
         return;
     }
 
@@ -1872,9 +1874,9 @@ fn executeJoinThenAggregate(
     // own dispatch, which forced an anyerror!void signature and caused a
     // severe compile-time blowup on at least one build configuration.
     if (stage2_query.group_by.len == 0) {
-        try executeScalarAgg(allocator, stage2_query, output_file, stage2_opts);
+        try executeScalarAgg(allocator, stage2_query, output_file, stage2_opts, null);
     } else {
-        try executeGroupBy(allocator, stage2_query, output_file, stage2_opts);
+        try executeGroupBy(allocator, stage2_query, output_file, stage2_opts, null);
     }
 }
 
@@ -3705,9 +3707,15 @@ fn executeScalarAgg(
     query: parser.Query,
     output_file: std.fs.File,
     opts: options_mod.Options,
+    preopened: ?std.fs.File,
 ) !void {
-    const file = try std.fs.cwd().openFile(query.file_path, .{});
-    defer file.close();
+    // preopened (#177): the stdin-spooled case hands over an already-open,
+    // unlinked-on-creation handle rather than a path — the spool file may
+    // have no name left on disk to reopen by the time we'd otherwise call
+    // openFile, and reusing the same fd across worker threads is safe since
+    // pread() is positionless. Caller owns closing it either way.
+    const file = preopened orelse try std.fs.cwd().openFile(query.file_path, .{});
+    defer if (preopened == null) file.close();
 
     const file_size = (try file.stat()).size;
     if (file_size == 0) return error.EmptyFile;
@@ -3902,6 +3910,7 @@ fn executeScalarAgg(
         for (0..n_threads) |i| {
             thread_ctxs[i] = .{
                 .file_path = query.file_path,
+                .preopened = preopened,
                 .chunk_start = chunks[i][0],
                 .chunk_end = chunks[i][1],
                 .lower_header = lower_header,
@@ -4215,6 +4224,10 @@ fn splitLineChunks(
 const GbWorkerCtx = struct {
     // Shared read-only inputs
     file_path: []const u8, // path opened independently by each worker thread
+    // Set instead of file_path for the stdin-spooled case (#177): the spool
+    // file may already be unlinked, so every worker reuses this one shared
+    // fd (safe — pread() is positionless) rather than reopening by path.
+    preopened: ?std.fs.File = null,
     chunk_start: usize, // byte offset into the file where this worker's chunk begins
     chunk_end: usize, // byte offset where this worker's chunk ends (exclusive)
     lower_header: []const []const u8,
@@ -4448,8 +4461,8 @@ fn gbWorkerScan(ctx: *GbWorkerCtx) !void {
     // concurrent pread calls are served by separate kernel I/O paths, letting
     // all 12 cores read in parallel rather than queuing behind a single
     // page-fault handler.
-    const file = try std.fs.cwd().openFile(ctx.file_path, .{});
-    defer file.close();
+    const file = ctx.preopened orelse try std.fs.cwd().openFile(ctx.file_path, .{});
+    defer if (ctx.preopened == null) file.close();
 
     const IO_BUF: usize = 2 * 1024 * 1024;
     const io_buf = try aa.alloc(u8, IO_BUF);
@@ -4543,6 +4556,8 @@ fn gbWorkerScan(ctx: *GbWorkerCtx) !void {
 /// Per-thread context for a parallel scalar aggregate chunk scan.
 const ScalarAggWorkerCtx = struct {
     file_path: []const u8,
+    // See GbWorkerCtx.preopened (#177).
+    preopened: ?std.fs.File = null,
     chunk_start: usize,
     chunk_end: usize,
     lower_header: []const []const u8,
@@ -4568,8 +4583,8 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
     const empty_keys = try aa.alloc([]const u8, 0);
     ctx.partial_accum = try CompactAccum.init(aa, empty_keys, ctx.n_aggs);
 
-    const file = try std.fs.cwd().openFile(ctx.file_path, .{});
-    defer file.close();
+    const file = ctx.preopened orelse try std.fs.cwd().openFile(ctx.file_path, .{});
+    defer if (ctx.preopened == null) file.close();
 
     const IO_BUF: usize = 2 * 1024 * 1024;
     const io_buf = try aa.alloc(u8, IO_BUF);
@@ -4947,9 +4962,11 @@ fn executeGroupBy(
     query: parser.Query,
     output_file: std.fs.File,
     opts: options_mod.Options,
+    preopened: ?std.fs.File,
 ) !void {
-    const file = try std.fs.cwd().openFile(query.file_path, .{});
-    defer file.close();
+    // See executeScalarAgg's matching comment (#177).
+    const file = preopened orelse try std.fs.cwd().openFile(query.file_path, .{});
+    defer if (preopened == null) file.close();
 
     const file_size = (try file.stat()).size;
     if (file_size == 0) return error.EmptyFile;
@@ -5409,6 +5426,7 @@ fn executeGroupBy(
         for (0..n_threads) |i| {
             thread_ctxs[i] = .{
                 .file_path = query.file_path,
+                .preopened = preopened,
                 .chunk_start = chunks[i][0],
                 .chunk_end = chunks[i][1],
                 .lower_header = lower_header,
