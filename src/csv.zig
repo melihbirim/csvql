@@ -148,6 +148,31 @@ pub const CsvReader = struct {
         self.putback_byte = byte;
     }
 
+    /// Batch-copy a run of plain content bytes directly out of the current
+    /// buffer, stopping at the first byte that needs its own decision (a
+    /// delimiter/CR/LF outside quotes, or a `"` inside quotes) — instead of
+    /// the one-append-per-byte cost that dominates readRecord on long
+    /// fields (#175 follow-up: this was ~44s of system time on a 345MB
+    /// stdin file, from field_buffer reallocating on every single byte).
+    /// No-op (falls through to the caller's own per-byte readByte loop)
+    /// whenever a putback byte is pending or the buffer is already
+    /// exhausted, so it never changes behavior — only batches the common
+    /// case where several plain bytes are already sitting in the buffer.
+    fn batchAppendPlainRun(self: *CsvReader, field_buffer: *std.ArrayList(u8), in_quotes: bool) !void {
+        if (self.putback_byte != null) return;
+        var scan = self.buffer_pos;
+        while (scan < self.buffer_len) : (scan += 1) {
+            const c = self.buffer[scan];
+            if (in_quotes) {
+                if (c == '"') break;
+            } else if (c == self.delimiter or c == '\r' or c == '\n') break;
+        }
+        if (scan > self.buffer_pos) {
+            try field_buffer.appendSlice(self.allocator, self.buffer[self.buffer_pos..scan]);
+            self.buffer_pos = scan;
+        }
+    }
+
     /// Read the next CSV record
     pub fn readRecord(self: *CsvReader) !?[][]u8 {
         var fields = std.ArrayList([]u8){};
@@ -199,6 +224,7 @@ pub const CsvReader = struct {
                     }
                 } else {
                     try field_buffer.append(self.allocator, byte);
+                    try self.batchAppendPlainRun(&field_buffer, true);
                 }
             } else {
                 if (byte == '"' and field_buffer.items.len == 0) {
@@ -225,6 +251,7 @@ pub const CsvReader = struct {
                     return try fields.toOwnedSlice(self.allocator);
                 } else {
                     try field_buffer.append(self.allocator, byte);
+                    try self.batchAppendPlainRun(&field_buffer, false);
                 }
             }
         }

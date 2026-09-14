@@ -2181,7 +2181,14 @@ fn executeFromStdin(
         std.fs.File{ .handle = try std.os.windows.GetStdHandle(std.os.windows.STD_INPUT_HANDLE) }
     else
         std.fs.File{ .handle = std.posix.STDIN_FILENO };
-    var reader = csv.CsvReader.init(allocator, stdin);
+    // c_allocator, not the GPA passed into this function: stdin reads one
+    // record at a time, each with its own per-field allocation (readRecord
+    // has no mmap'd buffer to slice zero-copy from, unlike every other
+    // reader in this file). At millions of rows the GPA's per-call safety
+    // bookkeeping dominates wall-clock time — 67x faster with c_allocator
+    // on a 345MB/2M-row stdin benchmark (75.6s -> 1.1s), same alloc/free
+    // pattern, nothing else about this reader's lifetime changed (#175).
+    var reader = csv.CsvReader.init(std.heap.c_allocator, stdin);
     reader.delimiter = opts.delimiter;
     var writer = csv.RecordWriter.init(output_file, opts);
     defer writer.deinit();
