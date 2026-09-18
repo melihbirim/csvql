@@ -2,7 +2,7 @@
 ///
 /// Supports: UPPER, LOWER, TRIM, REVERSE, LENGTH, SUBSTR/SUBSTRING,
 ///           ABS, SIGN, CEIL, FLOOR, MOD, COALESCE, CAST(col AS type), REPLACE,
-///           SPLIT_PART, GREATEST, LEAST
+///           SPLIT_PART, GREATEST, LEAST, LPAD, RPAD
 ///
 /// Usage:
 ///   1. Call tryParseScalar(expr, column_map, allocator) at query setup time to
@@ -26,6 +26,8 @@ pub const ScalarSpec = union(enum) {
     reverse: usize, // REVERSE(col)
     length: usize, // LENGTH(col) — returns character count as string
     substr: SubstrArgs, // SUBSTR(col, start[, len]) — 1-based SQL semantics
+    lpad: PadArgs, // LPAD(col, len[, pad]) — pad on the left, default pad is a space
+    rpad: PadArgs, // RPAD(col, len[, pad]) — pad on the right, default pad is a space
     abs: usize, // ABS(col)
     sign: usize, // SIGN(col)
     ceil: usize, // CEIL(col)
@@ -65,6 +67,12 @@ pub const ScalarSpec = union(enum) {
         col_idx: usize,
         start: i32, // 1-based; negative = count from end
         len: i32, // -1 = to end of string
+    };
+
+    pub const PadArgs = struct {
+        col_idx: usize,
+        target_len: usize,
+        pad: []const u8, // slice into the query expr; defaults to " " when omitted
     };
 
     pub const ModArgs = struct {
@@ -173,6 +181,7 @@ pub const ScalarSpec = union(enum) {
         return switch (self) {
             .upper, .lower, .trim, .reverse, .length, .abs, .sign, .ceil, .floor, .cast_int, .cast_float, .cast_text => |i| i,
             .substr => |a| a.col_idx,
+            .lpad, .rpad => |a| a.col_idx,
             .mod_op => |a| a.col_idx,
             .coalesce => |a| a.cols()[0],
             .datediff => |a| a.start_col, // return first column
@@ -342,6 +351,30 @@ pub fn tryParseScalar(
             -1;
 
         return .{ .substr = .{ .col_idx = cidx, .start = start, .len = len } };
+    }
+
+    // ── LPAD / RPAD(col, len[, pad]) ────────────────────────────────────────
+    if (std.mem.eql(u8, fn_lower, "lpad") or std.mem.eql(u8, fn_lower, "rpad")) {
+        const comma1 = std.mem.indexOfScalar(u8, args_str, ',') orelse return null;
+        const col_str = std.mem.trim(u8, args_str[0..comma1], &std.ascii.whitespace);
+        const rest = std.mem.trim(u8, args_str[comma1 + 1 ..], &std.ascii.whitespace);
+
+        const cidx = try resolveCol(col_str, column_map, allocator) orelse
+            return error.ColumnNotFound;
+
+        const comma2 = std.mem.indexOfScalar(u8, rest, ',');
+        const len_str = if (comma2) |c| std.mem.trim(u8, rest[0..c], &std.ascii.whitespace) else rest;
+        const target_len = std.fmt.parseInt(usize, len_str, 10) catch return null;
+
+        const pad: []const u8 = if (comma2) |c| blk: {
+            const pad_raw = std.mem.trim(u8, rest[c + 1 ..], &std.ascii.whitespace);
+            if (pad_raw.len < 2 or pad_raw[0] != '\'' or pad_raw[pad_raw.len - 1] != '\'') return null;
+            break :blk pad_raw[1 .. pad_raw.len - 1];
+        } else " ";
+
+        if (std.mem.eql(u8, fn_lower, "lpad"))
+            return .{ .lpad = .{ .col_idx = cidx, .target_len = target_len, .pad = pad } };
+        return .{ .rpad = .{ .col_idx = cidx, .target_len = target_len, .pad = pad } };
     }
 
     // ── REPLACE(col, 'from', 'to') ─────────────────────────────────────────
@@ -869,6 +902,28 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
             const end = @min(start0 + @as(usize, @intCast(args.len)), v.len);
             return v[start0..end];
         },
+        .lpad => |args| {
+            const v = field(record, args.col_idx);
+            // Already at or past the target length, or nothing to pad with:
+            // no-op — return the field unchanged rather than truncating.
+            if (v.len >= args.target_len or args.pad.len == 0) return v;
+            const pad_needed = args.target_len - v.len;
+            const buf = arena.alloc(u8, args.target_len) catch return v;
+            var i: usize = 0;
+            while (i < pad_needed) : (i += 1) buf[i] = args.pad[i % args.pad.len];
+            @memcpy(buf[pad_needed..], v);
+            return buf;
+        },
+        .rpad => |args| {
+            const v = field(record, args.col_idx);
+            if (v.len >= args.target_len or args.pad.len == 0) return v;
+            const pad_needed = args.target_len - v.len;
+            const buf = arena.alloc(u8, args.target_len) catch return v;
+            @memcpy(buf[0..v.len], v);
+            var i: usize = 0;
+            while (i < pad_needed) : (i += 1) buf[v.len + i] = args.pad[i % args.pad.len];
+            return buf;
+        },
         .abs => |cidx| {
             const v = field(record, cidx);
             const n = std.fmt.parseFloat(f64, v) catch return v;
@@ -1360,6 +1415,97 @@ test "SPLIT_PART: n-th field, 1-based, out of range empty" {
     fba.reset();
     try std.testing.expectEqualStrings("", eval(sp5, &.{"alice@example.com"}, fba.allocator()));
     try std.testing.expect((try tryParseScalar("SPLIT_PART(s, '@', 0)", cm, allocator)) == null);
+}
+
+test "LPAD/RPAD: basic pad-left and pad-right" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cm = std.StringHashMap(usize).init(allocator);
+    try cm.put("s", 0);
+
+    const lp = (try tryParseScalar("LPAD(s, 5, 'x')", cm, allocator)).?;
+    const rp = (try tryParseScalar("RPAD(s, 5, 'x')", cm, allocator)).?;
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+
+    try std.testing.expectEqualStrings("xxxhi", eval(lp, &.{"hi"}, fba.allocator()));
+    fba.reset();
+    try std.testing.expectEqualStrings("hixxx", eval(rp, &.{"hi"}, fba.allocator()));
+}
+
+test "LPAD/RPAD: default pad is a space when the third arg is omitted" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cm = std.StringHashMap(usize).init(allocator);
+    try cm.put("s", 0);
+
+    const lp = (try tryParseScalar("LPAD(s, 5)", cm, allocator)).?;
+    const rp = (try tryParseScalar("RPAD(s, 5)", cm, allocator)).?;
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+
+    try std.testing.expectEqualStrings("   hi", eval(lp, &.{"hi"}, fba.allocator()));
+    fba.reset();
+    try std.testing.expectEqualStrings("hi   ", eval(rp, &.{"hi"}, fba.allocator()));
+}
+
+test "LPAD/RPAD: a multi-character pad wraps to fill the remaining width" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cm = std.StringHashMap(usize).init(allocator);
+    try cm.put("s", 0);
+
+    const lp = (try tryParseScalar("LPAD(s, 8, 'ab')", cm, allocator)).?;
+    const rp = (try tryParseScalar("RPAD(s, 8, 'ab')", cm, allocator)).?;
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+
+    try std.testing.expectEqualStrings("abababhi", eval(lp, &.{"hi"}, fba.allocator()));
+    fba.reset();
+    try std.testing.expectEqualStrings("hiababab", eval(rp, &.{"hi"}, fba.allocator()));
+}
+
+test "LPAD/RPAD: string already at or past target length is a no-op" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cm = std.StringHashMap(usize).init(allocator);
+    try cm.put("s", 0);
+
+    const lp = (try tryParseScalar("LPAD(s, 3, 'x')", cm, allocator)).?;
+    const rp = (try tryParseScalar("RPAD(s, 3, 'x')", cm, allocator)).?;
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+
+    // exactly at target length
+    try std.testing.expectEqualStrings("cat", eval(lp, &.{"cat"}, fba.allocator()));
+    fba.reset();
+    try std.testing.expectEqualStrings("cat", eval(rp, &.{"cat"}, fba.allocator()));
+    fba.reset();
+    // longer than target length
+    try std.testing.expectEqualStrings("elephant", eval(lp, &.{"elephant"}, fba.allocator()));
+    fba.reset();
+    try std.testing.expectEqualStrings("elephant", eval(rp, &.{"elephant"}, fba.allocator()));
+}
+
+test "LPAD/RPAD: an explicit empty pad string is a no-op when padding is needed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cm = std.StringHashMap(usize).init(allocator);
+    try cm.put("s", 0);
+
+    const lp = (try tryParseScalar("LPAD(s, 5, '')", cm, allocator)).?;
+    const rp = (try tryParseScalar("RPAD(s, 5, '')", cm, allocator)).?;
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+
+    try std.testing.expectEqualStrings("hi", eval(lp, &.{"hi"}, fba.allocator()));
+    fba.reset();
+    try std.testing.expectEqualStrings("hi", eval(rp, &.{"hi"}, fba.allocator()));
 }
 
 test "GREATEST/LEAST: numeric and lexicographic" {

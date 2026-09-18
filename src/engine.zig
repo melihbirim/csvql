@@ -2866,6 +2866,7 @@ fn evalScalarOnSingleValue(spec: scalar.ScalarSpec, value: []const u8, arena: Al
         .cast_float => |*ci| ci.* = 0,
         .cast_text => |*ci| ci.* = 0,
         .substr => |*a| a.col_idx = 0,
+        .lpad, .rpad => |*a| a.col_idx = 0,
         .mod_op => |*a| a.col_idx = 0,
         .coalesce => |*a| {
             for (a.colsMut()) |*ci| ci.* = 0;
@@ -7934,6 +7935,36 @@ test "SUBSTR: extracts substring (1-based start index)" {
 
     try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "Ali"));
     try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "Bob"));
+}
+
+test "LPAD/RPAD: pads through the full query pipeline" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("sc.csv", .{});
+        defer f.close();
+        try f.writeAll("code\nab\nxyz\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("sc.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT LPAD(code,5,'0'), RPAD(code,5,'0') FROM '{s}'", .{p});
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "000ab,ab000"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, data, 1, "00xyz,xyz00"));
 }
 
 test "ABS: returns absolute value of negative numbers" {
