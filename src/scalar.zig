@@ -902,28 +902,8 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
             const end = @min(start0 + @as(usize, @intCast(args.len)), v.len);
             return v[start0..end];
         },
-        .lpad => |args| {
-            const v = field(record, args.col_idx);
-            // Already at or past the target length, or nothing to pad with:
-            // no-op — return the field unchanged rather than truncating.
-            if (v.len >= args.target_len or args.pad.len == 0) return v;
-            const pad_needed = args.target_len - v.len;
-            const buf = arena.alloc(u8, args.target_len) catch return v;
-            var i: usize = 0;
-            while (i < pad_needed) : (i += 1) buf[i] = args.pad[i % args.pad.len];
-            @memcpy(buf[pad_needed..], v);
-            return buf;
-        },
-        .rpad => |args| {
-            const v = field(record, args.col_idx);
-            if (v.len >= args.target_len or args.pad.len == 0) return v;
-            const pad_needed = args.target_len - v.len;
-            const buf = arena.alloc(u8, args.target_len) catch return v;
-            @memcpy(buf[0..v.len], v);
-            var i: usize = 0;
-            while (i < pad_needed) : (i += 1) buf[v.len + i] = args.pad[i % args.pad.len];
-            return buf;
-        },
+        .lpad => |args| return padTo(field(record, args.col_idx), args.target_len, args.pad, true, arena),
+        .rpad => |args| return padTo(field(record, args.col_idx), args.target_len, args.pad, false, arena),
         .abs => |cidx| {
             const v = field(record, cidx);
             const n = std.fmt.parseFloat(f64, v) catch return v;
@@ -1162,6 +1142,35 @@ fn pickExtremeValues(values: []const []const u8, want_max: bool) []const u8 {
         }
     }
     return best;
+}
+
+/// LPAD/RPAD body: pad `v` out to `target_len` with `pad`, or cut it down to
+/// `target_len` when it is already longer — DuckDB and Postgres both truncate
+/// rather than returning the value unchanged.
+///
+/// Lengths are in bytes, like LENGTH and SUBSTR here, so a multi-byte value
+/// pads to fewer characters than DuckDB would. The cut is still made on a
+/// codepoint boundary so truncation never emits invalid UTF-8.
+fn padTo(v: []const u8, target_len: usize, pad: []const u8, comptime left: bool, arena: Allocator) []const u8 {
+    // An empty field is NULL, and padding NULL would invent a value. See #147.
+    if (v.len == 0 or v.len == target_len) return v;
+    if (v.len > target_len) {
+        var end = target_len;
+        while (end > 0 and v[end] & 0xc0 == 0x80) end -= 1;
+        return v[0..end];
+    }
+    if (pad.len == 0) return v; // nothing to pad with
+    const pad_needed = target_len - v.len;
+    const buf = arena.alloc(u8, target_len) catch return v;
+    var i: usize = 0;
+    if (left) {
+        while (i < pad_needed) : (i += 1) buf[i] = pad[i % pad.len];
+        @memcpy(buf[pad_needed..], v);
+    } else {
+        @memcpy(buf[0..v.len], v);
+        while (i < pad_needed) : (i += 1) buf[v.len + i] = pad[i % pad.len];
+    }
+    return buf;
 }
 
 inline fn field(record: []const []const u8, idx: usize) []const u8 {
@@ -1468,7 +1477,7 @@ test "LPAD/RPAD: a multi-character pad wraps to fill the remaining width" {
     try std.testing.expectEqualStrings("hiababab", eval(rp, &.{"hi"}, fba.allocator()));
 }
 
-test "LPAD/RPAD: string already at or past target length is a no-op" {
+test "LPAD/RPAD: a longer string is truncated to the target length" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -1480,15 +1489,36 @@ test "LPAD/RPAD: string already at or past target length is a no-op" {
     var buf: [64]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
 
-    // exactly at target length
+    // exactly at target length — unchanged
     try std.testing.expectEqualStrings("cat", eval(lp, &.{"cat"}, fba.allocator()));
     fba.reset();
     try std.testing.expectEqualStrings("cat", eval(rp, &.{"cat"}, fba.allocator()));
     fba.reset();
-    // longer than target length
-    try std.testing.expectEqualStrings("elephant", eval(lp, &.{"elephant"}, fba.allocator()));
+    // longer than target length — cut down, as DuckDB/Postgres do
+    try std.testing.expectEqualStrings("ele", eval(lp, &.{"elephant"}, fba.allocator()));
     fba.reset();
-    try std.testing.expectEqualStrings("elephant", eval(rp, &.{"elephant"}, fba.allocator()));
+    try std.testing.expectEqualStrings("ele", eval(rp, &.{"elephant"}, fba.allocator()));
+    fba.reset();
+    // truncating never splits a codepoint: the 2-byte 'é' does not fit in 2
+    const lp2 = (try tryParseScalar("LPAD(s, 2, 'x')", cm, allocator)).?;
+    try std.testing.expectEqualStrings("h", eval(lp2, &.{"h\u{e9}llo"}, fba.allocator()));
+}
+
+test "LPAD/RPAD: an empty field is NULL and is left alone" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cm = std.StringHashMap(usize).init(allocator);
+    try cm.put("s", 0);
+
+    const lp = (try tryParseScalar("LPAD(s, 5, 'x')", cm, allocator)).?;
+    const rp = (try tryParseScalar("RPAD(s, 5, 'x')", cm, allocator)).?;
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+
+    try std.testing.expectEqualStrings("", eval(lp, &.{""}, fba.allocator()));
+    fba.reset();
+    try std.testing.expectEqualStrings("", eval(rp, &.{""}, fba.allocator()));
 }
 
 test "LPAD/RPAD: an explicit empty pad string is a no-op when padding is needed" {
@@ -1506,6 +1536,9 @@ test "LPAD/RPAD: an explicit empty pad string is a no-op when padding is needed"
     try std.testing.expectEqualStrings("hi", eval(lp, &.{"hi"}, fba.allocator()));
     fba.reset();
     try std.testing.expectEqualStrings("hi", eval(rp, &.{"hi"}, fba.allocator()));
+    fba.reset();
+    // truncation needs no pad character, so it still applies
+    try std.testing.expectEqualStrings("eleph", eval(lp, &.{"elephant"}, fba.allocator()));
 }
 
 test "GREATEST/LEAST: numeric and lexicographic" {

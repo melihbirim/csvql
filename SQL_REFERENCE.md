@@ -41,7 +41,7 @@ Full syntax reference and runnable examples for every SQL feature csvql supports
 | **SUBSTR**    | `SELECT SUBSTR(col, start, len)` — substring (1-based, `len` optional)  |
 | **REPLACE**   | `SELECT REPLACE(col, 'from', 'to')` — replace all occurrences of a substring |
 | **SPLIT_PART**| `SELECT SPLIT_PART(col, 'delim', n)` — n-th field (1-based) after splitting on delim |
-| **LPAD / RPAD** | `SELECT LPAD(col, n [, 'pad'])`, `RPAD(col, n [, 'pad'])` — pad a string to length `n` on the left/right; `pad` defaults to a single space when omitted. A value already at or past length `n`, or an explicit empty `pad`, is returned unchanged (no truncation) |
+| **LPAD / RPAD** | `SELECT LPAD(col, n [, 'pad'])`, `RPAD(col, n [, 'pad'])` — pad a string to length `n` on the left/right; `pad` defaults to a single space when omitted. A longer value is truncated to `n`; an empty field stays empty |
 | **GREATEST / LEAST** | `SELECT GREATEST(a, b, ...)`, `LEAST(a, b, ...)` — row-wise max/min (numeric or lexicographic) |
 | **ABS / SIGN / CEIL / FLOOR** | `SELECT ABS(col), SIGN(col), CEIL(col), FLOOR(col)` — numeric functions; `SIGN` returns `-1`, `0`, or `1` |
 | **MOD**       | `SELECT MOD(col, n)` — modulo by a numeric literal                      |
