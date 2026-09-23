@@ -2722,6 +2722,51 @@ const CaseWhenSpec = struct {
 /// Replaces `aggregation.Aggregator` (which held 6 AutoHashMap per group).
 /// For N aggregate functions: N direct array r/w per row vs 2N HashMap ops.
 /// Mins initialised to +inf, maxs to -inf — no branch needed in accumulation.
+/// Per-group accumulators carry one optional slot array per aggregate kind that
+/// buffers values: COUNT(DISTINCT), MEDIAN and GROUP_CONCAT. A query that uses
+/// none of them still allocated all three for every single group — at 5M groups
+/// that was ~70% of GROUP BY's runtime (by `sample`) and ~150 bytes per group.
+///
+/// A slot array that will only ever be read as null can be shared by the whole
+/// query: reads still see null, and the branches that write one only run when
+/// the matching aggregate exists, in which case the array is allocated per group
+/// as before.
+const OptionalSlots = struct {
+    distinct: ?[]?std.StringHashMap(void) = null,
+    values: ?[]?std.ArrayList(f64) = null,
+    concat: ?[]?std.ArrayList([]const u8) = null,
+
+    /// Build the shared all-null arrays for whichever kinds `specs` never uses.
+    fn forSpecs(ka: Allocator, specs: []const AggSpec, n_aggs: usize) !OptionalSlots {
+        var needs_distinct = false;
+        var needs_values = false;
+        var needs_concat = false;
+        for (specs) |spec| switch (spec.func_type) {
+            .count_distinct => needs_distinct = true,
+            .median => needs_values = true,
+            .group_concat => needs_concat = true,
+            else => {},
+        };
+        var opt = OptionalSlots{};
+        if (!needs_distinct) {
+            const d = try ka.alloc(?std.StringHashMap(void), n_aggs);
+            for (d) |*x| x.* = null;
+            opt.distinct = d;
+        }
+        if (!needs_values) {
+            const v = try ka.alloc(?std.ArrayList(f64), n_aggs);
+            for (v) |*x| x.* = null;
+            opt.values = v;
+        }
+        if (!needs_concat) {
+            const c = try ka.alloc(?std.ArrayList([]const u8), n_aggs);
+            for (c) |*x| x.* = null;
+            opt.concat = c;
+        }
+        return opt;
+    }
+};
+
 const CompactAccum = struct {
     key_values: [][]const u8, // GROUP BY column values, arena-owned
     count: i64, // row count for COUNT(*)
@@ -2734,15 +2779,30 @@ const CompactAccum = struct {
     value_lists: []?std.ArrayList(f64), // per-slot numeric values for MEDIAN (buffers all values)
     concat_lists: []?std.ArrayList([]const u8), // per-slot string values for GROUP_CONCAT
 
-    fn init(ka: Allocator, key_vals: [][]const u8, n_aggs: usize) !CompactAccum {
+    fn init(ka: Allocator, key_vals: [][]const u8, n_aggs: usize, opt: OptionalSlots) !CompactAccum {
         const sums = try ka.alloc(f64, n_aggs);
         const sum_sqs = try ka.alloc(f64, n_aggs);
         const sum_counts = try ka.alloc(i64, n_aggs);
         const mins = try ka.alloc(f64, n_aggs);
         const maxs = try ka.alloc(f64, n_aggs);
-        const distinct_sets = try ka.alloc(?std.StringHashMap(void), n_aggs);
-        const value_lists = try ka.alloc(?std.ArrayList(f64), n_aggs);
-        const concat_lists = try ka.alloc(?std.ArrayList([]const u8), n_aggs);
+        // MEDIAN, GROUP_CONCAT and COUNT(DISTINCT) slots stay null for the whole
+        // query unless some aggregate actually uses them, so every group can
+        // share one all-null array instead of allocating three of its own.
+        const distinct_sets = opt.distinct orelse blk: {
+            const d = try ka.alloc(?std.StringHashMap(void), n_aggs);
+            for (d) |*ds| ds.* = null;
+            break :blk d;
+        };
+        const value_lists = opt.values orelse blk: {
+            const v = try ka.alloc(?std.ArrayList(f64), n_aggs);
+            for (v) |*vl| vl.* = null;
+            break :blk v;
+        };
+        const concat_lists = opt.concat orelse blk: {
+            const c = try ka.alloc(?std.ArrayList([]const u8), n_aggs);
+            for (c) |*cl| cl.* = null;
+            break :blk c;
+        };
         @memset(sums, 0.0);
         @memset(sum_sqs, 0.0);
         @memset(sum_counts, 0);
@@ -2750,9 +2810,6 @@ const CompactAccum = struct {
             mn.* = std.math.inf(f64);
             mx.* = -std.math.inf(f64);
         }
-        for (distinct_sets) |*ds| ds.* = null;
-        for (value_lists) |*vl| vl.* = null;
-        for (concat_lists) |*cl| cl.* = null;
         return CompactAccum{
             .key_values = key_vals,
             .count = 0,
@@ -3892,7 +3949,8 @@ fn executeScalarAgg(
     defer ka.deinit();
     const n_aggs = agg_specs.items.len;
     const empty_keys = try ka.allocator().alloc([]const u8, 0);
-    var accum = try CompactAccum.init(ka.allocator(), empty_keys, n_aggs);
+    const opt_slots = try OptionalSlots.forSpecs(ka.allocator(), agg_specs.items, n_aggs);
+    var accum = try CompactAccum.init(ka.allocator(), empty_keys, n_aggs, opt_slots);
 
     // COUNT(DISTINCT) on the parallel path counts through a shared sharded set
     // rather than accum.distinct_sets; non-null here means "use this instead".
@@ -4270,6 +4328,8 @@ const GbWorkerCtx = struct {
     strict: bool,
     // Per-thread outputs (all arena-owned, freed together after merge)
     arena: std.heap.ArenaAllocator,
+    /// Shared all-null slot arrays for aggregate kinds this query never uses.
+    opt_slots: OptionalSlots = .{},
     partial_map: std.StringHashMap(CompactAccum),
     err: ?anyerror = null,
 };
@@ -4384,7 +4444,7 @@ fn gbProcessRecordCore(
             };
             key_vals[gi] = try aa.dupe(u8, kv);
         }
-        gop.value_ptr.* = try CompactAccum.init(aa, key_vals, ctx.n_aggs);
+        gop.value_ptr.* = try CompactAccum.init(aa, key_vals, ctx.n_aggs, ctx.opt_slots);
     }
     const accum = gop.value_ptr;
 
@@ -4475,6 +4535,7 @@ fn gbWorkerThread(ctx: *GbWorkerCtx) void {
 
 fn gbWorkerScan(ctx: *GbWorkerCtx) !void {
     const aa = ctx.arena.allocator();
+    ctx.opt_slots = try OptionalSlots.forSpecs(aa, ctx.agg_specs, ctx.n_aggs);
     ctx.partial_map = std.StringHashMap(CompactAccum).init(aa);
     // Per-thread map pre-sizing based on chunk byte range
     const chunk_size = ctx.chunk_end - ctx.chunk_start;
@@ -4697,7 +4758,8 @@ fn scalarAggWorkerThread(ctx: *ScalarAggWorkerCtx) void {
 fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
     const aa = ctx.arena.allocator();
     const empty_keys = try aa.alloc([]const u8, 0);
-    ctx.partial_accum = try CompactAccum.init(aa, empty_keys, ctx.n_aggs);
+    const opt_slots = try OptionalSlots.forSpecs(aa, ctx.agg_specs, ctx.n_aggs);
+    ctx.partial_accum = try CompactAccum.init(aa, empty_keys, ctx.n_aggs, opt_slots);
 
     const file = ctx.preopened orelse try std.fs.cwd().openFile(ctx.file_path, .{});
     defer if (ctx.preopened == null) file.close();
@@ -5519,6 +5581,7 @@ fn executeGroupBy(
     try group_map.ensureTotalCapacity(initial_capacity);
 
     const n_aggs = agg_specs.items.len;
+    const opt_slots_gb = try OptionalSlots.forSpecs(ka, agg_specs.items, n_aggs);
 
     // Reusable key builder (grows once, then reused without allocation)
     var key_buf = std.ArrayListUnmanaged(u8){};
@@ -5755,7 +5818,7 @@ fn executeGroupBy(
                     };
                     key_vals[gi] = try ka.dupe(u8, kv);
                 }
-                gop.value_ptr.* = try CompactAccum.init(ka, key_vals, n_aggs);
+                gop.value_ptr.* = try CompactAccum.init(ka, key_vals, n_aggs, opt_slots_gb);
             }
             const accum = gop.value_ptr;
 
