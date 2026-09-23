@@ -152,7 +152,7 @@ Full breakdown (LIKE, multi-table JOIN, subqueries, memory/storage, methodology)
 
 ## SQL Reference
 
-`SELECT`/`FROM`/`WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`/`OFFSET`, `JOIN`, subquery `IN`/`NOT IN`, `LIKE`/`ILIKE`/`BETWEEN`/`IS NULL`/`AND`/`OR`/`NOT`, aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`VARIANCE`/`STDDEV`/`MEDIAN`/`GROUP_CONCAT`), `CASE WHEN`, and scalar functions (`UPPER`/`LOWER`/`TRIM`/`CONCAT`/`SUBSTR`/`REPLACE`/`SPLIT_PART`/`ROUND`/`CAST`/`COALESCE`/`STRFTIME`/`DATEDIFF`/`DATEADD`/and more).
+`SELECT`/`FROM`/`WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`/`OFFSET`, `JOIN`, subquery `IN`/`NOT IN`, `LIKE`/`ILIKE`/`BETWEEN`/`IS NULL`/`AND`/`OR`/`NOT`, aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`VARIANCE`/`STDDEV`/`MEDIAN`/`GROUP_CONCAT`), `CASE WHEN`, and scalar functions (`UPPER`/`LOWER`/`TRIM`/`CONCAT`/`SUBSTR`/`REPLACE`/`SPLIT_PART`/`LPAD`/`RPAD`/`ROUND`/`CAST`/`COALESCE`/`STRFTIME`/`DATEDIFF`/`DATEADD`/and more).
 
 ```bash
 csvql "SELECT department, COUNT(*), AVG(salary) FROM 'data.csv' WHERE salary > 50000 GROUP BY department HAVING COUNT(*) > 10 ORDER BY department"
@@ -338,6 +338,7 @@ Full API, options (delimiter/comment/skip-empty-lines), memory comparisons again
 | `OFFSET` clause | [#70](https://github.com/melihbirim/csvql/issues/70) | ✅ shipped |
 | `--markdown` output | [#72](https://github.com/melihbirim/csvql/issues/72) | help wanted |
 | Shell completions (bash/zsh) | [#73](https://github.com/melihbirim/csvql/issues/73) | help wanted |
+| `LPAD`, `RPAD` in SELECT | [#160](https://github.com/melihbirim/csvql/issues/160) | ✅ shipped |
 
 ## Contributing
 
