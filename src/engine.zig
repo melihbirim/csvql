@@ -4330,6 +4330,10 @@ const GbWorkerCtx = struct {
     arena: std.heap.ArenaAllocator,
     /// Shared all-null slot arrays for aggregate kinds this query never uses.
     opt_slots: OptionalSlots = .{},
+    /// Set for a GROUP BY with no aggregates (what SELECT DISTINCT becomes):
+    /// workers only need the key set, so they share one instead of each
+    /// building a private map for the main thread to merge.
+    distinct_keys: ?*ShardedDistinctSet = null,
     partial_map: std.StringHashMap(CompactAccum),
     err: ?anyerror = null,
 };
@@ -4360,6 +4364,50 @@ fn gbProcessRecord(
 /// record — used by the fused single-pass scan path, which builds `record`
 /// directly from comma positions found during record-end detection instead
 /// of re-scanning the line for quotes and delimiters.
+/// Emit the rows of a GROUP BY that has no aggregates, straight from the shared
+/// key set. Keys are NUL-separated group values, in the same order as the SELECT
+/// list, so a key splits back into its output row. Sorted for the same
+/// deterministic output order the group-map path produces.
+fn emitDistinctKeys(
+    allocator: Allocator,
+    set: *ShardedDistinctSet,
+    writer: *csv.RecordWriter,
+    query: parser.Query,
+    opts: options_mod.Options,
+) !void {
+    var keys = try std.ArrayListUnmanaged([]const u8).initCapacity(allocator, set.count());
+    defer keys.deinit(allocator);
+    for (set.shards) |*sh| {
+        var it = sh.set.keyIterator();
+        while (it.next()) |k| keys.appendAssumeCapacity(k.*);
+    }
+    std.mem.sort([]const u8, keys.items, {}, struct {
+        fn lt(_: void, a: []const u8, b: []const u8) bool {
+            return std.mem.order(u8, a, b) == .lt;
+        }
+    }.lt);
+
+    const fields = try allocator.alloc([]const u8, query.columns.len);
+    defer allocator.free(fields);
+
+    var emitted: i64 = 0;
+    var skipped: u32 = 0;
+    for (keys.items) |key| {
+        if (skipped < query.offset) {
+            skipped += 1;
+            continue;
+        }
+        if (query.limit >= 0 and emitted >= query.limit) break;
+        var it = std.mem.splitScalar(u8, key, 0);
+        for (fields) |*f| f.* = it.next() orelse "";
+        try writer.writeRecord(fields);
+        emitted += 1;
+    }
+    try writer.finish();
+    try writer.flush();
+    _ = opts;
+}
+
 fn gbProcessRecordCore(
     ctx: *GbWorkerCtx,
     aa: Allocator,
@@ -4419,6 +4467,13 @@ fn gbProcessRecordCore(
                 "",
         };
         try key_buf.appendSlice(aa, val);
+    }
+
+    // No aggregates: the key is the whole result, so there is nothing to
+    // accumulate and no per-group CompactAccum to allocate.
+    if (ctx.distinct_keys) |set| {
+        try set.add(key_buf.items);
+        return;
     }
 
     const gop = try ctx.partial_map.getOrPut(key_buf.items);
@@ -5606,6 +5661,22 @@ fn executeGroupBy(
         var threads = try allocator.alloc(std.Thread, n_threads);
         defer allocator.free(threads);
 
+        // A GROUP BY with no aggregates — what SELECT DISTINCT is rewritten
+        // into — still paid for a CompactAccum per group: nine empty slice
+        // headers plus a duplicated copy of each key value, measured at 441
+        // bytes a group for keys about 10 bytes long. There is nothing to
+        // accumulate, so the workers share one key set and skip both the
+        // per-group allocation and the serial merge.
+        const distinct_only = n_aggs == 0 and
+            query.order_by == null and
+            !hasScalarSelectFunctions(query) and
+            query.columns.len == group_specs.len;
+        var key_set: ?ShardedDistinctSet = if (distinct_only)
+            try ShardedDistinctSet.init(allocator)
+        else
+            null;
+        defer if (key_set) |*ks| ks.deinit();
+
         for (0..n_threads) |i| {
             thread_ctxs[i] = .{
                 .file_path = query.file_path,
@@ -5621,6 +5692,7 @@ fn executeGroupBy(
                 .delimiter = opts.delimiter,
                 .strict = opts.strict,
                 .arena = std.heap.ArenaAllocator.init(allocator),
+                .distinct_keys = if (key_set) |*ks| ks else null,
                 .partial_map = undefined,
                 .err = null,
             };
@@ -5631,6 +5703,12 @@ fn executeGroupBy(
         // Propagate first worker error, if any
         for (thread_ctxs) |ctx| {
             if (ctx.err) |e| return e;
+        }
+
+        if (key_set) |*ks| {
+            for (thread_ctxs) |*ctx| ctx.arena.deinit();
+            try emitDistinctKeys(allocator, ks, &writer, query, opts);
+            return;
         }
 
         // Merge partial maps into the main group_map (output phase reads group_map)
