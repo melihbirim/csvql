@@ -3894,6 +3894,12 @@ fn executeScalarAgg(
     const empty_keys = try ka.allocator().alloc([]const u8, 0);
     var accum = try CompactAccum.init(ka.allocator(), empty_keys, n_aggs);
 
+    // COUNT(DISTINCT) on the parallel path counts through a shared sharded set
+    // rather than accum.distinct_sets; non-null here means "use this instead".
+    const distinct_counts = try allocator.alloc(?usize, n_aggs);
+    defer allocator.free(distinct_counts);
+    for (distinct_counts) |*c| c.* = null;
+
     var field_stk: [256][]const u8 = undefined;
 
     // -- Scan (parallel on large files, sequential on small) --
@@ -3902,6 +3908,21 @@ fn executeScalarAgg(
         const n_threads = num_cores_sa;
         const chunks = try splitLineChunks(data, hinfo.data_start, n_threads, allocator, opts.delimiter);
         defer allocator.free(chunks);
+
+        const shared_sets = try allocator.alloc(?*ShardedDistinctSet, n_aggs);
+        defer allocator.free(shared_sets);
+        for (shared_sets) |*sp| sp.* = null;
+        defer for (shared_sets) |sp| if (sp) |set| {
+            set.deinit();
+            allocator.destroy(set);
+        };
+        for (agg_specs.items, 0..) |spec, i| {
+            if (spec.func_type == .count_distinct) {
+                const set = try allocator.create(ShardedDistinctSet);
+                set.* = try ShardedDistinctSet.init(allocator);
+                shared_sets[i] = set;
+            }
+        }
 
         var thread_ctxs = try allocator.alloc(ScalarAggWorkerCtx, n_threads);
         defer allocator.free(thread_ctxs);
@@ -3923,6 +3944,7 @@ fn executeScalarAgg(
                 .strict = opts.strict,
                 .arena = std.heap.ArenaAllocator.init(allocator),
                 .partial_accum = undefined,
+                .shared_distinct = shared_sets,
                 .err = null,
             };
             threads[i] = try std.Thread.spawn(.{}, scalarAggWorkerThread, .{&thread_ctxs[i]});
@@ -3931,6 +3953,12 @@ fn executeScalarAgg(
 
         for (thread_ctxs) |ctx| {
             if (ctx.err) |e| return e;
+        }
+
+        // Shared distinct sets need no merge — every worker inserted into the
+        // same shards, so the count is final the moment the last worker joins.
+        for (shared_sets, 0..) |sp, i| {
+            if (sp) |set| distinct_counts[i] = set.count();
         }
 
         // Merge partial accumulators into the single `accum`
@@ -4115,7 +4143,8 @@ fn executeScalarAgg(
                 // COUNT(*): all rows
                 try std.fmt.allocPrint(allocator, "{d}", .{accum.count}),
             .count_distinct => blk: {
-                const cnt: u32 = if (accum.distinct_sets[i]) |ds| ds.count() else 0;
+                const cnt: usize = distinct_counts[i] orelse
+                    if (accum.distinct_sets[i]) |ds| ds.count() else 0;
                 break :blk try std.fmt.allocPrint(allocator, "{d}", .{cnt});
             },
             .sum => blk: {
@@ -4555,6 +4584,89 @@ fn gbWorkerScan(ctx: *GbWorkerCtx) !void {
 }
 
 /// Per-thread context for a parallel scalar aggregate chunk scan.
+/// A COUNT(DISTINCT) value set shared by every scalar-aggregate worker.
+///
+/// Each worker used to keep its own StringHashMap and the main thread unioned
+/// them at the end. That is free when the key space is small and quadratic when
+/// it is not: N workers over C distinct values hold N*C keys resident, then one
+/// thread merges N*C entries. Measured on an 11 GB file with 5M distinct ids:
+/// 4 GB resident and >6 minutes on 12 threads, against 33s for the same query
+/// on one thread — more threads made it monotonically worse.
+///
+/// Sharding by key hash keeps a single copy of each key and lets workers insert
+/// concurrently: a key only ever reaches the shard that owns it, so shards never
+/// coordinate with each other and there is no merge phase at all.
+const distinct_shard_count = 64; // power of two — the shard index is a mask
+
+const ShardedDistinctSet = struct {
+    const Shard = struct {
+        mutex: std.Thread.Mutex = .{},
+        set: std.StringHashMap(void),
+        arena: std.heap.ArenaAllocator,
+    };
+
+    shards: []Shard,
+    allocator: Allocator,
+
+    fn init(allocator: Allocator) !ShardedDistinctSet {
+        const shards = try allocator.alloc(Shard, distinct_shard_count);
+        for (shards) |*sh| sh.* = .{
+            .set = std.StringHashMap(void).init(allocator),
+            .arena = std.heap.ArenaAllocator.init(allocator),
+        };
+        return .{ .shards = shards, .allocator = allocator };
+    }
+
+    fn deinit(self: *ShardedDistinctSet) void {
+        for (self.shards) |*sh| {
+            sh.set.deinit();
+            sh.arena.deinit();
+        }
+        self.allocator.free(self.shards);
+    }
+
+    fn add(self: *ShardedDistinctSet, key: []const u8) !void {
+        const h = std.hash.Wyhash.hash(0, key);
+        const sh = &self.shards[h & (distinct_shard_count - 1)];
+        sh.mutex.lock();
+        defer sh.mutex.unlock();
+        const gop = try sh.set.getOrPut(key);
+        // The key points into the mmap, which outlives the scan, but the map may
+        // outlive the record slice — dupe on first sight only.
+        if (!gop.found_existing) gop.key_ptr.* = try sh.arena.allocator().dupe(u8, key);
+    }
+
+    fn count(self: *const ShardedDistinctSet) usize {
+        var total: usize = 0;
+        for (self.shards) |*sh| total += sh.set.count();
+        return total;
+    }
+};
+
+test "ShardedDistinctSet: concurrent inserts count every value once" {
+    const allocator = std.testing.allocator;
+    var set = try ShardedDistinctSet.init(allocator);
+    defer set.deinit();
+
+    // Every worker walks the same key space, which is the case the sharding
+    // exists for: 8 threads x 5000 values must still count 5000.
+    const Worker = struct {
+        fn run(s_ptr: *ShardedDistinctSet) void {
+            var buf: [32]u8 = undefined;
+            for (0..5000) |i| {
+                const key = std.fmt.bufPrint(&buf, "user{d}", .{i}) catch unreachable;
+                s_ptr.add(key) catch unreachable;
+            }
+        }
+    };
+
+    var threads: [8]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, Worker.run, .{&set});
+    for (threads) |t| t.join();
+
+    try std.testing.expectEqual(@as(usize, 5000), set.count());
+}
+
 const ScalarAggWorkerCtx = struct {
     file_path: []const u8,
     // See GbWorkerCtx.preopened (#177).
@@ -4570,6 +4682,9 @@ const ScalarAggWorkerCtx = struct {
     strict: bool,
     arena: std.heap.ArenaAllocator,
     partial_accum: CompactAccum,
+    /// Per-agg-slot shared distinct set, null for slots that are not
+    /// COUNT(DISTINCT). Non-empty only on the parallel path.
+    shared_distinct: []const ?*ShardedDistinctSet = &.{},
     err: ?anyerror = null,
 };
 
@@ -4768,10 +4883,14 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                     .count_distinct => {
                         if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
-                                const ds_ptr = &ctx.partial_accum.distinct_sets[i];
-                                if (ds_ptr.* == null) ds_ptr.* = std.StringHashMap(void).init(aa);
-                                const gop_e = try ds_ptr.*.?.getOrPut(record[cidx]);
-                                if (!gop_e.found_existing) gop_e.key_ptr.* = try aa.dupe(u8, record[cidx]);
+                                if (i < ctx.shared_distinct.len and ctx.shared_distinct[i] != null) {
+                                    try ctx.shared_distinct[i].?.add(record[cidx]);
+                                } else {
+                                    const ds_ptr = &ctx.partial_accum.distinct_sets[i];
+                                    if (ds_ptr.* == null) ds_ptr.* = std.StringHashMap(void).init(aa);
+                                    const gop_e = try ds_ptr.*.?.getOrPut(record[cidx]);
+                                    if (!gop_e.found_existing) gop_e.key_ptr.* = try aa.dupe(u8, record[cidx]);
+                                }
                             }
                         }
                     },
