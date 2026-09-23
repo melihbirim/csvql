@@ -4330,6 +4330,10 @@ const GbWorkerCtx = struct {
     arena: std.heap.ArenaAllocator,
     /// Shared all-null slot arrays for aggregate kinds this query never uses.
     opt_slots: OptionalSlots = .{},
+    /// Groups shared across workers, used once this worker's own map crosses
+    /// shared_groups_threshold. Null keeps the worker-local behaviour.
+    shared_groups: ?*SharedGroups = null,
+    spilled_to_shared: bool = false,
     /// Set for a GROUP BY with no aggregates (what SELECT DISTINCT becomes):
     /// workers only need the key set, so they share one instead of each
     /// building a private map for the main thread to merge.
@@ -4408,50 +4412,176 @@ fn emitDistinctKeys(
     _ = opts;
 }
 
-fn gbProcessRecordCore(
-    ctx: *GbWorkerCtx,
-    aa: Allocator,
-    key_buf: *std.ArrayListUnmanaged(u8),
-    record: []const []const u8,
+/// Fold one worker's partial group into a destination map. Split out of the
+/// merge loop so the merge can run on several threads, each owning a slice of
+/// the key space and therefore its own destination map.
+fn foldPartialGroup(
+    dst: *std.StringHashMap(CompactAccum),
+    ka: Allocator,
+    key: []const u8,
+    partial: *const CompactAccum,
+    n_aggs: usize,
 ) !void {
-    // WHERE filter
-    if (ctx.where_expr) |expr| {
-        if (expr == .comparison) {
-            const comp = expr.comparison;
-            const cidx = ctx.where_col_idx orelse return;
-            if (cidx >= record.len) return;
-            const fv = record[cidx];
-            if (comp.numeric_value) |threshold| {
-                const val = parseNumericFast(fv) catch {
-                    if (ctx.strict) return error.StrictModeNonNumericValue;
-                    return;
-                };
-                const matches = switch (comp.operator) {
-                    .equal => val == threshold,
-                    .not_equal => val != threshold,
-                    .greater => val > threshold,
-                    .greater_equal => val >= threshold,
-                    .less => val < threshold,
-                    .less_equal => val <= threshold,
-                    .like => parser.matchLike(fv, comp.value),
-                    .ilike => parser.matchILike(fv, comp.value),
-                    .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
-                };
-                if (!matches) return;
-            } else {
-                if (!parser.compareValues(comp, fv)) return;
+    const gop = try dst.getOrPut(key);
+    if (!gop.found_existing) {
+        // New group: copy key + accum arrays into main arena (ka)
+        gop.key_ptr.* = try ka.dupe(u8, key);
+        var key_vals = try ka.alloc([]const u8, partial.key_values.len);
+        for (partial.key_values, 0..) |kv, ki| {
+            key_vals[ki] = try ka.dupe(u8, kv);
+        }
+        const new_ds = try ka.alloc(?std.StringHashMap(void), n_aggs);
+        for (new_ds) |*d| d.* = null;
+        for (new_ds, 0..) |*nd, i| {
+            if (partial.distinct_sets[i] != null) {
+                var new_set = std.StringHashMap(void).init(ka);
+                var partial_set = partial.distinct_sets[i].?;
+                var ds_it = partial_set.iterator();
+                while (ds_it.next()) |e| {
+                    try new_set.put(try ka.dupe(u8, e.key_ptr.*), {});
+                }
+                nd.* = new_set;
             }
-        } else {
-            if (!parser.evaluateDirect(expr, record, ctx.lower_header)) return;
+        }
+        const new_vl = try ka.alloc(?std.ArrayList(f64), n_aggs);
+        for (new_vl) |*v| v.* = null;
+        for (new_vl, 0..) |*nv, i| {
+            if (partial.value_lists[i]) |pl| {
+                var lst = std.ArrayList(f64){};
+                try lst.appendSlice(ka, pl.items);
+                nv.* = lst;
+            }
+        }
+        const new_cl = try ka.alloc(?std.ArrayList([]const u8), n_aggs);
+        for (new_cl) |*c| c.* = null;
+        for (new_cl, 0..) |*nc, i| {
+            if (partial.concat_lists[i]) |pl| {
+                var lst = std.ArrayList([]const u8){};
+                for (pl.items) |s| try lst.append(ka, try ka.dupe(u8, s));
+                nc.* = lst;
+            }
+        }
+        gop.value_ptr.* = CompactAccum{
+            .key_values = key_vals,
+            .count = partial.count,
+            .sums = try ka.dupe(f64, partial.sums),
+            .sum_sqs = try ka.dupe(f64, partial.sum_sqs),
+            .sum_counts = try ka.dupe(i64, partial.sum_counts),
+            .mins = try ka.dupe(f64, partial.mins),
+            .maxs = try ka.dupe(f64, partial.maxs),
+            .distinct_sets = new_ds,
+            .value_lists = new_vl,
+            .concat_lists = new_cl,
+        };
+    } else {
+        // Existing group: fold arithmetic values
+        const accum = gop.value_ptr;
+        accum.count += partial.count;
+        for (0..n_aggs) |i| {
+            accum.sums[i] += partial.sums[i];
+            accum.sum_sqs[i] += partial.sum_sqs[i];
+            accum.sum_counts[i] += partial.sum_counts[i];
+            if (partial.mins[i] < accum.mins[i]) accum.mins[i] = partial.mins[i];
+            if (partial.maxs[i] > accum.maxs[i]) accum.maxs[i] = partial.maxs[i];
+            // Union distinct sets for COUNT(DISTINCT)
+            if (partial.distinct_sets[i] != null) {
+                if (accum.distinct_sets[i] == null)
+                    accum.distinct_sets[i] = std.StringHashMap(void).init(ka);
+                var partial_set = partial.distinct_sets[i].?;
+                var ds_it = partial_set.iterator();
+                while (ds_it.next()) |e| {
+                    const gop_e = try accum.distinct_sets[i].?.getOrPut(e.key_ptr.*);
+                    if (!gop_e.found_existing)
+                        gop_e.key_ptr.* = try ka.dupe(u8, e.key_ptr.*);
+                }
+            }
+            if (partial.value_lists[i]) |pl| {
+                if (accum.value_lists[i] == null) accum.value_lists[i] = std.ArrayList(f64){};
+                try accum.value_lists[i].?.appendSlice(ka, pl.items);
+            }
+            if (partial.concat_lists[i]) |pl| {
+                if (accum.concat_lists[i] == null) accum.concat_lists[i] = std.ArrayList([]const u8){};
+                for (pl.items) |s| try accum.concat_lists[i].?.append(ka, try ka.dupe(u8, s));
+            }
         }
     }
+}
 
-    // Build NUL-separated group key
-    key_buf.clearRetainingCapacity();
-    for (ctx.group_specs, 0..) |spec, i| {
-        if (i > 0) try key_buf.append(aa, 0);
+/// Which merge shard owns a key. Hash, not range, so groups spread evenly no
+/// matter what the key values look like.
+fn mergeShardOf(key: []const u8, n_shards: usize) usize {
+    return @intCast(std.hash.Wyhash.hash(0, key) % @as(u64, n_shards));
+}
+
+/// Below this many groups the merge is trivial and thread spawn costs more
+/// than it saves — an 8-group GROUP BY must not pay for 12 threads.
+const parallel_merge_min_groups: usize = 100_000;
+
+const MergeShard = struct {
+    mutex: std.Thread.Mutex = .{},
+    map: std.StringHashMap(CompactAccum),
+    arena: std.heap.ArenaAllocator,
+    /// Built once per shard: groups created here cannot borrow a worker's.
+    opt_slots: OptionalSlots = .{},
+};
+
+/// Groups shared by all workers, owned shard by shard so two workers only ever
+/// contend when their keys hash together.
+///
+/// Workers start with a private map because that is free of locks and is all a
+/// low-cardinality GROUP BY ever needs. The private map is also what makes a
+/// high-cardinality one collapse: every worker sees every key, so all 12 build
+/// all 5M groups — 60M accumulator constructions for 5M results, which `sample`
+/// showed as CompactAccum.init plus getOrPut dominating the scan. Past
+/// `shared_groups_threshold` a worker stops growing its own map and switches
+/// here, so each group is built once no matter how many workers saw it.
+const SharedGroups = struct {
+    shards: []MergeShard,
+
+    fn shardFor(self: *SharedGroups, key: []const u8) *MergeShard {
+        return &self.shards[mergeShardOf(key, self.shards.len)];
+    }
+};
+
+/// A worker keeps its own map until it holds this many groups. Low-cardinality
+/// GROUP BY never reaches it and never takes a lock.
+const shared_groups_threshold: usize = 50_000;
+
+const MergeWorkerCtx = struct {
+    shard_idx: usize,
+    n_shards: usize,
+    partials: []const *std.StringHashMap(CompactAccum),
+    shard: *MergeShard,
+    n_aggs: usize,
+    err: ?anyerror = null,
+};
+
+fn mergeWorkerThread(ctx: *MergeWorkerCtx) void {
+    mergeWorkerScan(ctx) catch |e| {
+        ctx.err = e;
+    };
+}
+
+fn mergeWorkerScan(ctx: *MergeWorkerCtx) !void {
+    const ka = ctx.shard.arena.allocator();
+    for (ctx.partials) |pm| {
+        var it = pm.iterator();
+        while (it.next()) |entry| {
+            if (mergeShardOf(entry.key_ptr.*, ctx.n_shards) != ctx.shard_idx) continue;
+            try foldPartialGroup(&ctx.shard.map, ka, entry.key_ptr.*, entry.value_ptr, ctx.n_aggs);
+        }
+    }
+}
+
+/// Apply one record to an existing group accumulator. Split out of
+/// gbProcessRecordCore so it can run against a worker-local group or a group
+/// in the shared map, which live in different arenas.
+/// The GROUP BY key values for a record, in group-spec order, duped into `a`.
+fn gbKeyValues(ctx: *GbWorkerCtx, a: Allocator, record: []const []const u8) ![][]const u8 {
+    const key_vals = try a.alloc([]const u8, ctx.group_specs.len);
+    for (ctx.group_specs, 0..) |spec, gi| {
         var date_buf: [64]u8 = undefined;
-        const val: []const u8 = switch (spec) {
+        const kv: []const u8 = switch (spec) {
             .column => |cidx| if (cidx < record.len) record[cidx] else "",
             .strftime => |sf| if (sf.col_idx < record.len)
                 applyStrftime(sf.fmt, record[sf.col_idx], &date_buf)
@@ -4466,43 +4596,12 @@ fn gbProcessRecordCore(
             else
                 "",
         };
-        try key_buf.appendSlice(aa, val);
+        key_vals[gi] = try a.dupe(u8, kv);
     }
+    return key_vals;
+}
 
-    // No aggregates: the key is the whole result, so there is nothing to
-    // accumulate and no per-group CompactAccum to allocate.
-    if (ctx.distinct_keys) |set| {
-        try set.add(key_buf.items);
-        return;
-    }
-
-    const gop = try ctx.partial_map.getOrPut(key_buf.items);
-    if (!gop.found_existing) {
-        gop.key_ptr.* = try aa.dupe(u8, key_buf.items);
-        var key_vals = try aa.alloc([]const u8, ctx.group_specs.len);
-        for (ctx.group_specs, 0..) |spec, gi| {
-            var date_buf_kv: [64]u8 = undefined;
-            const kv: []const u8 = switch (spec) {
-                .column => |cidx| if (cidx < record.len) record[cidx] else "",
-                .strftime => |sf| if (sf.col_idx < record.len)
-                    applyStrftime(sf.fmt, record[sf.col_idx], &date_buf_kv)
-                else
-                    "",
-                .substr => |ss| if (ss.col_idx < record.len)
-                    applySubstr(ss, record[ss.col_idx])
-                else
-                    "",
-                .round => |rg| if (rg.col_idx < record.len)
-                    applyRoundKey(rg, record[rg.col_idx], &date_buf_kv)
-                else
-                    "",
-            };
-            key_vals[gi] = try aa.dupe(u8, kv);
-        }
-        gop.value_ptr.* = try CompactAccum.init(aa, key_vals, ctx.n_aggs, ctx.opt_slots);
-    }
-    const accum = gop.value_ptr;
-
+fn gbApplyAggs(ctx: *GbWorkerCtx, aa: Allocator, accum: *CompactAccum, record: []const []const u8) !void {
     accum.count += 1;
     for (ctx.agg_specs, 0..) |spec, i| {
         switch (spec.func_type) {
@@ -4580,6 +4679,123 @@ fn gbProcessRecordCore(
             },
         }
     }
+}
+
+fn gbProcessRecordCore(
+    ctx: *GbWorkerCtx,
+    aa: Allocator,
+    key_buf: *std.ArrayListUnmanaged(u8),
+    record: []const []const u8,
+) !void {
+    // WHERE filter
+    if (ctx.where_expr) |expr| {
+        if (expr == .comparison) {
+            const comp = expr.comparison;
+            const cidx = ctx.where_col_idx orelse return;
+            if (cidx >= record.len) return;
+            const fv = record[cidx];
+            if (comp.numeric_value) |threshold| {
+                const val = parseNumericFast(fv) catch {
+                    if (ctx.strict) return error.StrictModeNonNumericValue;
+                    return;
+                };
+                const matches = switch (comp.operator) {
+                    .equal => val == threshold,
+                    .not_equal => val != threshold,
+                    .greater => val > threshold,
+                    .greater_equal => val >= threshold,
+                    .less => val < threshold,
+                    .less_equal => val <= threshold,
+                    .like => parser.matchLike(fv, comp.value),
+                    .ilike => parser.matchILike(fv, comp.value),
+                    .between, .is_null, .is_not_null => parser.compareValues(comp, fv),
+                };
+                if (!matches) return;
+            } else {
+                if (!parser.compareValues(comp, fv)) return;
+            }
+        } else {
+            if (!parser.evaluateDirect(expr, record, ctx.lower_header)) return;
+        }
+    }
+
+    // Build NUL-separated group key
+    key_buf.clearRetainingCapacity();
+    for (ctx.group_specs, 0..) |spec, i| {
+        if (i > 0) try key_buf.append(aa, 0);
+        var date_buf: [64]u8 = undefined;
+        const val: []const u8 = switch (spec) {
+            .column => |cidx| if (cidx < record.len) record[cidx] else "",
+            .strftime => |sf| if (sf.col_idx < record.len)
+                applyStrftime(sf.fmt, record[sf.col_idx], &date_buf)
+            else
+                "",
+            .substr => |ss| if (ss.col_idx < record.len)
+                applySubstr(ss, record[ss.col_idx])
+            else
+                "",
+            .round => |rg| if (rg.col_idx < record.len)
+                applyRoundKey(rg, record[rg.col_idx], &date_buf)
+            else
+                "",
+        };
+        try key_buf.appendSlice(aa, val);
+    }
+
+    // No aggregates: the key is the whole result, so there is nothing to
+    // accumulate and no per-group CompactAccum to allocate.
+    if (ctx.distinct_keys) |set| {
+        try set.add(key_buf.items);
+        return;
+    }
+
+    // Once this worker's own map is large, every further group it creates is one
+    // the other workers are creating too. Switch to the shared map so each group
+    // is built once.
+    if (ctx.shared_groups) |sg| {
+        if (!ctx.spilled_to_shared and ctx.partial_map.count() >= shared_groups_threshold)
+            ctx.spilled_to_shared = true;
+        if (ctx.spilled_to_shared) {
+            const sh = sg.shardFor(key_buf.items);
+            sh.mutex.lock();
+            defer sh.mutex.unlock();
+            const sa = sh.arena.allocator();
+            const sgop = try sh.map.getOrPut(key_buf.items);
+            if (!sgop.found_existing) {
+                sgop.key_ptr.* = try sa.dupe(u8, key_buf.items);
+                sgop.value_ptr.* = try CompactAccum.init(sa, try gbKeyValues(ctx, sa, record), ctx.n_aggs, sh.opt_slots);
+            }
+            try gbApplyAggs(ctx, sa, sgop.value_ptr, record);
+            return;
+        }
+    }
+
+    const gop = try ctx.partial_map.getOrPut(key_buf.items);
+    if (!gop.found_existing) {
+        gop.key_ptr.* = try aa.dupe(u8, key_buf.items);
+        var key_vals = try aa.alloc([]const u8, ctx.group_specs.len);
+        for (ctx.group_specs, 0..) |spec, gi| {
+            var date_buf_kv: [64]u8 = undefined;
+            const kv: []const u8 = switch (spec) {
+                .column => |cidx| if (cidx < record.len) record[cidx] else "",
+                .strftime => |sf| if (sf.col_idx < record.len)
+                    applyStrftime(sf.fmt, record[sf.col_idx], &date_buf_kv)
+                else
+                    "",
+                .substr => |ss| if (ss.col_idx < record.len)
+                    applySubstr(ss, record[ss.col_idx])
+                else
+                    "",
+                .round => |rg| if (rg.col_idx < record.len)
+                    applyRoundKey(rg, record[rg.col_idx], &date_buf_kv)
+                else
+                    "",
+            };
+            key_vals[gi] = try aa.dupe(u8, kv);
+        }
+        gop.value_ptr.* = try CompactAccum.init(aa, key_vals, ctx.n_aggs, ctx.opt_slots);
+    }
+    try gbApplyAggs(ctx, aa, gop.value_ptr, record);
 }
 
 fn gbWorkerThread(ctx: *GbWorkerCtx) void {
@@ -5624,6 +5840,17 @@ fn executeGroupBy(
 
     var group_map = std.StringHashMap(CompactAccum).init(allocator);
     defer group_map.deinit();
+
+    // Set when the merge ran sharded; the output phase then reads these instead
+    // of group_map. Keys and accumulators live in the shard arenas.
+    var merge_shards: ?[]MergeShard = null;
+    defer if (merge_shards) |shards| {
+        for (shards) |*sh| {
+            sh.map.deinit();
+            sh.arena.deinit();
+        }
+        allocator.free(shards);
+    };
     // Adaptive pre-sizing: larger files → more groups → fewer rehashes
     const initial_capacity: u32 = if (file_size < 10 * 1024 * 1024)
         128
@@ -5667,6 +5894,18 @@ fn executeGroupBy(
         // bytes a group for keys about 10 bytes long. There is nothing to
         // accumulate, so the workers share one key set and skip both the
         // per-group allocation and the serial merge.
+        // Shards the workers may spill into once their own maps get large, and
+        // the destination the leftover local maps fold into afterwards.
+        merge_shards = try allocator.alloc(MergeShard, n_threads);
+        for (merge_shards.?) |*sh| {
+            sh.* = .{
+                .map = std.StringHashMap(CompactAccum).init(allocator),
+                .arena = std.heap.ArenaAllocator.init(allocator),
+            };
+            sh.opt_slots = try OptionalSlots.forSpecs(sh.arena.allocator(), agg_specs.items, n_aggs);
+        }
+        var shared_groups = SharedGroups{ .shards = merge_shards.? };
+
         const distinct_only = n_aggs == 0 and
             query.order_by == null and
             !hasScalarSelectFunctions(query) and
@@ -5693,6 +5932,7 @@ fn executeGroupBy(
                 .strict = opts.strict,
                 .arena = std.heap.ArenaAllocator.init(allocator),
                 .distinct_keys = if (key_set) |*ks| ks else null,
+                .shared_groups = if (distinct_only) null else &shared_groups,
                 .partial_map = undefined,
                 .err = null,
             };
@@ -5711,95 +5951,16 @@ fn executeGroupBy(
             return;
         }
 
-        // Merge partial maps into the main group_map (output phase reads group_map)
+        // Fold what stayed worker-local into the shared shards. Each worker
+        // holds at most shared_groups_threshold groups, so this is bounded by
+        // n_threads * 50k however large the result is — the old merge was
+        // n_threads * every group.
         for (thread_ctxs) |*ctx| {
             defer ctx.arena.deinit();
             var it = ctx.partial_map.iterator();
             while (it.next()) |entry| {
-                const partial = entry.value_ptr;
-                const gop = try group_map.getOrPut(entry.key_ptr.*);
-                if (!gop.found_existing) {
-                    // New group: copy key + accum arrays into main arena (ka)
-                    gop.key_ptr.* = try ka.dupe(u8, entry.key_ptr.*);
-                    var key_vals = try ka.alloc([]const u8, partial.key_values.len);
-                    for (partial.key_values, 0..) |kv, ki| {
-                        key_vals[ki] = try ka.dupe(u8, kv);
-                    }
-                    const new_ds = try ka.alloc(?std.StringHashMap(void), n_aggs);
-                    for (new_ds) |*d| d.* = null;
-                    for (new_ds, 0..) |*nd, i| {
-                        if (partial.distinct_sets[i] != null) {
-                            var new_set = std.StringHashMap(void).init(ka);
-                            var partial_set = partial.distinct_sets[i].?;
-                            var ds_it = partial_set.iterator();
-                            while (ds_it.next()) |e| {
-                                try new_set.put(try ka.dupe(u8, e.key_ptr.*), {});
-                            }
-                            nd.* = new_set;
-                        }
-                    }
-                    const new_vl = try ka.alloc(?std.ArrayList(f64), n_aggs);
-                    for (new_vl) |*v| v.* = null;
-                    for (new_vl, 0..) |*nv, i| {
-                        if (partial.value_lists[i]) |pl| {
-                            var lst = std.ArrayList(f64){};
-                            try lst.appendSlice(ka, pl.items);
-                            nv.* = lst;
-                        }
-                    }
-                    const new_cl = try ka.alloc(?std.ArrayList([]const u8), n_aggs);
-                    for (new_cl) |*c| c.* = null;
-                    for (new_cl, 0..) |*nc, i| {
-                        if (partial.concat_lists[i]) |pl| {
-                            var lst = std.ArrayList([]const u8){};
-                            for (pl.items) |s| try lst.append(ka, try ka.dupe(u8, s));
-                            nc.* = lst;
-                        }
-                    }
-                    gop.value_ptr.* = CompactAccum{
-                        .key_values = key_vals,
-                        .count = partial.count,
-                        .sums = try ka.dupe(f64, partial.sums),
-                        .sum_sqs = try ka.dupe(f64, partial.sum_sqs),
-                        .sum_counts = try ka.dupe(i64, partial.sum_counts),
-                        .mins = try ka.dupe(f64, partial.mins),
-                        .maxs = try ka.dupe(f64, partial.maxs),
-                        .distinct_sets = new_ds,
-                        .value_lists = new_vl,
-                        .concat_lists = new_cl,
-                    };
-                } else {
-                    // Existing group: fold arithmetic values
-                    const accum = gop.value_ptr;
-                    accum.count += partial.count;
-                    for (0..n_aggs) |i| {
-                        accum.sums[i] += partial.sums[i];
-                        accum.sum_sqs[i] += partial.sum_sqs[i];
-                        accum.sum_counts[i] += partial.sum_counts[i];
-                        if (partial.mins[i] < accum.mins[i]) accum.mins[i] = partial.mins[i];
-                        if (partial.maxs[i] > accum.maxs[i]) accum.maxs[i] = partial.maxs[i];
-                        // Union distinct sets for COUNT(DISTINCT)
-                        if (partial.distinct_sets[i] != null) {
-                            if (accum.distinct_sets[i] == null)
-                                accum.distinct_sets[i] = std.StringHashMap(void).init(ka);
-                            var partial_set = partial.distinct_sets[i].?;
-                            var ds_it = partial_set.iterator();
-                            while (ds_it.next()) |e| {
-                                const gop_e = try accum.distinct_sets[i].?.getOrPut(e.key_ptr.*);
-                                if (!gop_e.found_existing)
-                                    gop_e.key_ptr.* = try ka.dupe(u8, e.key_ptr.*);
-                            }
-                        }
-                        if (partial.value_lists[i]) |pl| {
-                            if (accum.value_lists[i] == null) accum.value_lists[i] = std.ArrayList(f64){};
-                            try accum.value_lists[i].?.appendSlice(ka, pl.items);
-                        }
-                        if (partial.concat_lists[i]) |pl| {
-                            if (accum.concat_lists[i] == null) accum.concat_lists[i] = std.ArrayList([]const u8){};
-                            for (pl.items) |s| try accum.concat_lists[i].?.append(ka, try ka.dupe(u8, s));
-                        }
-                    }
-                }
+                const sh = shared_groups.shardFor(entry.key_ptr.*);
+                try foldPartialGroup(&sh.map, sh.arena.allocator(), entry.key_ptr.*, entry.value_ptr, n_aggs);
             }
         }
     } else {
@@ -5985,12 +6146,25 @@ fn executeGroupBy(
 
     // -- Sorted output phase -----------------------------------------------
     // Collect group keys and sort for deterministic output order.
-    var sorted_keys = try allocator.alloc([]const u8, group_map.count());
+    const total_groups = if (merge_shards) |shards| blk: {
+        var t: usize = 0;
+        for (shards) |*sh| t += sh.map.count();
+        break :blk t;
+    } else group_map.count();
+
+    var sorted_keys = try allocator.alloc([]const u8, total_groups);
     defer allocator.free(sorted_keys);
     {
-        var kit = group_map.keyIterator();
         var ki: usize = 0;
-        while (kit.next()) |k| : (ki += 1) sorted_keys[ki] = k.*;
+        if (merge_shards) |shards| {
+            for (shards) |*sh| {
+                var kit = sh.map.keyIterator();
+                while (kit.next()) |k| : (ki += 1) sorted_keys[ki] = k.*;
+            }
+        } else {
+            var kit = group_map.keyIterator();
+            while (kit.next()) |k| : (ki += 1) sorted_keys[ki] = k.*;
+        }
     }
     std.mem.sort([]const u8, sorted_keys, {}, struct {
         fn lt(_: void, a: []const u8, b: []const u8) bool {
@@ -6045,7 +6219,10 @@ fn executeGroupBy(
     var rows_skipped: i32 = 0;
     for (sorted_keys) |key| {
         if (query.order_by == null and query.limit >= 0 and rows_output >= query.limit) break;
-        const accum = group_map.getPtr(key).?;
+        const accum = if (merge_shards) |shards|
+            shards[mergeShardOf(key, shards.len)].map.getPtr(key).?
+        else
+            group_map.getPtr(key).?;
 
         // Per-row scratch arena, reset once at the top of each iteration:
         // aggregate formatting below and column/scalar formatting further
