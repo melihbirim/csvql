@@ -96,7 +96,7 @@ brew install melihbirim/csvql/csvql
 csvql <span class="k">"SELECT cab_type, COUNT(*) FROM 'trips.csv' GROUP BY cab_type"</span>
 
 <span class="c"># Wire it into Claude (Code + Desktop), no manual config</span>
-csvql install</span></pre>
+csvql install</pre>
     <p>Prebuilt binaries and one-click <code>.mcpb</code> bundles for Claude Desktop on the <a href="https://github.com/melihbirim/csvql/releases">releases page</a>. Also: <code>npm i csvql-query</code>, <code>pip install csvql-query</code>.</p>
   </div>
 </section>
