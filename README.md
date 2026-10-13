@@ -229,7 +229,7 @@ Full breakdown (LIKE, multi-table JOIN, subqueries, memory/storage, methodology)
 
 ## SQL Reference
 
-`SELECT`/`FROM`/`WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`/`OFFSET`, `JOIN`, subquery `IN`/`NOT IN`, `LIKE`/`ILIKE`/`BETWEEN`/`IS NULL`/`AND`/`OR`/`NOT`, aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`VARIANCE`/`STDDEV`/`MEDIAN`/`GROUP_CONCAT`), `CASE WHEN`, and scalar functions (`UPPER`/`LOWER`/`TRIM`/`LTRIM`/`RTRIM`/`LEFT`/`RIGHT`/`CONCAT`/`SUBSTR`/`REPLACE`/`SPLIT_PART`/`LPAD`/`RPAD`/`ROUND`/`SQRT`/`POWER`/`LN`/`LOG`/`EXP`/`TRUNC`/`CAST`/`COALESCE`/`STRFTIME`/`DATEDIFF`/`DATEADD`/and more).
+`SELECT`/`FROM`/`WHERE`/`GROUP BY`/`HAVING`/`ORDER BY`/`LIMIT`/`OFFSET`, `JOIN`, subquery `IN`/`NOT IN`, `LIKE`/`ILIKE`/`BETWEEN`/`IS NULL`/`AND`/`OR`/`NOT`, aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`VARIANCE`/`STDDEV`/`MEDIAN`/`GROUP_CONCAT`), `CASE WHEN`, and scalar functions (`UPPER`/`LOWER`/`TRIM`/`LTRIM`/`RTRIM`/`LEFT`/`RIGHT`/`CONCAT`/`SUBSTR`/`REPLACE`/`SPLIT_PART`/`LPAD`/`RPAD`/`ROUND`/`SQRT`/`POWER`/`LN`/`LOG`/`EXP`/`TRUNC`/`CAST`/`COALESCE`/`NULLIF`/`IFNULL`/`STRFTIME`/`DATEDIFF`/`DATEADD`/and more).
 
 ```bash
 csvql "SELECT department, COUNT(*), AVG(salary) FROM 'data.csv' WHERE salary > 50000 GROUP BY department HAVING COUNT(*) > 10 ORDER BY department"
@@ -290,7 +290,7 @@ The query cost is **flat** — it's the SQL plus a few result rows, independent 
 
 **Full WHERE clause support:** `=`, `!=`, `>`, `>=`, `<`, `<=`, `LIKE`, `BETWEEN`, `IN`, `IS NULL`, `IS NOT NULL`, `NOT`, `AND`, `OR`
 
-**Full SELECT support:** column projections, `AS` aliases, `DISTINCT`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`VARIANCE`/`STDDEV`/`MEDIAN`/`GROUP_CONCAT`, `GROUP BY`, `HAVING`, `ORDER BY` (by name, alias, or position), `LIMIT`, `STRFTIME()`, `DATE_PART()`, `JOIN`, `UPPER`/`LOWER`/`TRIM`/`LTRIM`/`RTRIM`/`REVERSE`/`LENGTH`/`SUBSTR`/`LEFT`/`RIGHT`/`REPLACE`/`SPLIT_PART`/`GREATEST`/`LEAST`, `ABS`/`SIGN`/`CEIL`/`FLOOR`/`MOD`/`ROUND`/`TRUNC`/`SQRT`/`POWER`/`LN`/`LOG`/`EXP`, `COALESCE`, `CAST`, `DATEDIFF`, `DATEADD`, `EXTRACT`
+**Full SELECT support:** column projections, `AS` aliases, `DISTINCT`, `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`VARIANCE`/`STDDEV`/`MEDIAN`/`GROUP_CONCAT`, `GROUP BY`, `HAVING`, `ORDER BY` (by name, alias, or position), `LIMIT`, `STRFTIME()`, `DATE_PART()`, `JOIN`, `UPPER`/`LOWER`/`TRIM`/`LTRIM`/`RTRIM`/`REVERSE`/`LENGTH`/`SUBSTR`/`LEFT`/`RIGHT`/`REPLACE`/`SPLIT_PART`/`GREATEST`/`LEAST`, `ABS`/`SIGN`/`CEIL`/`FLOOR`/`MOD`/`ROUND`/`TRUNC`/`SQRT`/`POWER`/`LN`/`LOG`/`EXP`, `COALESCE`, `NULLIF`/`IFNULL`, `CAST`, `DATEDIFF`, `DATEADD`, `EXTRACT`
 
 ### Setup
 
@@ -401,6 +401,7 @@ Full API, options (delimiter/comment/skip-empty-lines), memory comparisons again
 | `SQRT`, `POWER`, `LN`, `LOG`, `EXP`, `TRUNC` in SELECT | [#157](https://github.com/melihbirim/csvql/issues/157) | ✅ shipped |
 | `ROUND(col)` / `ROUND(col, n)` in SELECT |                                               | ✅ shipped          |
 | `COALESCE` in SELECT                |                                                      | ✅ shipped          |
+| `NULLIF`, `IFNULL` in SELECT | [#204](https://github.com/melihbirim/csvql/issues/204) | ✅ shipped |
 | `CAST` in SELECT                    |                                                      | ✅ shipped          |
 | `DATE_PART()`, `DATEDIFF`, `DATEADD`, `EXTRACT` |                                          | ✅ shipped          |
 | `JOIN` (inner, hash join)           |                                                      | ✅ shipped          |

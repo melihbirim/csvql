@@ -50,6 +50,7 @@ Full syntax reference and runnable examples for every SQL feature csvql supports
 | **SQRT / POWER / LN / LOG / EXP / TRUNC** | `SELECT SQRT(col)`, `POWER(col, n)` (alias `POW`), `LN(col)`, `LOG(col)` (base 10), `LOG(base, col)`, `EXP(col)`, `TRUNC(col)` (toward zero, so `TRUNC(-2.7)` is `-2.0`). `n` and `base` are numeric literals. Results are doubles and print with a decimal point, like `CEIL`/`FLOOR`. A result that is not a finite number (`SQRT` of a negative, `LN`/`LOG` of zero or a negative, an overflowing `EXP`/`POWER`) is NULL and written as an empty field, where DuckDB raises an error. An empty field stays empty and non-numeric text is returned unchanged. A `LOG` base that is not positive or is `1` is a query error. `LOG(base, col)` for a base other than 2 or 10 is computed as a ratio of logarithms, so an answer that is mathematically a whole number can come back a last-bit off and can differ from other engines: `LOG(3, 243)` is `4.999999999999999` here against DuckDB's `5.0`, and `LOG(6, 216)` is `3.0000000000000004` against DuckDB's `2.9999999999999996`. Neither is more correct; there is no ratio of logarithms that is exact for every base. Wrap in `ROUND` if you need a stable result |
 | **ROUND**     | `SELECT ROUND(col)` — round to integer; `ROUND(col, n)` — round to `n` decimal places |
 | **COALESCE**  | `SELECT COALESCE(col, 'default')` — replace empty/null with fallback    |
+| **NULLIF / IFNULL** | `SELECT NULLIF(col, -1)`, `NULLIF(col, 'N/A')`, `IFNULL(col, 0)`. `NULLIF` turns a sentinel into NULL (an empty field) when the field equals the literal. A bare number compares as a number, so `NULLIF(age, 30)` also matches `30.0` and ` 30 `; a quoted literal compares byte for byte, so `NULLIF(code, '30')` does not match `30.0`. Anything else passes through unchanged, including an empty field. `IFNULL(col, fallback)` is `COALESCE` with exactly two arguments: the first must be a column, the second a column or a literal. A wrong argument count, or an unquoted non-numeric second argument to `NULLIF`, is a query error. These work in the SELECT list; like every scalar function they cannot yet be wrapped in an aggregate such as `AVG(NULLIF(col, -1))` |
 | **CAST**      | `SELECT CAST(col AS INTEGER/FLOAT/TEXT)` — type conversion              |
 | **DATEDIFF**  | `DATEDIFF('unit', start_col, end_col)` — duration between two datetime columns. Units: `second`, `minute`, `hour`, `day`, `week`, `month` (≈30 days), `year` (≈365 days). Auto-detects ISO-8601, US (MM/DD/YYYY), EU (DD.MM.YYYY) and mixed formats in the same file |
 | **DATEADD**   | `DATEADD('unit', amount, date_col)` — add/subtract interval from a datetime column. `amount` may be negative. Units: `second`, `minute`, `hour`, `day`, `week`, `month` (≈30 days), `year` (≈365 days). Returns `YYYY-MM-DD HH:MM:SS` |
@@ -124,6 +125,9 @@ csvql "SELECT name, ROUND(price) AS rounded, ROUND(price, 2) AS price_2dp FROM '
 # COALESCE — replace empty values with a fallback
 csvql "SELECT name, COALESCE(email, 'unknown') FROM 'data.csv'"
 csvql "SELECT COALESCE(phone, COALESCE(email, 'no contact')) FROM 'contacts.csv'"
+
+# NULLIF turns a sentinel into NULL; IFNULL is COALESCE with two arguments
+csvql "SELECT name, NULLIF(age, -1) AS age, IFNULL(email, 'unknown') AS email FROM 'data.csv'"
 
 # CAST — explicit type conversion
 csvql "SELECT name, CAST(price AS INTEGER), CAST(id AS TEXT) FROM 'products.csv'"

@@ -3,7 +3,8 @@
 /// Supports: UPPER, LOWER, TRIM, REVERSE, LENGTH, SUBSTR/SUBSTRING,
 ///           ABS, SIGN, CEIL, FLOOR, MOD, COALESCE, CAST(col AS type), REPLACE,
 ///           SPLIT_PART, GREATEST, LEAST, LPAD, RPAD, SQRT, POWER/POW, LN, LOG,
-///           EXP, TRUNC, LTRIM, RTRIM, LEFT, RIGHT
+///           EXP, TRUNC, NULLIF, IFNULL,
+///           LTRIM, RTRIM, LEFT, RIGHT
 ///
 /// Usage:
 ///   1. Call tryParseScalar(expr, column_map, allocator) at query setup time to
@@ -39,7 +40,8 @@ pub const ScalarSpec = union(enum) {
     floor: usize, // FLOOR(col)
     mod_op: ModArgs, // MOD(col, divisor)
     math: MathArgs, // SQRT, POWER/POW, LN, LOG, EXP, TRUNC
-    coalesce: CoalesceArgs, // COALESCE(col, fallback_literal)
+    coalesce: CoalesceArgs, // COALESCE(col, fallback_literal); IFNULL is the two-argument form
+    nullif: NullifArgs, // NULLIF(col, literal) — empty when the field equals the literal
     cast_int: usize, // CAST(col AS INTEGER/BIGINT)
     cast_float: usize, // CAST(col AS FLOAT/REAL/NUMERIC/DECIMAL)
     cast_text: usize, // CAST(col AS TEXT/VARCHAR/CHAR/STRING) — identity
@@ -117,6 +119,15 @@ pub const ScalarSpec = union(enum) {
                 .trunc => @trunc(x),
             };
         }
+    };
+
+    pub const NullifArgs = struct {
+        col_idx: usize,
+        /// A quoted literal, without the quotes: compared byte for byte.
+        literal: []const u8,
+        /// Set for a bare numeric literal: the field is compared as a number
+        /// instead, so `NULLIF(age, 30)` also matches `30.0`.
+        numeric: ?f64,
     };
 
     /// Inline fixed-size buffer — no heap allocation. Supports up to 8 column args.
@@ -225,6 +236,7 @@ pub const ScalarSpec = union(enum) {
             .mod_op => |a| a.col_idx,
             .math => |a| a.col_idx,
             .coalesce => |a| a.cols()[0],
+            .nullif => |a| a.col_idx,
             .datediff => |a| a.start_col, // return first column
             .dateadd => |a| a.date_col,
             .extract => |a| a.date_col,
@@ -645,6 +657,44 @@ pub fn tryParseScalar(
         return .{ .coalesce = args };
     }
 
+    // ── IFNULL(col, fallback) — COALESCE with exactly two arguments ────────
+    if (std.mem.eql(u8, fn_lower, "ifnull")) {
+        const parts = try splitTwoArgs(args_str);
+        var args = ScalarSpec.CoalesceArgs{ .cols_len = 1, .fallback = "" };
+        // COALESCE tries its columns before the fallback whatever their order
+        // in the call, so a literal first argument would silently change the
+        // result. Require the column first.
+        args.cols_buf[0] = try resolveCol(parts[0], column_map, allocator) orelse
+            return error.ColumnNotFound;
+        const second = parts[1];
+        if (isQuoted(second)) {
+            args.fallback = second[1 .. second.len - 1];
+        } else if (std.fmt.parseFloat(f64, second)) |_| {
+            args.fallback = second;
+        } else |_| {
+            args.cols_buf[1] = try resolveCol(second, column_map, allocator) orelse
+                return error.ColumnNotFound;
+            args.cols_len = 2;
+        }
+        return .{ .coalesce = args };
+    }
+
+    // ── NULLIF(col, literal) ───────────────────────────────────────────────
+    if (std.mem.eql(u8, fn_lower, "nullif")) {
+        const parts = try splitTwoArgs(args_str);
+        const cidx = try resolveCol(parts[0], column_map, allocator) orelse
+            return error.ColumnNotFound;
+        const lit = parts[1];
+        if (isQuoted(lit)) {
+            return .{ .nullif = .{ .col_idx = cidx, .literal = lit[1 .. lit.len - 1], .numeric = null } };
+        }
+        // An unquoted token must be a finite number; anything else is more
+        // likely a mistyped column or a forgotten quote than a literal.
+        const n = std.fmt.parseFloat(f64, lit) catch return error.InvalidQuery;
+        if (!std.math.isFinite(n)) return error.InvalidQuery;
+        return .{ .nullif = .{ .col_idx = cidx, .literal = lit, .numeric = n } };
+    }
+
     // ── CAST ───────────────────────────────────────────────────────────────
     if (std.mem.eql(u8, fn_lower, "cast")) {
         // Expect: col AS type
@@ -1043,6 +1093,14 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
             }
             return args.fallback;
         },
+        .nullif => |args| {
+            const v = field(record, args.col_idx);
+            if (args.numeric) |want| {
+                const n = std.fmt.parseFloat(f64, std.mem.trim(u8, v, &std.ascii.whitespace)) catch return v;
+                return if (n == want) "" else v;
+            }
+            return if (std.mem.eql(u8, v, args.literal)) "" else v;
+        },
         .cast_int => |cidx| {
             const v = field(record, cidx);
             const n = std.fmt.parseFloat(f64, v) catch return v;
@@ -1304,6 +1362,31 @@ inline fn field(record: []const []const u8, idx: usize) []const u8 {
     return if (idx < record.len) record[idx] else "";
 }
 
+fn isQuoted(s: []const u8) bool {
+    return s.len >= 2 and s[0] == '\'' and s[s.len - 1] == '\'';
+}
+
+/// Split a two-argument call's argument list at its one top-level comma. A
+/// comma inside a quoted literal does not count. Any other argument count, or
+/// an empty argument, is a malformed query.
+fn splitTwoArgs(args_str: []const u8) error{InvalidQuery}![2][]const u8 {
+    var comma: ?usize = null;
+    var in_quote = false;
+    for (args_str, 0..) |c, i| {
+        if (c == '\'') {
+            in_quote = !in_quote;
+        } else if (c == ',' and !in_quote) {
+            if (comma != null) return error.InvalidQuery;
+            comma = i;
+        }
+    }
+    const at = comma orelse return error.InvalidQuery;
+    const a = std.mem.trim(u8, args_str[0..at], &std.ascii.whitespace);
+    const b = std.mem.trim(u8, args_str[at + 1 ..], &std.ascii.whitespace);
+    if (a.len == 0 or b.len == 0) return error.InvalidQuery;
+    return .{ a, b };
+}
+
 /// Resolve a column name string to its CSV field index.
 /// Returns null when `col_str` is not a plain column name (e.g. contains parens).
 fn resolveCol(col_str: []const u8, column_map: std.StringHashMap(usize), allocator: Allocator) !?usize {
@@ -1449,6 +1532,109 @@ test "COALESCE: whitespace-only field is treated as empty" {
     var fba = std.heap.FixedBufferAllocator.init(&buf);
 
     try std.testing.expectEqualStrings("default", eval(spec, &.{"   "}, fba.allocator()));
+}
+
+test "NULLIF: numeric literal compares as a number" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var column_map = std.StringHashMap(usize).init(allocator);
+    try column_map.put("age", 0);
+
+    const spec = (try tryParseScalar("NULLIF(age, -1)", column_map, allocator)).?;
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+
+    try std.testing.expectEqualStrings("", eval(spec, &.{"-1"}, a));
+    try std.testing.expectEqualStrings("", eval(spec, &.{"-1.0"}, a));
+    try std.testing.expectEqualStrings("", eval(spec, &.{" -1 "}, a));
+    try std.testing.expectEqualStrings("30", eval(spec, &.{"30"}, a));
+    try std.testing.expectEqualStrings("", eval(spec, &.{""}, a));
+    // Not a number: nothing to compare, the field passes through.
+    try std.testing.expectEqualStrings("n/a", eval(spec, &.{"n/a"}, a));
+}
+
+test "NULLIF: quoted literal compares byte for byte" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var column_map = std.StringHashMap(usize).init(allocator);
+    try column_map.put("name", 0);
+
+    const spec = (try tryParseScalar("NULLIF(name, 'N/A, unknown')", column_map, allocator)).?;
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const a = fba.allocator();
+
+    try std.testing.expectEqualStrings("", eval(spec, &.{"N/A, unknown"}, a));
+    try std.testing.expectEqualStrings("n/a, unknown", eval(spec, &.{"n/a, unknown"}, a));
+    try std.testing.expectEqualStrings("Alice", eval(spec, &.{"Alice"}, a));
+
+    // A quoted number is a string: "30" does not match "30.0".
+    const quoted = (try tryParseScalar("NULLIF(name, '30')", column_map, allocator)).?;
+    try std.testing.expectEqualStrings("", eval(quoted, &.{"30"}, a));
+    try std.testing.expectEqualStrings("30.0", eval(quoted, &.{"30.0"}, a));
+}
+
+test "NULLIF: rejects a wrong argument count and a non-literal second argument" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var column_map = std.StringHashMap(usize).init(allocator);
+    try column_map.put("age", 0);
+
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("NULLIF(age)", column_map, allocator));
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("NULLIF(age, 1, 2)", column_map, allocator));
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("NULLIF(age, )", column_map, allocator));
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("NULLIF(age, nan)", column_map, allocator));
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("NULLIF(age, unquoted)", column_map, allocator));
+    try std.testing.expectError(error.ColumnNotFound, tryParseScalar("NULLIF(nope, 1)", column_map, allocator));
+}
+
+test "IFNULL: literal and column fallbacks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var column_map = std.StringHashMap(usize).init(allocator);
+    try column_map.put("a", 0);
+    try column_map.put("b", 1);
+
+    var buf: [64]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const alloc = fba.allocator();
+
+    const lit = (try tryParseScalar("IFNULL(a, 'x, y')", column_map, allocator)).?;
+    try std.testing.expectEqualStrings("x, y", eval(lit, &.{ "", "B" }, alloc));
+    try std.testing.expectEqualStrings("x, y", eval(lit, &.{ "  ", "B" }, alloc));
+    try std.testing.expectEqualStrings("A", eval(lit, &.{ "A", "B" }, alloc));
+
+    const num = (try tryParseScalar("IFNULL(a, 0)", column_map, allocator)).?;
+    try std.testing.expectEqualStrings("0", eval(num, &.{ "", "B" }, alloc));
+
+    const col = (try tryParseScalar("IFNULL(a, b)", column_map, allocator)).?;
+    try std.testing.expectEqualStrings("B", eval(col, &.{ "", "B" }, alloc));
+    try std.testing.expectEqualStrings("A", eval(col, &.{ "A", "B" }, alloc));
+    try std.testing.expectEqualStrings("", eval(col, &.{ "", "" }, alloc));
+}
+
+test "IFNULL: needs exactly two arguments with a column first" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var column_map = std.StringHashMap(usize).init(allocator);
+    try column_map.put("a", 0);
+    try column_map.put("b", 1);
+
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("IFNULL(a)", column_map, allocator));
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("IFNULL(a, b, 'x')", column_map, allocator));
+    try std.testing.expectError(error.ColumnNotFound, tryParseScalar("IFNULL('x', a)", column_map, allocator));
+    try std.testing.expectError(error.ColumnNotFound, tryParseScalar("IFNULL(a, nope)", column_map, allocator));
 }
 
 test "COALESCE: returns error.TooManyArgs for more than 8 column args" {
