@@ -638,6 +638,51 @@ check_approx \
   "SELECT id, CAST(salary AS FLOAT) FROM read_csv_auto('$CSV') WHERE id <= 20 ORDER BY id" \
   "1"
 
+# -- #203 / #204 / #202: LTRIM/RTRIM/LEFT/RIGHT, REPEAT/POSITION/INSTR,
+#    NULLIF/IFNULL, CURRENT_DATE/NOW. DuckDB prints a NULL VARCHAR as the
+#    text NULL in -csv mode while csvql writes an empty field, so the
+#    reference side wraps NULLIF in COALESCE(..., ''). DuckDB also quotes
+#    non-ASCII fields on output, so the trim fixture is ASCII only.
+PADDED="$TMP/padded.csv"
+cat > "$PADDED" <<'EOF'
+id,code,label
+1,  a-x  ,alpha
+2,b-y,beta
+3,  c,gamma
+4,d-z-w,
+5,e,delta
+EOF
+
+check \
+  "LTRIM/RTRIM trim one side only (#203)" \
+  "SELECT id, LTRIM(code), RTRIM(code) FROM '$PADDED' ORDER BY id" \
+  "SELECT id, LTRIM(code), RTRIM(code) FROM read_csv_auto('$PADDED') ORDER BY id"
+
+check \
+  "LEFT/RIGHT: positive, negative, zero and over-length counts (#203)" \
+  "SELECT id, LEFT(name, 2), RIGHT(city, 3), LEFT(name, -1), RIGHT(name, -2), LEFT(name, 10), RIGHT(name, 0) FROM '$CSV' WHERE id <= 20 ORDER BY id" \
+  "SELECT id, LEFT(name, 2), RIGHT(city, 3), LEFT(name, -1), RIGHT(name, -2), LEFT(name, 10), RIGHT(name, 0) FROM read_csv_auto('$CSV') WHERE id <= 20 ORDER BY id"
+
+check \
+  "LEFT/RIGHT in a GROUP BY SELECT list (group-key eval path) (#203)" \
+  "SELECT department, LEFT(department, 3), RIGHT(department, 2), COUNT(*) FROM '$CSV' GROUP BY department ORDER BY department" \
+  "SELECT department, LEFT(department, 3), RIGHT(department, 2), COUNT(*) FROM read_csv_auto('$CSV') GROUP BY department ORDER BY department"
+
+check \
+  "REPEAT/INSTR/POSITION on ASCII text (#203)" \
+  "SELECT id, REPEAT(name, 2), REPEAT(name, 0), INSTR(name, 'a'), POSITION('e' IN city) FROM '$CSV' WHERE id <= 20 ORDER BY id" \
+  "SELECT id, REPEAT(name, 2), REPEAT(name, 0), INSTR(name, 'a'), POSITION('e' IN city) FROM read_csv_auto('$CSV') WHERE id <= 20 ORDER BY id"
+
+check \
+  "NULLIF with a numeric and a quoted literal (#204)" \
+  "SELECT id, NULLIF(age, 30), NULLIF(department, 'HR') FROM '$CSV' WHERE id <= 20 ORDER BY id" \
+  "SELECT id, COALESCE(CAST(NULLIF(age, 30) AS VARCHAR), ''), COALESCE(NULLIF(department, 'HR'), '') FROM read_csv_auto('$CSV') WHERE id <= 20 ORDER BY id"
+
+check \
+  "IFNULL on an empty field (#204)" \
+  "SELECT id, IFNULL(label, 'none') FROM '$PADDED' ORDER BY id" \
+  "SELECT id, IFNULL(label, 'none') FROM read_csv_auto('$PADDED') ORDER BY id"
+
 # ════════════════════════════════════════════════════════════════
 echo ""
 echo "── Date/Time Functions ─────────────────────────────────────"
@@ -652,6 +697,25 @@ id,event,started_at,ended_at
 5,review,2024-07-04 10:00:00,2024-07-04 11:30:00
 6,maintenance,2024-08-01 00:00:00,2024-08-03 00:00:00
 EOF
+
+# -- #202: CURRENT_DATE / NOW(). CSVQL_NOW pins csvql's clock so the
+#    reference can use literals; the last check reads the real clock and
+#    compares against the shell's UTC date (same second, so no midnight race
+#    in practice).
+CSVQL_NOW="2024-06-01 12:34:56" check \
+  "CURRENT_DATE and NOW() in the SELECT list, pinned via CSVQL_NOW (#202)" \
+  "SELECT id, CURRENT_DATE, NOW(), CURRENT_TIMESTAMP FROM '$DATES' WHERE id = 1" \
+  "SELECT id, DATE '2024-06-01', TIMESTAMP '2024-06-01 12:34:56', TIMESTAMP '2024-06-01 12:34:56' FROM read_csv_auto('$DATES') WHERE id = 1"
+
+CSVQL_NOW="2024-06-01 12:34:56" check \
+  "WHERE timestamp >= CURRENT_DATE, pinned via CSVQL_NOW (#202)" \
+  "SELECT id, event FROM '$DATES' WHERE started_at >= CURRENT_DATE ORDER BY id" \
+  "SELECT id, event FROM read_csv_auto('$DATES') WHERE started_at >= DATE '2024-06-01' ORDER BY id"
+
+check \
+  "CURRENT_DATE reads the real clock in UTC (#202)" \
+  "SELECT id, CURRENT_DATE FROM '$DATES' WHERE id = 1" \
+  "SELECT 1, '$(date -u +%F)'"
 
 check \
   "DATEDIFF('day', started_at, ended_at) — exact-day data avoids the fractional-vs-truncated difference (see README Known differences)" \

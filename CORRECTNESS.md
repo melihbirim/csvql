@@ -17,10 +17,12 @@ Run it yourself: `zig build verify -Doptimize=ReleaseFast` (or directly:
   `AND`/`OR`/`NOT`), GROUP BY + all aggregate functions
   (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `VARIANCE`, `STDDEV`, `MEDIAN`, `GROUP_CONCAT`,
   `COUNT(DISTINCT)`), HAVING, DISTINCT, ORDER BY (single/multi-column, positional, alias),
-  LIMIT, every scalar function (`UPPER`/`LOWER`/`TRIM`/`LENGTH`/`SUBSTR`/`REPLACE`/
-  `SPLIT_PART`/`GREATEST`/`LEAST`/`ABS`/`CEIL`/`FLOOR`/`MOD`/`ROUND`/`COALESCE`/`CAST`,
-  one level of nesting), date/time functions (`DATEDIFF`, `DATEADD`, `STRFTIME`,
-  `DATE_PART`, including mixed ISO/US/EU date formats in a single column), JOIN
+  LIMIT, every scalar function (`UPPER`/`LOWER`/`TRIM`/`LTRIM`/`RTRIM`/`LENGTH`/
+  `SUBSTR`/`LEFT`/`RIGHT`/`REPEAT`/`INSTR`/`POSITION`/`REPLACE`/`SPLIT_PART`/
+  `GREATEST`/`LEAST`/`ABS`/`CEIL`/`FLOOR`/`MOD`/`ROUND`/`COALESCE`/`NULLIF`/`IFNULL`/
+  `CAST`, one level of nesting), date/time functions (`DATEDIFF`, `DATEADD`, `STRFTIME`,
+  `DATE_PART`, `CURRENT_DATE`/`NOW()` pinned through `CSVQL_NOW`, including mixed
+  ISO/US/EU date formats in a single column), JOIN
   (including a 3-table chain and a 50K-row hash probe), table aliases, and a wide
   adversarial CSV fixture set: embedded commas/newlines/quotes, escaped `""`, CRLF line
   endings, a UTF-8 BOM, emoji/RTL/combining-mark unicode (matched via `LIKE`, not
