@@ -2947,7 +2947,8 @@ fn evalScalarOnSingleValue(spec: scalar.ScalarSpec, value: []const u8, arena: Al
         .cast_float => |*ci| ci.* = 0,
         .cast_text => |*ci| ci.* = 0,
         .substr => |*a| a.col_idx = 0,
-        .left, .right => |*a| a.col_idx = 0,
+        .left, .right, .repeat => |*a| a.col_idx = 0,
+        .position => |*a| a.col_idx = 0,
         .lpad, .rpad => |*a| a.col_idx = 0,
         .mod_op => |*a| a.col_idx = 0,
         .math => |*a| a.col_idx = 0,
@@ -10361,4 +10362,60 @@ test "bare CURRENT_DATE routes to the scalar path" {
     var q = try parser.parseAt(std.testing.allocator, "SELECT id, CURRENT_DATE FROM 'f.csv'", 0);
     defer q.deinit();
     try std.testing.expect(hasScalarSelectFunctions(q));
+}
+
+test "REPEAT, POSITION and INSTR: SELECT list, nesting and GROUP BY" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const f = try tmp.dir.createFile("rp.csv", .{});
+        defer f.close();
+        try f.writeAll("v\nab-cd\nab-cd\n\nh\xc3\xa9llo\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("rp.csv", &pb);
+
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT REPEAT(v, 2) AS r, POSITION('-' IN v) AS p, INSTR(v, 'l') AS i, UPPER(REPEAT(v, 0)) AS z FROM '{s}'",
+        .{p},
+    );
+    defer allocator.free(sql);
+    var q = try parser.parse(allocator, sql);
+    defer q.deinit();
+    const out = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out.close();
+    try execute(allocator, q, out, .{});
+    try out.seekTo(0);
+    const data = try out.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(data);
+    try std.testing.expectEqualStrings(
+        "r,p,i,z\n" ++
+            "ab-cdab-cd,3,0,\n" ++
+            "ab-cdab-cd,3,0,\n" ++
+            ",,,\n" ++
+            "h\xc3\xa9llohéllo,0,4,\n",
+        data,
+    );
+
+    const gsql = try std.fmt.allocPrint(
+        allocator,
+        "SELECT REPEAT(v, 2), INSTR(v, '-'), COUNT(*) FROM '{s}' WHERE v != '' GROUP BY v ORDER BY v",
+        .{p},
+    );
+    defer allocator.free(gsql);
+    var gq = try parser.parse(allocator, gsql);
+    defer gq.deinit();
+    const gout = try tmp.dir.createFile("gout.csv", .{ .read = true });
+    defer gout.close();
+    try execute(allocator, gq, gout, .{});
+    try gout.seekTo(0);
+    const gdata = try gout.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(gdata);
+    try std.testing.expectEqualStrings(
+        "\"REPEAT(v, 2)\",\"INSTR(v, '-')\",COUNT(*)\nab-cdab-cd,3,2\nh\xc3\xa9llohéllo,0,1\n",
+        gdata,
+    );
 }

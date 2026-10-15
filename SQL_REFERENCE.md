@@ -40,6 +40,8 @@ Full syntax reference and runnable examples for every SQL feature csvql supports
 | **CONCAT**    | `SELECT CONCAT(col1, '-', col2, ...)` — concatenate columns and/or string literals |
 | **LTRIM / RTRIM** | `SELECT LTRIM(col)`, `RTRIM(col)` — trim ASCII whitespace from the left or right side only (`TRIM` does both); nestable as the inner call, e.g. `UPPER(LTRIM(col))` |
 | **LEFT / RIGHT** | `SELECT LEFT(col, n)`, `RIGHT(col, n)` — the first or last `n` bytes. A negative `n` drops that many bytes from the other end (`LEFT('abcdef', -2)` is `abcd`, `RIGHT('abcdef', -2)` is `cdef`). `n` larger than the value returns the whole value; `0` returns an empty field. `n` is an integer literal. Counts are bytes, like `LENGTH` and `SUBSTR`, but a cut never lands inside a multi-byte character, so the result is always valid UTF-8 and can be shorter than `n`. An empty field stays empty |
+| **REPEAT** | `SELECT REPEAT(col, n)` — `col` repeated `n` times. `n` is an integer literal. `n` of `0` or less returns an empty field. A result longer than 1 MiB (1,048,576 bytes) is also an empty field, so a typo cannot allocate gigabytes; DuckDB would build it. An empty field stays empty |
+| **POSITION / INSTR** | `SELECT POSITION('sub' IN col)`, `INSTR(col, 'sub')` — the 1-based index of the first occurrence of the quoted literal `sub` in `col`, or `0` when it is absent, so a value from either can feed `SUBSTR`. Matching is case-sensitive and the index counts bytes, like `LENGTH` and `SUBSTR`, so it is larger than the character index after a multi-byte character. An empty `sub` gives `1`. An empty field stays empty. `sub` must be a quoted literal, not a column |
 | **SUBSTR**    | `SELECT SUBSTR(col, start, len)` — substring (1-based, `len` optional)  |
 | **REPLACE**   | `SELECT REPLACE(col, 'from', 'to')` — replace all occurrences of a substring |
 | **SPLIT_PART**| `SELECT SPLIT_PART(col, 'delim', n)` — n-th field (1-based) after splitting on delim |
@@ -66,6 +68,7 @@ Two intentional differences, found via differential testing against DuckDB (see 
 | -------- | ----- | ------ |
 | `LENGTH(col)` on a unicode string | Byte length (UTF-8 bytes) | Character count (codepoints) |
 | `LEFT(col, n)` / `RIGHT(col, n)` on a unicode string | `n` counts bytes; a character that would be split is dropped | `n` counts codepoints |
+| `POSITION` / `INSTR` after a unicode character | The index counts bytes | The index counts codepoints |
 | Empty CSV field | Stays an empty string | Inferred as `NULL` |
 | `DATEDIFF('hour'/'minute'/etc, a, b)` on a non-exact interval | Fractional (e.g. `8.5` hours) | Truncated to whole units (e.g. `8`) |
 
@@ -116,6 +119,7 @@ Scalar functions transform column values row-by-row in `SELECT`. They can also b
 csvql "SELECT UPPER(name), LOWER(city), TRIM(notes) FROM 'data.csv'"
 csvql "SELECT name, LENGTH(name), SUBSTR(name, 1, 3) FROM 'data.csv'"
 csvql "SELECT LTRIM(name), RTRIM(name), LEFT(code, 2), RIGHT(file, 4) FROM 'data.csv'"
+csvql "SELECT REPEAT(code, 3), POSITION('@' IN email), INSTR(email, '.') FROM 'data.csv'"
 
 # Numeric functions
 csvql "SELECT name, ABS(balance), SIGN(balance), CEIL(score), FLOOR(score) FROM 'data.csv'"

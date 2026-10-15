@@ -4,7 +4,8 @@
 ///           ABS, SIGN, CEIL, FLOOR, MOD, COALESCE, CAST(col AS type), REPLACE,
 ///           SPLIT_PART, GREATEST, LEAST, LPAD, RPAD, SQRT, POWER/POW, LN, LOG,
 ///           EXP, TRUNC, NULLIF, IFNULL,
-///           LTRIM, RTRIM, LEFT, RIGHT, CURRENT_DATE, NOW, CURRENT_TIMESTAMP
+///           LTRIM, RTRIM, LEFT, RIGHT, REPEAT, POSITION, INSTR,
+///           CURRENT_DATE, NOW, CURRENT_TIMESTAMP
 ///
 /// Usage:
 ///   1. Call tryParseScalar(expr, column_map, allocator) at query setup time to
@@ -32,6 +33,8 @@ pub const ScalarSpec = union(enum) {
     rtrim: usize, // RTRIM(col) — trim whitespace on the right only
     left: CountArgs, // LEFT(col, n) — first n bytes; negative n drops the last |n|
     right: CountArgs, // RIGHT(col, n) — last n bytes; negative n drops the first |n|
+    repeat: CountArgs, // REPEAT(col, n) — n copies; n <= 0, or a result over max_repeat_bytes, is empty
+    position: PositionArgs, // POSITION('sub' IN col) / INSTR(col, 'sub') — 1-based byte index, 0 when absent
     lpad: PadArgs, // LPAD(col, len[, pad]) — pad on the left, default pad is a space
     rpad: PadArgs, // RPAD(col, len[, pad]) — pad on the right, default pad is a space
     abs: usize, // ABS(col)
@@ -81,6 +84,11 @@ pub const ScalarSpec = union(enum) {
     pub const CountArgs = struct {
         col_idx: usize,
         n: i64,
+    };
+
+    pub const PositionArgs = struct {
+        col_idx: usize,
+        needle: []const u8, // slice into the query expr, without the quotes
     };
 
     pub const PadArgs = struct {
@@ -232,7 +240,8 @@ pub const ScalarSpec = union(enum) {
         return switch (self) {
             .upper, .lower, .trim, .ltrim, .rtrim, .reverse, .length, .abs, .sign, .ceil, .floor, .cast_int, .cast_float, .cast_text => |i| i,
             .substr => |a| a.col_idx,
-            .left, .right => |a| a.col_idx,
+            .left, .right, .repeat => |a| a.col_idx,
+            .position => |a| a.col_idx,
             .lpad, .rpad => |a| a.col_idx,
             .mod_op => |a| a.col_idx,
             .math => |a| a.col_idx,
@@ -444,6 +453,34 @@ pub fn tryParseScalarAt(
             return error.ColumnNotFound;
         if (std.mem.eql(u8, fn_lower, "left")) return .{ .left = .{ .col_idx = cidx, .n = n } };
         return .{ .right = .{ .col_idx = cidx, .n = n } };
+    }
+
+    // ── REPEAT(col, n) ─────────────────────────────────────────────────────
+    if (std.mem.eql(u8, fn_lower, "repeat")) {
+        const parts = try splitTwoArgs(args_str);
+        const n = std.fmt.parseInt(i64, parts[1], 10) catch return error.InvalidQuery;
+        const cidx = try resolveCol(parts[0], column_map, allocator) orelse
+            return error.ColumnNotFound;
+        return .{ .repeat = .{ .col_idx = cidx, .n = n } };
+    }
+
+    // ── INSTR(col, 'sub') and POSITION('sub' IN col) ───────────────────────
+    if (std.mem.eql(u8, fn_lower, "instr")) {
+        const parts = try splitTwoArgs(args_str);
+        if (!isQuoted(parts[1])) return error.InvalidQuery;
+        const cidx = try resolveCol(parts[0], column_map, allocator) orelse
+            return error.ColumnNotFound;
+        return .{ .position = .{ .col_idx = cidx, .needle = parts[1][1 .. parts[1].len - 1] } };
+    }
+    if (std.mem.eql(u8, fn_lower, "position")) {
+        if (args_str.len < 2 or args_str[0] != '\'') return error.InvalidQuery;
+        const close = std.mem.indexOfScalarPos(u8, args_str, 1, '\'') orelse return error.InvalidQuery;
+        const rest = std.mem.trim(u8, args_str[close + 1 ..], &std.ascii.whitespace);
+        if (rest.len < 3 or !std.ascii.eqlIgnoreCase(rest[0..2], "in") or !std.ascii.isWhitespace(rest[2]))
+            return error.InvalidQuery;
+        const cidx = try resolveCol(rest[2..], column_map, allocator) orelse
+            return error.ColumnNotFound;
+        return .{ .position = .{ .col_idx = cidx, .needle = args_str[1..close] } };
     }
 
     // ── LPAD / RPAD(col, len[, pad]) ────────────────────────────────────────
@@ -950,6 +987,14 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
         .rtrim => |cidx| return std.mem.trimRight(u8, field(record, cidx), &std.ascii.whitespace),
         .left => |args| return leftBytes(field(record, args.col_idx), args.n),
         .right => |args| return rightBytes(field(record, args.col_idx), args.n),
+        .repeat => |args| return repeatBytes(field(record, args.col_idx), args.n, arena),
+        .position => |args| {
+            const v = field(record, args.col_idx);
+            if (v.len == 0) return v; // an empty field is NULL
+            const pos = if (std.mem.indexOf(u8, v, args.needle)) |i| i + 1 else 0;
+            const buf = arena.alloc(u8, 20) catch return "0";
+            return std.fmt.bufPrint(buf, "{d}", .{pos}) catch "0";
+        },
         .reverse => |cidx| {
             const v = field(record, cidx);
             if (v.len == 0) return v;
@@ -1355,6 +1400,23 @@ fn padTo(v: []const u8, target_len: usize, pad: []const u8, comptime left: bool,
         @memcpy(buf[0..v.len], v);
         while (i < pad_needed) : (i += 1) buf[v.len + i] = pad[i % pad.len];
     }
+    return buf;
+}
+
+/// The most bytes REPEAT will produce for one field. A longer result is NULL
+/// (an empty field) instead of an allocation sized by the query text.
+pub const max_repeat_bytes: usize = 1 << 20;
+
+/// `v` repeated `n` times. An empty field is NULL and stays empty. `n <= 0`
+/// gives an empty string, like DuckDB. A result over `max_repeat_bytes` is
+/// empty, where DuckDB would build it.
+fn repeatBytes(v: []const u8, n: i64, arena: Allocator) []const u8 {
+    if (v.len == 0 or n == 1) return v;
+    const count = std.math.cast(usize, n) orelse return "";
+    const total = std.math.mul(usize, v.len, count) catch return "";
+    if (total > max_repeat_bytes) return "";
+    const buf = arena.alloc(u8, total) catch return "";
+    for (0..count) |i| @memcpy(buf[i * v.len ..][0..v.len], v);
     return buf;
 }
 
@@ -2207,4 +2269,86 @@ test "clock keywords resolve to a fixed instant, alone or nested" {
         try std.testing.expectEqualStrings(c.want, eval(spec, &.{}, arena.allocator()));
     }
     try std.testing.expect((try tryParseScalarAt("NOW(1)", cm, allocator, ts)) == null);
+}
+
+test "REPEAT: counts, empty field, and the output cap" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cm = std.StringHashMap(usize).init(allocator);
+    try cm.put("s", 0);
+
+    const cases = [_]struct { expr: []const u8, input: []const u8, want: []const u8 }{
+        .{ .expr = "REPEAT(s, 3)", .input = "ab", .want = "ababab" },
+        .{ .expr = "REPEAT(s, 1)", .input = "ab", .want = "ab" },
+        .{ .expr = "REPEAT(s, 0)", .input = "ab", .want = "" },
+        .{ .expr = "REPEAT(s, -2)", .input = "ab", .want = "" },
+        .{ .expr = "REPEAT(s, -9223372036854775808)", .input = "ab", .want = "" },
+        .{ .expr = "REPEAT(s, 9223372036854775807)", .input = "ab", .want = "" },
+        .{ .expr = "repeat( s ,2 )", .input = "x", .want = "xx" },
+        .{ .expr = "REPEAT(s, 3)", .input = "", .want = "" },
+        // Whole characters are repeated, so multi-byte text stays valid UTF-8.
+        .{ .expr = "REPEAT(s, 2)", .input = "\xc3\xa9", .want = "\xc3\xa9\xc3\xa9" },
+    };
+    for (cases) |c| {
+        const spec = (try tryParseScalar(c.expr, cm, allocator)).?;
+        try std.testing.expectEqualStrings(c.want, eval(spec, &.{c.input}, allocator));
+    }
+
+    // The cap is on the result: exactly max_repeat_bytes is built, one more is empty.
+    const exact = (try tryParseScalar("REPEAT(s, 1048576)", cm, allocator)).?;
+    const over = (try tryParseScalar("REPEAT(s, 1048577)", cm, allocator)).?;
+    const long = (try tryParseScalar("REPEAT(s, 524289)", cm, allocator)).?;
+    try std.testing.expectEqual(max_repeat_bytes, eval(exact, &.{"a"}, allocator).len);
+    try std.testing.expectEqualStrings("", eval(over, &.{"a"}, allocator));
+    try std.testing.expectEqualStrings("", eval(long, &.{"ab"}, allocator));
+
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("REPEAT(s)", cm, allocator));
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("REPEAT(s, 1, 2)", cm, allocator));
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("REPEAT(s, 1.5)", cm, allocator));
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("REPEAT(s, x)", cm, allocator));
+    try std.testing.expectError(error.ColumnNotFound, tryParseScalar("REPEAT(nope, 2)", cm, allocator));
+}
+
+test "POSITION/INSTR: 1-based byte index, 0 when absent, empty field is NULL" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cm = std.StringHashMap(usize).init(allocator);
+    try cm.put("s", 0);
+
+    const cases = [_]struct { expr: []const u8, input: []const u8, want: []const u8 }{
+        .{ .expr = "POSITION('lo' IN s)", .input = "hello", .want = "4" },
+        .{ .expr = "INSTR(s, 'lo')", .input = "hello", .want = "4" },
+        .{ .expr = "position( 'h' in s )", .input = "hello", .want = "1" },
+        .{ .expr = "INSTR(s, 'o')", .input = "hello", .want = "5" },
+        .{ .expr = "INSTR(s, 'l')", .input = "hello", .want = "3" },
+        .{ .expr = "INSTR(s, 'z')", .input = "hello", .want = "0" },
+        .{ .expr = "INSTR(s, 'hello!')", .input = "hello", .want = "0" },
+        .{ .expr = "INSTR(s, 'Hello')", .input = "hello", .want = "0" },
+        .{ .expr = "INSTR(s, '')", .input = "hello", .want = "1" },
+        .{ .expr = "POSITION('' IN s)", .input = "hello", .want = "1" },
+        .{ .expr = "INSTR(s, ',')", .input = "a,b", .want = "2" },
+        .{ .expr = "POSITION(' IN ' IN s)", .input = "x IN y", .want = "2" },
+        .{ .expr = "POSITION('a,b' IN s)", .input = "xa,b", .want = "2" },
+        .{ .expr = "INSTR(s, 'a')", .input = "", .want = "" },
+        .{ .expr = "POSITION('a' IN s)", .input = "", .want = "" },
+        // Bytes, like SUBSTR and LENGTH: "é" is two bytes, so "l" is at byte 4.
+        .{ .expr = "INSTR(s, 'l')", .input = "h\xc3\xa9llo", .want = "4" },
+        .{ .expr = "INSTR(s, '\xc3\xa9')", .input = "h\xc3\xa9llo", .want = "2" },
+    };
+    for (cases) |c| {
+        const spec = (try tryParseScalar(c.expr, cm, allocator)).?;
+        try std.testing.expectEqualStrings(c.want, eval(spec, &.{c.input}, allocator));
+    }
+
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("INSTR(s)", cm, allocator));
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("INSTR(s, a)", cm, allocator));
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("INSTR(s, 'a', 'b')", cm, allocator));
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("POSITION('a' s)", cm, allocator));
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("POSITION('a' INs)", cm, allocator));
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("POSITION(a IN s)", cm, allocator));
+    try std.testing.expectError(error.InvalidQuery, tryParseScalar("POSITION('a)", cm, allocator));
+    try std.testing.expectError(error.ColumnNotFound, tryParseScalar("INSTR(nope, 'a')", cm, allocator));
+    try std.testing.expectError(error.ColumnNotFound, tryParseScalar("POSITION('a' IN nope)", cm, allocator));
 }

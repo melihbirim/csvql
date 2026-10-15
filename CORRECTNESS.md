@@ -186,6 +186,7 @@ above:
 | -------- | ----- | ------ |
 | `LENGTH(col)` on a unicode string | Byte length (UTF-8 bytes) | Character count (codepoints) |
 | `LEFT(col, n)` / `RIGHT(col, n)` on a unicode string | `n` counts bytes; a character that would be split is dropped, so the result may be shorter than `n` | `n` counts codepoints |
+| `POSITION` / `INSTR` after a unicode character | The index counts bytes | The index counts codepoints |
 | Empty CSV field, compared as a **value** (`col = ''`) | Matches the empty field | No match (`NULL = ''` is not true) |
 | How a `NULL` result is written to CSV output | An empty field (RFC 4180 — survives a round-trip back into csvql as `NULL`) | The DuckDB CLI's CSV mode writes the literal text `NULL` |
 | `DATEDIFF('hour'/'minute'/etc, a, b)` on a non-exact interval | Fractional (e.g. `8.5`) | Truncated (e.g. `8`) |
