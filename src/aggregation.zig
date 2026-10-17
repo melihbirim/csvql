@@ -10,6 +10,8 @@ pub const AggregateType = enum {
     min,
     max,
     median,
+    quantile, // QUANTILE(col, p): interpolated p-th quantile, p in [0, 1]
+    mode, // MODE(col): most frequent non-empty value
     variance, // population variance (VAR_POP)
     stddev, // population standard deviation (STDDEV_POP)
     variance_samp, // sample variance (VAR_SAMP) — bare VARIANCE/VAR default (#110)
@@ -23,6 +25,7 @@ pub const AggregateFunc = struct {
     column: ?[]const u8, // null for COUNT(*)
     alias: []const u8, // Original expression
     sep: ?[]const u8 = null, // GROUP_CONCAT separator (allocator-owned); null otherwise
+    quantile: f64 = 0.5, // QUANTILE fraction; unused by other aggregates
 
     pub fn deinit(self: AggregateFunc, allocator: Allocator) void {
         if (self.column) |col| {
@@ -76,6 +79,10 @@ pub fn parseAggregateFunc(allocator: Allocator, expr: []const u8) !?AggregateFun
         func_type = .max;
     } else if (std.mem.eql(u8, func_lower, "median")) {
         func_type = .median;
+    } else if (std.mem.eql(u8, func_lower, "quantile")) {
+        func_type = .quantile;
+    } else if (std.mem.eql(u8, func_lower, "mode")) {
+        func_type = .mode;
     } else if (std.mem.eql(u8, func_lower, "var_pop")) {
         func_type = .variance;
     } else if (std.mem.eql(u8, func_lower, "stddev_pop")) {
@@ -117,6 +124,16 @@ pub fn parseAggregateFunc(allocator: Allocator, expr: []const u8) !?AggregateFun
     }
     errdefer if (gc_sep) |s| allocator.free(s);
 
+    // QUANTILE(col, p): p is a numeric literal in [0, 1].
+    var quantile: f64 = 0.5;
+    if (func_type == .quantile) {
+        const c = std.mem.lastIndexOfScalar(u8, column_part, ',') orelse return error.InvalidQuery;
+        actual_column_part = std.mem.trim(u8, column_part[0..c], &std.ascii.whitespace);
+        const p_raw = std.mem.trim(u8, column_part[c + 1 ..], &std.ascii.whitespace);
+        quantile = std.fmt.parseFloat(f64, p_raw) catch return error.InvalidQuery;
+        if (!(quantile >= 0.0 and quantile <= 1.0)) return error.InvalidQuery;
+    }
+
     const column = if (std.mem.eql(u8, actual_column_part, "*"))
         null
     else
@@ -127,6 +144,7 @@ pub fn parseAggregateFunc(allocator: Allocator, expr: []const u8) !?AggregateFun
         .column = column,
         .alias = try allocator.dupe(u8, trimmed),
         .sep = gc_sep,
+        .quantile = quantile,
     };
 }
 

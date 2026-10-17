@@ -312,6 +312,8 @@ fn hasScalarSelectFunctions(query: parser.Query) bool {
             std.ascii.eqlIgnoreCase(fn_raw, "group_concat") or
             std.ascii.eqlIgnoreCase(fn_raw, "string_agg") or
             std.ascii.eqlIgnoreCase(fn_raw, "median") or
+            std.ascii.eqlIgnoreCase(fn_raw, "quantile") or
+            std.ascii.eqlIgnoreCase(fn_raw, "mode") or
             std.ascii.eqlIgnoreCase(fn_raw, "variance") or
             std.ascii.eqlIgnoreCase(fn_raw, "var") or
             std.ascii.eqlIgnoreCase(fn_raw, "var_pop") or
@@ -2671,6 +2673,7 @@ const AggSpec = struct {
     round_digits: ?u8 = null, // non-null for ROUND(expr, n)
     case_when: ?CaseWhenSpec = null, // non-null for CASE WHEN conditional aggregates
     sep: []const u8 = ",", // GROUP_CONCAT separator
+    quantile: f64 = 0.5, // QUANTILE fraction in [0, 1]
 };
 
 /// THEN/ELSE value in a CASE WHEN — either a numeric literal or a column reference.
@@ -2713,6 +2716,7 @@ const CaseWhenSpec = struct {
 const OptionalSlots = struct {
     distinct: ?[]?std.StringHashMap(void) = null,
     values: ?[]?std.ArrayList(f64) = null,
+    modes: ?[]?std.StringHashMap(u64) = null,
     concat: ?[]?std.ArrayList([]const u8) = null,
     means: ?[]f64 = null,
     sum_comps: ?[]f64 = null,
@@ -2721,12 +2725,14 @@ const OptionalSlots = struct {
     fn forSpecs(ka: Allocator, specs: []const AggSpec, n_aggs: usize) !OptionalSlots {
         var needs_distinct = false;
         var needs_values = false;
+        var needs_modes = false;
         var needs_concat = false;
         var needs_means = false;
         var needs_comps = false;
         for (specs) |spec| switch (spec.func_type) {
             .count_distinct => needs_distinct = true,
-            .median => needs_values = true,
+            .median, .quantile => needs_values = true,
+            .mode => needs_modes = true,
             .group_concat => needs_concat = true,
             .variance, .stddev, .variance_samp, .stddev_samp => needs_means = true,
             .sum, .avg => needs_comps = true,
@@ -2742,6 +2748,11 @@ const OptionalSlots = struct {
             const v = try ka.alloc(?std.ArrayList(f64), n_aggs);
             for (v) |*x| x.* = null;
             opt.values = v;
+        }
+        if (!needs_modes) {
+            const m = try ka.alloc(?std.StringHashMap(u64), n_aggs);
+            for (m) |*x| x.* = null;
+            opt.modes = m;
         }
         if (!needs_concat) {
             const c = try ka.alloc(?std.ArrayList([]const u8), n_aggs);
@@ -2773,7 +2784,8 @@ const CompactAccum = struct {
     mins: []f64, // min[i], arena-alloc, init to +inf
     maxs: []f64, // max[i], arena-alloc, init to -inf
     distinct_sets: []?std.StringHashMap(void), // per-slot distinct-value set for COUNT(DISTINCT)
-    value_lists: []?std.ArrayList(f64), // per-slot numeric values for MEDIAN (buffers all values)
+    value_lists: []?std.ArrayList(f64), // per-slot numeric values for MEDIAN and QUANTILE (buffers all values)
+    mode_counts: []?std.StringHashMap(u64), // per-slot value -> occurrences for MODE (O(distinct) per group)
     concat_lists: []?std.ArrayList([]const u8), // per-slot string values for GROUP_CONCAT
 
     fn init(ka: Allocator, key_vals: [][]const u8, n_aggs: usize, opt: OptionalSlots) !CompactAccum {
@@ -2794,6 +2806,11 @@ const CompactAccum = struct {
             const v = try ka.alloc(?std.ArrayList(f64), n_aggs);
             for (v) |*vl| vl.* = null;
             break :blk v;
+        };
+        const mode_counts = opt.modes orelse blk: {
+            const m = try ka.alloc(?std.StringHashMap(u64), n_aggs);
+            for (m) |*x| x.* = null;
+            break :blk m;
         };
         const means = opt.means orelse blk: {
             const m = try ka.alloc(f64, n_aggs);
@@ -2829,6 +2846,7 @@ const CompactAccum = struct {
             .maxs = maxs,
             .distinct_sets = distinct_sets,
             .value_lists = value_lists,
+            .mode_counts = mode_counts,
             .concat_lists = concat_lists,
         };
     }
@@ -3379,6 +3397,69 @@ fn fmtMedian(allocator: Allocator, vl: ?std.ArrayList(f64), round_digits: ?u8) !
     return fmtAggrF64(allocator, med, round_digits);
 }
 
+/// Format the QUANTILE(p) of a per-group value list, interpolating linearly
+/// between the two neighbouring order statistics (DuckDB `quantile_cont`).
+/// Empty/absent list gives "". Reorders the list in place.
+fn fmtQuantile(allocator: Allocator, vl: ?std.ArrayList(f64), p: f64, round_digits: ?u8) ![]u8 {
+    const list = vl orelse return allocator.dupe(u8, "");
+    const items = list.items;
+    if (items.len == 0) return allocator.dupe(u8, "");
+    const pos = p * @as(f64, @floatFromInt(items.len - 1));
+    const lo_idx: usize = @intFromFloat(@floor(pos));
+    const frac = pos - @floor(pos);
+    var q = quickselectF64(items, lo_idx);
+    if (frac > 0.0) {
+        // items[lo_idx + 1 ..] are all >= items[lo_idx], so the next order statistic is their minimum.
+        var upper = items[lo_idx + 1];
+        for (items[lo_idx + 2 ..]) |v| {
+            if (v < upper) upper = v;
+        }
+        q += (upper - q) * frac;
+    }
+    return fmtAggrF64(allocator, q, round_digits);
+}
+
+/// True when `a` sorts before `b` for MODE tie-breaking: numerically when both
+/// parse as numbers, otherwise by bytes. Keeps ties deterministic across threads.
+fn modeKeyLess(a: []const u8, b: []const u8) bool {
+    const na = parseNumericFast(a) catch return std.mem.lessThan(u8, a, b);
+    const nb = parseNumericFast(b) catch return std.mem.lessThan(u8, a, b);
+    if (na != nb) return na < nb;
+    return std.mem.lessThan(u8, a, b);
+}
+
+/// Format MODE: the most frequent value; ties go to the smallest by `modeKeyLess`.
+/// Empty/absent counts give "".
+fn fmtMode(allocator: Allocator, mc: ?std.StringHashMap(u64)) ![]u8 {
+    var map = mc orelse return allocator.dupe(u8, "");
+    var best: ?[]const u8 = null;
+    var best_n: u64 = 0;
+    var it = map.iterator();
+    while (it.next()) |e| {
+        const n = e.value_ptr.*;
+        if (n > best_n or (n == best_n and modeKeyLess(e.key_ptr.*, best.?))) {
+            best = e.key_ptr.*;
+            best_n = n;
+        }
+    }
+    return allocator.dupe(u8, best orelse "");
+}
+
+/// Add a partial MODE multiset into `dst`, copying new keys into `ka`.
+fn mergeModeCounts(ka: Allocator, dst: *?std.StringHashMap(u64), src: std.StringHashMap(u64)) !void {
+    if (dst.* == null) dst.* = std.StringHashMap(u64).init(ka);
+    var it = src.iterator();
+    while (it.next()) |e| {
+        const gop_e = try dst.*.?.getOrPut(e.key_ptr.*);
+        if (gop_e.found_existing) {
+            gop_e.value_ptr.* += e.value_ptr.*;
+        } else {
+            gop_e.key_ptr.* = try ka.dupe(u8, e.key_ptr.*);
+            gop_e.value_ptr.* = e.value_ptr.*;
+        }
+    }
+}
+
 /// Join a per-group string list with `sep` for GROUP_CONCAT. Empty/absent → "".
 fn fmtGroupConcat(allocator: Allocator, cl: ?std.ArrayList([]const u8), sep: []const u8) ![]u8 {
     const list = cl orelse return allocator.dupe(u8, "");
@@ -3507,6 +3588,8 @@ fn isAggregateExpr(col: []const u8) bool {
         std.mem.eql(u8, lower, "group_concat") or
         std.mem.eql(u8, lower, "string_agg") or
         std.mem.eql(u8, lower, "median") or
+        std.mem.eql(u8, lower, "quantile") or
+        std.mem.eql(u8, lower, "mode") or
         std.mem.eql(u8, lower, "variance") or
         std.mem.eql(u8, lower, "var") or
         std.mem.eql(u8, lower, "var_pop") or
@@ -3526,9 +3609,9 @@ fn conditionHasAggregateCall(col: []const u8) bool {
     const then_idx = std.ascii.indexOfIgnoreCase(col, " then ") orelse return false;
     const cond = col[0..then_idx];
     const names = [_][]const u8{
-        "count",  "sum",      "avg",     "min",      "max", "group_concat", "string_agg",
-        "median", "variance", "var_pop", "var_samp", "var", "stddev_pop",   "stddev_samp",
-        "stddev", "std",
+        "count",  "sum",      "avg",      "min",      "max", "group_concat", "string_agg",
+        "median", "variance", "var_pop",  "var_samp", "var", "stddev_pop",   "stddev_samp",
+        "stddev", "std",      "quantile", "mode",
     };
     var i: usize = 0;
     while (i < cond.len) : (i += 1) {
@@ -3976,6 +4059,7 @@ fn executeScalarAgg(
                 agg_func.sep = null;
                 try agg_specs.append(allocator, AggSpec{
                     .func_type = agg_func.func_type,
+                    .quantile = agg_func.quantile,
                     .col_idx = col_idx,
                     .alias = agg_func.alias,
                     .round_digits = null,
@@ -4014,6 +4098,7 @@ fn executeScalarAgg(
             agg_func.sep = null; // ownership transfers to AggSpec
             try agg_specs.append(allocator, AggSpec{
                 .func_type = agg_func.func_type,
+                .quantile = agg_func.quantile,
                 .col_idx = col_idx,
                 .alias = agg_func.alias,
                 .round_digits = round_digits,
@@ -4170,6 +4255,7 @@ fn executeScalarAgg(
                     if (accum.value_lists[i] == null) accum.value_lists[i] = std.ArrayList(f64){};
                     try accum.value_lists[i].?.appendSlice(ka.allocator(), pl.items);
                 }
+                if (partial.mode_counts[i]) |pm| try mergeModeCounts(ka.allocator(), &accum.mode_counts[i], pm);
                 // GROUP_CONCAT string lists — re-dupe (partial arena is freed after merge)
                 if (partial.concat_lists[i]) |pl| {
                     if (accum.concat_lists[i] == null) accum.concat_lists[i] = std.ArrayList([]const u8){};
@@ -4246,7 +4332,7 @@ fn executeScalarAgg(
                             }
                         }
                     },
-                    .median => {
+                    .median, .quantile => {
                         if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
                                 if (parseNumericFast(record[cidx])) |val| {
@@ -4254,6 +4340,21 @@ fn executeScalarAgg(
                                     if (vl_ptr.* == null) vl_ptr.* = std.ArrayList(f64){};
                                     try vl_ptr.*.?.append(ka.allocator(), val);
                                 } else |_| {}
+                            }
+                        }
+                    },
+                    .mode => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len and record[cidx].len > 0) {
+                                const mc_ptr = &accum.mode_counts[i];
+                                if (mc_ptr.* == null) mc_ptr.* = std.StringHashMap(u64).init(ka.allocator());
+                                const gop_e = try mc_ptr.*.?.getOrPut(record[cidx]);
+                                if (gop_e.found_existing) {
+                                    gop_e.value_ptr.* += 1;
+                                } else {
+                                    gop_e.key_ptr.* = try ka.allocator().dupe(u8, record[cidx]);
+                                    gop_e.value_ptr.* = 1;
+                                }
                             }
                         }
                     },
@@ -4362,6 +4463,8 @@ fn executeScalarAgg(
             .variance_samp => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sum_counts[i], false, true, spec.round_digits),
             .stddev_samp => try fmtVarStd(allocator, accum.sum_sqs[i], accum.sum_counts[i], true, true, spec.round_digits),
             .median => try fmtMedian(allocator, accum.value_lists[i], spec.round_digits),
+            .quantile => try fmtQuantile(allocator, accum.value_lists[i], spec.quantile, spec.round_digits),
+            .mode => try fmtMode(allocator, accum.mode_counts[i]),
 
             .group_concat => try fmtGroupConcat(allocator, accum.concat_lists[i], spec.sep),
         };
@@ -4580,6 +4683,11 @@ fn foldPartialGroup(
                 nv.* = lst;
             }
         }
+        const new_mc = try ka.alloc(?std.StringHashMap(u64), n_aggs);
+        for (new_mc) |*m| m.* = null;
+        for (new_mc, 0..) |*nm, i| {
+            if (partial.mode_counts[i]) |pm| try mergeModeCounts(ka, nm, pm);
+        }
         const new_cl = try ka.alloc(?std.ArrayList([]const u8), n_aggs);
         for (new_cl) |*c| c.* = null;
         for (new_cl, 0..) |*nc, i| {
@@ -4601,6 +4709,7 @@ fn foldPartialGroup(
             .maxs = try ka.dupe(f64, partial.maxs),
             .distinct_sets = new_ds,
             .value_lists = new_vl,
+            .mode_counts = new_mc,
             .concat_lists = new_cl,
         };
     } else {
@@ -4629,6 +4738,7 @@ fn foldPartialGroup(
                 if (accum.value_lists[i] == null) accum.value_lists[i] = std.ArrayList(f64){};
                 try accum.value_lists[i].?.appendSlice(ka, pl.items);
             }
+            if (partial.mode_counts[i]) |pm| try mergeModeCounts(ka, &accum.mode_counts[i], pm);
             if (partial.concat_lists[i]) |pl| {
                 if (accum.concat_lists[i] == null) accum.concat_lists[i] = std.ArrayList([]const u8){};
                 for (pl.items) |s| try accum.concat_lists[i].?.append(ka, try ka.dupe(u8, s));
@@ -4806,7 +4916,7 @@ fn gbApplyAggs(ctx: *GbWorkerCtx, aa: Allocator, accum: *CompactAccum, record: [
                     }
                 }
             },
-            .median => {
+            .median, .quantile => {
                 if (spec.col_idx) |cidx| {
                     if (cidx < record.len) {
                         if (parseNumericFast(record[cidx])) |val| {
@@ -4814,6 +4924,21 @@ fn gbApplyAggs(ctx: *GbWorkerCtx, aa: Allocator, accum: *CompactAccum, record: [
                             if (vl_ptr.* == null) vl_ptr.* = std.ArrayList(f64){};
                             try vl_ptr.*.?.append(aa, val);
                         } else |_| {}
+                    }
+                }
+            },
+            .mode => {
+                if (spec.col_idx) |cidx| {
+                    if (cidx < record.len and record[cidx].len > 0) {
+                        const mc_ptr = &accum.mode_counts[i];
+                        if (mc_ptr.* == null) mc_ptr.* = std.StringHashMap(u64).init(aa);
+                        const gop_e = try mc_ptr.*.?.getOrPut(record[cidx]);
+                        if (gop_e.found_existing) {
+                            gop_e.value_ptr.* += 1;
+                        } else {
+                            gop_e.key_ptr.* = try aa.dupe(u8, record[cidx]);
+                            gop_e.value_ptr.* = 1;
+                        }
                     }
                 }
             },
@@ -5429,7 +5554,7 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                             }
                         }
                     },
-                    .median => {
+                    .median, .quantile => {
                         if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
                                 if (parseNumericFast(record[cidx])) |val| {
@@ -5437,6 +5562,21 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                                     if (vl_ptr.* == null) vl_ptr.* = std.ArrayList(f64){};
                                     try vl_ptr.*.?.append(aa, val);
                                 } else |_| {}
+                            }
+                        }
+                    },
+                    .mode => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len and record[cidx].len > 0) {
+                                const mc_ptr = &ctx.partial_accum.mode_counts[i];
+                                if (mc_ptr.* == null) mc_ptr.* = std.StringHashMap(u64).init(aa);
+                                const gop_e = try mc_ptr.*.?.getOrPut(record[cidx]);
+                                if (gop_e.found_existing) {
+                                    gop_e.value_ptr.* += 1;
+                                } else {
+                                    gop_e.key_ptr.* = try aa.dupe(u8, record[cidx]);
+                                    gop_e.value_ptr.* = 1;
+                                }
                             }
                         }
                     },
@@ -5547,7 +5687,7 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                             }
                         }
                     },
-                    .median => {
+                    .median, .quantile => {
                         if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
                                 if (parseNumericFast(record[cidx])) |val| {
@@ -5555,6 +5695,21 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                                     if (vl_ptr.* == null) vl_ptr.* = std.ArrayList(f64){};
                                     try vl_ptr.*.?.append(aa, val);
                                 } else |_| {}
+                            }
+                        }
+                    },
+                    .mode => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len and record[cidx].len > 0) {
+                                const mc_ptr = &ctx.partial_accum.mode_counts[i];
+                                if (mc_ptr.* == null) mc_ptr.* = std.StringHashMap(u64).init(aa);
+                                const gop_e = try mc_ptr.*.?.getOrPut(record[cidx]);
+                                if (gop_e.found_existing) {
+                                    gop_e.value_ptr.* += 1;
+                                } else {
+                                    gop_e.key_ptr.* = try aa.dupe(u8, record[cidx]);
+                                    gop_e.value_ptr.* = 1;
+                                }
                             }
                         }
                     },
@@ -5831,6 +5986,7 @@ fn executeGroupBy(
                     agg_func.sep = null;
                     try agg_specs.append(allocator, AggSpec{
                         .func_type = agg_func.func_type,
+                        .quantile = agg_func.quantile,
                         .col_idx = col_idx,
                         .alias = agg_func.alias,
                         .round_digits = null,
@@ -5870,6 +6026,7 @@ fn executeGroupBy(
                 agg_func.sep = null;
                 try agg_specs.append(allocator, AggSpec{
                     .func_type = agg_func.func_type,
+                    .quantile = agg_func.quantile,
                     .col_idx = col_idx,
                     .alias = agg_func.alias,
                     .round_digits = round_digits,
@@ -6012,6 +6169,7 @@ fn executeGroupBy(
                 try having_extra_aggs.append(allocator, .{ .idx = agg_specs.items.len, .text = try allocator.dupe(u8, hcol) });
                 try agg_specs.append(allocator, AggSpec{
                     .func_type = agg_func.func_type,
+                    .quantile = agg_func.quantile,
                     .col_idx = col_idx,
                     .alias = agg_func.alias,
                     .sep = gc_sep,
@@ -6297,7 +6455,7 @@ fn executeGroupBy(
                             }
                         }
                     },
-                    .median => {
+                    .median, .quantile => {
                         if (spec.col_idx) |cidx| {
                             if (cidx < record.len) {
                                 if (parseNumericFast(record[cidx])) |val| {
@@ -6305,6 +6463,21 @@ fn executeGroupBy(
                                     if (vl_ptr.* == null) vl_ptr.* = std.ArrayList(f64){};
                                     try vl_ptr.*.?.append(ka, val);
                                 } else |_| {}
+                            }
+                        }
+                    },
+                    .mode => {
+                        if (spec.col_idx) |cidx| {
+                            if (cidx < record.len and record[cidx].len > 0) {
+                                const mc_ptr = &accum.mode_counts[i];
+                                if (mc_ptr.* == null) mc_ptr.* = std.StringHashMap(u64).init(ka);
+                                const gop_e = try mc_ptr.*.?.getOrPut(record[cidx]);
+                                if (gop_e.found_existing) {
+                                    gop_e.value_ptr.* += 1;
+                                } else {
+                                    gop_e.key_ptr.* = try ka.dupe(u8, record[cidx]);
+                                    gop_e.value_ptr.* = 1;
+                                }
                             }
                         }
                     },
@@ -6491,6 +6664,8 @@ fn executeGroupBy(
                 .variance_samp => try fmtVarStd(sra, accum.sum_sqs[i], accum.sum_counts[i], false, true, spec.round_digits),
                 .stddev_samp => try fmtVarStd(sra, accum.sum_sqs[i], accum.sum_counts[i], true, true, spec.round_digits),
                 .median => try fmtMedian(sra, accum.value_lists[i], spec.round_digits),
+                .quantile => try fmtQuantile(sra, accum.value_lists[i], spec.quantile, spec.round_digits),
+                .mode => try fmtMode(sra, accum.mode_counts[i]),
 
                 .group_concat => try fmtGroupConcat(sra, accum.concat_lists[i], spec.sep),
             };
@@ -6703,6 +6878,93 @@ test "MEDIAN: odd and even counts, scalar and GROUP BY" {
     defer allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "a,4") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "b,6") != null);
+}
+
+test "QUANTILE: interpolates, skips NULLs, empty group is empty, GROUP BY" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // a: 1,2,3,4 -> p0.5 = 2.5, p0.25 = 1.75, p0 = 1, p1 = 4, p0.9 = 3.7
+    // b: 10 plus an empty cell and text (skipped) -> every p is 10
+    // c: only empty cells -> empty result
+    const data = "g,x\na,4\na,1\na,3\na,2\nb,10\nb,\nb,n/a\nc,\nc,\n";
+    const out = try runQueryForTest(allocator, &tmp, data, "SELECT g, QUANTILE(x, 0.5) AS q50, QUANTILE(x, 0.25) AS q25, QUANTILE(x, 0) AS q0, QUANTILE(x, 1) AS q100, QUANTILE(x, 0.9) AS q90 FROM '{s}' GROUP BY g ORDER BY g");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("g,q50,q25,q0,q100,q90\na,2.5,1.75,1,4,3.7\nb,10,10,10,10,10\nc,,,,,\n", out);
+
+    // Scalar form, ROUND wrapper (unaliased), and agreement with MEDIAN at p = 0.5.
+    const one_row = try runQueryForTest(allocator, &tmp, data, "SELECT QUANTILE(x, 0.5) AS q, MEDIAN(x) AS m FROM '{s}'");
+    defer allocator.free(one_row);
+    try std.testing.expectEqualStrings("q,m\n3,3\n", one_row);
+    const rounded = try runQueryForTest(allocator, &tmp, data, "SELECT ROUND(QUANTILE(x, 0.9), 1) FROM '{s}'");
+    defer allocator.free(rounded);
+    try std.testing.expectEqualStrings("\"ROUND(QUANTILE(x, 0.9), 1)\"\n7.6\n", rounded);
+}
+
+test "QUANTILE: p outside [0, 1] or missing is InvalidQuery" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = "x\n1\n2\n";
+    try std.testing.expectError(error.InvalidQuery, runQueryForTest(allocator, &tmp, data, "SELECT QUANTILE(x, 1.5) FROM '{s}'"));
+    try std.testing.expectError(error.InvalidQuery, runQueryForTest(allocator, &tmp, data, "SELECT QUANTILE(x, -0.1) FROM '{s}'"));
+    try std.testing.expectError(error.InvalidQuery, runQueryForTest(allocator, &tmp, data, "SELECT QUANTILE(x, nan) FROM '{s}'"));
+    try std.testing.expectError(error.InvalidQuery, runQueryForTest(allocator, &tmp, data, "SELECT QUANTILE(x) FROM '{s}'"));
+}
+
+test "MODE: most frequent value, ties pick the smallest, NULLs skipped, GROUP BY" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // a: red x3, blue x2          -> red
+    // b: 10 x2, 9 x2 (numeric tie) -> 9, not "10" (byte order would say 10)
+    // c: x x2, y x2 (text tie)     -> x
+    // d: empty cells are not counted even though they are the most common -> z
+    // e: only empty cells          -> empty result
+    const data = "g,v\na,red\na,blue\na,red\na,blue\na,red\nb,10\nb,9\nb,10\nb,9\nc,y\nc,x\nc,y\nc,x\nd,\nd,\nd,\nd,z\ne,\n";
+    const out = try runQueryForTest(allocator, &tmp, data, "SELECT g, MODE(v) AS m FROM '{s}' GROUP BY g ORDER BY g");
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("g,m\na,red\nb,9\nc,x\nd,z\ne,\n", out);
+
+    const one_row = try runQueryForTest(allocator, &tmp, data, "SELECT MODE(v) AS m FROM '{s}'");
+    defer allocator.free(one_row);
+    try std.testing.expectEqualStrings("m\nred\n", one_row);
+}
+
+test "QUANTILE / MODE: result does not depend on --threads" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Above the 10 MB threshold so the parallel scan is used.
+    const n_rows: usize = 700_000;
+    var data = std.ArrayList(u8){};
+    defer data.deinit(allocator);
+    try data.appendSlice(allocator, "id,g,x\n");
+    var line: [64]u8 = undefined;
+    for (0..n_rows) |i| {
+        const x = (i * 37) % 100_003;
+        const row = try std.fmt.bufPrint(&line, "{d},g{d},{d}\n", .{ i, i % 4, x });
+        try data.appendSlice(allocator, row);
+    }
+    try std.testing.expect(data.items.len > 10 * 1024 * 1024);
+
+    const sql = "SELECT g, QUANTILE(x, 0.95), QUANTILE(x, 0.5), MODE(x) FROM '{s}' GROUP BY g ORDER BY g";
+    const scalar_sql = "SELECT QUANTILE(x, 0.95), MODE(x) FROM '{s}'";
+    const seq = try runQueryForTestOpts(allocator, &tmp, data.items, sql, .{ .threads = 1 });
+    defer allocator.free(seq);
+    const seq_scalar = try runQueryForTestOpts(allocator, &tmp, data.items, scalar_sql, .{ .threads = 1 });
+    defer allocator.free(seq_scalar);
+    try std.testing.expect(std.mem.indexOf(u8, seq, "g3,") != null);
+
+    for ([_]usize{ 2, 3, 7 }) |threads| {
+        const par = try runQueryForTestOpts(allocator, &tmp, data.items, sql, .{ .threads = threads });
+        defer allocator.free(par);
+        try std.testing.expectEqualStrings(seq, par);
+        const par_scalar = try runQueryForTestOpts(allocator, &tmp, data.items, scalar_sql, .{ .threads = threads });
+        defer allocator.free(par_scalar);
+        try std.testing.expectEqualStrings(seq_scalar, par_scalar);
+    }
 }
 
 test "VARIANCE / STDDEV: bare defaults to sample, _POP stays population (#110)" {

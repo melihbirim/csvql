@@ -315,6 +315,11 @@ check_approx \
   "SELECT MEDIAN(salary) FROM '$CSV'" \
   "SELECT MEDIAN(salary) FROM read_csv_auto('$CSV')"
 
+check_approx \
+  "QUANTILE(salary, 0.95)" \
+  "SELECT QUANTILE(salary, 0.95) FROM '$CSV'" \
+  "SELECT quantile_cont(salary, 0.95) FROM read_csv_auto('$CSV')"
+
 GC="$TMP/groupconcat.csv"
 cat > "$GC" <<'EOF'
 dept,city

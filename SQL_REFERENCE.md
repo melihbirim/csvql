@@ -27,6 +27,8 @@ Full syntax reference and runnable examples for every SQL feature csvql supports
 | **AVG**       | `AVG(col)` — full precision; with or without `GROUP BY`                 |
 | **VARIANCE / STDDEV** | `VARIANCE(col)`, `STDDEV(col)` — sample variance / std deviation, N-1 denominator (aliases `VAR`, `VAR_SAMP`, `STDDEV_SAMP`). Population variants: `VAR_POP(col)`, `STDDEV_POP(col)` |
 | **MEDIAN** | `MEDIAN(col)` — median of numeric values (mean of the two middles for an even count) |
+| **QUANTILE** | `QUANTILE(col, p)` — the `p`-th quantile of numeric values, `p` a numeric literal from 0 to 1 (`QUANTILE(latency_ms, 0.95)` is the p95). Interpolates linearly between the two nearest values, like DuckDB's `quantile_cont`, so `QUANTILE(col, 0.5)` equals `MEDIAN(col)`. Empty and non-numeric fields are skipped; a group with none gives an empty field. A `p` outside 0 to 1, or a missing `p`, is a query error. Like `MEDIAN`, it buffers every value of a group, so memory is O(rows) rather than O(groups); several `QUANTILE`/`MEDIAN` calls in one query each keep their own buffer |
+| **MODE**      | `MODE(col)` — the most frequent value, as text. Empty fields are not counted; a group with no values gives an empty field. Ties go to the smallest value (numerically when both are numbers, otherwise byte order), so the result does not depend on row order or `--threads`. Memory is O(distinct values) per group |
 | **GROUP_CONCAT** | `GROUP_CONCAT(col [, 'sep'])` — concatenate group values (default separator `,`; alias `STRING_AGG`) |
 | **CASE WHEN** | `CASE WHEN col OP val THEN n ELSE m END` inside any aggregate function, or wrapping an aggregate in its own condition — `CASE WHEN AVG(col) > n THEN ... END` |
 | **MIN / MAX** | `MIN(col)`, `MAX(col)` — with or without `GROUP BY`                     |
@@ -70,6 +72,7 @@ Two intentional differences, found via differential testing against DuckDB (see 
 | `LEFT(col, n)` / `RIGHT(col, n)` on a unicode string | `n` counts bytes; a character that would be split is dropped | `n` counts codepoints |
 | `POSITION` / `INSTR` after a unicode character | The index counts bytes | The index counts codepoints |
 | Empty CSV field | Stays an empty string | Inferred as `NULL` |
+| `MODE(col)` with several equally frequent values | The smallest value | Not specified |
 | `DATEDIFF('hour'/'minute'/etc, a, b)` on a non-exact interval | Fractional (e.g. `8.5` hours) | Truncated to whole units (e.g. `8`) |
 
 If you need character count instead of byte length, NULL instead of empty-string semantics, or truncated instead of fractional interval math, be aware the two engines diverge here rather than assume identical output.
@@ -92,6 +95,9 @@ csvql "SELECT COUNT(*), SUM(salary), AVG(salary), MIN(age), MAX(age) FROM 'data.
 
 # Grouped aggregates
 csvql "SELECT department, COUNT(*), AVG(salary) FROM 'data.csv' GROUP BY department ORDER BY department"
+
+# Tail latency and most common value per group
+csvql "SELECT endpoint, QUANTILE(latency_ms, 0.95) AS p95, MODE(status) AS common_status FROM 'logs.csv' GROUP BY endpoint"
 
 # HAVING — filter groups after aggregation
 csvql "SELECT department, SUM(salary) FROM 'data.csv' GROUP BY department HAVING SUM(salary) > 500000"
