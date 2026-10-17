@@ -159,6 +159,16 @@ zig build -Doptimize=ReleaseFast
 sudo cp zig-out/bin/csvql /usr/local/bin/
 ```
 
+**Shell completions** for bash and zsh live in [`completions/`](completions/). They complete the flags in `csvql --help`, the `install` subcommand and file paths.
+
+```bash
+# bash: add to ~/.bashrc
+source /path/to/csvql/completions/csvql.bash
+
+# zsh: put _csvql on your fpath before compinit
+cp completions/_csvql ~/.zsh/completions/_csvql
+```
+
 ## Performance
 
 Same `GROUP BY department` on raw CSV, one process per engine, Apple M2 Pro with 16 GB. Peak memory and wall time:
@@ -203,7 +213,6 @@ Full syntax and limitations: **[SQL_REFERENCE.md](SQL_REFERENCE.md)**. What is d
 
 - HTTP/SSE MCP transport, so one csvql can serve a team as a shared service ([#60](https://github.com/melihbirim/csvql/issues/60)).
 - `MEDIAN` in O(groups) memory ([#205](https://github.com/melihbirim/csvql/issues/205)).
-- Shell completions, help wanted ([#73](https://github.com/melihbirim/csvql/issues/73)).
 
 Shipped features are in the [release notes](https://github.com/melihbirim/csvql/releases). [Good first issues](https://github.com/melihbirim/csvql/labels/good%20first%20issue) are scoped with file pointers and done-when criteria.
 

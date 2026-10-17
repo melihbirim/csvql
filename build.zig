@@ -285,6 +285,20 @@ pub fn build(b: *std.Build) void {
     const run_where_expr_tests = b.addRunArtifact(where_expr_tests);
     test_step.dependOn(&run_where_expr_tests.step);
 
+    // Shell completion drift tests (#73): completions/ must list every flag in
+    // `csvql --help`. The files are embedded, so no working-directory assumptions.
+    const completions_test_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .root_source_file = b.path("tests/completions_test.zig"),
+    });
+    completions_test_mod.addAnonymousImport("main_source", .{ .root_source_file = b.path("src/main.zig") });
+    completions_test_mod.addAnonymousImport("bash_completion", .{ .root_source_file = b.path("completions/csvql.bash") });
+    completions_test_mod.addAnonymousImport("zsh_completion", .{ .root_source_file = b.path("completions/_csvql") });
+    const completions_tests = b.addTest(.{ .root_module = completions_test_mod });
+    const run_completions_tests = b.addRunArtifact(completions_tests);
+    test_step.dependOn(&run_completions_tests.step);
+
     // CSV tests
     const csv_tests = b.addTest(.{
         .root_module = b.createModule(.{
