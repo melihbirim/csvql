@@ -3419,13 +3419,34 @@ fn fmtQuantile(allocator: Allocator, vl: ?std.ArrayList(f64), p: f64, round_digi
     return fmtAggrF64(allocator, q, round_digits);
 }
 
-/// True when `a` sorts before `b` for MODE tie-breaking: numerically when both
-/// parse as numbers, otherwise by bytes. Keeps ties deterministic across threads.
+/// True when `a` sorts before `b` for MODE tie-breaking. Numbers sort before
+/// text, numbers by value, everything else by bytes. The class check comes
+/// first so the order is total when a tie mixes numeric and text values
+/// ("9" < "10" numerically, but "10" < "1a" < "9" by bytes would cycle);
+/// a total order keeps ties deterministic across threads.
 fn modeKeyLess(a: []const u8, b: []const u8) bool {
-    const na = parseNumericFast(a) catch return std.mem.lessThan(u8, a, b);
-    const nb = parseNumericFast(b) catch return std.mem.lessThan(u8, a, b);
-    if (na != nb) return na < nb;
+    const na: ?f64 = parseNumericFast(a) catch null;
+    const nb: ?f64 = parseNumericFast(b) catch null;
+    if (na != null and nb != null) {
+        if (na.? != nb.?) return na.? < nb.?;
+        return std.mem.lessThan(u8, a, b);
+    }
+    if (na != null) return true;
+    if (nb != null) return false;
     return std.mem.lessThan(u8, a, b);
+}
+
+test "modeKeyLess: total order when numeric and text keys tie" {
+    // Numeric before text, numeric by value, text by bytes.
+    try std.testing.expect(modeKeyLess("9", "10"));
+    try std.testing.expect(modeKeyLess("10", "1a"));
+    try std.testing.expect(modeKeyLess("9", "1a"));
+    try std.testing.expect(!modeKeyLess("1a", "9"));
+    try std.testing.expect(modeKeyLess("1a", "b"));
+    try std.testing.expect(!modeKeyLess("9", "9"));
+    // Equal value, different spelling: bytes decide, consistently.
+    try std.testing.expect(modeKeyLess("10", "10.0"));
+    try std.testing.expect(!modeKeyLess("10.0", "10"));
 }
 
 /// Format MODE: the most frequent value; ties go to the smallest by `modeKeyLess`.
