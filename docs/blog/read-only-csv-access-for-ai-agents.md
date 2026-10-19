@@ -13,7 +13,7 @@ csvql is a third option. It runs `SELECT` on CSV files where they already sit, o
 
 Marketing says read-only about a lot of things. These are the specific properties, and how to verify each one yourself.
 
-**The parser has no write statements.** There is no `INSERT`, `UPDATE`, `DELETE` or `DROP` in the grammar. `grep -ri "insert\|update\|delete\|drop" src/parser.zig` finds them only in the help text that lists them as unsupported. An agent cannot be talked into writing to a file through SQL because the engine has no code path for it.
+**The parser has no write statements.** There is no `INSERT`, `UPDATE`, `DELETE` or `DROP` in the grammar. `grep -i "insert\|update\|delete\|drop" src/parser.zig` hits two code comments and nothing else; the only place those words appear as SQL is the help text that lists them as unsupported. An agent cannot be talked into writing to a file through SQL because the engine has no code path for it.
 
 **No network.** There is no `std.net`, `std.http` or socket call in the codebase. No telemetry, no update check, no API key. On Linux, `strace -f -e trace=network csvql "SELECT COUNT(*) FROM 'data.csv'"` shows an empty trace. On an air gapped server it runs the same as anywhere else.
 
