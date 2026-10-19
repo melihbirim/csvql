@@ -36,7 +36,7 @@ _csvql() {
             return 0
             ;;
         -o|--output|--audit|--schema|-s)
-            COMPREPLY=( $(compgen -f -- "$cur") )
+            _csvql_files "$cur"
             return 0
             ;;
         -d|--delimiter|--threads)
@@ -52,8 +52,17 @@ _csvql() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         COMPREPLY=( $(compgen -W 'install' -- "$cur") )
     fi
-    COMPREPLY+=( $(compgen -f -- "$cur") )
+    _csvql_files "$cur"
     return 0
+}
+
+# Append file completions one per line so names with spaces or glob
+# characters stay a single entry (an unquoted $(compgen ...) would split them).
+_csvql_files() {
+    local f
+    while IFS= read -r f; do
+        COMPREPLY+=( "$f" )
+    done < <(compgen -f -- "$1")
 }
 
 complete -o filenames -F _csvql csvql
