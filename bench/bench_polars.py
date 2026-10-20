@@ -12,8 +12,8 @@ Usage:
     N=5 ./bench/bench_polars.py       # best-of-N runs per query (default: 5)
 
 Needs: csvql built (zig build -Doptimize=ReleaseFast), polars installed
-(this repo pins bench/.venv-polars to a specific pre-release — see
-BENCHMARKS.md before trusting these numbers against a different version).
+(bench/.venv-polars holds the version BENCHMARKS.md was measured with; check
+pl.__version__ in the output before citing a number).
 """
 import os
 import subprocess
@@ -37,7 +37,7 @@ if not os.path.exists(CSVQL):
 try:
     import polars as pl
 except ImportError:
-    sys.exit("polars not installed — this repo pins a version, see bench/.venv-polars (BENCHMARKS.md)")
+    sys.exit("polars not installed, see bench/.venv-polars (BENCHMARKS.md)")
 
 QUERIES = [
     ("Q01  COUNT(*) GROUP BY cab_type",
@@ -67,7 +67,7 @@ def polars_run(sql):
     ctx.execute(sql).collect(engine="streaming")
 
 
-print(f"\n  csvql vs Polars {pl.__version__} (pre-release) — {CSV}  ({os.path.getsize(CSV) / 1e6:.0f} MB, best-of-{RUNS})\n")
+print(f"\n  csvql vs Polars {pl.__version__} — {CSV}  ({os.path.getsize(CSV) / 1e6:.0f} MB, best-of-{RUNS})\n")
 print(f"  {'query':<45} {'csvql':>10} {'polars':>10} {'speedup':>9}")
 
 for label, csvql_sql, polars_sql in QUERIES:
