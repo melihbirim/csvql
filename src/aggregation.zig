@@ -134,6 +134,12 @@ pub fn parseAggregateFunc(allocator: Allocator, expr: []const u8) !?AggregateFun
         if (!(quantile >= 0.0 and quantile <= 1.0)) return error.InvalidQuery;
     }
 
+    // Only COUNT(*) has a meaning without a column; for these three the star
+    // would otherwise yield an empty field and exit 0 (#254).
+    if (std.mem.eql(u8, actual_column_part, "*") and
+        (func_type == .median or func_type == .quantile or func_type == .mode))
+        return error.InvalidQuery;
+
     const column = if (std.mem.eql(u8, actual_column_part, "*"))
         null
     else
@@ -168,4 +174,18 @@ test "parse aggregate functions" {
     // Not an aggregate
     const not_agg = try parseAggregateFunc(allocator, "name");
     try std.testing.expect(not_agg == null);
+}
+
+test "MEDIAN, QUANTILE and MODE reject the star form" {
+    const allocator = std.testing.allocator;
+
+    try std.testing.expectError(error.InvalidQuery, parseAggregateFunc(allocator, "MEDIAN(*)"));
+    try std.testing.expectError(error.InvalidQuery, parseAggregateFunc(allocator, "MODE(*)"));
+    try std.testing.expectError(error.InvalidQuery, parseAggregateFunc(allocator, "QUANTILE(*, 0.5)"));
+    try std.testing.expectError(error.InvalidQuery, parseAggregateFunc(allocator, "median( * )"));
+
+    // The column forms still parse.
+    const median = (try parseAggregateFunc(allocator, "MEDIAN(a)")).?;
+    defer median.deinit(allocator);
+    try std.testing.expectEqualStrings("a", median.column.?);
 }
