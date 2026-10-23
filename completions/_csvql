@@ -17,21 +17,21 @@ fi
 _arguments -S \
     '(- *)'{-h,--help}'[show help]' \
     '(- *)'{-v,--version}'[show version]' \
-    '--no-header[suppress header row in output]' \
+    '(--markdown)--no-header[suppress header row in output]' \
     '--no-input-header[treat the first row as data, name columns c1..cN]' \
     '(-o --output)'{-o,--output}'[write results to a file instead of stdout]:output file:_files' \
     '(-d --delimiter)'{-d,--delimiter}'[field delimiter]:delimiter: ' \
-    '(--jsonl --table --no-table --markdown)--json[output a JSON array of objects]' \
-    '(--json --table --no-table --markdown)--jsonl[output newline-delimited JSON]' \
-    '(--json --jsonl --no-table --markdown)--table[always render output as a table]' \
-    '(--json --jsonl --table --markdown)--no-table[never render output as a table]' \
-    '(--json --jsonl --table --no-table)--markdown[render output as a Markdown table]' \
+    '(--markdown)--json[output a JSON array of objects]' \
+    '(--markdown)--jsonl[output newline-delimited JSON]' \
+    '--table[always render output as a table]' \
+    '--no-table[never render output as a table]' \
+    '(--json --jsonl --no-header)--markdown[render output as a Markdown table]' \
     '--wrap[wrap long cell text across lines]' \
     '--threads[worker threads for parallel execution (0 = auto)]:threads: ' \
     '--strict[error on non-numeric values in WHERE numeric comparisons]' \
     '--schema[show column names, inferred types, row count, file size]:csv file:_files' \
     '--mcp[start as an MCP server]' \
-    '--root[confine file access to these directories]:directories:_files -/' \
+    '--root[confine file access to these directories]:directories:{_dir_list -s ,}' \
     '--audit[append a JSONL record per query]:audit file:_files' \
     '1:file or subcommand: _alternative "subcommands:subcommand:(install)" "files:file:_files"' \
     '*:file or query:_files'

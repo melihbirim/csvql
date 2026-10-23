@@ -162,11 +162,15 @@ sudo cp zig-out/bin/csvql /usr/local/bin/
 **Shell completions** for bash and zsh live in [`completions/`](completions/). They complete the flags in `csvql --help`, the `install` subcommand and file paths.
 
 ```bash
-# bash: add to ~/.bashrc
+# bash: add to ~/.bashrc (on macOS, Terminal opens login shells, so use ~/.bash_profile)
 source /path/to/csvql/completions/csvql.bash
 
-# zsh: put _csvql on your fpath before compinit
+# zsh: put _csvql in a directory on your fpath
+mkdir -p ~/.zsh/completions
 cp completions/_csvql ~/.zsh/completions/_csvql
+# then in ~/.zshrc, before compinit runs:
+#   fpath=(~/.zsh/completions $fpath)
+#   autoload -Uz compinit && compinit
 ```
 
 ## Performance
