@@ -10761,3 +10761,44 @@ test "REPEAT, POSITION and INSTR: SELECT list, nesting and GROUP BY" {
         gdata,
     );
 }
+
+test "a doubled single quote in a string literal is one quote (#257)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile("ap.csv", .{});
+        defer f.close();
+        try f.writeAll("id,s\n1,it's\n2,its\n3,say it's ok\n4,x'y\n");
+    }
+    var pb: [std.fs.max_path_bytes]u8 = undefined;
+    const p = try tmp.dir.realpath("ap.csv", &pb);
+
+    const cases = [_]struct { select: []const u8, want: []const u8 }{
+        .{ .select = "SELECT id FROM '{s}' WHERE s = 'it''s'", .want = "id\n1\n" },
+        .{ .select = "SELECT id FROM '{s}' WHERE s != 'it''s' AND id < 3", .want = "id\n2\n" },
+        .{ .select = "SELECT id FROM '{s}' WHERE s IN ('its', 'x''y')", .want = "id\n2\n4\n" },
+        .{ .select = "SELECT id FROM '{s}' WHERE s NOT IN ('its', 'x''y') AND id < 4", .want = "id\n1\n3\n" },
+        .{ .select = "SELECT id FROM '{s}' WHERE s LIKE '%it''s%'", .want = "id\n1\n3\n" },
+        .{ .select = "SELECT id FROM '{s}' WHERE s BETWEEN 'it''s' AND 'its'", .want = "id\n1\n2\n" },
+        .{ .select = "SELECT id, INSTR(s, 'it''s') AS i, POSITION('''' IN s) AS q FROM '{s}' WHERE id < 4", .want = "id,i,q\n1,1,3\n2,0,0\n3,5,7\n" },
+    };
+    for (cases, 0..) |c, n| {
+        const sql = try std.mem.replaceOwned(u8, allocator, c.select, "{s}", p);
+        defer allocator.free(sql);
+        var q = try parser.parse(allocator, sql);
+        defer q.deinit();
+        var name_buf: [16]u8 = undefined;
+        const out_name = try std.fmt.bufPrint(&name_buf, "out{d}.csv", .{n});
+        const out = try tmp.dir.createFile(out_name, .{ .read = true });
+        defer out.close();
+        try execute(allocator, q, out, .{});
+        try out.seekTo(0);
+        const data = try out.readToEndAlloc(allocator, 64 * 1024);
+        defer allocator.free(data);
+        std.testing.expectEqualStrings(c.want, data) catch |err| {
+            std.debug.print("query: {s}\n", .{c.select});
+            return err;
+        };
+    }
+}

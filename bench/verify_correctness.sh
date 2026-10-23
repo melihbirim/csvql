@@ -688,6 +688,30 @@ check \
   "SELECT id, IFNULL(label, 'none') FROM '$PADDED' ORDER BY id" \
   "SELECT id, IFNULL(label, 'none') FROM read_csv_auto('$PADDED') ORDER BY id"
 
+# -- #257: a doubled single quote inside a string literal is one quote.
+APOS="$TMP/apostrophe.csv"
+cat > "$APOS" <<'EOF'
+id,s
+1,it's
+2,its
+3,say it's ok
+EOF
+
+check \
+  "WHERE equality and IN with a doubled quote (#257)" \
+  "SELECT id FROM '$APOS' WHERE s = 'it''s' OR s IN ('its', 'x''y') ORDER BY id" \
+  "SELECT id FROM read_csv_auto('$APOS') WHERE s = 'it''s' OR s IN ('its', 'x''y') ORDER BY id"
+
+check \
+  "WHERE LIKE with a doubled quote (#257)" \
+  "SELECT id FROM '$APOS' WHERE s LIKE '%it''s%' ORDER BY id" \
+  "SELECT id FROM read_csv_auto('$APOS') WHERE s LIKE '%it''s%' ORDER BY id"
+
+check \
+  "INSTR and POSITION with a doubled quote (#257)" \
+  "SELECT id, INSTR(s, 'it''s'), POSITION('''' IN s) FROM '$APOS' ORDER BY id" \
+  "SELECT id, INSTR(s, 'it''s'), POSITION('''' IN s) FROM read_csv_auto('$APOS') ORDER BY id"
+
 # ════════════════════════════════════════════════════════════════
 echo ""
 echo "── Date/Time Functions ─────────────────────────────────────"

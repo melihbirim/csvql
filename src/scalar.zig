@@ -88,7 +88,8 @@ pub const ScalarSpec = union(enum) {
 
     pub const PositionArgs = struct {
         col_idx: usize,
-        needle: []const u8, // slice into the query expr, without the quotes
+        needle: []const u8, // without the quotes, doubled quotes collapsed (#257)
+        needle_owned: bool = false, // true when `needle` was allocated to collapse a doubled quote
     };
 
     pub const PadArgs = struct {
@@ -276,6 +277,7 @@ pub const ScalarSpec = union(enum) {
                 allocator.destroy(inner);
             },
             .clock => |text| allocator.free(text),
+            .position => |a| if (a.needle_owned) allocator.free(a.needle),
             else => {},
         }
     }
@@ -470,17 +472,17 @@ pub fn tryParseScalarAt(
         if (!isQuoted(parts[1])) return error.InvalidQuery;
         const cidx = try resolveCol(parts[0], column_map, allocator) orelse
             return error.ColumnNotFound;
-        return .{ .position = .{ .col_idx = cidx, .needle = parts[1][1 .. parts[1].len - 1] } };
+        return try positionSpec(allocator, cidx, parts[1][1 .. parts[1].len - 1]);
     }
     if (std.mem.eql(u8, fn_lower, "position")) {
         if (args_str.len < 2 or args_str[0] != '\'') return error.InvalidQuery;
-        const close = std.mem.indexOfScalarPos(u8, args_str, 1, '\'') orelse return error.InvalidQuery;
+        const close = closingQuote(args_str, 1) orelse return error.InvalidQuery;
         const rest = std.mem.trim(u8, args_str[close + 1 ..], &std.ascii.whitespace);
         if (rest.len < 3 or !std.ascii.eqlIgnoreCase(rest[0..2], "in") or !std.ascii.isWhitespace(rest[2]))
             return error.InvalidQuery;
         const cidx = try resolveCol(rest[2..], column_map, allocator) orelse
             return error.ColumnNotFound;
-        return .{ .position = .{ .col_idx = cidx, .needle = args_str[1..close] } };
+        return try positionSpec(allocator, cidx, args_str[1..close]);
     }
 
     // ── LPAD / RPAD(col, len[, pad]) ────────────────────────────────────────
@@ -1448,6 +1450,30 @@ inline fn field(record: []const []const u8, idx: usize) []const u8 {
     return if (idx < record.len) record[idx] else "";
 }
 
+/// Index of the quote that closes a literal whose content starts at `from`.
+/// A doubled quote inside the literal is an escaped quote, not the end.
+fn closingQuote(s: []const u8, from: usize) ?usize {
+    var i = from;
+    while (i < s.len) : (i += 1) {
+        if (s[i] != '\'') continue;
+        if (i + 1 < s.len and s[i + 1] == '\'') {
+            i += 1;
+            continue;
+        }
+        return i;
+    }
+    return null;
+}
+
+/// POSITION/INSTR spec for the literal `raw` (the text between the quotes).
+/// A doubled quote in `raw` stands for one quote, so the needle is an owned
+/// copy with each pair collapsed; otherwise it borrows `raw` (#257).
+fn positionSpec(allocator: Allocator, col_idx: usize, raw: []const u8) !ScalarSpec {
+    if (std.mem.indexOf(u8, raw, "''") == null) return .{ .position = .{ .col_idx = col_idx, .needle = raw } };
+    const needle = try std.mem.replaceOwned(u8, allocator, raw, "''", "'");
+    return .{ .position = .{ .col_idx = col_idx, .needle = needle, .needle_owned = true } };
+}
+
 fn isQuoted(s: []const u8) bool {
     return s.len >= 2 and s[0] == '\'' and s[s.len - 1] == '\'';
 }
@@ -2351,4 +2377,27 @@ test "POSITION/INSTR: 1-based byte index, 0 when absent, empty field is NULL" {
     try std.testing.expectError(error.InvalidQuery, tryParseScalar("POSITION('a)", cm, allocator));
     try std.testing.expectError(error.ColumnNotFound, tryParseScalar("INSTR(nope, 'a')", cm, allocator));
     try std.testing.expectError(error.ColumnNotFound, tryParseScalar("POSITION('a' IN nope)", cm, allocator));
+}
+
+test "POSITION/INSTR: a doubled single quote in the literal is one quote (#257)" {
+    var cm = std.StringHashMap(usize).init(std.testing.allocator);
+    defer cm.deinit();
+    try cm.put("s", 0);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const cases = [_]struct { expr: []const u8, input: []const u8, want: []const u8 }{
+        .{ .expr = "INSTR(s, 'it''s')", .input = "say it's ok", .want = "5" },
+        .{ .expr = "INSTR(s, 'it''s')", .input = "say it''s ok", .want = "0" },
+        .{ .expr = "POSITION('''' IN s)", .input = "it's", .want = "3" },
+        .{ .expr = "POSITION('it''s' IN s)", .input = "say it's ok", .want = "5" },
+        .{ .expr = "INSTR(s, '''')", .input = "''", .want = "1" },
+        .{ .expr = "INSTR(s, '''''')", .input = "a''b", .want = "2" },
+    };
+    for (cases) |c| {
+        // Parse with the testing allocator so deinit must free the needle.
+        var spec = (try tryParseScalar(c.expr, cm, std.testing.allocator)).?;
+        defer spec.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings(c.want, eval(spec, &.{c.input}, arena.allocator()));
+    }
 }

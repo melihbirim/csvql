@@ -1341,9 +1341,9 @@ fn parseBetween(allocator: Allocator, input: []const u8, between_idx: usize) !Ex
     return Expression{ .comparison = Comparison{
         .column = col_lower,
         .operator = .between,
-        .value = try allocator.dupe(u8, low_clean),
+        .value = try dupeLiteral(allocator, low_str),
         .numeric_value = std.fmt.parseFloat(f64, low_clean) catch null,
-        .between_high = try allocator.dupe(u8, high_clean),
+        .between_high = try dupeLiteral(allocator, high_str),
         .between_high_num = std.fmt.parseFloat(f64, high_clean) catch null,
     } };
 }
@@ -1395,12 +1395,12 @@ fn parseInComparison(allocator: Allocator, input: []const u8, in_idx: usize, neg
             in_quote = true;
         } else if (c == ',') {
             const t = std.mem.trim(u8, inner[start..i], &std.ascii.whitespace);
-            try values.append(allocator, try allocator.dupe(u8, trimQuotes(t)));
+            try values.append(allocator, try dupeLiteral(allocator, t));
             start = i + 1;
         }
     }
     const last = std.mem.trim(u8, inner[start..], &std.ascii.whitespace);
-    try values.append(allocator, try allocator.dupe(u8, trimQuotes(last)));
+    try values.append(allocator, try dupeLiteral(allocator, last));
 
     const column_lower = try allocator.alloc(u8, column_part.len);
     errdefer allocator.free(column_lower);
@@ -1422,7 +1422,6 @@ fn parseLikeComparison(allocator: Allocator, input: []const u8, like_idx: usize)
     const column_part = std.mem.trim(u8, input[0..like_idx], &std.ascii.whitespace);
     // " LIKE " is 6 bytes: space + L + I + K + E + space
     const value_part = std.mem.trim(u8, input[like_idx + 6 ..], &std.ascii.whitespace);
-    const value_clean = trimQuotes(value_part);
 
     const column_lower = try allocator.alloc(u8, column_part.len);
     _ = std.ascii.lowerString(column_lower, column_part);
@@ -1431,7 +1430,7 @@ fn parseLikeComparison(allocator: Allocator, input: []const u8, like_idx: usize)
         .comparison = Comparison{
             .column = column_lower,
             .operator = .like,
-            .value = try allocator.dupe(u8, value_clean),
+            .value = try dupeLiteral(allocator, value_part),
             .numeric_value = null, // LIKE is always a string pattern match
         },
     };
@@ -1441,7 +1440,6 @@ fn parseILikeComparison(allocator: Allocator, input: []const u8, ilike_idx: usiz
     const column_part = std.mem.trim(u8, input[0..ilike_idx], &std.ascii.whitespace);
     // " ILIKE " is 7 bytes: space + I + L + I + K + E + space
     const value_part = std.mem.trim(u8, input[ilike_idx + 7 ..], &std.ascii.whitespace);
-    const value_clean = trimQuotes(value_part);
 
     const column_lower = try allocator.alloc(u8, column_part.len);
     _ = std.ascii.lowerString(column_lower, column_part);
@@ -1450,7 +1448,7 @@ fn parseILikeComparison(allocator: Allocator, input: []const u8, ilike_idx: usiz
         .comparison = Comparison{
             .column = column_lower,
             .operator = .ilike,
-            .value = try allocator.dupe(u8, value_clean),
+            .value = try dupeLiteral(allocator, value_part),
             .numeric_value = null, // ILIKE is always a string pattern match
         },
     };
@@ -1626,7 +1624,7 @@ fn parseComparison(allocator: Allocator, input: []const u8, op_str: []const u8, 
         .comparison = Comparison{
             .column = column_lower, // Use lowercased version
             .operator = operator,
-            .value = try allocator.dupe(u8, value_clean),
+            .value = try dupeLiteral(allocator, value_part),
             .numeric_value = numeric_value,
         },
     };
@@ -1673,6 +1671,16 @@ fn parseModComparison(allocator: Allocator, input: []const u8, mod_idx: usize) !
         };
     }
     return null;
+}
+
+/// Owned copy of the value in `input` with its quotes removed. Inside a
+/// single-quoted literal a doubled quote stands for one quote, so 'it''s'
+/// becomes it's (#257). Double-quoted and bare values are copied as is.
+fn dupeLiteral(allocator: Allocator, input: []const u8) ![]u8 {
+    const clean = trimQuotes(input);
+    const single_quoted = input.len >= 2 and input[0] == '\'' and input[input.len - 1] == '\'';
+    if (!single_quoted) return allocator.dupe(u8, clean);
+    return std.mem.replaceOwned(u8, allocator, clean, "''", "'");
 }
 
 fn trimQuotes(input: []const u8) []const u8 {
@@ -2081,4 +2089,41 @@ test "parseAt: query keeps the instant it was parsed with" {
     try std.testing.expectEqual(ts, q.now_ts);
     try std.testing.expectEqualStrings("NOW()", q.columns[1]);
     try std.testing.expectEqualStrings("2026-03-05", q.where_expr.?.comparison.value);
+}
+
+test "a doubled single quote in a WHERE literal is one quote (#257)" {
+    const allocator = std.testing.allocator;
+
+    var eq = try parse(allocator, "SELECT id FROM 't.csv' WHERE s = 'it''s'");
+    defer eq.deinit();
+    try std.testing.expectEqualStrings("it's", eq.where_expr.?.comparison.value);
+
+    var like = try parse(allocator, "SELECT id FROM 't.csv' WHERE s LIKE '%it''s%'");
+    defer like.deinit();
+    try std.testing.expectEqualStrings("%it's%", like.where_expr.?.comparison.value);
+
+    var ilike = try parse(allocator, "SELECT id FROM 't.csv' WHERE s ILIKE 'IT''S'");
+    defer ilike.deinit();
+    try std.testing.expectEqualStrings("IT'S", ilike.where_expr.?.comparison.value);
+
+    var in = try parse(allocator, "SELECT id FROM 't.csv' WHERE s IN ('a''b', 'c', '''')");
+    defer in.deinit();
+    const vals = in.where_expr.?.comparison.in_values.?;
+    try std.testing.expectEqual(@as(usize, 3), vals.len);
+    try std.testing.expectEqualStrings("a'b", vals[0]);
+    try std.testing.expectEqualStrings("c", vals[1]);
+    try std.testing.expectEqualStrings("'", vals[2]);
+
+    var between = try parse(allocator, "SELECT id FROM 't.csv' WHERE s BETWEEN 'a''b' AND 'c''d'");
+    defer between.deinit();
+    try std.testing.expectEqualStrings("a'b", between.where_expr.?.comparison.value);
+    try std.testing.expectEqualStrings("c'd", between.where_expr.?.comparison.between_high.?);
+
+    // An empty literal and a double-quoted value are unchanged.
+    var empty = try parse(allocator, "SELECT id FROM 't.csv' WHERE s != ''");
+    defer empty.deinit();
+    try std.testing.expectEqualStrings("", empty.where_expr.?.comparison.value);
+    var dq = try parse(allocator, "SELECT id FROM 't.csv' WHERE s = \"a''b\"");
+    defer dq.deinit();
+    try std.testing.expectEqualStrings("a''b", dq.where_expr.?.comparison.value);
 }
