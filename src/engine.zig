@@ -3350,31 +3350,38 @@ fn fmtAggrF64(allocator: Allocator, val: f64, round_digits: ?u8) ![]u8 {
 /// once at output time), takes the middle element (mean of the two middles for an
 /// even count). Empty/absent list → "".
 /// In-place quickselect: return the k-th smallest (0-based), partitioning `a` so
-/// that everything before index k is <= a[k]. O(n) average; median-of-three pivot
-/// keeps sorted/adversarial inputs off the O(n^2) path. Faster than a full sort
-/// when we only need the middle element(s).
+/// that everything before index k is <= a[k] and everything after is >= a[k].
+/// O(n) average; median-of-three pivot keeps sorted/adversarial inputs off the
+/// O(n^2) path, and a three-way partition (less / equal / greater) puts every
+/// element equal to the pivot in the middle band, so a column of equal or
+/// low-cardinality values terminates as soon as k falls inside that band.
 fn quickselectF64(a: []f64, k: usize) f64 {
     var lo: usize = 0;
     var hi: usize = a.len - 1;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        // Order a[lo] <= a[mid] <= a[hi], then move the median to a[hi] as pivot.
+        // Order a[lo] <= a[mid] <= a[hi], then use the median as the pivot value.
         if (a[mid] < a[lo]) std.mem.swap(f64, &a[mid], &a[lo]);
         if (a[hi] < a[lo]) std.mem.swap(f64, &a[hi], &a[lo]);
         if (a[hi] < a[mid]) std.mem.swap(f64, &a[hi], &a[mid]);
-        std.mem.swap(f64, &a[mid], &a[hi]);
-        const pivot = a[hi];
+        const pivot = a[mid];
+        // Invariant: a[lo..lt] < pivot, a[lt..i] == pivot, a[gt..hi + 1] > pivot.
+        var lt = lo;
         var i = lo;
-        var j = lo;
-        while (j < hi) : (j += 1) {
-            if (a[j] < pivot) {
-                std.mem.swap(f64, &a[i], &a[j]);
+        var gt = hi + 1;
+        while (i < gt) {
+            if (a[i] < pivot) {
+                std.mem.swap(f64, &a[lt], &a[i]);
+                lt += 1;
+                i += 1;
+            } else if (a[i] > pivot) {
+                gt -= 1;
+                std.mem.swap(f64, &a[i], &a[gt]);
+            } else {
                 i += 1;
             }
         }
-        std.mem.swap(f64, &a[i], &a[hi]);
-        if (i == k) return a[i];
-        if (i < k) lo = i + 1 else hi = i - 1;
+        if (k < lt) hi = lt - 1 else if (k >= gt) lo = gt else return pivot;
     }
     return a[k];
 }
@@ -6887,6 +6894,58 @@ test "quickselectF64 returns the k-th smallest (sorted, reverse, single)" {
     try std.testing.expectEqual(@as(f64, 5), quickselectF64(&c, 4));
     var d = [_]f64{42};
     try std.testing.expectEqual(@as(f64, 42), quickselectF64(&d, 0));
+}
+
+test "quickselectF64 matches a full sort on duplicate-heavy input" {
+    const allocator = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(255);
+    const rand = prng.random();
+    const n = 2000;
+    const buf = try allocator.alloc(f64, n);
+    defer allocator.free(buf);
+    const expected = try allocator.alloc(f64, n);
+    defer allocator.free(expected);
+    for ([_]u32{ 1, 2, 3, 10 }) |distinct| {
+        for (buf, expected) |*v, *e| {
+            v.* = @floatFromInt(rand.uintLessThan(u32, distinct));
+            e.* = v.*;
+        }
+        std.mem.sort(f64, expected, {}, std.sort.asc(f64));
+        for ([_]usize{ 0, 1, n / 4, n / 2, n - 2, n - 1 }) |k| {
+            const got = quickselectF64(buf, k);
+            try std.testing.expectEqual(expected[k], got);
+            for (buf[0..k]) |v| try std.testing.expect(v <= got);
+            for (buf[k + 1 ..]) |v| try std.testing.expect(v >= got);
+        }
+    }
+}
+
+test "quickselectF64 is linear on a large column of equal or two distinct values" {
+    // Lomuto partitioning with a strict less-than made these inputs quadratic.
+    const allocator = std.testing.allocator;
+    const n = 300_000;
+    const buf = try allocator.alloc(f64, n);
+    defer allocator.free(buf);
+    @memset(buf, 7);
+    try std.testing.expectEqual(@as(f64, 7), quickselectF64(buf, n / 2));
+    try std.testing.expectEqual(@as(f64, 7), quickselectF64(buf, n - 1));
+    for (buf, 0..) |*v, idx| v.* = if (idx % 2 == 0) 1 else 2;
+    try std.testing.expectEqual(@as(f64, 1), quickselectF64(buf, n / 2 - 1));
+    try std.testing.expectEqual(@as(f64, 2), quickselectF64(buf, n / 2));
+}
+
+test "MEDIAN and QUANTILE on a large column of equal values" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const rows = 200_000;
+    var data: std.ArrayList(u8) = .empty;
+    defer data.deinit(allocator);
+    try data.appendSlice(allocator, "v\n");
+    for (0..rows) |_| try data.appendSlice(allocator, "7\n");
+    const out = try runQueryForTest(allocator, &tmp, data.items, "SELECT MEDIAN(v) AS m, QUANTILE(v, 0.9) AS q FROM '{s}'");
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "7,7") != null);
 }
 
 test "MEDIAN: odd and even counts, scalar and GROUP BY" {
