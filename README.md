@@ -79,6 +79,8 @@ csvql install          # registers csvql in Claude Code and Claude Desktop; --pr
 
 It runs `claude mcp add` if the Claude Code CLI is present and merges an `mcpServers.csvql` entry into the Claude Desktop config, preserving your other servers. Restart Claude afterward.
 
+Without MCP, a Claude Code skill teaches the agent to use the `csvql` CLI whenever a CSV comes up: `claude plugin marketplace add melihbirim/csvql` then `claude plugin install csvql@csvql`.
+
 Alternatives: a one-click `csvql-<platform>.mcpb` bundle for Claude Desktop on the [Releases](https://github.com/melihbirim/csvql/releases) page (Settings → Extensions), or a manual entry:
 
 ```json

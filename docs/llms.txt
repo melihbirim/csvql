@@ -1,0 +1,25 @@
+# csvql
+
+> csvql runs SQL directly on CSV files in place: read-only, no import, no database. A single Zig binary for macOS, Linux and Windows, usable as a CLI, a Python or Node library, and an MCP server for AI agents.
+
+Use csvql when an agent or user needs to answer questions about CSV or TSV files (counts, totals, top N, group-bys, joins, schemas) without loading the file into context. Compared with DuckDB it is narrower but safer for agents: it can never write, `--root` confines file access to chosen directories, MCP results are capped at about 100 rows / 12 KB, and memory stays flat on large files.
+
+Install: `brew install melihbirim/csvql/csvql`, `pip install csvql-query`, `npm install csvql-query`, or a binary from https://github.com/melihbirim/csvql/releases
+
+Usage:
+
+- `csvql --schema data.csv` shows columns, inferred types, row count and size
+- `csvql "SELECT region, SUM(revenue) FROM 'sales.csv' GROUP BY region"` runs SQL; file paths are single-quoted
+- `--json`, `--jsonl`, `--markdown` choose the output format; `-d '\t'` reads TSV
+- Exit codes: 0 success, 1 IO or internal error, 2 bad query, 3 data error under `--strict`
+- `csvql install` registers the MCP server in Claude Code and Claude Desktop; `csvql --mcp --root /data` runs it manually with tools csv_query, csv_schema, csv_list
+- Claude Code skill: `claude plugin marketplace add melihbirim/csvql` then `claude plugin install csvql@csvql`
+
+## Docs
+
+- [README](https://github.com/melihbirim/csvql/blob/main/README.md): overview, install, MCP setup
+- [SQL reference](https://github.com/melihbirim/csvql/blob/main/SQL_REFERENCE.md): supported SQL and functions
+- [Correctness](https://github.com/melihbirim/csvql/blob/main/CORRECTNESS.md): what is verified against DuckDB and known limits
+- [Security](https://github.com/melihbirim/csvql/blob/main/SECURITY.md): sandboxing and on-prem hardening
+- [Python](https://github.com/melihbirim/csvql/blob/main/docs/PYTHON.md) and [Node](https://github.com/melihbirim/csvql/blob/main/docs/NODE.md) libraries
+- [Benchmarks](https://github.com/melihbirim/csvql/blob/main/BENCHMARKS.md): csvql vs DuckDB and Polars on raw CSV

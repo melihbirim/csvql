@@ -1,0 +1,14 @@
+{
+  "name": "csvql",
+  "description": "csvql: read-only SQL on CSV files in place",
+  "owner": {
+    "name": "Melih Birim"
+  },
+  "plugins": [
+    {
+      "name": "csvql",
+      "source": "./plugin",
+      "description": "Query, inspect and summarise CSV files with SQL using csvql, without loading the file into context"
+    }
+  ]
+}
