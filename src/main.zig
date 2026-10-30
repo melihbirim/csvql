@@ -131,6 +131,7 @@ fn exitCodeForError(err: anyerror) u8 {
         error.NestedFunctionNotSupported,
         error.PathOutsideAllowedRoot,
         error.UnterminatedQuotedValue,
+        error.ArithmeticExpressionsNotSupported,
         => 2,
         error.StrictModeNonNumericValue,
         error.EmptyFile,
@@ -968,6 +969,7 @@ test "exitCodeForError classifies bad-query, strict-mode, and uncategorized erro
     try std.testing.expectEqual(@as(u8, 2), exitCodeForError(error.InvalidSubquery));
     try std.testing.expectEqual(@as(u8, 2), exitCodeForError(error.UnsupportedSetOperation));
     try std.testing.expectEqual(@as(u8, 2), exitCodeForError(error.InvalidQuery));
+    try std.testing.expectEqual(@as(u8, 2), exitCodeForError(error.ArithmeticExpressionsNotSupported));
 
     // --strict / data-quality signal — the data defeated csvql, not a query bug.
     try std.testing.expectEqual(@as(u8, 3), exitCodeForError(error.StrictModeNonNumericValue));
