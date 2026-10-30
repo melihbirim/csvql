@@ -8,5 +8,6 @@
   },
   "homepage": "https://github.com/melihbirim/csvql",
   "repository": "https://github.com/melihbirim/csvql",
-  "license": "MIT"
+  "license": "MIT",
+  "privacyPolicyUrl": "https://melihbirim.github.io/csvql/privacy/"
 }
