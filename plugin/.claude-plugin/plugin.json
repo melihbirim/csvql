@@ -1,9 +1,12 @@
 {
   "name": "csvql",
+  "displayName": "csvql",
+  "version": "1.0.0",
   "description": "Query, inspect and summarise CSV files with SQL using csvql, without loading the file into context",
   "author": {
     "name": "Melih Birim"
   },
   "homepage": "https://github.com/melihbirim/csvql",
+  "repository": "https://github.com/melihbirim/csvql",
   "license": "MIT"
 }
