@@ -1,0 +1,9 @@
+{
+  "name": "csvql",
+  "description": "Query, inspect and summarise CSV files with SQL using csvql, without loading the file into context",
+  "author": {
+    "name": "Melih Birim"
+  },
+  "homepage": "https://github.com/melihbirim/csvql",
+  "license": "MIT"
+}
