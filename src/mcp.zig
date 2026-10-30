@@ -28,7 +28,7 @@ const ManagedList = std.array_list.Managed(u8);
 // ---------------------------------------------------------------------------
 
 const INIT_RESULT =
-    "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"csvql\",\"version\":\"2.9.0\"}}";
+    "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"tools\":{}},\"serverInfo\":{\"name\":\"csvql\",\"version\":\"2.10.0\"}}";
 
 // Multiline for readability; flattened to single line before sending.
 const TOOLS_JSON =
