@@ -11,7 +11,7 @@ const memfile = @import("memfile.zig");
 const zigtable = @import("zigtable");
 const Allocator = std.mem.Allocator;
 
-const version = "2.9.0";
+const version = "2.10.0";
 
 const help_text =
     \\csvql — SQL on CSV files in place, read-only

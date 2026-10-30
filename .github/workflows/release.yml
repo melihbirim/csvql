@@ -20,12 +20,12 @@ jobs:
             artifact: csvql-linux-x86_64
             ext: ""
             pkg: tar.gz
-          - os: macos-14
+          - os: macos-15
             zig-target: aarch64-macos
             artifact: csvql-macos-aarch64
             ext: ""
             pkg: tar.gz
-          - os: macos-14
+          - os: macos-15
             zig-target: x86_64-macos
             artifact: csvql-macos-x86_64
             ext: ""
@@ -123,9 +123,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             name: darwin-arm64
-          - os: macos-14
+          - os: macos-15
             name: darwin-x64
             zig-target: x86_64-macos
           - os: ubuntu-latest
@@ -384,10 +384,10 @@ jobs:
             plat: manylinux_2_17_x86_64
           - os: ubuntu-24.04-arm
             plat: manylinux_2_17_aarch64
-          - os: macos-14
+          - os: macos-15
             arch: x86_64
             plat: macosx_12_0_x86_64
-          - os: macos-14
+          - os: macos-15
             arch: arm64
             plat: macosx_12_0_arm64
           - os: windows-latest

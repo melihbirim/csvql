@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "csvql-query"
-version = "2.9.0"
+version = "2.10.0"
 description = "Run SQL on CSV files in place from Python. Query large CSV files fast with no import and no database. A CSV SQL engine in Zig with SIMD parsing. Read only by design."
 readme = "README.md"
 license = { text = "MIT" }
