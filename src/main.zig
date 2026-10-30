@@ -157,18 +157,28 @@ pub fn main() !void {
     var roots_list = std.ArrayList([]const u8){};
     defer roots_list.deinit(allocator);
     var audit_path: ?[]const u8 = null;
+    if (unknownFlag(args[1..])) |bad| {
+        std.debug.print("error: unknown flag '{s}'\n\nRun 'csvql --help' for usage information.\n", .{bad});
+        std.process.exit(2);
+    }
     {
         var i: usize = 1;
         while (i < args.len) : (i += 1) {
-            if (std.mem.eql(u8, args[i], "--root")) {
-                i += 1;
-                if (i < args.len) {
-                    var it = std.mem.splitScalar(u8, args[i], ',');
-                    while (it.next()) |r| if (r.len > 0) try roots_list.append(allocator, r);
+            if (flagValue(args, &i, "--root")) |v| {
+                const before = roots_list.items.len;
+                var it = std.mem.splitScalar(u8, v, ',');
+                while (it.next()) |r| if (r.len > 0) try roots_list.append(allocator, r);
+                // An empty --root would mean "unrestricted", the opposite of what was asked.
+                if (roots_list.items.len == before) {
+                    try stderr_file.writeAll("error: --root requires a directory argument\n");
+                    std.process.exit(2);
                 }
-            } else if (std.mem.eql(u8, args[i], "--audit")) {
-                i += 1;
-                if (i < args.len) audit_path = args[i];
+            } else if (flagValue(args, &i, "--audit")) |v| {
+                if (v.len == 0) {
+                    try stderr_file.writeAll("error: --audit requires a file path argument\n");
+                    std.process.exit(2);
+                }
+                audit_path = v;
             }
         }
     }
@@ -252,10 +262,10 @@ pub fn main() !void {
                 std.process.exit(1);
             }
             opts.delimiter = parseDelimiter(args[i]);
-        } else if (std.mem.eql(u8, arg, "--root")) {
-            i += 1; // value already parsed into opts.roots above; skip it here
-        } else if (std.mem.eql(u8, arg, "--audit")) {
-            i += 1; // value already parsed into opts.audit_path above; skip it here
+        } else if (std.mem.eql(u8, arg, "--root") or std.mem.eql(u8, arg, "--audit")) {
+            i += 1; // value already parsed into opts above; skip it here
+        } else if (std.mem.startsWith(u8, arg, "--root=") or std.mem.startsWith(u8, arg, "--audit=")) {
+            // parsed above
         } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
             i += 1;
             if (i >= args.len) {
@@ -528,6 +538,49 @@ fn getTerminalWidth() usize {
 /// Analyse a CSV file and print a schema table: column index, name, inferred type,
 /// non-empty count, and empty count.  Also prints a summary header line.
 /// True if `tok` appears anywhere in args[1..].
+/// Flags that consume the next argument as their value.
+const value_flags = [_][]const u8{ "--threads", "-d", "--delimiter", "--root", "--audit", "-o", "--output", "--schema", "-schema", "-s" };
+/// Flags that stand alone.
+const bare_flags = [_][]const u8{ "--no-header", "--json", "--jsonl", "--table", "--wrap", "--no-input-header", "--no-table", "--markdown", "--strict", "--mcp", "--version", "-v", "--help", "-h", "--print" };
+
+fn inList(list: []const []const u8, a: []const u8) bool {
+    for (list) |f| if (std.mem.eql(u8, f, a)) return true;
+    return false;
+}
+
+/// First argument that looks like a long flag csvql does not know, or null.
+/// Unknown flags used to fall through as query text, so a typo like `--rot`
+/// silently ran with no sandbox at all (#265). Anything containing whitespace
+/// is query text (a query may start with a `--` SQL comment), not a flag.
+fn unknownFlag(args: anytype) ?[]const u8 {
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a: []const u8 = args[i];
+        if (inList(&value_flags, a)) {
+            i += 1;
+        } else if (inList(&bare_flags, a) or
+            std.mem.startsWith(u8, a, "--root=") or std.mem.startsWith(u8, a, "--audit="))
+        {
+            continue;
+        } else if (std.mem.startsWith(u8, a, "--") and std.mem.indexOfAny(u8, a, " \t\r\n") == null) {
+            return a;
+        }
+    }
+    return null;
+}
+
+/// Value of `name` given as either `name <value>` (advancing `i.*`) or
+/// `name=<value>`. A missing value comes back as "" so the caller can reject it.
+fn flagValue(args: anytype, i: *usize, name: []const u8) ?[]const u8 {
+    const a: []const u8 = args[i.*];
+    if (std.mem.eql(u8, a, name)) {
+        i.* += 1;
+        return if (i.* < args.len) args[i.*] else "";
+    }
+    if (a.len > name.len and std.mem.startsWith(u8, a, name) and a[name.len] == '=') return a[name.len + 1 ..];
+    return null;
+}
+
 fn argHas(args: []const [:0]u8, tok: []const u8) bool {
     for (args[1..]) |a| if (std.mem.eql(u8, a, tok)) return true;
     return false;
@@ -1008,4 +1061,29 @@ test "markdown: engine output renders end to end" {
             "| Bob   |      |\n",
         out,
     );
+}
+
+test "unknownFlag: rejects unknown long flags, accepts known ones and their values (#265)" {
+    try std.testing.expectEqual(@as(?[]const u8, null), unknownFlag(&[_][]const u8{ "SELECT * FROM 'a.csv'", "--root", "/x", "--json" }));
+    try std.testing.expectEqual(@as(?[]const u8, null), unknownFlag(&[_][]const u8{ "--root=/x,/y", "--audit=a.jsonl", "--mcp" }));
+    try std.testing.expectEqual(@as(?[]const u8, null), unknownFlag(&[_][]const u8{ "-o", "--weird-but-a-value", "q" }));
+    try std.testing.expectEqual(@as(?[]const u8, null), unknownFlag(&[_][]const u8{"-- comment\nSELECT 1 FROM 'a.csv'"}));
+    try std.testing.expectEqualStrings("--rot", unknownFlag(&[_][]const u8{ "--mcp", "--rot", "/x" }).?);
+    try std.testing.expectEqualStrings("--bogus", unknownFlag(&[_][]const u8{ "SELECT 1 FROM 'a.csv'", "--bogus" }).?);
+    try std.testing.expectEqualStrings("--rootx=/x", unknownFlag(&[_][]const u8{"--rootx=/x"}).?);
+}
+
+test "flagValue: space and equals forms, missing value is empty" {
+    var i: usize = 0;
+    const a = [_][]const u8{ "--root", "/x" };
+    try std.testing.expectEqualStrings("/x", flagValue(&a, &i, "--root").?);
+    try std.testing.expectEqual(@as(usize, 1), i);
+    i = 0;
+    try std.testing.expectEqualStrings("/a,/b", flagValue(&[_][]const u8{"--root=/a,/b"}, &i, "--root").?);
+    i = 0;
+    try std.testing.expectEqualStrings("", flagValue(&[_][]const u8{"--root"}, &i, "--root").?);
+    i = 0;
+    try std.testing.expectEqualStrings("", flagValue(&[_][]const u8{"--root="}, &i, "--root").?);
+    i = 0;
+    try std.testing.expectEqual(@as(?[]const u8, null), flagValue(&[_][]const u8{"--rootx"}, &i, "--root"));
 }
