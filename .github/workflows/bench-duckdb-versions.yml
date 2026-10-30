@@ -20,7 +20,7 @@ on:
       os:
         description: "Runner OS"
         type: choice
-        options: [windows-latest, ubuntu-latest, macos-14]
+        options: [windows-latest, ubuntu-latest, macos-15]
         default: windows-latest
       scale:
         description: "sample = 1M rows (~417 MB); full = trips_xaa (20M rows, ~8 GB)"
