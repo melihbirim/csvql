@@ -165,6 +165,22 @@ pub fn parseNamed(allocator: Allocator, text: []const u8) !*Expr {
     return parseIn(allocator, text, null);
 }
 
+/// Resolves a function call's text (`SUM(a)`) to the record slot it reads.
+pub const CallHook = struct {
+    ctx: *anyopaque,
+    resolve: *const fn (ctx: *anyopaque, call: []const u8) anyerror!usize,
+};
+
+/// Parse arithmetic over function calls only, e.g. `SUM(a) / COUNT(*)`, where
+/// `hook` turns each call into a slot of the record the result is evaluated on.
+pub fn parseCalls(allocator: Allocator, text: []const u8, hook: CallHook) !*Expr {
+    var p = Parser{ .allocator = allocator, .s = text, .map = null, .hook = hook };
+    const e = try p.expr();
+    errdefer e.deinit(allocator);
+    if (p.peek() != null) return error.ArithmeticExpressionsNotSupported;
+    return e;
+}
+
 fn parseIn(allocator: Allocator, text: []const u8, column_map: ?std.StringHashMap(usize)) !*Expr {
     var p = Parser{ .allocator = allocator, .s = text, .map = column_map };
     const e = try p.expr();
@@ -178,6 +194,7 @@ const Parser = struct {
     s: []const u8,
     i: usize = 0,
     map: ?std.StringHashMap(usize),
+    hook: ?CallHook = null,
 
     fn peek(p: *Parser) ?u8 {
         while (p.i < p.s.len and std.ascii.isWhitespace(p.s[p.i])) p.i += 1;
@@ -253,8 +270,15 @@ const Parser = struct {
         if (std.ascii.isAlphabetic(c) or c == '_') {
             while (p.i < p.s.len and (std.ascii.isAlphanumeric(p.s[p.i]) or p.s[p.i] == '_')) p.i += 1;
             const name = p.s[start..p.i];
-            // A function call inside an expression is not evaluated yet.
-            if (p.peek() == '(') return error.ArithmeticExpressionsNotSupported;
+            if (p.peek() == '(') {
+                // A call is only meaningful when a hook resolves it.
+                const hook = p.hook orelse return error.ArithmeticExpressionsNotSupported;
+                const close = matchParen(p.s, p.i) orelse return error.ArithmeticExpressionsNotSupported;
+                const idx = try hook.resolve(hook.ctx, p.s[start .. close + 1]);
+                p.i = close + 1;
+                return p.node(.{ .col = idx });
+            }
+            if (p.hook != null) return error.ArithmeticExpressionsNotSupported; // bare column beside aggregates
             return p.column(name);
         }
         return error.ArithmeticExpressionsNotSupported;
@@ -271,6 +295,30 @@ const Parser = struct {
         return p.node(.{ .col = idx });
     }
 };
+
+/// Index of the ')' matching the '(' at `open`, skipping quoted text.
+fn matchParen(s: []const u8, open: usize) ?usize {
+    var depth: usize = 0;
+    var quote: u8 = 0;
+    var i = open;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (quote != 0) {
+            if (c == quote) quote = 0;
+            continue;
+        }
+        switch (c) {
+            '\'', '"' => quote = c,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if (depth == 0) return i;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
 
 fn testMap(allocator: Allocator) !std.StringHashMap(usize) {
     var m = std.StringHashMap(usize).init(allocator);
