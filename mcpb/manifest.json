@@ -13,6 +13,6 @@
   "tools": [
     { "name": "csv_query", "description": "Run SQL against a CSV file; results are capped so large files never flood the context." },
     { "name": "csv_schema", "description": "Column names, types, and row count for a CSV file." },
-    { "name": "csv_list", "description": "List CSV files in a directory." }
+    { "name": "csv_list", "description": "List CSV files in a directory and its subfolders (up to 200)." }
   ]
 }

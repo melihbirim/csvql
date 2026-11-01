@@ -4,7 +4,7 @@
 //! Exposed tools:
 //!   csv_query(sql)           — execute any SQL, return JSON results
 //!   csv_schema(file)         — column names + sample rows
-//!   csv_list(directory?)     — list CSV files in a directory
+//!   csv_list(directory?)     — list CSV files in a directory and its subfolders
 //!
 //! Usage:  csvql --mcp
 //! Config (Claude Desktop example):
@@ -35,7 +35,7 @@ const TOOLS_JSON =
     \\{"tools":[
     \\{"name":"csv_query","description":"Execute a SQL query against CSV files and return results as JSON. Supports SELECT, WHERE, GROUP BY, ORDER BY, LIMIT, JOIN, COUNT/SUM/AVG/MIN/MAX, DISTINCT, LIKE. File paths must be single-quoted in FROM. Results are capped (~100 rows / 12KB): do NOT SELECT * on large files — aggregate (COUNT/SUM/AVG with GROUP BY) or add WHERE/LIMIT to answer questions without pulling raw rows. Example: SELECT dept, COUNT(*) FROM 'data.csv' GROUP BY dept","inputSchema":{"type":"object","properties":{"sql":{"type":"string","description":"SQL query with single-quoted file paths in FROM clause"}},"required":["sql"]}},
     \\{"name":"csv_schema","description":"Show column names and a few sample rows from a CSV file. Call this before csv_query to understand column names and data types.","inputSchema":{"type":"object","properties":{"file":{"type":"string","description":"Path to the CSV file"}},"required":["file"]}},
-    \\{"name":"csv_list","description":"List CSV files in a directory.","inputSchema":{"type":"object","properties":{"directory":{"type":"string","description":"Directory to search (defaults to current working directory)"}}}}
+    \\{"name":"csv_list","description":"List CSV files in a directory and its subfolders (up to 200).","inputSchema":{"type":"object","properties":{"directory":{"type":"string","description":"Directory to search (defaults to current working directory)"}}}}
     \\]}
 ;
 
@@ -274,6 +274,9 @@ fn toolCsvSchema(
 // Tool: csv_list
 // ---------------------------------------------------------------------------
 
+const max_list_files = 200;
+const max_list_visits = 20_000;
+
 fn toolCsvList(
     allocator: Allocator,
     id: ?std.json.Value,
@@ -307,11 +310,22 @@ fn toolCsvList(
         files.deinit(allocator);
     }
 
-    var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    // Walk subfolders too: an agent that lists "." and sees nothing concludes
+    // the data isn't there. The walker does not follow symlinked folders, so it
+    // stays inside --root. Both caps bound the time and size of one call.
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+    var visited: usize = 0;
+    var truncated = false;
+    while (try walker.next()) |entry| {
+        visited += 1;
+        if (visited > max_list_visits or files.items.len >= max_list_files) {
+            truncated = true;
+            break;
+        }
         if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".csv")) continue;
-        try files.append(allocator, try allocator.dupe(u8, entry.name));
+        if (!std.mem.endsWith(u8, entry.basename, ".csv")) continue;
+        try files.append(allocator, try allocator.dupe(u8, entry.path));
     }
 
     std.mem.sort([]const u8, files.items, {}, struct {
@@ -334,6 +348,7 @@ fn toolCsvList(
             try result.appendSlice(f);
             try result.append('\n');
         }
+        if (truncated) try result.appendSlice("(list truncated; pass a narrower directory)\n");
     }
 
     const trimmed = std.mem.trim(u8, result.items, "\n");
@@ -624,4 +639,29 @@ test "runQuery injects DEFAULT_ROW_CAP when the query has no LIMIT" {
     defer allocator.free(limited.output);
     try std.testing.expect(!limited.row_capped);
     try std.testing.expectEqual(@as(usize, 5), std.mem.count(u8, limited.output, "{"));
+}
+
+test "csv_list finds CSV files in subfolders" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("data/2026");
+    for ([_][]const u8{ "top.csv", "data/orders.csv", "data/2026/jan.csv", "data/notes.txt" }) |p| {
+        const f = try tmp.dir.createFile(p, .{});
+        f.close();
+    }
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realpath(".", &path_buf);
+
+    var args = std.json.ObjectMap.init(allocator);
+    defer args.deinit();
+    try args.put("directory", .{ .string = root });
+    var resp = ManagedList.init(allocator);
+    defer resp.deinit();
+    try toolCsvList(allocator, null, args, &resp);
+
+    try std.testing.expect(std.mem.indexOf(u8, resp.items, "top.csv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.items, "orders.csv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.items, "jan.csv") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.items, "notes.txt") == null);
 }
