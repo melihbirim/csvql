@@ -268,7 +268,8 @@ const Parser = struct {
             return p.node(.{ .num = n });
         }
         if (std.ascii.isAlphabetic(c) or c == '_') {
-            while (p.i < p.s.len and (std.ascii.isAlphanumeric(p.s[p.i]) or p.s[p.i] == '_')) p.i += 1;
+            // 0x1F is a space inside a quoted identifier (parser.ident_space).
+            while (p.i < p.s.len and (std.ascii.isAlphanumeric(p.s[p.i]) or p.s[p.i] == '_' or p.s[p.i] == 0x1F)) p.i += 1;
             const name = p.s[start..p.i];
             if (p.peek() == '(') {
                 // A call is only meaningful when a hook resolves it.

@@ -366,7 +366,7 @@ pub fn deniedColumnIn(sql: []const u8, deny: []const []const u8) ?[]const u8 {
         for (sql, 0..) |c, i| {
             if (c == '\'') in_literal = !in_literal;
             if (in_literal or i + name.len > sql.len) continue;
-            if (!std.ascii.eqlIgnoreCase(sql[i .. i + name.len], name)) continue;
+            if (!sameName(sql[i .. i + name.len], name)) continue;
             const before_ok = i == 0 or !isIdentByte(sql[i - 1]);
             const after_ok = i + name.len == sql.len or !isIdentByte(sql[i + name.len]);
             if (before_ok and after_ok) return name;
@@ -375,13 +375,24 @@ pub fn deniedColumnIn(sql: []const u8, deny: []const []const u8) ?[]const u8 {
     return null;
 }
 
+/// Case-insensitive, with a space in `name` also matching parser.ident_space,
+/// which is how a quoted identifier's spaces reach the parsed SQL (#280).
+fn sameName(sql_part: []const u8, name: []const u8) bool {
+    for (sql_part, name) |a, b| {
+        if (b == ' ' and (a == ' ' or a == parser.ident_space)) continue;
+        if (std.ascii.toLower(a) != std.ascii.toLower(b)) return false;
+    }
+    return true;
+}
+
 fn isIdentByte(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
 /// The header names of `path` minus the denied ones, for SELECT * under
-/// --deny-columns. A name with whitespace or quotes cannot be written as a
-/// column reference, so such a file has to name its columns explicitly.
+/// --deny-columns, written the way the parser writes a quoted identifier.
+/// A name with quotes or tabs cannot be referenced, so such a file has to
+/// name its columns explicitly.
 fn allowedColumns(allocator: Allocator, path: []const u8, opts: options_mod.Options) ![][]u8 {
     const f = try std.fs.cwd().openFile(path, .{});
     defer f.close();
@@ -401,8 +412,10 @@ fn allowedColumns(allocator: Allocator, path: []const u8, opts: options_mod.Opti
         var name = std.mem.trim(u8, raw, " \t\r");
         if (name.len >= 2 and name[0] == '"' and name[name.len - 1] == '"') name = name[1 .. name.len - 1];
         for (opts.deny_columns) |d| if (std.ascii.eqlIgnoreCase(name, d)) continue :outer;
-        if (std.mem.indexOfAny(u8, name, " \t\"'") != null) return error.DeniedColumnSelectStar;
-        try out.append(allocator, try allocator.dupe(u8, name));
+        if (std.mem.indexOfAny(u8, name, "\t\"'") != null) return error.DeniedColumnSelectStar;
+        const ref = try allocator.dupe(u8, name);
+        std.mem.replaceScalar(u8, ref, ' ', parser.ident_space);
+        try out.append(allocator, ref);
     }
     if (out.items.len == 0) return error.DeniedColumn;
     return out.toOwnedSlice(allocator);
@@ -791,7 +804,7 @@ fn executeSequential(
         const col_name = std.mem.trim(u8, col_name_raw, " \t\r\n"); // trim header whitespace (#101)
         // Store lowercase version for case-insensitive lookup
         const lower_name = try allocator.alloc(u8, col_name.len);
-        _ = std.ascii.lowerString(lower_name, col_name);
+        parser.normalizeHeaderName(lower_name, col_name);
         lower_header[idx] = lower_name;
         _ = try column_map.getOrPutValue(lower_name, idx); // first occurrence of a duplicate header name wins (#102)
     }
@@ -1370,7 +1383,7 @@ fn executeParallelScalar(
     for (header, 0..) |col_raw, idx| {
         const col = std.mem.trim(u8, col_raw, " \t\r\n"); // trim header whitespace (#101)
         const lower = try allocator.alloc(u8, col.len);
-        _ = std.ascii.lowerString(lower, col);
+        parser.normalizeHeaderName(lower, col);
         lower_header_buf[idx] = lower;
         _ = try column_map.getOrPutValue(lower, idx); // first occurrence of a duplicate header name wins (#102)
     }
@@ -1525,7 +1538,7 @@ fn joinOneStep(
     var right_col_map = std.StringHashMap(usize).init(arena);
     for (rh_raw, 0..) |col, i| {
         const lower = try arena.alloc(u8, col.len);
-        _ = std.ascii.lowerString(lower, col);
+        parser.normalizeHeaderName(lower, col);
         right_lh[i] = lower;
         try right_col_map.put(lower, i);
         if (join.right_alias.len > 0) {
@@ -1995,7 +2008,7 @@ fn executeJoin(
     } else {
         for (base_hdr_raw, 0..) |col, i| {
             const lower = try aa.alloc(u8, col.len);
-            _ = std.ascii.lowerString(lower, col);
+            parser.normalizeHeaderName(lower, col);
             base_headers[i] = lower;
         }
     }
@@ -2062,7 +2075,7 @@ fn executeJoin(
                 try std.fmt.allocPrint(aa, "c{d}", .{i + 1})
             else name_blk: {
                 const lower = try aa.alloc(u8, col.len);
-                _ = std.ascii.lowerString(lower, col);
+                parser.normalizeHeaderName(lower, col);
                 break :name_blk lower;
             };
             right_lh[i] = name;
@@ -2353,7 +2366,7 @@ fn executeFromStdin(
     for (header, 0..) |col_name_raw, idx| {
         const col_name = std.mem.trim(u8, col_name_raw, " \t\r\n"); // trim header whitespace (#101)
         const lower_name = try allocator.alloc(u8, col_name.len);
-        _ = std.ascii.lowerString(lower_name, col_name);
+        parser.normalizeHeaderName(lower_name, col_name);
         lower_header[idx] = lower_name;
         _ = try column_map.getOrPutValue(lower_name, idx); // first occurrence of a duplicate header name wins (#102)
     }
@@ -3895,7 +3908,7 @@ fn executeDistinct(
     for (header, 0..) |col_name_raw, idx| {
         const col_name = std.mem.trim(u8, col_name_raw, " \t\r\n"); // trim header whitespace (#101)
         const lower = try allocator.alloc(u8, col_name.len);
-        _ = std.ascii.lowerString(lower, col_name);
+        parser.normalizeHeaderName(lower, col_name);
         lower_header[idx] = lower;
         _ = try column_map.getOrPutValue(lower, idx); // first occurrence of a duplicate header name wins (#102)
     }
@@ -4182,7 +4195,7 @@ fn executeScalarAgg(
     for (header, 0..) |col_name_raw, idx| {
         const col_name = std.mem.trim(u8, col_name_raw, " \t\r\n"); // trim header whitespace (#101)
         const lower = try allocator.alloc(u8, col_name.len);
-        _ = std.ascii.lowerString(lower, col_name);
+        parser.normalizeHeaderName(lower, col_name);
         lower_header[idx] = lower;
         _ = try column_map.getOrPutValue(lower, idx); // first occurrence of a duplicate header name wins (#102)
     }
@@ -6065,7 +6078,7 @@ fn executeGroupBy(
     for (header, 0..) |col_name_raw, idx| {
         const col_name = std.mem.trim(u8, col_name_raw, " \t\r\n"); // trim header whitespace (#101)
         const lower = try allocator.alloc(u8, col_name.len);
-        _ = std.ascii.lowerString(lower, col_name);
+        parser.normalizeHeaderName(lower, col_name);
         lower_header[idx] = lower;
         _ = try column_map.getOrPutValue(lower, idx); // first occurrence of a duplicate header name wins (#102)
     }
@@ -11146,4 +11159,26 @@ test "arithmetic over aggregate results (#281)" {
         try std.testing.expectEqualStrings(c.want, out);
     }
     try std.testing.expectError(error.ArithmeticExpressionsNotSupported, runQueryForTest(allocator, &tmp, data, "SELECT cat, SUM(price) + qty FROM '{s}' GROUP BY cat"));
+}
+
+test "column names with spaces: quoted identifiers, deny list and SELECT * (#280)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = "First Name,Total Sales,city\nAnn,100,New York\nBob,50,Boston\n";
+    const cases = [_]struct { sql: []const u8, want: []const u8 }{
+        .{ .sql = "SELECT \"First Name\", [Total Sales] FROM '{s}' WHERE city = \"New York\"", .want = "First Name,Total Sales\nAnn,100\n" },
+        .{ .sql = "SELECT city, SUM(`Total Sales` * 2) AS d FROM '{s}' GROUP BY city ORDER BY city", .want = "city,d\nBoston,100\nNew York,200\n" },
+        .{ .sql = "SELECT \"First Name\" FROM '{s}' WHERE \"Total Sales\" > 60", .want = "First Name\nAnn\n" },
+    };
+    for (cases) |c| {
+        const out = try runQueryForTest(allocator, &tmp, data, c.sql);
+        defer allocator.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    }
+    const deny = options_mod.Options{ .deny_columns = &.{"Total Sales"} };
+    try std.testing.expectError(error.DeniedColumn, runQueryForTestOpts(allocator, &tmp, data, "SELECT [Total Sales] FROM '{s}'", deny));
+    const star = try runQueryForTestOpts(allocator, &tmp, data, "SELECT * FROM '{s}'", deny);
+    defer allocator.free(star);
+    try std.testing.expectEqualStrings("First Name,city\nAnn,New York\nBob,Boston\n", star);
 }

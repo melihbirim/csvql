@@ -678,13 +678,112 @@ fn resolveClockKeywords(allocator: Allocator, text: []const u8, now_ts: i64) ![]
 
 /// Parse a SQL query string. CURRENT_DATE, NOW() and CURRENT_TIMESTAMP
 /// resolve to the current time (or `CSVQL_NOW`), read once here.
+/// A space inside a quoted identifier ("First Name", `First Name`,
+/// [First Name]) becomes this byte, so the name stays one token through every
+/// clause. Header names get the same mapping (normalizeHeaderName) and output
+/// headers turn it back into a space (#280).
+pub const ident_space: u8 = 0x1F;
+
+/// Lowercase a header name into `dst` (same length) with spaces mapped to
+/// ident_space, so it matches a quoted identifier from the query.
+pub fn normalizeHeaderName(dst: []u8, src: []const u8) void {
+    for (src, 0..) |c, i| dst[i] = if (c == ' ') ident_space else std.ascii.toLower(c);
+}
+
+/// Rewrite quoted identifiers to bare names with ident_space for spaces.
+/// Backticks and brackets are always identifiers. A double-quoted string is
+/// one only where it cannot be a value: not after a comparison operator,
+/// LIKE, ILIKE, THEN or ELSE, not inside an IN (...) list, and only when it
+/// looks like a name (no leading or trailing space).
+fn rewriteQuotedIdentifiers(allocator: Allocator, input: []const u8) ![]u8 {
+    var out = std.ArrayList(u8){};
+    errdefer out.deinit(allocator);
+    var in_list = false;
+    var i: usize = 0;
+    while (i < input.len) {
+        const c = input[i];
+        if (c == '\'') {
+            // Copy a string literal through its closing quote ('' is an escaped quote).
+            var j = i + 1;
+            while (j < input.len) : (j += 1) {
+                if (input[j] == '\'') {
+                    if (j + 1 < input.len and input[j + 1] == '\'') {
+                        j += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            const end = @min(j + 1, input.len);
+            try out.appendSlice(allocator, input[i..end]);
+            i = end;
+            continue;
+        }
+        if (c == '(') {
+            in_list = endsWithWord(out.items, "in") and !startsWithWord(input[i + 1 ..], "select");
+        } else if (c == ')') {
+            in_list = false;
+        }
+        const close: u8 = switch (c) {
+            '`' => '`',
+            '[' => ']',
+            '"' => '"',
+            else => 0,
+        };
+        if (close != 0) {
+            if (std.mem.indexOfScalarPos(u8, input, i + 1, close)) |end| {
+                const name = input[i + 1 .. end];
+                const is_ident = c != '"' or (!in_list and !inValuePosition(out.items) and looksLikeName(name));
+                if (is_ident) {
+                    for (name) |ch| try out.append(allocator, if (ch == ' ') ident_space else ch);
+                } else {
+                    try out.appendSlice(allocator, input[i .. end + 1]);
+                }
+                i = end + 1;
+                continue;
+            }
+        }
+        try out.append(allocator, c);
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn looksLikeName(name: []const u8) bool {
+    if (name.len == 0 or name[0] == ' ' or name[name.len - 1] == ' ') return false;
+    for (name) |ch| if (!(std.ascii.isAlphanumeric(ch) or ch == ' ' or ch == '_' or ch == '-' or ch == '.')) return false;
+    return true;
+}
+
+fn inValuePosition(before: []const u8) bool {
+    const t = std.mem.trimRight(u8, before, &std.ascii.whitespace);
+    if (t.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, "=<>!", t[t.len - 1]) != null) return true;
+    for ([_][]const u8{ "like", "ilike", "then", "else" }) |w| if (endsWithWord(t, w)) return true;
+    return false;
+}
+
+fn endsWithWord(text: []const u8, word: []const u8) bool {
+    const t = std.mem.trimRight(u8, text, &std.ascii.whitespace);
+    if (t.len < word.len or !std.ascii.eqlIgnoreCase(t[t.len - word.len ..], word)) return false;
+    return t.len == word.len or !(std.ascii.isAlphanumeric(t[t.len - word.len - 1]) or t[t.len - word.len - 1] == '_');
+}
+
+fn startsWithWord(text: []const u8, word: []const u8) bool {
+    const t = std.mem.trimLeft(u8, text, &std.ascii.whitespace);
+    return t.len >= word.len and std.ascii.eqlIgnoreCase(t[0..word.len], word);
+}
+
 pub fn parse(allocator: Allocator, input: []const u8) !Query {
     return parseAt(allocator, input, try datetime.queryInstant());
 }
 
 /// `parse` with the instant for CURRENT_DATE, NOW() and CURRENT_TIMESTAMP
 /// given as Unix seconds (UTC) instead of read from the clock.
-pub fn parseAt(allocator: Allocator, input: []const u8, now_ts: i64) !Query {
+pub fn parseAt(allocator: Allocator, raw_input: []const u8, now_ts: i64) !Query {
+    const input = try rewriteQuotedIdentifiers(allocator, raw_input);
+    var input_owned = true;
+    defer if (input_owned) allocator.free(input);
     // Every slice field starts as a valid empty slice (safe to free as a
     // no-op) rather than `undefined`, so the single errdefer below can call
     // query.deinit() from here on regardless of which fields have actually
@@ -707,7 +806,8 @@ pub fn parseAt(allocator: Allocator, input: []const u8, now_ts: i64) !Query {
         .allocator = allocator,
     };
     errdefer query.deinit();
-    query.sql = try allocator.dupe(u8, input);
+    query.sql = input; // the rewritten text is what the --deny-columns check reads
+    input_owned = false;
 
     // This is a simplified parser - full implementation would use proper regex or parser combinator
     // For now, we'll do basic string parsing
