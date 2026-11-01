@@ -671,3 +671,10 @@ test "a trailing semicolon ends the statement" {
     var q2 = try parser.parse(allocator, "SELECT a FROM 'f.csv';");
     defer q2.deinit();
 }
+
+test "write statements say csvql is read only" {
+    const allocator = std.testing.allocator;
+    for ([_][]const u8{ "INSERT INTO 'f.csv' VALUES (1)", "delete from 'f.csv'", "COPY (SELECT 1) TO 'x.csv'", "DROP TABLE t", "ATTACH 'x.db'" }) |sql| {
+        try std.testing.expectError(error.ReadOnly, parser.parse(allocator, sql));
+    }
+}

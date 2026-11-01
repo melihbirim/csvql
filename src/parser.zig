@@ -617,6 +617,17 @@ fn resolveClockKeywords(allocator: Allocator, text: []const u8, now_ts: i64) ![]
 
 /// Parse a SQL query string. CURRENT_DATE, NOW() and CURRENT_TIMESTAMP
 /// resolve to the current time (or `CSVQL_NOW`), read once here.
+/// True when `sql` starts with a statement that would write or change state.
+/// csvql has none of them; callers say so plainly instead of FileNotFound for
+/// INSERT or SubqueriesNotSupported for COPY (#282).
+pub fn isWriteStatement(sql: []const u8) bool {
+    const t = std.mem.trimLeft(u8, sql, &std.ascii.whitespace);
+    const end = std.mem.indexOfAny(u8, t, &std.ascii.whitespace) orelse t.len;
+    const writes = [_][]const u8{ "insert", "update", "delete", "drop", "create", "alter", "truncate", "copy", "attach", "detach", "merge", "replace", "upsert", "grant", "revoke", "vacuum", "pragma", "install", "load", "export", "import", "set" };
+    for (writes) |w| if (std.ascii.eqlIgnoreCase(t[0..end], w)) return true;
+    return false;
+}
+
 pub fn parse(allocator: Allocator, input: []const u8) !Query {
     return parseAt(allocator, input, try datetime.queryInstant());
 }
@@ -663,6 +674,7 @@ pub fn parseAt(allocator: Allocator, input: []const u8, now_ts: i64) !Query {
     // compare against the value "1;" and silently match nothing.
     while (trimmed.len > 0 and trimmed[trimmed.len - 1] == ';')
         trimmed = std.mem.trimRight(u8, trimmed[0 .. trimmed.len - 1], &std.ascii.whitespace);
+    if (isWriteStatement(trimmed)) return error.ReadOnly;
 
     // Set operators (UNION/INTERSECT/EXCEPT) and most subqueries aren't
     // supported. Erroring clearly here is far better than silently

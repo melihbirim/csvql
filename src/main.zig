@@ -139,6 +139,7 @@ fn exitCodeForError(err: anyerror) u8 {
         error.DeniedColumnSelectStar,
         error.UnexpectedTextAfterTable,
         error.NotARegularFile,
+        error.ReadOnly,
         => 2,
         error.StrictModeNonNumericValue,
         error.EmptyFile,
@@ -302,6 +303,10 @@ pub fn main() !void {
     }
 
     // Detect query mode: simple vs SQL
+    if (clean_args.items.len > 1 and parser.isWriteStatement(clean_args.items[1])) {
+        try stderr_file.writeAll("error: csvql is read-only; it runs SELECT queries and never writes files\n");
+        std.process.exit(2);
+    }
     var query = if (clean_args.items.len > 1 and !isSQL(clean_args.items[1])) blk: {
         // Simple mode: csvql file.csv [columns] [where] [limit] [orderby]
         break :blk simple_parser.parseSimple(allocator, clean_args.items[1..]) catch |err| {
