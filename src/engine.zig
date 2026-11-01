@@ -532,7 +532,7 @@ fn resolveInSubqueries(allocator: Allocator, expr: *parser.Expression, opts: opt
                 c.in_values_set = set;
             }
         },
-        .scalar_comparison => {},
+        .scalar_comparison, .arith_comparison => {},
         .binary => |b| {
             try resolveInSubqueries(allocator, &b.left, opts);
             try resolveInSubqueries(allocator, &b.right, opts);
@@ -3141,7 +3141,7 @@ fn looksLikeFunctionCall(s: []const u8) bool {
 fn collectComparisons(expr: parser.Expression, out: *std.ArrayListUnmanaged(parser.Comparison), allocator: Allocator) !void {
     switch (expr) {
         .comparison => |c| try out.append(allocator, c),
-        .scalar_comparison => {},
+        .scalar_comparison, .arith_comparison => {},
         .binary => |b| {
             try collectComparisons(b.left, out, allocator);
             try collectComparisons(b.right, out, allocator);

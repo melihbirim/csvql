@@ -2,6 +2,7 @@ const std = @import("std");
 const simd = @import("simd.zig");
 const scalar = @import("scalar.zig");
 const datetime = @import("datetime.zig");
+const arith = @import("arith.zig");
 const Allocator = std.mem.Allocator;
 
 /// Represents a comparison operator
@@ -117,9 +118,68 @@ pub const ScalarWhereComparison = struct {
 };
 
 /// Represents a WHERE clause expression
+/// `price * qty > 100`, `price > qty * 5`: both sides are arithmetic over
+/// columns and numbers, compared as numbers (#281). A side whose whole text is
+/// a column name ("unit-price") reads that column instead.
+pub const ArithComparison = struct {
+    lhs: *arith.Expr,
+    rhs: *arith.Expr,
+    lhs_text: []const u8, // lowercase, owned
+    rhs_text: []const u8, // lowercase, owned
+    operator: Operator,
+
+    pub fn deinit(self: ArithComparison, allocator: Allocator) void {
+        self.lhs.deinit(allocator);
+        self.rhs.deinit(allocator);
+        allocator.free(self.lhs_text);
+        allocator.free(self.rhs_text);
+    }
+
+    fn side(e: *const arith.Expr, text: []const u8, fields: []const []const u8, header: []const []const u8) ?f64 {
+        for (header, 0..) |h, i| {
+            if (std.mem.eql(u8, h, text)) {
+                const v = std.mem.trim(u8, if (i < fields.len) fields[i] else "", &std.ascii.whitespace);
+                return std.fmt.parseFloat(f64, v) catch null;
+            }
+        }
+        return e.evalNamed(fields, header);
+    }
+
+    pub fn evalDirect(self: ArithComparison, fields: []const []const u8, header: []const []const u8) bool {
+        const l = side(self.lhs, self.lhs_text, fields, header) orelse return false;
+        const r = side(self.rhs, self.rhs_text, fields, header) orelse return false;
+        return compareNums(self.operator, l, r);
+    }
+
+    pub fn evalRow(self: ArithComparison, row: std.StringHashMap([]const u8)) bool {
+        const l = (if (row.get(self.lhs_text)) |v| std.fmt.parseFloat(f64, std.mem.trim(u8, v, &std.ascii.whitespace)) catch null else self.lhs.evalRow(row)) orelse return false;
+        const r = (if (row.get(self.rhs_text)) |v| std.fmt.parseFloat(f64, std.mem.trim(u8, v, &std.ascii.whitespace)) catch null else self.rhs.evalRow(row)) orelse return false;
+        return compareNums(self.operator, l, r);
+    }
+
+    /// ColumnNotFound unless every column either side reads exists.
+    pub fn validate(self: ArithComparison, ctx: anytype) !void {
+        if (!ctx.has(self.lhs_text) and self.lhs.missingName(ctx) != null) return error.ColumnNotFound;
+        if (!ctx.has(self.rhs_text) and self.rhs.missingName(ctx) != null) return error.ColumnNotFound;
+    }
+};
+
+fn compareNums(op: Operator, l: f64, r: f64) bool {
+    return switch (op) {
+        .equal => l == r,
+        .not_equal => l != r,
+        .greater => l > r,
+        .greater_equal => l >= r,
+        .less => l < r,
+        .less_equal => l <= r,
+        else => false,
+    };
+}
+
 pub const Expression = union(enum) {
     comparison: Comparison,
     scalar_comparison: ScalarWhereComparison,
+    arith_comparison: ArithComparison,
     binary: *BinaryExpr,
     unary: *UnaryExpr,
 
@@ -127,6 +187,7 @@ pub const Expression = union(enum) {
         switch (self) {
             .comparison => |c| c.deinit(allocator),
             .scalar_comparison => |sc| sc.deinit(allocator),
+            .arith_comparison => |ac| ac.deinit(allocator),
             .binary => |b| {
                 b.left.deinit(allocator);
                 b.right.deinit(allocator);
@@ -1618,11 +1679,38 @@ fn parseScalarWhereComparison(allocator: Allocator, input: []const u8) !?Express
     } };
 }
 
+/// An unquoted side with an operator outside parens that names a column.
+/// A bare date like 2024-01-01 has no letters and stays a literal.
+fn isArithSide(text: []const u8) bool {
+    if (text.len == 0 or text[0] == '\'' or text[0] == '"') return false;
+    if (!arith.hasTopLevelOp(text)) return false;
+    for (text) |c| if (std.ascii.isAlphabetic(c) or c == '_') return true;
+    return false;
+}
+
+fn parseArithComparison(allocator: Allocator, lhs: []const u8, rhs: []const u8, operator: Operator) !Expression {
+    const l = try arith.parseNamed(allocator, lhs);
+    errdefer l.deinit(allocator);
+    const r = try arith.parseNamed(allocator, rhs);
+    errdefer r.deinit(allocator);
+    const lt = try std.ascii.allocLowerString(allocator, lhs);
+    errdefer allocator.free(lt);
+    const rt = try std.ascii.allocLowerString(allocator, rhs);
+    return .{ .arith_comparison = .{ .lhs = l, .rhs = r, .lhs_text = lt, .rhs_text = rt, .operator = operator } };
+}
+
 fn parseComparison(allocator: Allocator, input: []const u8, op_str: []const u8, op_idx: usize) !Expression {
     const column_part = std.mem.trim(u8, input[0..op_idx], &std.ascii.whitespace);
     const value_part = std.mem.trim(u8, input[op_idx + op_str.len ..], &std.ascii.whitespace);
 
     const operator = Operator.fromString(op_str) orelse return error.InvalidOperator;
+
+    if (isArithSide(column_part) or isArithSide(value_part)) {
+        switch (operator) {
+            .equal, .not_equal, .greater, .greater_equal, .less, .less_equal => return parseArithComparison(allocator, column_part, value_part, operator),
+            else => {},
+        }
+    }
 
     // A value starting with a quote must be a complete, properly terminated
     // quoted literal — reject trailing garbage like "'x' IN (1,2)" (#163)
@@ -1717,6 +1805,7 @@ fn trimQuotes(input: []const u8) []const u8 {
 /// Evaluate an expression against a row
 pub fn evaluate(expr: Expression, row: std.StringHashMap([]const u8)) bool {
     switch (expr) {
+        .arith_comparison => |ac| return ac.evalRow(row),
         .comparison => |comp| {
             const value = row.get(comp.column) orelse return false;
             return compareValues(comp, value);
@@ -1779,6 +1868,7 @@ pub fn evaluate(expr: Expression, row: std.StringHashMap([]const u8)) bool {
 /// Avoids per-row heap allocation for AND/OR/NOT WHERE clauses in hot loops.
 pub fn evaluateDirect(expr: Expression, fields: []const []const u8, lower_header: []const []const u8) bool {
     switch (expr) {
+        .arith_comparison => |ac| return ac.evalDirect(fields, lower_header),
         .comparison => |comp| {
             for (lower_header, 0..) |col, i| {
                 if (std.mem.eql(u8, col, comp.column)) {
@@ -1865,6 +1955,13 @@ pub fn evaluateDirect(expr: Expression, fields: []const []const u8, lower_header
 /// referenced column, not a scan per row.
 pub fn validateWhereExprColumns(expr: Expression, lower_header: []const []const u8) !void {
     switch (expr) {
+        .arith_comparison => |ac| try ac.validate(struct {
+            h: []const []const u8,
+            pub fn has(c: @This(), n: []const u8) bool {
+                for (c.h) |x| if (std.mem.eql(u8, x, n)) return true;
+                return false;
+            }
+        }{ .h = lower_header }),
         .comparison => |c| {
             for (lower_header) |lh| {
                 if (std.mem.eql(u8, lh, c.column)) return;
@@ -1894,6 +1991,12 @@ pub fn validateWhereExprColumns(expr: Expression, lower_header: []const []const 
 /// during the merge, not a flat lower_header array.
 pub fn validateWhereExprColumnsMap(expr: Expression, col_map: std.StringHashMap(usize)) !void {
     switch (expr) {
+        .arith_comparison => |ac| try ac.validate(struct {
+            m: std.StringHashMap(usize),
+            pub fn has(c: @This(), n: []const u8) bool {
+                return c.m.get(n) != null;
+            }
+        }{ .m = col_map }),
         .comparison => |c| {
             if (col_map.get(c.column) == null) return error.ColumnNotFound;
         },

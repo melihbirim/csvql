@@ -10,6 +10,9 @@ const Allocator = std.mem.Allocator;
 
 pub const Expr = union(enum) {
     col: usize,
+    /// A column by lowercase name, for WHERE, which is parsed before the
+    /// header is known. Owned.
+    name: []const u8,
     num: f64,
     neg: *Expr,
     bin: Bin,
@@ -23,19 +26,63 @@ pub const Expr = union(enum) {
                 b.l.deinit(allocator);
                 b.r.deinit(allocator);
             },
+            .name => |n| allocator.free(n),
             else => {},
         }
         allocator.destroy(self);
     }
 
     pub fn eval(self: *const Expr, record: []const []const u8) ?f64 {
+        return self.evalIn(struct {
+            record: []const []const u8,
+            fn leaf(c: @This(), e: *const Expr) ?f64 {
+                return switch (e.*) {
+                    .col => |i| if (i < c.record.len) parseNum(c.record[i]) else null,
+                    else => null,
+                };
+            }
+        }{ .record = record });
+    }
+
+    /// Evaluate with `.name` leaves looked up in `header` (lowercase names).
+    pub fn evalNamed(self: *const Expr, fields: []const []const u8, header: []const []const u8) ?f64 {
+        return self.evalIn(struct {
+            fields: []const []const u8,
+            header: []const []const u8,
+            fn leaf(c: @This(), e: *const Expr) ?f64 {
+                const n = switch (e.*) {
+                    .name => |n| n,
+                    else => return null,
+                };
+                for (c.header, 0..) |h, i| {
+                    if (std.mem.eql(u8, h, n)) return if (i < c.fields.len) parseNum(c.fields[i]) else null;
+                }
+                return null;
+            }
+        }{ .fields = fields, .header = header });
+    }
+
+    /// Evaluate with `.name` leaves looked up in a row map (the JOIN path).
+    pub fn evalRow(self: *const Expr, row: std.StringHashMap([]const u8)) ?f64 {
+        return self.evalIn(struct {
+            row: std.StringHashMap([]const u8),
+            fn leaf(c: @This(), e: *const Expr) ?f64 {
+                return switch (e.*) {
+                    .name => |n| if (c.row.get(n)) |v| parseNum(v) else null,
+                    else => null,
+                };
+            }
+        }{ .row = row });
+    }
+
+    fn evalIn(self: *const Expr, ctx: anytype) ?f64 {
         return switch (self.*) {
             .num => |n| n,
-            .col => |i| if (i < record.len) parseNum(record[i]) else null,
-            .neg => |e| if (e.eval(record)) |v| -v else null,
+            .col, .name => ctx.leaf(self),
+            .neg => |e| if (e.evalIn(ctx)) |v| -v else null,
             .bin => |b| {
-                const l = b.l.eval(record) orelse return null;
-                const r = b.r.eval(record) orelse return null;
+                const l = b.l.evalIn(ctx) orelse return null;
+                const r = b.r.evalIn(ctx) orelse return null;
                 return switch (b.op) {
                     '+' => l + r,
                     '-' => l - r,
@@ -47,11 +94,21 @@ pub const Expr = union(enum) {
         };
     }
 
+    /// The first `.name` leaf `has` rejects, for column validation.
+    pub fn missingName(self: *const Expr, ctx: anytype) ?[]const u8 {
+        return switch (self.*) {
+            .name => |n| if (ctx.has(n)) null else n,
+            .col, .num => null,
+            .neg => |e| e.missingName(ctx),
+            .bin => |b| b.l.missingName(ctx) orelse b.r.missingName(ctx),
+        };
+    }
+
     /// First column the expression reads, or 0 when it reads none.
     pub fn firstCol(self: *const Expr) usize {
         return switch (self.*) {
             .col => |i| i,
-            .num => 0,
+            .num, .name => 0,
             .neg => |e| e.firstCol(),
             .bin => |b| if (b.l.reads()) b.l.firstCol() else b.r.firstCol(),
         };
@@ -59,7 +116,7 @@ pub const Expr = union(enum) {
 
     fn reads(self: *const Expr) bool {
         return switch (self.*) {
-            .col => true,
+            .col, .name => true,
             .num => false,
             .neg => |e| e.reads(),
             .bin => |b| b.l.reads() or b.r.reads(),
@@ -100,6 +157,15 @@ pub fn hasTopLevelOp(text: []const u8) bool {
 /// (lowercase keys); a bare name is `[A-Za-z_][A-Za-z0-9_]*`, anything else
 /// needs double quotes.
 pub fn parse(allocator: Allocator, text: []const u8, column_map: std.StringHashMap(usize)) !*Expr {
+    return parseIn(allocator, text, column_map);
+}
+
+/// Parse with columns kept as lowercase names, resolved at evaluation time.
+pub fn parseNamed(allocator: Allocator, text: []const u8) !*Expr {
+    return parseIn(allocator, text, null);
+}
+
+fn parseIn(allocator: Allocator, text: []const u8, column_map: ?std.StringHashMap(usize)) !*Expr {
     var p = Parser{ .allocator = allocator, .s = text, .map = column_map };
     const e = try p.expr();
     errdefer e.deinit(allocator);
@@ -111,7 +177,7 @@ const Parser = struct {
     allocator: Allocator,
     s: []const u8,
     i: usize = 0,
-    map: std.StringHashMap(usize),
+    map: ?std.StringHashMap(usize),
 
     fn peek(p: *Parser) ?u8 {
         while (p.i < p.s.len and std.ascii.isWhitespace(p.s[p.i])) p.i += 1;
@@ -196,8 +262,12 @@ const Parser = struct {
 
     fn column(p: *Parser, name: []const u8) !*Expr {
         const lower = try std.ascii.allocLowerString(p.allocator, name);
+        const map = p.map orelse return p.node(.{ .name = lower }) catch |e| {
+            p.allocator.free(lower);
+            return e;
+        };
         defer p.allocator.free(lower);
-        const idx = p.map.get(lower) orelse return error.ColumnNotFound;
+        const idx = map.get(lower) orelse return error.ColumnNotFound;
         return p.node(.{ .col = idx });
     }
 };

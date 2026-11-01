@@ -671,3 +671,16 @@ test "a trailing semicolon ends the statement" {
     var q2 = try parser.parse(allocator, "SELECT a FROM 'f.csv';");
     defer q2.deinit();
 }
+
+test "WHERE arithmetic parses to a numeric comparison; a bare date stays a literal" {
+    const allocator = std.testing.allocator;
+    var q = try parser.parse(allocator, "SELECT a FROM 'f.csv' WHERE price > qty * 5");
+    defer q.deinit();
+    try std.testing.expect(q.where_expr.? == .arith_comparison);
+    const header = [_][]const u8{ "price", "qty" };
+    try std.testing.expect(parser.evaluateDirect(q.where_expr.?, &.{ "50", "1" }, &header));
+    try std.testing.expect(!parser.evaluateDirect(q.where_expr.?, &.{ "10", "3" }, &header));
+    var d = try parser.parse(allocator, "SELECT a FROM 'f.csv' WHERE d > 2024-01-01");
+    defer d.deinit();
+    try std.testing.expect(d.where_expr.? == .comparison);
+}
