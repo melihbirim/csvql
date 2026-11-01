@@ -10,7 +10,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
-pub fn run(allocator: Allocator, print_only: bool) !void {
+pub fn run(allocator: Allocator, print_only: bool, roots: []const []const u8) !void {
     const out = std.fs.File.stdout();
     var buf: [4096]u8 = undefined;
 
@@ -20,7 +20,19 @@ pub fn run(allocator: Allocator, print_only: bool) !void {
     try print(out, &buf, "csvql install — registering the MCP server\n  binary: {s}\n\n", .{self_path});
 
     try installClaudeCode(allocator, out, &buf, self_path, print_only);
-    try installClaudeDesktop(allocator, out, &buf, self_path, print_only);
+    // Claude Code starts the server in the project folder, so its working-directory
+    // default is right. Claude Desktop starts it in `/`, so pin the folder here.
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const desktop_root = if (roots.len > 0)
+        try std.mem.join(allocator, ",", roots)
+    else
+        try allocator.dupe(u8, try std.fs.cwd().realpath(".", &cwd_buf));
+    defer allocator.free(desktop_root);
+    if (roots.len == 0 and std.fs.path.dirname(desktop_root) == null) {
+        try out.writeAll("Claude Desktop: run 'csvql install' from your data folder, or pass --root <folder> — skipped.\n");
+    } else {
+        try installClaudeDesktop(allocator, out, &buf, self_path, desktop_root, print_only);
+    }
 
     if (print_only)
         try out.writeAll("\n(--print: nothing was written.)\n")
@@ -77,7 +89,7 @@ fn desktopConfigPath(allocator: Allocator) !?[]u8 {
     return try std.fs.path.join(allocator, &.{ home, rel });
 }
 
-fn installClaudeDesktop(allocator: Allocator, out: std.fs.File, buf: []u8, self_path: []const u8, print_only: bool) !void {
+fn installClaudeDesktop(allocator: Allocator, out: std.fs.File, buf: []u8, self_path: []const u8, data_root: []const u8, print_only: bool) !void {
     const path = (try desktopConfigPath(allocator)) orelse {
         try out.writeAll("Claude Desktop: home directory not found — skipped.\n");
         return;
@@ -91,22 +103,22 @@ fn installClaudeDesktop(allocator: Allocator, out: std.fs.File, buf: []u8, self_
     };
     defer allocator.free(existing);
 
-    const bytes = try mergeDesktopConfig(allocator, existing, self_path);
+    const bytes = try mergeDesktopConfig(allocator, existing, self_path, data_root);
     defer allocator.free(bytes);
 
     if (print_only) {
-        try print(out, buf, "Claude Desktop: would write {s}\n", .{path});
+        try print(out, buf, "Claude Desktop: would write {s} (agent reads only {s})\n", .{ path, data_root });
         return;
     }
     if (std.fs.path.dirname(path)) |dir| std.fs.cwd().makePath(dir) catch {};
     try std.fs.cwd().writeFile(.{ .sub_path = path, .data = bytes });
-    try print(out, buf, "Claude Desktop: configured {s}\n", .{path});
+    try print(out, buf, "Claude Desktop: configured {s}\n                agent reads only {s} (rerun with --root <folder> to change)\n", .{ path, data_root });
 }
 
 /// Merge an `mcpServers.csvql` entry into `existing` JSON, preserving every other
 /// key and server. Returns the pretty-printed result (caller frees). Invalid or
 /// non-object input is replaced with a fresh object rather than crashing.
-fn mergeDesktopConfig(allocator: Allocator, existing: []const u8, self_path: []const u8) ![]u8 {
+fn mergeDesktopConfig(allocator: Allocator, existing: []const u8, self_path: []const u8, data_root: []const u8) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -121,11 +133,13 @@ fn mergeDesktopConfig(allocator: Allocator, existing: []const u8, self_path: []c
     else
         std.json.ObjectMap.init(a);
 
-    // csvql entry: { "command": <self>, "args": ["--mcp"] }
+    // csvql entry: { "command": <self>, "args": ["--mcp", "--root", <folder>] }
     var entry = std.json.ObjectMap.init(a);
     try entry.put("command", .{ .string = try a.dupe(u8, self_path) });
     var args_arr = std.json.Array.init(a);
     try args_arr.append(.{ .string = "--mcp" });
+    try args_arr.append(.{ .string = "--root" });
+    try args_arr.append(.{ .string = try a.dupe(u8, data_root) });
     try entry.put("args", .{ .array = args_arr });
     try servers.put("csvql", .{ .object = entry });
     try root.put("mcpServers", .{ .object = servers });
@@ -141,18 +155,20 @@ test "mergeDesktopConfig preserves other servers and keys" {
     const in =
         \\{ "mcpServers": { "other": { "command": "/bin/other", "args": [] } }, "theme": "dark" }
     ;
-    const out = try mergeDesktopConfig(allocator, in, "/usr/local/bin/csvql");
+    const out = try mergeDesktopConfig(allocator, in, "/usr/local/bin/csvql", "/Users/x/data");
     defer allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"other\"") != null); // kept
     try std.testing.expect(std.mem.indexOf(u8, out, "\"theme\"") != null); // kept
     try std.testing.expect(std.mem.indexOf(u8, out, "\"csvql\"") != null); // added
     try std.testing.expect(std.mem.indexOf(u8, out, "/usr/local/bin/csvql") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "--mcp") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"--root\",\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "/Users/x/data") != null);
 }
 
 test "mergeDesktopConfig on empty/missing config creates a valid object" {
     const allocator = std.testing.allocator;
-    const out = try mergeDesktopConfig(allocator, "{}", "/x/csvql");
+    const out = try mergeDesktopConfig(allocator, "{}", "/x/csvql", "/x/data");
     defer allocator.free(out);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"mcpServers\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "\"csvql\"") != null);
