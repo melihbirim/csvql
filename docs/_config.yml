@@ -2,7 +2,7 @@ markdown: kramdown
 url: "https://melihbirim.github.io"
 baseurl: "/csvql"
 title: "csvql"
-description: "Read-only SQL on CSV files for AI agents. Query CSV files in place, about as fast as DuckDB and polars with 3 to 11x less memory. MCP-native, sandboxed with --root, one static binary."
+description: "Read-only SQL on CSV files for AI agents. It can't write, can't reach the network, and with --root can't leave the folders you give it. One static binary, 3 to 11x less memory than DuckDB."
 logo: "/logo.svg"
 
 # Proves site ownership to Google Search Console. jekyll-seo-tag turns this into

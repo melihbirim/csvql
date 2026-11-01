@@ -6,11 +6,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.md)
 [![Release](https://img.shields.io/github/v/release/melihbirim/csvql)](https://github.com/melihbirim/csvql/releases)
 
-**Read-only SQL on CSV files, in place, for AI agents.**
+**Read-only SQL on CSV files for AI agents. It can't write, can't reach the network, and with `--root` can't leave the folders you give it.**
 
 > A database is something you load your data *into*. csvql is a query you run on the data where it already lives.
 
-csvql runs `SELECT` on CSV files where they sit: no import, no ingest, no server. It is about as fast as DuckDB and polars on raw CSV and uses 3 to 11x less memory. It ships as an [MCP](https://modelcontextprotocol.io/) server, so an agent can ask a question of a gigabyte file and get back a few rows instead of the file. One static Zig binary, no network calls, no way to write to your data.
+csvql runs `SELECT` on CSV files where they sit: no import, no ingest, no server. It ships as an [MCP](https://modelcontextprotocol.io/) server, so an agent can ask a question of a gigabyte file and get back a few hundred tokens instead of the file. Safe by construction, not by configuration: the SQL has no write statements and the binary has no network code. It is about as fast as DuckDB and polars on raw CSV and uses 3 to 11x less memory.
 
 ```bash
 $ csvql "SELECT cab_type, COUNT(*) FROM 'trips.csv' GROUP BY cab_type"

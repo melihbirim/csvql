@@ -2,7 +2,7 @@
   "manifest_version": "0.1",
   "name": "csvql",
   "version": "0.0.0",
-  "description": "Query CSV files with SQL via MCP — fast, local, zero-config. Answers questions about CSV data without pasting the file into context.",
+  "description": "Read-only SQL on CSV files for AI agents. No writes, no network, --root confines file access, and capped results keep large files out of context.",
   "author": { "name": "Melih Birim" },
   "license": "MIT",
   "homepage": "https://github.com/melihbirim/csvql",

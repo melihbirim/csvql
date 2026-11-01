@@ -1,6 +1,6 @@
 {
   "name": "csvql",
-  "description": "csvql: read-only SQL on CSV files in place",
+  "description": "csvql: read-only SQL on CSV files for AI agents, sandboxed with --root",
   "owner": {
     "name": "Melih Birim"
   },
@@ -8,7 +8,7 @@
     {
       "name": "csvql",
       "source": "./plugin",
-      "description": "Query, inspect and summarise CSV files with SQL using csvql, without loading the file into context"
+      "description": "Answer questions about CSV files with read-only SQL, without loading the file into context. csvql can't write or reach the network, and --root keeps it inside chosen folders"
     }
   ]
 }

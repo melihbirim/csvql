@@ -2,7 +2,7 @@
   "name": "csvql",
   "displayName": "csvql",
   "version": "1.0.0",
-  "description": "Query, inspect and summarise CSV files with SQL using csvql, without loading the file into context",
+  "description": "Answer questions about CSV files with read-only SQL, without loading the file into context. csvql can't write or reach the network, and --root keeps it inside chosen folders",
   "author": {
     "name": "Melih Birim"
   },

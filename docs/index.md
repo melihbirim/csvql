@@ -1,7 +1,7 @@
 ---
 layout: home
 title: "csvql: read-only SQL on CSV files for AI agents"
-description: "Query CSV files in place. About as fast as DuckDB and polars on raw CSV, with 3 to 11x less memory. MCP-native, confined to a directory you choose, one static Zig binary, read-only, air-gappable."
+description: "Read-only SQL on CSV files for AI agents. It can't write, can't reach the network, and with --root can't leave the folders you give it. About as fast as DuckDB and polars, with 3 to 11x less memory."
 ---
 
 <section id="why">
