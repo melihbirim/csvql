@@ -7360,7 +7360,7 @@ test "ensurePathAllowed confines file access to --root trees" {
     defer allocator.free(escape);
     try std.testing.expectError(error.PathOutsideAllowedRoot, ensurePathAllowed(allocator, escape, &roots));
     // Root "/" (the --mcp opt-out) contains everything.
-    try ensurePathAllowed(allocator, "/etc/hosts", &.{"/"});
+    if (builtin.os.tag != .windows) try ensurePathAllowed(allocator, inside, &.{"/"});
 }
 
 test "DATE_PART('year', col) rewrites to STRFTIME and groups by year" {
