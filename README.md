@@ -116,6 +116,20 @@ Run csvql on the server next to the data and connect over SSH. Only the SQL and 
 
 Without `--root`, `--mcp` is confined to the directory it was started in. Set `--root` explicitly when an agent or another user can reach csvql, since that directory depends on how the client launches the server. Pair it with an unprivileged OS user and a read-only mount. Checklist: [SECURITY.md#hardening-for-on-prem-and-remote-access](SECURITY.md#hardening-for-on-prem-and-remote-access).
 
+### What an agent can do, out of the box
+
+Default settings, no hardening flags. DuckDB is the CLI an agent with a shell would call; it can be locked down with `SET enable_external_access = false` and read-only mode, but only if someone remembers to.
+
+| An agent asks the tool to... | csvql `--mcp` | DuckDB 1.5 CLI |
+| --- | --- | --- |
+| write a file (`COPY ... TO 'x.csv'`) | no, there is no write statement | yes |
+| read `/etc/hosts` or `../` outside its folder | no, `PathOutsideAllowedRoot` | yes |
+| fetch a URL or install an extension | no, no network code | yes (`enable_external_access` and `autoinstall_known_extensions` default to true) |
+| return a whole large table in one call | no, about 100 rows / 12 KB cap | yes |
+| peak memory, `GROUP BY` on a 0.72 GB file | 54 MB | 221 MB (polars 2.0: 1137 MB) |
+
+Check the DuckDB column yourself: `duckdb -c "COPY (SELECT 1) TO 'x.csv'"` and `duckdb -c "SELECT current_setting('enable_external_access')"`.
+
 ### Token cost
 
 Five questions about a taxi dataset cost about 640 tokens over MCP, tool schema included, and the cost does not change with file size. Pasting the 417 MB file would cost about 230 million tokens, which is a feasibility argument, not a savings figure. An agent that already has a shell and runs `duckdb -csv` uses slightly fewer tokens than csvql over MCP, because MCP returns JSON. The case for csvql with agents is `--root`, read-only execution, the output cap and memory, not token count. Measure it: [`bench/bench_tokens.py`](bench/bench_tokens.py).
