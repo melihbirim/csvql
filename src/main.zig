@@ -90,6 +90,8 @@ const help_text =
     \\  --root <dir>[,<dir>]    Confine all file access to these directories (blocks
     \\                          traversal/symlink escape). With --mcp the default is the
     \\                          working directory; --root / allows the whole filesystem.
+    \\  --deny-columns <a,b>    Refuse any query that reads these columns; SELECT * leaves
+    \\                          them out. For personal data an agent must never see.
     \\  --audit <file>          Append a JSONL record per query (timestamp, SQL) for compliance
     \\  install                 Register csvql as an MCP server in Claude (Code + Desktop),
     \\                          no manual config. Add --print to dry-run.
@@ -133,6 +135,8 @@ fn exitCodeForError(err: anyerror) u8 {
         error.PathOutsideAllowedRoot,
         error.UnterminatedQuotedValue,
         error.ArithmeticExpressionsNotSupported,
+        error.DeniedColumn,
+        error.DeniedColumnSelectStar,
         => 2,
         error.StrictModeNonNumericValue,
         error.EmptyFile,
@@ -159,6 +163,8 @@ pub fn main() !void {
     var roots_list = std.ArrayList([]const u8){};
     defer roots_list.deinit(allocator);
     var audit_path: ?[]const u8 = null;
+    var deny_list = std.ArrayList([]const u8){};
+    defer deny_list.deinit(allocator);
     if (unknownFlag(args[1..])) |bad| {
         std.debug.print("error: unknown flag '{s}'\n\nRun 'csvql --help' for usage information.\n", .{bad});
         std.process.exit(2);
@@ -175,6 +181,16 @@ pub fn main() !void {
                     try stderr_file.writeAll("error: --root requires a directory argument\n");
                     std.process.exit(2);
                 }
+            } else if (flagValue(args, &i, "--deny-columns")) |v| {
+                var it = std.mem.splitScalar(u8, v, ',');
+                while (it.next()) |c| {
+                    const t = std.mem.trim(u8, c, " \t");
+                    if (t.len > 0) try deny_list.append(allocator, t);
+                }
+                if (deny_list.items.len == 0) {
+                    try stderr_file.writeAll("error: --deny-columns requires a column list\n");
+                    std.process.exit(2);
+                }
             } else if (flagValue(args, &i, "--audit")) |v| {
                 if (v.len == 0) {
                     try stderr_file.writeAll("error: --audit requires a file path argument\n");
@@ -185,6 +201,7 @@ pub fn main() !void {
         }
     }
     const roots = roots_list.items;
+    const deny_columns = deny_list.items;
 
     // Check for early-exit flags first (before any filtering)
     if (args.len >= 2) {
@@ -199,7 +216,7 @@ pub fn main() !void {
         if (argHas(args, "--mcp")) {
             // An agent is confined by default: without --root it gets the working
             // directory only. `--root /` opts back into the whole filesystem.
-            try mcp.run(allocator, if (roots.len > 0) roots else &.{"."}, audit_path);
+            try mcp.run(allocator, if (roots.len > 0) roots else &.{"."}, audit_path, deny_columns);
             return;
         }
         if (std.mem.eql(u8, args[1], "install")) {
@@ -222,7 +239,7 @@ pub fn main() !void {
     }
 
     // Strip --no-header / -d / --delimiter flags; collect remainder for query parsing.
-    var opts = options_mod.Options{ .roots = roots, .audit_path = audit_path };
+    var opts = options_mod.Options{ .roots = roots, .audit_path = audit_path, .deny_columns = deny_columns };
     var output_path: ?[]const u8 = null;
     var clean_args = try std.ArrayList([]const u8).initCapacity(allocator, args.len);
     defer clean_args.deinit(allocator);
@@ -266,9 +283,9 @@ pub fn main() !void {
                 std.process.exit(1);
             }
             opts.delimiter = parseDelimiter(args[i]);
-        } else if (std.mem.eql(u8, arg, "--root") or std.mem.eql(u8, arg, "--audit")) {
+        } else if (std.mem.eql(u8, arg, "--root") or std.mem.eql(u8, arg, "--audit") or std.mem.eql(u8, arg, "--deny-columns")) {
             i += 1; // value already parsed into opts above; skip it here
-        } else if (std.mem.startsWith(u8, arg, "--root=") or std.mem.startsWith(u8, arg, "--audit=")) {
+        } else if (std.mem.startsWith(u8, arg, "--root=") or std.mem.startsWith(u8, arg, "--audit=") or std.mem.startsWith(u8, arg, "--deny-columns=")) {
             // parsed above
         } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
             i += 1;
@@ -543,7 +560,7 @@ fn getTerminalWidth() usize {
 /// non-empty count, and empty count.  Also prints a summary header line.
 /// True if `tok` appears anywhere in args[1..].
 /// Flags that consume the next argument as their value.
-const value_flags = [_][]const u8{ "--threads", "-d", "--delimiter", "--root", "--audit", "-o", "--output", "--schema", "-schema", "-s" };
+const value_flags = [_][]const u8{ "--threads", "-d", "--delimiter", "--root", "--audit", "--deny-columns", "-o", "--output", "--schema", "-schema", "-s" };
 /// Flags that stand alone.
 const bare_flags = [_][]const u8{ "--no-header", "--json", "--jsonl", "--table", "--wrap", "--no-input-header", "--no-table", "--markdown", "--strict", "--mcp", "--version", "-v", "--help", "-h", "--print" };
 
@@ -563,7 +580,8 @@ fn unknownFlag(args: anytype) ?[]const u8 {
         if (inList(&value_flags, a)) {
             i += 1;
         } else if (inList(&bare_flags, a) or
-            std.mem.startsWith(u8, a, "--root=") or std.mem.startsWith(u8, a, "--audit="))
+            std.mem.startsWith(u8, a, "--root=") or std.mem.startsWith(u8, a, "--audit=") or
+            std.mem.startsWith(u8, a, "--deny-columns="))
         {
             continue;
         } else if (std.mem.startsWith(u8, a, "--") and std.mem.indexOfAny(u8, a, " \t\r\n") == null) {

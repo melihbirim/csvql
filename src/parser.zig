@@ -265,9 +265,13 @@ pub const Query = struct {
     /// The instant CURRENT_DATE, NOW() and CURRENT_TIMESTAMP resolve to, in
     /// Unix seconds (UTC). Fixed at parse time so every row sees the same value.
     now_ts: i64 = 0,
+    /// The SQL text this query was parsed from (owned), for the
+    /// --deny-columns check. Empty for simple mode, which has no SQL.
+    sql: []const u8 = "",
     allocator: Allocator,
 
     pub fn deinit(self: *Query) void {
+        if (self.sql.len > 0) self.allocator.free(self.sql);
         for (self.columns) |col| {
             self.allocator.free(col);
         }
@@ -631,6 +635,7 @@ pub fn parseAt(allocator: Allocator, input: []const u8, now_ts: i64) !Query {
         .allocator = allocator,
     };
     errdefer query.deinit();
+    query.sql = try allocator.dupe(u8, input);
 
     // This is a simplified parser - full implementation would use proper regex or parser combinator
     // For now, we'll do basic string parsing

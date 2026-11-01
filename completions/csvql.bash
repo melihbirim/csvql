@@ -35,6 +35,9 @@ _csvql() {
             done < <(compgen -d -- "$tail")
             return 0
             ;;
+        --deny-columns)
+            return 0
+            ;;
         -o|--output|--audit|--schema|-s)
             _csvql_files "$cur"
             return 0
@@ -45,7 +48,7 @@ _csvql() {
     esac
 
     if [[ $cur == -* ]]; then
-        COMPREPLY=( $(compgen -W '-h --help -v --version --no-header --no-input-header -o --output -d --delimiter --json --jsonl --table --no-table --markdown --wrap --threads --strict --schema --mcp --root --audit' -- "$cur") )
+        COMPREPLY=( $(compgen -W '-h --help -v --version --no-header --no-input-header -o --output -d --delimiter --json --jsonl --table --no-table --markdown --wrap --threads --strict --schema --mcp --root --audit --deny-columns' -- "$cur") )
         return 0
     fi
 

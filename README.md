@@ -30,6 +30,7 @@ Agents are getting access to company data. The usual paths are a database connec
 - **Read-only by construction.** The parser has no `INSERT`, `UPDATE`, `DELETE` or `DROP`. Nothing writes to an input file.
 - **No network.** No `std.net`, `std.http` or socket call in the codebase. No telemetry, no update check. `strace -f -e trace=network` shows an empty trace.
 - **Sandboxed by default for agents.** `csvql --mcp` only opens files under its working directory; `--root /data` picks the folders instead, and `--root /` allows everything. `/etc/passwd` and `../` traversal fail with `PathOutsideAllowedRoot`.
+- **Private columns stay private.** `--deny-columns email,ssn` refuses any query that reads those columns, in SELECT, WHERE, ORDER BY or a subquery, and `SELECT *` leaves them out. The agent can still run `AVG(salary) GROUP BY dept`.
 - **Bounded output.** MCP results are capped at about 100 rows / 12 KB per call. A careless `SELECT *` cannot flood the context or pull a table out one call at a time.
 - **Flat memory.** An aggregate holds a running accumulator, not a dataset: 74 MB on a 0.7 GB file and 74 MB on an 8 GB one. It fits on the small VM beside the data.
 - **Auditable.** `--audit <file>` appends one JSONL record per query. Over SSH you inherit your existing keys, bastion and logs.
@@ -67,7 +68,7 @@ csvql "SELECT name, age FROM 'data.csv' LIMIT 3" --json      # or --jsonl, --mar
 csvql --schema data.csv
 ```
 
-Flags: `-d/--delimiter`, `--json`, `--jsonl`, `--markdown`, `--no-header`, `--no-input-header` (headerless files get `c1..cN`), `-o/--output`, `--threads`, `--strict`, `--schema`, `--root`, `--audit`, `--mcp`. Details in `csvql --help`. Simple mode: [SIMPLE_QUERY_LANGUAGE.md](SIMPLE_QUERY_LANGUAGE.md).
+Flags: `-d/--delimiter`, `--json`, `--jsonl`, `--markdown`, `--no-header`, `--no-input-header` (headerless files get `c1..cN`), `-o/--output`, `--threads`, `--strict`, `--schema`, `--root`, `--deny-columns`, `--audit`, `--mcp`. Details in `csvql --help`. Simple mode: [SIMPLE_QUERY_LANGUAGE.md](SIMPLE_QUERY_LANGUAGE.md).
 
 ## For agents (MCP)
 
@@ -126,6 +127,7 @@ Default settings, no hardening flags. DuckDB is the CLI an agent with a shell wo
 | read `/etc/hosts` or `../` outside its folder | no, `PathOutsideAllowedRoot` | yes |
 | fetch a URL or install an extension | no, no network code | yes (`enable_external_access` and `autoinstall_known_extensions` default to true) |
 | return a whole large table in one call | no, about 100 rows / 12 KB cap | yes |
+| read a column you marked private | no, with `--deny-columns email` | yes, unless you build views and only expose those |
 | peak memory, `GROUP BY` on a 0.72 GB file | 54 MB | 221 MB (polars 2.0: 1137 MB) |
 
 Check the DuckDB column yourself: `duckdb -c "COPY (SELECT 1) TO 'x.csv'"` and `duckdb -c "SELECT current_setting('enable_external_access')"`.
