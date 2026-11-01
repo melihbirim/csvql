@@ -94,7 +94,8 @@ const help_text =
     \\                          them out. For personal data an agent must never see.
     \\  --audit <file>          Append a JSONL record per query (timestamp, SQL) for compliance
     \\  install                 Register csvql as an MCP server in Claude (Code + Desktop),
-    \\                          no manual config. Add --print to dry-run.
+    \\                          no manual config. Claude Desktop gets --root set to the
+    \\                          current folder (or --root <dir>). Add --print to dry-run.
     \\
     \\EXAMPLES:
     \\  csvql "SELECT * FROM 'users.csv' WHERE age >= 18 LIMIT 100"
@@ -219,12 +220,18 @@ pub fn main() !void {
         if (argHas(args, "--mcp")) {
             // An agent is confined by default: without --root it gets the working
             // directory only. `--root /` opts back into the whole filesystem.
+            // A client that starts us in the filesystem root (Claude Desktop does on
+            // macOS) would make that default everything, so refuse instead.
+            if (roots.len == 0 and cwdIsFilesystemRoot()) {
+                try stderr_file.writeAll("error: csvql --mcp started in the filesystem root with no --root.\n" ++
+                    "Add --root <folder> to choose what the agent can read, or run 'csvql install' from that folder.\n");
+                std.process.exit(2);
+            }
             try mcp.run(allocator, if (roots.len > 0) roots else &.{"."}, audit_path, deny_columns);
             return;
         }
         if (std.mem.eql(u8, args[1], "install")) {
-            const print_only = args.len > 2 and std.mem.eql(u8, args[2], "--print");
-            try install.run(allocator, print_only);
+            try install.run(allocator, argHas(args, "--print"), roots);
             return;
         }
         if (std.mem.eql(u8, args[1], "--schema") or std.mem.eql(u8, args[1], "-schema") or std.mem.eql(u8, args[1], "-s")) {
@@ -924,6 +931,12 @@ fn isSQL(arg: []const u8) bool {
     var upper_buf: [6]u8 = undefined;
     const upper = std.ascii.upperString(&upper_buf, trimmed[0..6]);
     return std.mem.eql(u8, upper, "SELECT");
+}
+
+fn cwdIsFilesystemRoot() bool {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = std.fs.cwd().realpath(".", &buf) catch return false;
+    return std.fs.path.dirname(cwd) == null;
 }
 
 /// Join clean_args[1..] into a single query string, or read from stdin.
