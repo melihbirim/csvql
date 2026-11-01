@@ -16,6 +16,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const datetime = @import("datetime.zig");
+const arith = @import("arith.zig");
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -62,6 +63,7 @@ pub const ScalarSpec = union(enum) {
     case_when: CaseWhenArgs, // bare CASE WHEN ... THEN ... ELSE ... END (#105)
     is_null_check: IsNullArgs, // col IS NULL / col IS NOT NULL as a SELECT expression
     clock: []const u8, // CURRENT_DATE / NOW() / CURRENT_TIMESTAMP, resolved once per query (#202); owned
+    arith: *arith.Expr, // price * qty, (a + b) / 2; owned
 
     pub const ReplaceArgs = struct {
         col_idx: usize,
@@ -265,6 +267,7 @@ pub const ScalarSpec = union(enum) {
             } else 0,
             .nested => |a| a.inner.colIdx(),
             .clock => 0,
+            .arith => |e| e.firstCol(),
         };
     }
 
@@ -277,6 +280,7 @@ pub const ScalarSpec = union(enum) {
                 allocator.destroy(inner);
             },
             .clock => |text| allocator.free(text),
+            .arith => |e| e.deinit(allocator),
             .position => |a| if (a.needle_owned) allocator.free(a.needle),
             else => {},
         }
@@ -352,6 +356,12 @@ pub fn tryParseScalarAt(
             return .{ .case_when = args };
         }
         return null;
+    }
+
+    // price * qty, (a + b) / 2: an operator outside parens, unless the whole
+    // text is a column whose name contains one ("unit-price").
+    if (arith.hasTopLevelOp(t) and try resolveCol(t, column_map, allocator) == null) {
+        return .{ .arith = try arith.parse(allocator, t, column_map) };
     }
 
     // Must have balanced parens: '(' somewhere and ')' as last non-whitespace char.
@@ -1049,6 +1059,11 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
             };
         },
         .clock => |text| return text,
+        .arith => |e| {
+            const v = e.eval(record) orelse return "";
+            const buf = arena.alloc(u8, 32) catch return "";
+            return fmtArith(buf, v);
+        },
         .is_null_check => |args| {
             const is_null = field(record, args.col_idx).len == 0;
             const result = if (args.negate) !is_null else is_null;
@@ -1542,6 +1557,15 @@ pub fn fmtFloat(buf: []u8, n: f64) []const u8 {
 fn fmtMath(buf: []u8, n: f64) []const u8 {
     if (!std.math.isFinite(n)) return "";
     const plain = fmtFloat(buf, n);
+    if (plain.len > 0) return plain;
+    return std.fmt.bufPrint(buf, "{e}", .{n}) catch "";
+}
+
+/// Format an arithmetic result: whole numbers without a decimal point, like the
+/// integer inputs they usually come from. NaN and infinity become empty (NULL).
+fn fmtArith(buf: []u8, n: f64) []const u8 {
+    if (!std.math.isFinite(n)) return "";
+    const plain = fmtNum(buf, n);
     if (plain.len > 0) return plain;
     return std.fmt.bufPrint(buf, "{e}", .{n}) catch "";
 }

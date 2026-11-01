@@ -46,9 +46,9 @@ cat data.csv | csvql "SELECT * FROM '-' WHERE age > 30"
 
 ## SQL support
 
-SELECT, WHERE (AND/OR/NOT, LIKE/ILIKE, IN, BETWEEN, IS NULL), GROUP BY, HAVING, ORDER BY, LIMIT, DISTINCT, inner JOIN, `col IN (SELECT ...)`. Aggregates: COUNT, SUM, AVG, MIN, MAX, MEDIAN, QUANTILE, MODE, STDDEV, VARIANCE, GROUP_CONCAT, COUNT(DISTINCT). Date and string functions such as STRFTIME, DATEDIFF, LOWER, UPPER, SUBSTR, ROUND.
+SELECT, WHERE (AND/OR/NOT, LIKE/ILIKE, IN, BETWEEN, IS NULL), GROUP BY, HAVING, ORDER BY, LIMIT, DISTINCT, inner JOIN, `col IN (SELECT ...)`. Aggregates: COUNT, SUM, AVG, MIN, MAX, MEDIAN, QUANTILE, MODE, STDDEV, VARIANCE, GROUP_CONCAT, COUNT(DISTINCT). Date and string functions such as STRFTIME, DATEDIFF, LOWER, UPPER, SUBSTR, ROUND. Arithmetic (`+ - * /`, parentheses) over columns and numbers in SELECT and inside SUM, AVG, MIN, MAX, STDDEV and VARIANCE, e.g. `SUM(price * qty)`.
 
-Not supported: arithmetic expressions such as `price * qty`, LEFT/RIGHT/FULL/CROSS JOIN, window functions, UNION, subqueries in FROM, any writes. DATEDIFF and DATEADD take columns, not literals. For those, fall back to another tool.
+Not supported: arithmetic in WHERE, on aggregate results (`SUM(a) / COUNT(*)`) or around function calls (`ROUND(a) * 2`), LEFT/RIGHT/FULL/CROSS JOIN, window functions, UNION, subqueries in FROM, any writes. DATEDIFF and DATEADD take columns, not literals. For those, fall back to another tool.
 
 ## Exit codes
 
