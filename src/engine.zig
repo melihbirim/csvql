@@ -1622,6 +1622,7 @@ const JoinCtx = struct {
     right_maps: []const std.StringHashMap(std.ArrayList([][]const u8)),
     left_key_idxs: []const usize,
     right_ws: []const usize,
+    left_outer: []const bool,
     n_steps: usize,
     final_headers: []const []const u8,
     output_indices: []const usize,
@@ -1685,8 +1686,13 @@ fn expandAndEmit(merged: [][]const u8, filled_w: usize, step_idx: usize, ctx: *J
 
     // Probe the right hash map for this step using the left key from the merged row.
     const lkey = merged[ctx.left_key_idxs[step_idx]];
-    const matches = ctx.right_maps[step_idx].get(lkey) orelse return; // INNER: no match → discard
     const rw = ctx.right_ws[step_idx];
+    const matches = ctx.right_maps[step_idx].get(lkey) orelse {
+        if (!ctx.left_outer[step_idx]) return; // INNER: no match → discard
+        // LEFT: keep the row, right columns empty (csvql's NULL).
+        for (0..rw) |ci| merged[filled_w + ci] = "";
+        return expandAndEmit(merged, filled_w + rw, step_idx + 1, ctx);
+    };
     for (matches.items) |rrow| {
         // Fill right fields in-place; the next recursion level handles the next step.
         for (0..rw) |ci| merged[filled_w + ci] = if (ci < rrow.len) rrow[ci] else "";
@@ -1707,6 +1713,7 @@ const JoinWorkerCtx = struct {
     right_maps: []const std.StringHashMap(std.ArrayList([][]const u8)),
     left_key_idxs: []const usize,
     right_ws: []const usize,
+    left_outer: []const bool,
     n_steps: usize,
     final_headers: []const []const u8,
     output_indices: []const usize,
@@ -1744,6 +1751,7 @@ fn joinWorkerRun(w: *JoinWorkerCtx) !void {
         .right_maps = w.right_maps,
         .left_key_idxs = w.left_key_idxs,
         .right_ws = w.right_ws,
+        .left_outer = w.left_outer,
         .n_steps = w.n_steps,
         .final_headers = w.final_headers,
         .output_indices = w.output_indices,
@@ -2025,6 +2033,8 @@ fn executeJoin(
     var right_maps = try aa.alloc(std.StringHashMap(std.ArrayList([][]const u8)), joins.len);
     var left_key_idxs = try aa.alloc(usize, joins.len);
     var right_ws = try aa.alloc(usize, joins.len);
+    const left_outer = try aa.alloc(bool, joins.len);
+    for (joins, left_outer) |j, *lo| lo.* = j.left;
     var alias_ranges = try aa.alloc(AliasRange, joins.len + 1);
     alias_ranges[0] = .{ .name = joins[0].left_alias, .start = 0, .width = base_w };
     var acc_offset: usize = base_w;
@@ -2238,6 +2248,7 @@ fn executeJoin(
                 .right_maps = right_maps,
                 .left_key_idxs = left_key_idxs,
                 .right_ws = right_ws,
+                .left_outer = left_outer,
                 .n_steps = joins.len,
                 .final_headers = final_headers,
                 .output_indices = output_indices.items,
@@ -2275,6 +2286,7 @@ fn executeJoin(
         .right_maps = right_maps,
         .left_key_idxs = left_key_idxs,
         .right_ws = right_ws,
+        .left_outer = left_outer,
         .n_steps = joins.len,
         .final_headers = final_headers,
         .output_indices = output_indices.items,
@@ -7508,6 +7520,31 @@ test "--no-input-header works with JOIN (c1..cN on both tables)" {
     try std.testing.expect(std.mem.indexOf(u8, out, "alice,NYC") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "bob,LA") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "carol") == null);
+}
+
+test "LEFT JOIN keeps unmatched left rows with empty right columns" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "e.csv", .data = "id,name,dept\n1,ann,10\n2,bob,99\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "d.csv", .data = "dept,dname\n10,eng\n" });
+    var eb: [std.fs.max_path_bytes]u8 = undefined;
+    var db: [std.fs.max_path_bytes]u8 = undefined;
+    const ep = try tmp.dir.realpath("e.csv", &eb);
+    const dp = try tmp.dir.realpath("d.csv", &db);
+
+    const sql = try std.fmt.allocPrint(allocator, "SELECT e.name, d.dname FROM '{s}' e LEFT JOIN '{s}' d ON e.dept = d.dept", .{ ep, dp });
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+
+    const out_file = try tmp.dir.createFile("out.csv", .{ .read = true });
+    defer out_file.close();
+    try execute(allocator, query, out_file, .{});
+    try out_file.seekTo(0);
+    const out = try out_file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("name,dname\nann,eng\nbob,\n", out);
 }
 
 test "ensurePathAllowed confines file access to --root trees" {
