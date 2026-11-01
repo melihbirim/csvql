@@ -138,6 +138,7 @@ fn exitCodeForError(err: anyerror) u8 {
         error.DeniedColumn,
         error.DeniedColumnSelectStar,
         error.UnexpectedTextAfterTable,
+        error.NotARegularFile,
         => 2,
         error.StrictModeNonNumericValue,
         error.EmptyFile,
