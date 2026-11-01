@@ -571,7 +571,15 @@ pub fn allocJsonKeyFragment(allocator: Allocator, key: []const u8) ![]const u8 {
     var out = std.ArrayList(u8){};
     defer out.deinit(allocator);
     try out.append(allocator, '"');
+    const start = out.items.len;
     try appendJsonEscapedToList(&out, allocator, key);
+    // A quoted identifier's spaces travel as 0x1F, escaped as \u001f; show spaces.
+    if (std.mem.indexOfScalar(u8, key, 0x1F) != null) {
+        const esc = try std.mem.replaceOwned(u8, allocator, out.items[start..], "\\u001f", " ");
+        defer allocator.free(esc);
+        out.shrinkRetainingCapacity(start);
+        try out.appendSlice(allocator, esc);
+    }
     try out.appendSlice(allocator, "\":");
     return try out.toOwnedSlice(allocator);
 }
@@ -800,11 +808,27 @@ pub const RecordWriter = union(enum) {
     /// For CSV: writes the row unless `no_header` is true.
     /// For JSON/JSONL: stores column names for use as object keys (ignores `no_header`).
     pub fn writeHeader(self: *RecordWriter, fields: []const []const u8, no_header: bool) !void {
+        // A quoted identifier carries 0x1F for each space (parser.ident_space);
+        // print the space.
+        const a = std.heap.page_allocator;
+        const shown = try a.alloc([]const u8, fields.len);
+        defer a.free(shown);
+        defer for (shown[0..fields.len], fields) |sh, f| {
+            if (sh.ptr != f.ptr) a.free(sh);
+        };
+        for (fields, 0..) |f, i| {
+            shown[i] = f;
+            if (std.mem.indexOfScalar(u8, f, 0x1F) != null) {
+                const copy = try a.dupe(u8, f);
+                std.mem.replaceScalar(u8, copy, 0x1F, ' ');
+                shown[i] = copy;
+            }
+        }
         switch (self.*) {
             .csv => |*w| {
-                if (!no_header) try w.writeRecord(fields);
+                if (!no_header) try w.writeRecord(shown);
             },
-            .json => |*w| try w.setHeader(fields),
+            .json => |*w| try w.setHeader(shown),
         }
     }
 

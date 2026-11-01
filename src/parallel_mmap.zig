@@ -141,7 +141,7 @@ pub fn executeParallelMapped(
     for (header, 0..) |col_name_raw, idx| {
         const col_name = std.mem.trim(u8, col_name_raw, " \t\r\n"); // trim header whitespace (#101)
         const lower_name = try allocator.alloc(u8, col_name.len);
-        _ = std.ascii.lowerString(lower_name, col_name);
+        parser.normalizeHeaderName(lower_name, col_name);
         lower_header[idx] = lower_name;
         _ = try column_map.getOrPutValue(lower_name, idx); // first occurrence of a duplicate header name wins (#102)
     }

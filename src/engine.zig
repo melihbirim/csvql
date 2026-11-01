@@ -366,7 +366,7 @@ pub fn deniedColumnIn(sql: []const u8, deny: []const []const u8) ?[]const u8 {
         for (sql, 0..) |c, i| {
             if (c == '\'') in_literal = !in_literal;
             if (in_literal or i + name.len > sql.len) continue;
-            if (!std.ascii.eqlIgnoreCase(sql[i .. i + name.len], name)) continue;
+            if (!sameName(sql[i .. i + name.len], name)) continue;
             const before_ok = i == 0 or !isIdentByte(sql[i - 1]);
             const after_ok = i + name.len == sql.len or !isIdentByte(sql[i + name.len]);
             if (before_ok and after_ok) return name;
@@ -375,13 +375,24 @@ pub fn deniedColumnIn(sql: []const u8, deny: []const []const u8) ?[]const u8 {
     return null;
 }
 
+/// Case-insensitive, with a space in `name` also matching parser.ident_space,
+/// which is how a quoted identifier's spaces reach the parsed SQL (#280).
+fn sameName(sql_part: []const u8, name: []const u8) bool {
+    for (sql_part, name) |a, b| {
+        if (b == ' ' and (a == ' ' or a == parser.ident_space)) continue;
+        if (std.ascii.toLower(a) != std.ascii.toLower(b)) return false;
+    }
+    return true;
+}
+
 fn isIdentByte(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
 /// The header names of `path` minus the denied ones, for SELECT * under
-/// --deny-columns. A name with whitespace or quotes cannot be written as a
-/// column reference, so such a file has to name its columns explicitly.
+/// --deny-columns, written the way the parser writes a quoted identifier.
+/// A name with quotes or tabs cannot be referenced, so such a file has to
+/// name its columns explicitly.
 fn allowedColumns(allocator: Allocator, path: []const u8, opts: options_mod.Options) ![][]u8 {
     const f = try std.fs.cwd().openFile(path, .{});
     defer f.close();
@@ -401,8 +412,10 @@ fn allowedColumns(allocator: Allocator, path: []const u8, opts: options_mod.Opti
         var name = std.mem.trim(u8, raw, " \t\r");
         if (name.len >= 2 and name[0] == '"' and name[name.len - 1] == '"') name = name[1 .. name.len - 1];
         for (opts.deny_columns) |d| if (std.ascii.eqlIgnoreCase(name, d)) continue :outer;
-        if (std.mem.indexOfAny(u8, name, " \t\"'") != null) return error.DeniedColumnSelectStar;
-        try out.append(allocator, try allocator.dupe(u8, name));
+        if (std.mem.indexOfAny(u8, name, "\t\"'") != null) return error.DeniedColumnSelectStar;
+        const ref = try allocator.dupe(u8, name);
+        std.mem.replaceScalar(u8, ref, ' ', parser.ident_space);
+        try out.append(allocator, ref);
     }
     if (out.items.len == 0) return error.DeniedColumn;
     return out.toOwnedSlice(allocator);
@@ -532,7 +545,7 @@ fn resolveInSubqueries(allocator: Allocator, expr: *parser.Expression, opts: opt
                 c.in_values_set = set;
             }
         },
-        .scalar_comparison => {},
+        .scalar_comparison, .arith_comparison => {},
         .binary => |b| {
             try resolveInSubqueries(allocator, &b.left, opts);
             try resolveInSubqueries(allocator, &b.right, opts);
@@ -791,7 +804,7 @@ fn executeSequential(
         const col_name = std.mem.trim(u8, col_name_raw, " \t\r\n"); // trim header whitespace (#101)
         // Store lowercase version for case-insensitive lookup
         const lower_name = try allocator.alloc(u8, col_name.len);
-        _ = std.ascii.lowerString(lower_name, col_name);
+        parser.normalizeHeaderName(lower_name, col_name);
         lower_header[idx] = lower_name;
         _ = try column_map.getOrPutValue(lower_name, idx); // first occurrence of a duplicate header name wins (#102)
     }
@@ -1370,7 +1383,7 @@ fn executeParallelScalar(
     for (header, 0..) |col_raw, idx| {
         const col = std.mem.trim(u8, col_raw, " \t\r\n"); // trim header whitespace (#101)
         const lower = try allocator.alloc(u8, col.len);
-        _ = std.ascii.lowerString(lower, col);
+        parser.normalizeHeaderName(lower, col);
         lower_header_buf[idx] = lower;
         _ = try column_map.getOrPutValue(lower, idx); // first occurrence of a duplicate header name wins (#102)
     }
@@ -1525,7 +1538,7 @@ fn joinOneStep(
     var right_col_map = std.StringHashMap(usize).init(arena);
     for (rh_raw, 0..) |col, i| {
         const lower = try arena.alloc(u8, col.len);
-        _ = std.ascii.lowerString(lower, col);
+        parser.normalizeHeaderName(lower, col);
         right_lh[i] = lower;
         try right_col_map.put(lower, i);
         if (join.right_alias.len > 0) {
@@ -1995,7 +2008,7 @@ fn executeJoin(
     } else {
         for (base_hdr_raw, 0..) |col, i| {
             const lower = try aa.alloc(u8, col.len);
-            _ = std.ascii.lowerString(lower, col);
+            parser.normalizeHeaderName(lower, col);
             base_headers[i] = lower;
         }
     }
@@ -2062,7 +2075,7 @@ fn executeJoin(
                 try std.fmt.allocPrint(aa, "c{d}", .{i + 1})
             else name_blk: {
                 const lower = try aa.alloc(u8, col.len);
-                _ = std.ascii.lowerString(lower, col);
+                parser.normalizeHeaderName(lower, col);
                 break :name_blk lower;
             };
             right_lh[i] = name;
@@ -2353,7 +2366,7 @@ fn executeFromStdin(
     for (header, 0..) |col_name_raw, idx| {
         const col_name = std.mem.trim(u8, col_name_raw, " \t\r\n"); // trim header whitespace (#101)
         const lower_name = try allocator.alloc(u8, col_name.len);
-        _ = std.ascii.lowerString(lower_name, col_name);
+        parser.normalizeHeaderName(lower_name, col_name);
         lower_header[idx] = lower_name;
         _ = try column_map.getOrPutValue(lower_name, idx); // first occurrence of a duplicate header name wins (#102)
     }
@@ -2563,11 +2576,15 @@ const ColKind = union(enum) {
     /// group at output time against agg_results[agg_idx] (#113), e.g.
     /// SELECT dept, CASE WHEN AVG(salary) > 80000 THEN 'high' ELSE 'low' END.
     agg_case: struct { agg_idx: usize, spec: scalar.ScalarSpec },
+    /// Arithmetic over aggregate results, e.g. SUM(a) / COUNT(*) (#281). Each
+    /// call is a hidden AggSpec; expr reads agg_results by index.
+    agg_arith: struct { expr: *arith.Expr, digits: ?u8 },
 
     fn deinit(self: *ColKind, allocator: Allocator) void {
         switch (self.*) {
             .group_key_scalar => |*value| value.spec.deinit(allocator),
             .agg_case => |*value| value.spec.deinit(allocator),
+            .agg_arith => |value| value.expr.deinit(allocator),
             else => {},
         }
     }
@@ -3141,7 +3158,7 @@ fn looksLikeFunctionCall(s: []const u8) bool {
 fn collectComparisons(expr: parser.Expression, out: *std.ArrayListUnmanaged(parser.Comparison), allocator: Allocator) !void {
     switch (expr) {
         .comparison => |c| try out.append(allocator, c),
-        .scalar_comparison => {},
+        .scalar_comparison, .arith_comparison => {},
         .binary => |b| {
             try collectComparisons(b.left, out, allocator);
             try collectComparisons(b.right, out, allocator);
@@ -3709,6 +3726,52 @@ fn fmtVarStd(allocator: Allocator, m2: f64, n: i64, is_stddev: bool, is_sample: 
 }
 
 /// Returns true if any SELECT column is an aggregate expression (no alloc).
+/// Turns each aggregate call in `SUM(a) / COUNT(*)` into a hidden AggSpec
+/// and hands back its index, for arith.parseCalls (#281).
+const AggCallCtx = struct {
+    allocator: Allocator,
+    agg_specs: *std.ArrayListUnmanaged(AggSpec),
+    column_map: std.StringHashMap(usize),
+
+    fn resolve(ptr: *anyopaque, call: []const u8) anyerror!usize {
+        const self: *AggCallCtx = @ptrCast(@alignCast(ptr));
+        var agg_func = (try aggregation.parseAggregateFunc(self.allocator, call)) orelse return error.ArithmeticExpressionsNotSupported;
+        errdefer agg_func.deinit(self.allocator);
+        const agg_arg = try resolveAggArg(self.allocator, &agg_func, self.column_map);
+        const gc_sep: []const u8 = agg_func.sep orelse ",";
+        agg_func.sep = null;
+        const idx = self.agg_specs.items.len;
+        try self.agg_specs.append(self.allocator, .{
+            .func_type = agg_func.func_type,
+            .quantile = agg_func.quantile,
+            .col_idx = agg_arg.col_idx,
+            .arith = agg_arg.arith,
+            .alias = agg_func.alias,
+            .sep = gc_sep,
+        });
+        return idx;
+    }
+};
+
+/// True when `col` has an aggregate call anywhere, e.g. 100.0 * COUNT(*).
+fn hasAggregateCall(col: []const u8) bool {
+    for (col, 0..) |c, i| {
+        if (c != '(' or i == 0) continue;
+        var start = i;
+        while (start > 0 and (std.ascii.isAlphanumeric(col[start - 1]) or col[start - 1] == '_')) start -= 1;
+        if (start < i and isAggregateExpr(col[start..])) return true;
+    }
+    return false;
+}
+
+/// Format an arithmetic-over-aggregates result; null (a NULL operand or a
+/// division by zero) prints empty.
+fn formatAggArith(allocator: Allocator, v: ?f64, digits: ?u8) ![]u8 {
+    const x = v orelse return allocator.dupe(u8, "");
+    if (!std.math.isFinite(x)) return allocator.dupe(u8, "");
+    return if (digits) |d| formatF64Rounded(allocator, x, d) else formatF64(allocator, x);
+}
+
 fn isAggregateExpr(col: []const u8) bool {
     // Check for ROUND(inner, n) wrapper first
     if (parseRoundWrapper(col)) |rw| {
@@ -3723,6 +3786,7 @@ fn isAggregateExpr(col: []const u8) bool {
     }
     const paren = std.mem.indexOf(u8, col, "(") orelse return false;
     const name_part = std.mem.trim(u8, col[0..paren], &std.ascii.whitespace);
+    if (arith.hasTopLevelOp(name_part)) return hasAggregateCall(col); // 100.0 * COUNT(*)
     if (name_part.len == 0 or name_part.len > 12) return false;
     var buf: [12]u8 = undefined;
     const lower = std.ascii.lowerString(buf[0..name_part.len], name_part);
@@ -3844,7 +3908,7 @@ fn executeDistinct(
     for (header, 0..) |col_name_raw, idx| {
         const col_name = std.mem.trim(u8, col_name_raw, " \t\r\n"); // trim header whitespace (#101)
         const lower = try allocator.alloc(u8, col_name.len);
-        _ = std.ascii.lowerString(lower, col_name);
+        parser.normalizeHeaderName(lower, col_name);
         lower_header[idx] = lower;
         _ = try column_map.getOrPutValue(lower, idx); // first occurrence of a duplicate header name wins (#102)
     }
@@ -4131,7 +4195,7 @@ fn executeScalarAgg(
     for (header, 0..) |col_name_raw, idx| {
         const col_name = std.mem.trim(u8, col_name_raw, " \t\r\n"); // trim header whitespace (#101)
         const lower = try allocator.alloc(u8, col_name.len);
-        _ = std.ascii.lowerString(lower, col_name);
+        parser.normalizeHeaderName(lower, col_name);
         lower_header[idx] = lower;
         _ = try column_map.getOrPutValue(lower, idx); // first occurrence of a duplicate header name wins (#102)
     }
@@ -4217,6 +4281,14 @@ fn executeScalarAgg(
                 continue;
             }
             break :cw_blk;
+        }
+        if (arith.hasTopLevelOp(effective_col) and hasAggregateCall(effective_col)) {
+            var call_ctx = AggCallCtx{ .allocator = allocator, .agg_specs = &agg_specs, .column_map = column_map };
+            const e = try arith.parseCalls(allocator, effective_col, .{ .ctx = &call_ctx, .resolve = AggCallCtx.resolve });
+            errdefer e.deinit(allocator);
+            try col_kinds.append(allocator, .{ .agg_arith = .{ .expr = e, .digits = round_digits } });
+            try out_header_list.append(allocator, if (sa.alias) |a| a else col_base);
+            continue;
         }
         if (try aggregation.parseAggregateFunc(allocator, effective_col)) |parsed_agg| {
             var agg_func = parsed_agg;
@@ -4635,6 +4707,11 @@ fn executeScalarAgg(
             .group_key => "",
             .group_key_scalar => "",
             .aggregate => |agg_idx| agg_results[agg_idx],
+            .agg_arith => |aa| blk: {
+                const out = try formatAggArith(allocator, aa.expr.eval(agg_results), aa.digits);
+                try agg_allocs.append(allocator, out);
+                break :blk out;
+            },
             .agg_case => |ac| blk: {
                 // CASE WHEN with an aggregate in its condition (#113). Only
                 // one output row ever exists here, so a dedicated arena for
@@ -6001,7 +6078,7 @@ fn executeGroupBy(
     for (header, 0..) |col_name_raw, idx| {
         const col_name = std.mem.trim(u8, col_name_raw, " \t\r\n"); // trim header whitespace (#101)
         const lower = try allocator.alloc(u8, col_name.len);
-        _ = std.ascii.lowerString(lower, col_name);
+        parser.normalizeHeaderName(lower, col_name);
         lower_header[idx] = lower;
         _ = try column_map.getOrPutValue(lower, idx); // first occurrence of a duplicate header name wins (#102)
     }
@@ -6195,6 +6272,14 @@ fn executeGroupBy(
                     continue;
                 }
                 break :cw_blk;
+            }
+            if (arith.hasTopLevelOp(effective_col) and hasAggregateCall(effective_col)) {
+                var call_ctx = AggCallCtx{ .allocator = allocator, .agg_specs = &agg_specs, .column_map = column_map };
+                const e = try arith.parseCalls(allocator, effective_col, .{ .ctx = &call_ctx, .resolve = AggCallCtx.resolve });
+                errdefer e.deinit(allocator);
+                try col_kinds.append(allocator, .{ .agg_arith = .{ .expr = e, .digits = round_digits } });
+                try out_header_list.append(allocator, if (sa.alias) |a| a else col_base);
+                continue;
             }
             if (try aggregation.parseAggregateFunc(allocator, effective_col)) |parsed_agg| {
                 var agg_func = parsed_agg;
@@ -6886,6 +6971,7 @@ fn executeGroupBy(
                 },
                 .group_key => |gi| accum.key_values[gi],
                 .aggregate => |agg_idx| agg_results[agg_idx],
+                .agg_arith => |aa| try formatAggArith(gb_scalar_arena.allocator(), aa.expr.eval(agg_results), aa.digits),
                 .group_key_scalar => |gks| blk: {
                     // Apply scalar function to the group key value at output time
                     const key_val: []const u8 = if (gks.gi < accum.key_values.len) accum.key_values[gks.gi] else "";
@@ -11055,4 +11141,44 @@ test "IN subquery resolves under JSON output, and sandboxed reads refuse stdin a
     const sub = try std.fmt.allocPrint(allocator, "{s}/sub", .{dir});
     defer allocator.free(sub);
     try std.testing.expectError(error.NotARegularFile, ensureReadable(allocator, sub, sandbox));
+}
+
+test "arithmetic over aggregate results (#281)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = "price,qty,cat\n2.5,4,a\n10,3,b\n50,1,a\n";
+    const cases = [_]struct { sql: []const u8, want: []const u8 }{
+        .{ .sql = "SELECT cat, SUM(price*qty) / COUNT(*) AS r FROM '{s}' GROUP BY cat ORDER BY cat", .want = "cat,r\na,30\nb,30\n" },
+        .{ .sql = "SELECT 100.0 * COUNT(*) / 4 AS pct, MAX(price) - MIN(price) AS spread FROM '{s}'", .want = "pct,spread\n75,47.5\n" },
+        .{ .sql = "SELECT cat, SUM(price) / 0 AS z FROM '{s}' GROUP BY cat ORDER BY cat", .want = "cat,z\na,\nb,\n" },
+    };
+    for (cases) |c| {
+        const out = try runQueryForTest(allocator, &tmp, data, c.sql);
+        defer allocator.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    }
+    try std.testing.expectError(error.ArithmeticExpressionsNotSupported, runQueryForTest(allocator, &tmp, data, "SELECT cat, SUM(price) + qty FROM '{s}' GROUP BY cat"));
+}
+
+test "column names with spaces: quoted identifiers, deny list and SELECT * (#280)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = "First Name,Total Sales,city\nAnn,100,New York\nBob,50,Boston\n";
+    const cases = [_]struct { sql: []const u8, want: []const u8 }{
+        .{ .sql = "SELECT \"First Name\", [Total Sales] FROM '{s}' WHERE city = \"New York\"", .want = "First Name,Total Sales\nAnn,100\n" },
+        .{ .sql = "SELECT city, SUM(`Total Sales` * 2) AS d FROM '{s}' GROUP BY city ORDER BY city", .want = "city,d\nBoston,100\nNew York,200\n" },
+        .{ .sql = "SELECT \"First Name\" FROM '{s}' WHERE \"Total Sales\" > 60", .want = "First Name\nAnn\n" },
+    };
+    for (cases) |c| {
+        const out = try runQueryForTest(allocator, &tmp, data, c.sql);
+        defer allocator.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    }
+    const deny = options_mod.Options{ .deny_columns = &.{"Total Sales"} };
+    try std.testing.expectError(error.DeniedColumn, runQueryForTestOpts(allocator, &tmp, data, "SELECT [Total Sales] FROM '{s}'", deny));
+    const star = try runQueryForTestOpts(allocator, &tmp, data, "SELECT * FROM '{s}'", deny);
+    defer allocator.free(star);
+    try std.testing.expectEqualStrings("First Name,city\nAnn,New York\nBob,Boston\n", star);
 }
