@@ -1,7 +1,7 @@
 {
   "name": "csvql",
   "displayName": "csvql",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Answer questions about CSV files with read-only SQL, without loading the file into context. csvql can't write or reach the network, and --root keeps it inside chosen folders",
   "author": {
     "name": "Melih Birim"
