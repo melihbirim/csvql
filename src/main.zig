@@ -88,7 +88,8 @@ const help_text =
     \\  --mcp                   Start as an MCP (Model Context Protocol) server
     \\                          Exposes csv_query, csv_schema, csv_list tools
     \\  --root <dir>[,<dir>]    Confine all file access to these directories (blocks
-    \\                          traversal/symlink escape). Use for remote/on-prem servers.
+    \\                          traversal/symlink escape). With --mcp the default is the
+    \\                          working directory; --root / allows the whole filesystem.
     \\  --audit <file>          Append a JSONL record per query (timestamp, SQL) for compliance
     \\  install                 Register csvql as an MCP server in Claude (Code + Desktop),
     \\                          no manual config. Add --print to dry-run.
@@ -196,7 +197,9 @@ pub fn main() !void {
             return;
         }
         if (argHas(args, "--mcp")) {
-            try mcp.run(allocator, roots, audit_path);
+            // An agent is confined by default: without --root it gets the working
+            // directory only. `--root /` opts back into the whole filesystem.
+            try mcp.run(allocator, if (roots.len > 0) roots else &.{"."}, audit_path);
             return;
         }
         if (std.mem.eql(u8, args[1], "install")) {
