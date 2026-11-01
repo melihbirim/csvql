@@ -407,6 +407,17 @@ pub fn build(b: *std.Build) void {
     const run_scalar_tests = b.addRunArtifact(scalar_tests);
     test_step.dependOn(&run_scalar_tests.step);
 
+    // Arithmetic expression tests (price * qty, SUM(price * qty))
+    const arith_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/arith.zig"),
+        }),
+    });
+    const run_arith_tests = b.addRunArtifact(arith_tests);
+    test_step.dependOn(&run_arith_tests.step);
+
     // BulkCsvReader tests (TooManyColumns, etc.)
     const bulk_csv_tests = b.addTest(.{
         .root_module = b.createModule(.{

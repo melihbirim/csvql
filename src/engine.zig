@@ -10,6 +10,7 @@ const aggregation = @import("aggregation.zig");
 const simd = @import("simd.zig");
 const options_mod = @import("options.zig");
 const scalar = @import("scalar.zig");
+const arith = @import("arith.zig");
 const datetime = @import("datetime.zig");
 const arena_buffer = @import("arena_buffer.zig");
 const memfile = @import("memfile.zig");
@@ -298,6 +299,9 @@ fn hasScalarSelectFunctions(query: parser.Query) bool {
         if (datetime.matchClockKeyword(e)) |m| {
             if (m.len == e.len) return true;
         }
+        // price * qty: only the scalar path evaluates arithmetic. A column
+        // whose name contains an operator also lands here, which is harmless.
+        if (arith.hasTopLevelOp(e)) return true;
         const open = std.mem.indexOf(u8, e, "(") orelse continue;
         const fn_raw = std.mem.trim(u8, e[0..open], &std.ascii.whitespace);
         // Skip empty (would be a syntax error anyway)
@@ -2672,9 +2676,29 @@ const AggSpec = struct {
     alias: []const u8, // output header name (allocator-owned)
     round_digits: ?u8 = null, // non-null for ROUND(expr, n)
     case_when: ?CaseWhenSpec = null, // non-null for CASE WHEN conditional aggregates
+    arith: ?*arith.Expr = null, // non-null for SUM(price * qty) and the like; col_idx is then null
     sep: []const u8 = ",", // GROUP_CONCAT separator
     quantile: f64 = 0.5, // QUANTILE fraction in [0, 1]
 };
+
+/// Resolve an aggregate's argument to a column, or to an arithmetic
+/// expression over columns for SUM(price * qty). Frees agg_func.column.
+fn resolveAggArg(allocator: Allocator, agg_func: *aggregation.AggregateFunc, column_map: std.StringHashMap(usize)) !struct { col_idx: ?usize, arith: ?*arith.Expr } {
+    const agg_col = agg_func.column orelse return .{ .col_idx = null, .arith = null };
+    defer {
+        allocator.free(agg_col);
+        agg_func.column = null;
+    }
+    const lower = try std.ascii.allocLowerString(allocator, agg_col);
+    defer allocator.free(lower);
+    if (column_map.get(lower)) |idx| return .{ .col_idx = idx, .arith = null };
+    if (!arith.hasTopLevelOp(agg_col)) return error.ColumnNotFound;
+    switch (agg_func.func_type) {
+        .sum, .avg, .min, .max, .variance, .stddev, .variance_samp, .stddev_samp => {},
+        else => return error.ArithmeticExpressionsNotSupported,
+    }
+    return .{ .col_idx = null, .arith = try arith.parse(allocator, agg_col, column_map) };
+}
 
 /// THEN/ELSE value in a CASE WHEN — either a numeric literal or a column reference.
 const CaseWhenValue = union(enum) {
@@ -3004,6 +3028,7 @@ fn evalScalarOnSingleValue(spec: scalar.ScalarSpec, value: []const u8, arena: Al
             if (p.* == .col_idx) p.* = .{ .col_idx = 0 };
         },
         .nested => unreachable, // handled by the early return above
+        .arith => unreachable, // rejected as a GROUP BY key expression at setup
     }
     return scalar.eval(adj_spec, &rec, arena);
 }
@@ -3107,7 +3132,9 @@ fn splitAlias(expr: []const u8) struct { expr: []const u8, alias: ?[]const u8 } 
     if (last_top_space) |idx| {
         const head = std.mem.trim(u8, expr[0..idx], &std.ascii.whitespace);
         const tail = std.mem.trim(u8, expr[idx + 1 ..], &std.ascii.whitespace);
-        if (head.len > 0 and isBareIdent(tail) and !isImplicitAliasStopword(tail)) {
+        // "price + qty" is arithmetic, not "price +" aliased as qty.
+        const ends_in_op = head.len > 0 and std.mem.indexOfScalar(u8, "+-*/", head[head.len - 1]) != null;
+        if (head.len > 0 and !ends_in_op and isBareIdent(tail) and !isImplicitAliasStopword(tail)) {
             return .{ .expr = head, .alias = tail };
         }
     }
@@ -4030,6 +4057,7 @@ fn executeScalarAgg(
             allocator.free(spec.alias);
             if (spec.case_when) |cw| cw.comp.deinit(allocator);
             if (spec.func_type == .group_concat) allocator.free(spec.sep);
+            if (spec.arith) |e| e.deinit(allocator);
         }
         agg_specs.deinit(allocator);
     }
@@ -4103,15 +4131,8 @@ fn executeScalarAgg(
             var agg_func = parsed_agg;
             errdefer agg_func.deinit(allocator);
             const agg_idx = agg_specs.items.len;
-            var col_idx: ?usize = null;
-            if (agg_func.column) |agg_col| {
-                const lower = try allocator.alloc(u8, agg_col.len);
-                defer allocator.free(lower);
-                _ = std.ascii.lowerString(lower, agg_col);
-                col_idx = column_map.get(lower) orelse return error.ColumnNotFound;
-                allocator.free(agg_col);
-                agg_func.column = null;
-            }
+            const agg_arg = try resolveAggArg(allocator, &agg_func, column_map);
+            const col_idx = agg_arg.col_idx;
             // User alias overrides the auto-generated one; ROUND wrapper uses col_base
             if (sa.alias) |user_alias| {
                 allocator.free(agg_func.alias);
@@ -4128,6 +4149,7 @@ fn executeScalarAgg(
                 .func_type = agg_func.func_type,
                 .quantile = agg_func.quantile,
                 .col_idx = col_idx,
+                .arith = agg_arg.arith,
                 .alias = agg_func.alias,
                 .round_digits = round_digits,
                 .sep = gc_sep,
@@ -4410,6 +4432,12 @@ fn executeScalarAgg(
                                     if (needsVariance(spec.func_type)) welfordAdd(accum.means, accum.sum_sqs, accum.sum_counts[i], i, val);
                                 } else |_| {}
                             }
+                        } else if (spec.arith) |ex| {
+                            if (ex.eval(record)) |val| {
+                                if (!needsVariance(spec.func_type)) sumAdd(accum.sums, accum.sum_comps, i, val);
+                                accum.sum_counts[i] += 1;
+                                if (needsVariance(spec.func_type)) welfordAdd(accum.means, accum.sum_sqs, accum.sum_counts[i], i, val);
+                            }
                         }
                     },
                     .min => {
@@ -4419,6 +4447,10 @@ fn executeScalarAgg(
                                     if (val < accum.mins[i]) accum.mins[i] = val;
                                 } else |_| {}
                             }
+                        } else if (spec.arith) |ex| {
+                            if (ex.eval(record)) |val| {
+                                if (val < accum.mins[i]) accum.mins[i] = val;
+                            }
                         }
                     },
                     .max => {
@@ -4427,6 +4459,10 @@ fn executeScalarAgg(
                                 if (parseNumericFast(record[cidx])) |val| {
                                     if (val > accum.maxs[i]) accum.maxs[i] = val;
                                 } else |_| {}
+                            }
+                        } else if (spec.arith) |ex| {
+                            if (ex.eval(record)) |val| {
+                                if (val > accum.maxs[i]) accum.maxs[i] = val;
                             }
                         }
                     },
@@ -4994,6 +5030,12 @@ fn gbApplyAggs(ctx: *GbWorkerCtx, aa: Allocator, accum: *CompactAccum, record: [
                             if (needsVariance(spec.func_type)) welfordAdd(accum.means, accum.sum_sqs, accum.sum_counts[i], i, val);
                         } else |_| {}
                     }
+                } else if (spec.arith) |ex| {
+                    if (ex.eval(record)) |val| {
+                        if (!needsVariance(spec.func_type)) sumAdd(accum.sums, accum.sum_comps, i, val);
+                        accum.sum_counts[i] += 1;
+                        if (needsVariance(spec.func_type)) welfordAdd(accum.means, accum.sum_sqs, accum.sum_counts[i], i, val);
+                    }
                 }
             },
             .min => {
@@ -5003,6 +5045,10 @@ fn gbApplyAggs(ctx: *GbWorkerCtx, aa: Allocator, accum: *CompactAccum, record: [
                             if (val < accum.mins[i]) accum.mins[i] = val;
                         } else |_| {}
                     }
+                } else if (spec.arith) |ex| {
+                    if (ex.eval(record)) |val| {
+                        if (val < accum.mins[i]) accum.mins[i] = val;
+                    }
                 }
             },
             .max => {
@@ -5011,6 +5057,10 @@ fn gbApplyAggs(ctx: *GbWorkerCtx, aa: Allocator, accum: *CompactAccum, record: [
                         if (parseNumericFast(record[cidx])) |val| {
                             if (val > accum.maxs[i]) accum.maxs[i] = val;
                         } else |_| {}
+                    }
+                } else if (spec.arith) |ex| {
+                    if (ex.eval(record)) |val| {
+                        if (val > accum.maxs[i]) accum.maxs[i] = val;
                     }
                 }
             },
@@ -5632,6 +5682,12 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                                     if (needsVariance(spec.func_type)) welfordAdd(ctx.partial_accum.means, ctx.partial_accum.sum_sqs, ctx.partial_accum.sum_counts[i], i, val);
                                 } else |_| {}
                             }
+                        } else if (spec.arith) |ex| {
+                            if (ex.eval(record)) |val| {
+                                if (!needsVariance(spec.func_type)) sumAdd(ctx.partial_accum.sums, ctx.partial_accum.sum_comps, i, val);
+                                ctx.partial_accum.sum_counts[i] += 1;
+                                if (needsVariance(spec.func_type)) welfordAdd(ctx.partial_accum.means, ctx.partial_accum.sum_sqs, ctx.partial_accum.sum_counts[i], i, val);
+                            }
                         }
                     },
                     .min => {
@@ -5641,6 +5697,10 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                                     if (val < ctx.partial_accum.mins[i]) ctx.partial_accum.mins[i] = val;
                                 } else |_| {}
                             }
+                        } else if (spec.arith) |ex| {
+                            if (ex.eval(record)) |val| {
+                                if (val < ctx.partial_accum.mins[i]) ctx.partial_accum.mins[i] = val;
+                            }
                         }
                     },
                     .max => {
@@ -5649,6 +5709,10 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                                 if (parseNumericFast(record[cidx])) |val| {
                                     if (val > ctx.partial_accum.maxs[i]) ctx.partial_accum.maxs[i] = val;
                                 } else |_| {}
+                            }
+                        } else if (spec.arith) |ex| {
+                            if (ex.eval(record)) |val| {
+                                if (val > ctx.partial_accum.maxs[i]) ctx.partial_accum.maxs[i] = val;
                             }
                         }
                     },
@@ -5765,6 +5829,12 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                                     if (needsVariance(spec.func_type)) welfordAdd(ctx.partial_accum.means, ctx.partial_accum.sum_sqs, ctx.partial_accum.sum_counts[i], i, val);
                                 } else |_| {}
                             }
+                        } else if (spec.arith) |ex| {
+                            if (ex.eval(record)) |val| {
+                                if (!needsVariance(spec.func_type)) sumAdd(ctx.partial_accum.sums, ctx.partial_accum.sum_comps, i, val);
+                                ctx.partial_accum.sum_counts[i] += 1;
+                                if (needsVariance(spec.func_type)) welfordAdd(ctx.partial_accum.means, ctx.partial_accum.sum_sqs, ctx.partial_accum.sum_counts[i], i, val);
+                            }
                         }
                     },
                     .min => {
@@ -5774,6 +5844,10 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                                     if (val < ctx.partial_accum.mins[i]) ctx.partial_accum.mins[i] = val;
                                 } else |_| {}
                             }
+                        } else if (spec.arith) |ex| {
+                            if (ex.eval(record)) |val| {
+                                if (val < ctx.partial_accum.mins[i]) ctx.partial_accum.mins[i] = val;
+                            }
                         }
                     },
                     .max => {
@@ -5782,6 +5856,10 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                                 if (parseNumericFast(record[cidx])) |val| {
                                     if (val > ctx.partial_accum.maxs[i]) ctx.partial_accum.maxs[i] = val;
                                 } else |_| {}
+                            }
+                        } else if (spec.arith) |ex| {
+                            if (ex.eval(record)) |val| {
+                                if (val > ctx.partial_accum.maxs[i]) ctx.partial_accum.maxs[i] = val;
                             }
                         }
                     },
@@ -5928,6 +6006,7 @@ fn executeGroupBy(
         for (agg_specs.items) |spec| {
             allocator.free(spec.alias);
             if (spec.func_type == .group_concat) allocator.free(spec.sep);
+            if (spec.arith) |e| e.deinit(allocator);
         }
         agg_specs.deinit(allocator);
     }
@@ -6030,15 +6109,8 @@ fn executeGroupBy(
                 var agg_func = parsed_agg;
                 errdefer agg_func.deinit(allocator);
                 const agg_idx = agg_specs.items.len;
-                var col_idx: ?usize = null;
-                if (agg_func.column) |agg_col| {
-                    const lower = try allocator.alloc(u8, agg_col.len);
-                    defer allocator.free(lower);
-                    _ = std.ascii.lowerString(lower, agg_col);
-                    col_idx = column_map.get(lower) orelse return error.ColumnNotFound;
-                    allocator.free(agg_col);
-                    agg_func.column = null;
-                }
+                const agg_arg = try resolveAggArg(allocator, &agg_func, column_map);
+                const col_idx = agg_arg.col_idx;
                 // User alias overrides the auto-generated one; ROUND wrapper uses col_base
                 if (sa.alias) |user_alias| {
                     allocator.free(agg_func.alias);
@@ -6056,6 +6128,7 @@ fn executeGroupBy(
                     .func_type = agg_func.func_type,
                     .quantile = agg_func.quantile,
                     .col_idx = col_idx,
+                    .arith = agg_arg.arith,
                     .alias = agg_func.alias,
                     .round_digits = round_digits,
                     .sep = gc_sep,
@@ -6101,6 +6174,7 @@ fn executeGroupBy(
                             var sc_spec = parsed_spec;
                             {
                                 errdefer sc_spec.deinit(allocator);
+                                if (sc_spec == .arith) return error.ArithmeticExpressionsNotSupported;
                                 // Find which group_spec slot contains this column
                                 const sc_col_idx = sc_spec.colIdx();
                                 // A clock keyword reads no column, so any key slot will do.
@@ -6183,15 +6257,8 @@ fn executeGroupBy(
             if (try aggregation.parseAggregateFunc(allocator, hcol)) |parsed_agg| {
                 var agg_func = parsed_agg;
                 errdefer agg_func.deinit(allocator);
-                var col_idx: ?usize = null;
-                if (agg_func.column) |agg_col| {
-                    const lower = try allocator.alloc(u8, agg_col.len);
-                    defer allocator.free(lower);
-                    _ = std.ascii.lowerString(lower, agg_col);
-                    col_idx = column_map.get(lower) orelse return error.ColumnNotFound;
-                    allocator.free(agg_col);
-                    agg_func.column = null;
-                }
+                const agg_arg = try resolveAggArg(allocator, &agg_func, column_map);
+                const col_idx = agg_arg.col_idx;
                 const gc_sep: []const u8 = agg_func.sep orelse ",";
                 agg_func.sep = null;
                 try having_extra_aggs.append(allocator, .{ .idx = agg_specs.items.len, .text = try allocator.dupe(u8, hcol) });
@@ -6199,6 +6266,7 @@ fn executeGroupBy(
                     .func_type = agg_func.func_type,
                     .quantile = agg_func.quantile,
                     .col_idx = col_idx,
+                    .arith = agg_arg.arith,
                     .alias = agg_func.alias,
                     .sep = gc_sep,
                 });
@@ -6533,6 +6601,12 @@ fn executeGroupBy(
                                     if (needsVariance(spec.func_type)) welfordAdd(accum.means, accum.sum_sqs, accum.sum_counts[i], i, val);
                                 } else |_| {}
                             }
+                        } else if (spec.arith) |ex| {
+                            if (ex.eval(record)) |val| {
+                                if (!needsVariance(spec.func_type)) sumAdd(accum.sums, accum.sum_comps, i, val);
+                                accum.sum_counts[i] += 1;
+                                if (needsVariance(spec.func_type)) welfordAdd(accum.means, accum.sum_sqs, accum.sum_counts[i], i, val);
+                            }
                         }
                     },
                     .min => {
@@ -6542,6 +6616,10 @@ fn executeGroupBy(
                                     if (val < accum.mins[i]) accum.mins[i] = val;
                                 } else |_| {}
                             }
+                        } else if (spec.arith) |ex| {
+                            if (ex.eval(record)) |val| {
+                                if (val < accum.mins[i]) accum.mins[i] = val;
+                            }
                         }
                     },
                     .max => {
@@ -6550,6 +6628,10 @@ fn executeGroupBy(
                                 if (parseNumericFast(record[cidx])) |val| {
                                     if (val > accum.maxs[i]) accum.maxs[i] = val;
                                 } else |_| {}
+                            }
+                        } else if (spec.arith) |ex| {
+                            if (ex.eval(record)) |val| {
+                                if (val > accum.maxs[i]) accum.maxs[i] = val;
                             }
                         }
                     },
@@ -6837,6 +6919,26 @@ fn runQueryForTestOpts(allocator: Allocator, tmp: *std.testing.TmpDir, csv_conte
     try execute(allocator, query, out_file, opts);
     try out_file.seekTo(0);
     return out_file.readToEndAlloc(allocator, 64 * 1024);
+}
+
+test "arithmetic: SELECT columns, aggregate arguments, GROUP BY and HAVING" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = "price,qty,cat\n2.5,4,a\n10,3,b\n,2,a\n1,0,b\n";
+    const cases = [_]struct { sql: []const u8, want: []const u8 }{
+        .{ .sql = "SELECT price * qty AS t, price + qty, price/qty FROM '{s}'", .want = "t,price + qty,price/qty\n10,6.5,0.625\n30,13,3.3333333333333335\n,,\n0,1,\n" },
+        .{ .sql = "SELECT SUM(price*qty), MIN(price*qty), MAX((price+1)*2) FROM '{s}'", .want = "SUM(price*qty),MIN(price*qty),MAX((price+1)*2)\n40,0,22\n" },
+        .{ .sql = "SELECT cat, SUM(price * qty) AS rev FROM '{s}' GROUP BY cat ORDER BY cat", .want = "cat,rev\na,10\nb,30\n" },
+        .{ .sql = "SELECT cat FROM '{s}' GROUP BY cat HAVING SUM(price*qty) > 20", .want = "cat\nb\n" },
+    };
+    for (cases) |c| {
+        const out = try runQueryForTest(allocator, &tmp, data, c.sql);
+        defer allocator.free(out);
+        try std.testing.expectEqualStrings(c.want, out);
+    }
+    try std.testing.expectError(error.ArithmeticExpressionsNotSupported, runQueryForTest(allocator, &tmp, data, "SELECT COUNT(price*qty) FROM '{s}'"));
+    try std.testing.expectError(error.ColumnNotFound, runQueryForTest(allocator, &tmp, data, "SELECT price*nope FROM '{s}'"));
 }
 
 test "GROUP BY: ORDER BY aggregate result is applied (issue #46)" {
