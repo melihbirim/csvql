@@ -408,16 +408,23 @@ fn runOnce(allocator: Allocator, q: parser.Query, format: options_mod.OutputForm
         if (absolute) std.fs.deleteFileAbsolute(tmp_path) catch {} else std.fs.cwd().deleteFile(tmp_path) catch {};
     }
 
-    const opts = options_mod.Options{ .format = format, .roots = g_roots, .deny_columns = g_deny };
-    try engine.execute(allocator, q, tmp_file, opts);
+    try engine.execute(allocator, q, tmp_file, sandboxOptions(format));
 
     try tmp_file.seekTo(0);
     return try tmp_file.readToEndAlloc(allocator, 100 * 1024 * 1024);
 }
 
+/// Every query an agent sends runs with the server's sandbox. stdin is the
+/// JSON-RPC stream itself, so it is never a readable file here.
+fn sandboxOptions(format: options_mod.OutputFormat) options_mod.Options {
+    return .{ .format = format, .roots = g_roots, .deny_columns = g_deny, .allow_stdin = false };
+}
+
 fn runQuery(allocator: Allocator, sql: []const u8, format: options_mod.OutputFormat) !QueryResult {
     var q = try parser.parse(allocator, sql);
     defer q.deinit();
+    // `col IN (SELECT ...)` was never resolved here, so it silently matched nothing.
+    try engine.resolveQuery(allocator, &q, sandboxOptions(format));
 
     // No LIMIT given → bound the row count so a bare SELECT can't dump the table.
     var row_capped = false;

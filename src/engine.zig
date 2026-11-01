@@ -408,6 +408,21 @@ fn allowedColumns(allocator: Allocator, path: []const u8, opts: options_mod.Opti
     return out.toOwnedSlice(allocator);
 }
 
+/// The --root check plus two sandbox rules: no stdin when it is not ours to
+/// read (--mcp), and under --root only regular files, since opening a named
+/// pipe or a device blocks the server forever.
+fn ensureReadable(allocator: Allocator, path: []const u8, opts: options_mod.Options) !void {
+    const is_stdin = std.mem.eql(u8, path, "-") or std.mem.eql(u8, path, "stdin");
+    if (is_stdin) {
+        if (!opts.allow_stdin) return error.PathOutsideAllowedRoot;
+        return;
+    }
+    try ensurePathAllowed(allocator, path, opts.roots);
+    if (opts.roots.len == 0) return;
+    const st = std.fs.cwd().statFile(path) catch return error.PathOutsideAllowedRoot;
+    if (st.kind != .file) return error.NotARegularFile;
+}
+
 /// Runs the non-correlated subquery `sql` (the raw text captured by
 /// parseInComparison for `col IN (SELECT ...)`, #124) and returns its single
 /// output column's values, owned by `allocator` — the caller attaches this
@@ -444,6 +459,8 @@ fn runSubqueryForInList(allocator: Allocator, sql: []const u8, opts: options_mod
         defer tmp_file.close();
         var sub_opts = opts;
         sub_opts.no_header = false; // always emit a header so the skip below is reliable
+        sub_opts.format = .csv; // read back as CSV below, whatever the outer query prints
+        sub_opts.table_mode = .off;
         try execute(allocator, subquery, tmp_file, sub_opts);
         try tmp_file.seekTo(0);
         break :blk try tmp_file.readToEndAlloc(sa, 64 * 1024 * 1024);
@@ -535,8 +552,8 @@ pub fn resolveQuery(allocator: Allocator, query: *parser.Query, opts: options_mo
 
 pub fn execute(allocator: Allocator, parsed: parser.Query, output_file: std.fs.File, opts: options_mod.Options) !void {
     // --root sandbox: reject any file outside the allowed trees before opening.
-    try ensurePathAllowed(allocator, parsed.file_path, opts.roots);
-    for (parsed.joins) |j| try ensurePathAllowed(allocator, j.right_file, opts.roots);
+    try ensureReadable(allocator, parsed.file_path, opts);
+    for (parsed.joins) |j| try ensureReadable(allocator, j.right_file, opts);
 
     // --deny-columns: refuse a query that names a denied column anywhere, and
     // turn SELECT * into the list of allowed columns.
@@ -11002,4 +11019,39 @@ test "--deny-columns: refuses a query naming a denied column, SELECT * leaves it
     defer allocator.free(agg);
     try std.testing.expectEqualStrings("dept,COUNT(*)\nEng,1\nOps,1\n", agg);
     try std.testing.expectError(error.DeniedColumn, runQueryForTestOpts(allocator, &tmp, data, "SELECT COUNT(*) FROM '{s}' WHERE email LIKE 'a%'", opts));
+}
+
+test "IN subquery resolves under JSON output, and sandboxed reads refuse stdin and non-files" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    {
+        const f = try tmp.dir.createFile("d.csv", .{});
+        defer f.close();
+        try f.writeAll("id,dept\n1,Eng\n2,Ops\n");
+    }
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try tmp.dir.realpath("d.csv", &buf);
+    const sql = try std.fmt.allocPrint(allocator, "SELECT id FROM '{s}' WHERE dept IN (SELECT dept FROM '{s}' WHERE id = 1)", .{ path, path });
+    defer allocator.free(sql);
+    var query = try parser.parse(allocator, sql);
+    defer query.deinit();
+    const opts = options_mod.Options{ .format = .json };
+    try resolveQuery(allocator, &query, opts);
+    const out_file = try tmp.dir.createFile("out.json", .{ .read = true });
+    defer out_file.close();
+    try execute(allocator, query, out_file, opts);
+    try out_file.seekTo(0);
+    const out = try out_file.readToEndAlloc(allocator, 4096);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("[\n{\"id\":1}\n]\n", out);
+
+    const dir = try tmp.dir.realpath(".", &buf);
+    const sandbox = options_mod.Options{ .roots = &.{dir}, .allow_stdin = false };
+    try std.testing.expectError(error.PathOutsideAllowedRoot, ensureReadable(allocator, "-", sandbox));
+    // A directory is not a regular file either (a FIFO needs libc to create here).
+    try tmp.dir.makeDir("sub");
+    const sub = try std.fmt.allocPrint(allocator, "{s}/sub", .{dir});
+    defer allocator.free(sub);
+    try std.testing.expectError(error.NotARegularFile, ensureReadable(allocator, sub, sandbox));
 }

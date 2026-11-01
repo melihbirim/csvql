@@ -79,6 +79,7 @@ fn runQuery(sql: []const u8, format: options_mod.OutputFormat) ![*:0]u8 {
         .format = format,
         .table_mode = .off,
     };
+    try engine.resolveQuery(allocator, &query, opts);
 
     const output: []u8 = if (builtin.os.tag == .windows) blk: {
         // Windows: write to temp file (no std.posix.pipe)
