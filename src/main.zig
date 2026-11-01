@@ -59,13 +59,13 @@ const help_text =
     \\  AS       column aliases: SELECT name AS n
     \\  DISTINCT deduplicate output rows
     \\  SELECT   aggregate functions: COUNT, SUM, AVG, MIN, MAX, VARIANCE, STDDEV, MEDIAN, QUANTILE, MODE, GROUP_CONCAT, COUNT(DISTINCT)
-    \\  JOIN     inner join: SELECT ... FROM 'a.csv' JOIN 'b.csv' ON a.id = b.id
+    \\  JOIN     inner or LEFT join: SELECT ... FROM 'a.csv' JOIN 'b.csv' ON a.id = b.id
     \\
     \\NOT SUPPORTED:
     \\  correlated subqueries, subqueries in FROM/SELECT-list/HAVING-comparison
     \\  (col IN (SELECT ...) is the one supported subquery shape, single column,
     \\  non-correlated — see CORRECTNESS.md), scalar functions in WHERE other
-    \\  than DATEDIFF/DATEADD/EXTRACT, LEFT/RIGHT/FULL/CROSS JOIN, window functions,
+    \\  than DATEDIFF/DATEADD/EXTRACT, RIGHT/FULL/CROSS JOIN, window functions,
     \\  UNION, INTERSECT, EXCEPT, INSERT/UPDATE/DELETE
     \\
     \\OPTIONS:
