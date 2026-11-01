@@ -47,11 +47,13 @@ const TOOLS_JSON =
 // ponytail: global — the MCP server is a single sequential process, so one
 // server-wide config is correct; no per-request roots needed.
 var g_roots: []const []const u8 = &.{};
+var g_deny: []const []const u8 = &.{};
 // Optional audit-log path, set once at startup. null = off.
 var g_audit: ?[]const u8 = null;
 
-pub fn run(allocator: Allocator, roots: []const []const u8, audit_path: ?[]const u8) !void {
+pub fn run(allocator: Allocator, roots: []const []const u8, audit_path: ?[]const u8, deny_columns: []const []const u8) !void {
     g_roots = roots;
+    g_deny = deny_columns;
     g_audit = audit_path;
     const stdin = if (builtin.os.tag == .windows)
         std.fs.File{ .handle = std.os.windows.GetStdHandle(std.os.windows.STD_INPUT_HANDLE) catch return error.NoStdin }
@@ -406,7 +408,7 @@ fn runOnce(allocator: Allocator, q: parser.Query, format: options_mod.OutputForm
         if (absolute) std.fs.deleteFileAbsolute(tmp_path) catch {} else std.fs.cwd().deleteFile(tmp_path) catch {};
     }
 
-    const opts = options_mod.Options{ .format = format, .roots = g_roots };
+    const opts = options_mod.Options{ .format = format, .roots = g_roots, .deny_columns = g_deny };
     try engine.execute(allocator, q, tmp_file, opts);
 
     try tmp_file.seekTo(0);

@@ -356,6 +356,58 @@ pub fn ensurePathAllowed(allocator: Allocator, path: []const u8, roots: []const 
     return error.PathOutsideAllowedRoot;
 }
 
+/// The first denied column that `sql` names outside a string literal (bare,
+/// quoted or table-qualified), or null. Deliberately conservative: an alias or
+/// function that shares a denied column's name is refused too.
+pub fn deniedColumnIn(sql: []const u8, deny: []const []const u8) ?[]const u8 {
+    for (deny) |name| {
+        if (name.len == 0) continue;
+        var in_literal = false;
+        for (sql, 0..) |c, i| {
+            if (c == '\'') in_literal = !in_literal;
+            if (in_literal or i + name.len > sql.len) continue;
+            if (!std.ascii.eqlIgnoreCase(sql[i .. i + name.len], name)) continue;
+            const before_ok = i == 0 or !isIdentByte(sql[i - 1]);
+            const after_ok = i + name.len == sql.len or !isIdentByte(sql[i + name.len]);
+            if (before_ok and after_ok) return name;
+        }
+    }
+    return null;
+}
+
+fn isIdentByte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_';
+}
+
+/// The header names of `path` minus the denied ones, for SELECT * under
+/// --deny-columns. A name with whitespace or quotes cannot be written as a
+/// column reference, so such a file has to name its columns explicitly.
+fn allowedColumns(allocator: Allocator, path: []const u8, opts: options_mod.Options) ![][]u8 {
+    const f = try std.fs.cwd().openFile(path, .{});
+    defer f.close();
+    var buf: [64 * 1024]u8 = undefined;
+    const n = try f.readAll(&buf);
+    const hdr = try csv.resolveMmapHeader(allocator, buf[0..n], opts);
+    defer {
+        if (hdr.synth) for (hdr.names) |nm| allocator.free(nm);
+        allocator.free(hdr.names);
+    }
+    var out = std.ArrayList([]u8){};
+    errdefer {
+        for (out.items) |c| allocator.free(c);
+        out.deinit(allocator);
+    }
+    outer: for (hdr.names) |raw| {
+        var name = std.mem.trim(u8, raw, " \t\r");
+        if (name.len >= 2 and name[0] == '"' and name[name.len - 1] == '"') name = name[1 .. name.len - 1];
+        for (opts.deny_columns) |d| if (std.ascii.eqlIgnoreCase(name, d)) continue :outer;
+        if (std.mem.indexOfAny(u8, name, " \t\"'") != null) return error.DeniedColumnSelectStar;
+        try out.append(allocator, try allocator.dupe(u8, name));
+    }
+    if (out.items.len == 0) return error.DeniedColumn;
+    return out.toOwnedSlice(allocator);
+}
+
 /// Runs the non-correlated subquery `sql` (the raw text captured by
 /// parseInComparison for `col IN (SELECT ...)`, #124) and returns its single
 /// output column's values, owned by `allocator` — the caller attaches this
@@ -481,10 +533,30 @@ pub fn resolveQuery(allocator: Allocator, query: *parser.Query, opts: options_mo
     if (query.having_expr) |*he| try resolveInSubqueries(allocator, he, opts);
 }
 
-pub fn execute(allocator: Allocator, query: parser.Query, output_file: std.fs.File, opts: options_mod.Options) !void {
+pub fn execute(allocator: Allocator, parsed: parser.Query, output_file: std.fs.File, opts: options_mod.Options) !void {
     // --root sandbox: reject any file outside the allowed trees before opening.
-    try ensurePathAllowed(allocator, query.file_path, opts.roots);
-    for (query.joins) |j| try ensurePathAllowed(allocator, j.right_file, opts.roots);
+    try ensurePathAllowed(allocator, parsed.file_path, opts.roots);
+    for (parsed.joins) |j| try ensurePathAllowed(allocator, j.right_file, opts.roots);
+
+    // --deny-columns: refuse a query that names a denied column anywhere, and
+    // turn SELECT * into the list of allowed columns.
+    var query = parsed;
+    var star_cols: ?[][]u8 = null;
+    defer if (star_cols) |cols| {
+        for (cols) |c| allocator.free(c);
+        allocator.free(cols);
+    };
+    if (opts.deny_columns.len > 0) {
+        // Simple mode has no SQL text to check, so it is refused outright.
+        if (query.sql.len == 0 or deniedColumnIn(query.sql, opts.deny_columns) != null) return error.DeniedColumn;
+        if (query.all_columns) {
+            if (query.joins.len > 0 or std.mem.eql(u8, query.file_path, "-") or std.mem.eql(u8, query.file_path, "stdin"))
+                return error.DeniedColumnSelectStar;
+            star_cols = try allowedColumns(allocator, query.file_path, opts);
+            query.columns = star_cols.?;
+            query.all_columns = false;
+        }
+    }
 
     // Normalize DATE_PART(...) → STRFTIME(...) up front so every downstream path
     // (SELECT, GROUP BY, stdin, JOIN) handles it via the existing STRFTIME machinery.
@@ -10906,4 +10978,28 @@ test "a doubled single quote in a string literal is one quote (#257)" {
             return err;
         };
     }
+}
+
+test "deniedColumnIn: bare, quoted, qualified and case-insensitive names; not inside literals" {
+    const deny = [_][]const u8{ "email", "ssn" };
+    try std.testing.expectEqualStrings("email", deniedColumnIn("SELECT email FROM 'a.csv'", &deny).?);
+    try std.testing.expectEqualStrings("email", deniedColumnIn("SELECT x FROM 'a.csv' t WHERE t.EMAIL LIKE 'a%'", &deny).?);
+    try std.testing.expectEqualStrings("ssn", deniedColumnIn("SELECT COUNT(DISTINCT \"ssn\") FROM 'a.csv'", &deny).?);
+    try std.testing.expect(deniedColumnIn("SELECT x FROM 'email.csv' WHERE y = 'email'", &deny) == null);
+    try std.testing.expect(deniedColumnIn("SELECT email_count FROM 'a.csv'", &deny) == null);
+}
+
+test "--deny-columns: refuses a query naming a denied column, SELECT * leaves it out" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const data = "id,email,dept\n1,a@x,Eng\n2,b@x,Ops\n";
+    const opts = options_mod.Options{ .deny_columns = &.{"email"} };
+    const out = try runQueryForTestOpts(allocator, &tmp, data, "SELECT * FROM '{s}'", opts);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("id,dept\n1,Eng\n2,Ops\n", out);
+    const agg = try runQueryForTestOpts(allocator, &tmp, data, "SELECT dept, COUNT(*) FROM '{s}' GROUP BY dept ORDER BY dept", opts);
+    defer allocator.free(agg);
+    try std.testing.expectEqualStrings("dept,COUNT(*)\nEng,1\nOps,1\n", agg);
+    try std.testing.expectError(error.DeniedColumn, runQueryForTestOpts(allocator, &tmp, data, "SELECT COUNT(*) FROM '{s}' WHERE email LIKE 'a%'", opts));
 }
