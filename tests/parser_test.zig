@@ -662,3 +662,12 @@ test "a misspelled keyword after the table is an error, not an alias" {
     var q = try parser.parse(allocator, "SELECT t.a FROM 'f.csv' AS t WHERE t.a = 1");
     defer q.deinit();
 }
+
+test "a trailing semicolon ends the statement" {
+    const allocator = std.testing.allocator;
+    var q = try parser.parse(allocator, "SELECT a FROM 'f.csv' WHERE a = 1 ;");
+    defer q.deinit();
+    try std.testing.expectEqualStrings("1", q.where_expr.?.comparison.value);
+    var q2 = try parser.parse(allocator, "SELECT a FROM 'f.csv';");
+    defer q2.deinit();
+}

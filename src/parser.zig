@@ -659,6 +659,10 @@ pub fn parseAt(allocator: Allocator, input: []const u8, now_ts: i64) !Query {
     defer alias_scratch.deinit();
 
     var trimmed = std.mem.trim(u8, input, &std.ascii.whitespace);
+    // A statement terminator is not part of the query: "WHERE id = 1;" used to
+    // compare against the value "1;" and silently match nothing.
+    while (trimmed.len > 0 and trimmed[trimmed.len - 1] == ';')
+        trimmed = std.mem.trimRight(u8, trimmed[0 .. trimmed.len - 1], &std.ascii.whitespace);
 
     // Set operators (UNION/INTERSECT/EXCEPT) and most subqueries aren't
     // supported. Erroring clearly here is far better than silently
