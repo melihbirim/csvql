@@ -33,7 +33,7 @@ const INIT_RESULT =
 // Multiline for readability; flattened to single line before sending.
 const TOOLS_JSON =
     \\{"tools":[
-    \\{"name":"csv_query","description":"Execute a SQL query against CSV files and return results as JSON. Supports SELECT, WHERE, GROUP BY, ORDER BY, LIMIT, JOIN, COUNT/SUM/AVG/MIN/MAX, DISTINCT, LIKE. File paths must be single-quoted in FROM. Results are capped (~100 rows / 12KB): do NOT SELECT * on large files — aggregate (COUNT/SUM/AVG with GROUP BY) or add WHERE/LIMIT to answer questions without pulling raw rows. Example: SELECT dept, COUNT(*) FROM 'data.csv' GROUP BY dept","inputSchema":{"type":"object","properties":{"sql":{"type":"string","description":"SQL query with single-quoted file paths in FROM clause"}},"required":["sql"]}},
+    \\{"name":"csv_query","description":"Execute a SQL query against CSV or .xlsx files (first sheet) and return results as JSON. Supports SELECT, WHERE, GROUP BY, ORDER BY, LIMIT, JOIN, COUNT/SUM/AVG/MIN/MAX, DISTINCT, LIKE. File paths must be single-quoted in FROM. Results are capped (~100 rows / 12KB): do NOT SELECT * on large files — aggregate (COUNT/SUM/AVG with GROUP BY) or add WHERE/LIMIT to answer questions without pulling raw rows. Example: SELECT dept, COUNT(*) FROM 'data.csv' GROUP BY dept","inputSchema":{"type":"object","properties":{"sql":{"type":"string","description":"SQL query with single-quoted file paths in FROM clause"}},"required":["sql"]}},
     \\{"name":"csv_schema","description":"Show column names and a few sample rows from a CSV file. Call this before csv_query to understand column names and data types.","inputSchema":{"type":"object","properties":{"file":{"type":"string","description":"Path to the CSV file"}},"required":["file"]}},
     \\{"name":"csv_list","description":"List CSV files in a directory and its subfolders (up to 200).","inputSchema":{"type":"object","properties":{"directory":{"type":"string","description":"Directory to search (defaults to current working directory)"}}}}
     \\]}
@@ -326,7 +326,7 @@ fn toolCsvList(
             break;
         }
         if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.basename, ".csv")) continue;
+        if (!std.mem.endsWith(u8, entry.basename, ".csv") and !std.mem.endsWith(u8, entry.basename, ".xlsx")) continue;
         try files.append(allocator, try allocator.dupe(u8, entry.path));
     }
 

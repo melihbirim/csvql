@@ -418,6 +418,17 @@ pub fn build(b: *std.Build) void {
     const run_arith_tests = b.addRunArtifact(arith_tests);
     test_step.dependOn(&run_arith_tests.step);
 
+    // .xlsx reader tests (zip, shared strings, date serials)
+    const xlsx_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .root_source_file = b.path("src/xlsx.zig"),
+        }),
+    });
+    const run_xlsx_tests = b.addRunArtifact(xlsx_tests);
+    test_step.dependOn(&run_xlsx_tests.step);
+
     // BulkCsvReader tests (TooManyColumns, etc.)
     const bulk_csv_tests = b.addTest(.{
         .root_module = b.createModule(.{

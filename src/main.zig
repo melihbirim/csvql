@@ -6,6 +6,7 @@ const engine = @import("engine.zig");
 const options_mod = @import("options.zig");
 const mcp = @import("mcp.zig");
 const install = @import("install.zig");
+const xlsx = @import("xlsx.zig");
 const audit = @import("audit.zig");
 const memfile = @import("memfile.zig");
 const zigtable = @import("zigtable");
@@ -641,10 +642,12 @@ fn runSchema(allocator: Allocator, raw_path: []const u8, stdout_file: std.fs.Fil
     };
     const file_size = stat.size;
 
-    // Read the whole file.
-    const file = try std.fs.cwd().openFile(file_path, .{});
-    defer file.close();
-    const csv_data = try file.readToEndAlloc(allocator, 4 * 1024 * 1024 * 1024);
+    // Read the whole file (.xlsx: its first sheet as CSV).
+    const csv_data = if (xlsx.isXlsx(file_path)) try xlsx.fileToCsv(allocator, file_path) else blk: {
+        const file = try std.fs.cwd().openFile(file_path, .{});
+        defer file.close();
+        break :blk try file.readToEndAlloc(allocator, 4 * 1024 * 1024 * 1024);
+    };
     defer allocator.free(csv_data);
 
     var records = CsvRecordIterator.init(csv_data);
