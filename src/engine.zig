@@ -419,7 +419,8 @@ fn ensureReadable(allocator: Allocator, path: []const u8, opts: options_mod.Opti
     }
     try ensurePathAllowed(allocator, path, opts.roots);
     if (opts.roots.len == 0) return;
-    const st = std.fs.cwd().statFile(path) catch return error.PathOutsideAllowedRoot;
+    // Windows reports a directory as IsDir here rather than a stat result.
+    const st = std.fs.cwd().statFile(path) catch |e| return if (e == error.IsDir) error.NotARegularFile else error.PathOutsideAllowedRoot;
     if (st.kind != .file) return error.NotARegularFile;
 }
 
