@@ -29,7 +29,7 @@ Agents are getting access to company data. The usual paths are a database connec
 
 - **Read-only by construction.** The parser has no `INSERT`, `UPDATE`, `DELETE` or `DROP`. Nothing writes to an input file.
 - **No network.** No `std.net`, `std.http` or socket call in the codebase. No telemetry, no update check. `strace -f -e trace=network` shows an empty trace.
-- **Sandboxed by a flag.** `--root /data` confines every file the process can open. `/etc/passwd` and `../` traversal fail with `PathOutsideAllowedRoot`.
+- **Sandboxed by default for agents.** `csvql --mcp` only opens files under its working directory; `--root /data` picks the folders instead, and `--root /` allows everything. `/etc/passwd` and `../` traversal fail with `PathOutsideAllowedRoot`.
 - **Bounded output.** MCP results are capped at about 100 rows / 12 KB per call. A careless `SELECT *` cannot flood the context or pull a table out one call at a time.
 - **Flat memory.** An aggregate holds a running accumulator, not a dataset: 74 MB on a 0.7 GB file and 74 MB on an 8 GB one. It fits on the small VM beside the data.
 - **Auditable.** `--audit <file>` appends one JSONL record per query. Over SSH you inherit your existing keys, bastion and logs.
@@ -114,7 +114,21 @@ Run csvql on the server next to the data and connect over SSH. Only the SQL and 
 { "command": "ssh", "args": ["analyst@dataserver", "csvql", "--mcp", "--root", "/data"] }
 ```
 
-Always set `--root` when an agent or another user can reach csvql. Pair it with an unprivileged OS user and a read-only mount. Checklist: [SECURITY.md#hardening-for-on-prem-and-remote-access](SECURITY.md#hardening-for-on-prem-and-remote-access).
+Without `--root`, `--mcp` is confined to the directory it was started in. Set `--root` explicitly when an agent or another user can reach csvql, since that directory depends on how the client launches the server. Pair it with an unprivileged OS user and a read-only mount. Checklist: [SECURITY.md#hardening-for-on-prem-and-remote-access](SECURITY.md#hardening-for-on-prem-and-remote-access).
+
+### What an agent can do, out of the box
+
+Default settings, no hardening flags. DuckDB is the CLI an agent with a shell would call; it can be locked down with `SET enable_external_access = false` and read-only mode, but only if someone remembers to.
+
+| An agent asks the tool to... | csvql `--mcp` | DuckDB 1.5 CLI |
+| --- | --- | --- |
+| write a file (`COPY ... TO 'x.csv'`) | no, there is no write statement | yes |
+| read `/etc/hosts` or `../` outside its folder | no, `PathOutsideAllowedRoot` | yes |
+| fetch a URL or install an extension | no, no network code | yes (`enable_external_access` and `autoinstall_known_extensions` default to true) |
+| return a whole large table in one call | no, about 100 rows / 12 KB cap | yes |
+| peak memory, `GROUP BY` on a 0.72 GB file | 54 MB | 221 MB (polars 2.0: 1137 MB) |
+
+Check the DuckDB column yourself: `duckdb -c "COPY (SELECT 1) TO 'x.csv'"` and `duckdb -c "SELECT current_setting('enable_external_access')"`.
 
 ### Token cost
 

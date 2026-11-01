@@ -348,8 +348,9 @@ pub fn ensurePathAllowed(allocator: Allocator, path: []const u8, roots: []const 
         defer allocator.free(rroot);
         // Inside root iff real == rroot, or real starts with "rroot/" (the separator
         // check stops "/data-secret" from matching root "/data").
+        // A root that already ends in a separator ("/") contains everything under it.
         if (std.mem.startsWith(u8, real, rroot) and
-            (real.len == rroot.len or real[rroot.len] == std.fs.path.sep))
+            (real.len == rroot.len or rroot[rroot.len - 1] == std.fs.path.sep or real[rroot.len] == std.fs.path.sep))
             return;
     }
     return error.PathOutsideAllowedRoot;
@@ -7358,6 +7359,8 @@ test "ensurePathAllowed confines file access to --root trees" {
     const escape = try std.fmt.allocPrint(allocator, "{s}/../../../etc/hosts", .{root});
     defer allocator.free(escape);
     try std.testing.expectError(error.PathOutsideAllowedRoot, ensurePathAllowed(allocator, escape, &roots));
+    // Root "/" (the --mcp opt-out) contains everything.
+    if (builtin.os.tag != .windows) try ensurePathAllowed(allocator, inside, &.{"/"});
 }
 
 test "DATE_PART('year', col) rewrites to STRFTIME and groups by year" {
