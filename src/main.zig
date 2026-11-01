@@ -137,6 +137,7 @@ fn exitCodeForError(err: anyerror) u8 {
         error.ArithmeticExpressionsNotSupported,
         error.DeniedColumn,
         error.DeniedColumnSelectStar,
+        error.UnexpectedTextAfterTable,
         => 2,
         error.StrictModeNonNumericValue,
         error.EmptyFile,
