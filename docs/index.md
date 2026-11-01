@@ -1,7 +1,7 @@
 ---
 layout: home
 title: "csvql: read-only SQL on CSV files for AI agents"
-description: "Read-only SQL on CSV files for AI agents. It can't write, can't reach the network, and with --root can't leave the folders you give it. About as fast as DuckDB and polars, with 3 to 11x less memory."
+description: "Give an AI agent SQL over your CSV files, not your computer. Out of the box it can't write, can't reach the network, can't leave its folder, and can't pour a whole table into the context. About as fast as DuckDB and polars, with 3 to 11x less memory."
 ---
 
 <section id="why">

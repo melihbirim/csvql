@@ -6,7 +6,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE.md)
 [![Release](https://img.shields.io/github/v/release/melihbirim/csvql)](https://github.com/melihbirim/csvql/releases)
 
-**Read-only SQL on CSV files for AI agents. It can't write, can't reach the network, and with `--root` can't leave the folders you give it.**
+**Give an AI agent SQL over your CSV files, not your computer.** Out of the box it can't write, can't reach the network, can't leave its folder, and can't pour a whole table into the context.
 
 > A database is something you load your data *into*. csvql is a query you run on the data where it already lives.
 
