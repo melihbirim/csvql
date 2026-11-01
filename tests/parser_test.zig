@@ -654,3 +654,11 @@ test "compareValues uses in_values_set (hash lookup) when present, and honors in
     try std.testing.expect(!parser.compareValues(comp_negated, "10"));
     try std.testing.expect(parser.compareValues(comp_negated, "15"));
 }
+
+test "a misspelled keyword after the table is an error, not an alias" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.UnexpectedTextAfterTable, parser.parse(allocator, "SELECT a FROM 'f.csv' WHRE a = 1"));
+    try std.testing.expectError(error.UnexpectedTextAfterTable, parser.parse(allocator, "SELECT a FROM f.csv GROUPBY a"));
+    var q = try parser.parse(allocator, "SELECT t.a FROM 'f.csv' AS t WHERE t.a = 1");
+    defer q.deinit();
+}

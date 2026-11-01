@@ -440,6 +440,15 @@ fn stripAsKeyword(s: []const u8) []const u8 {
     return s;
 }
 
+/// An alias is one identifier or nothing. Anything else after the file is a
+/// misspelled keyword (`WHRE city = 'x'`), which used to be swallowed as the
+/// alias and silently return every row.
+fn checkAlias(alias: []const u8) !void {
+    if (alias.len == 0) return;
+    if (!(std.ascii.isAlphabetic(alias[0]) or alias[0] == '_')) return error.UnexpectedTextAfterTable;
+    for (alias) |c| if (!(std.ascii.isAlphanumeric(c) or c == '_')) return error.UnexpectedTextAfterTable;
+}
+
 /// Extract a file path and optional alias from a string like:
 ///   'path/to/file.csv' alias
 ///   'path/to/file.csv' AS alias
@@ -456,6 +465,7 @@ fn extractFileAndAlias(allocator: Allocator, input: []const u8) !FileAlias {
         const end_q = std.mem.indexOfScalar(u8, s[1..], '\'') orelse return error.InvalidQuery;
         const file_raw = s[1 .. end_q + 1]; // inside the quotes
         const after = stripAsKeyword(std.mem.trim(u8, s[end_q + 2 ..], &std.ascii.whitespace));
+        try checkAlias(after);
         const alias_buf = try allocator.alloc(u8, after.len);
         _ = std.ascii.lowerString(alias_buf, after);
         return FileAlias{
@@ -467,6 +477,7 @@ fn extractFileAndAlias(allocator: Allocator, input: []const u8) !FileAlias {
         if (std.mem.indexOfAny(u8, s, &std.ascii.whitespace)) |sp| {
             const file_raw = s[0..sp];
             const after = stripAsKeyword(std.mem.trim(u8, s[sp + 1 ..], &std.ascii.whitespace));
+            try checkAlias(after);
             const alias_buf = try allocator.alloc(u8, after.len);
             _ = std.ascii.lowerString(alias_buf, after);
             return FileAlias{
