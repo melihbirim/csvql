@@ -14,6 +14,7 @@ const arith = @import("arith.zig");
 const datetime = @import("datetime.zig");
 const arena_buffer = @import("arena_buffer.zig");
 const memfile = @import("memfile.zig");
+const xlsx = @import("xlsx.zig");
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 const file_map = @import("file_map.zig");
@@ -564,14 +565,48 @@ pub fn resolveQuery(allocator: Allocator, query: *parser.Query, opts: options_mo
     if (query.having_expr) |*he| try resolveInSubqueries(allocator, he, opts);
 }
 
+fn stageXlsx(allocator: Allocator, staged: *std.ArrayList(memfile.FileWithPath), path: []const u8) ![]const u8 {
+    const csv_bytes = try xlsx.fileToCsv(allocator, path);
+    defer allocator.free(csv_bytes);
+    const f = try memfile.createMemoryBackedFileWithPath(allocator, "xlsx");
+    staged.append(allocator, f) catch |err| {
+        f.file.close();
+        f.cleanup(allocator);
+        return err;
+    };
+    try f.file.writeAll(csv_bytes);
+    return f.path;
+}
+
 pub fn execute(allocator: Allocator, parsed: parser.Query, output_file: std.fs.File, opts: options_mod.Options) !void {
     // --root sandbox: reject any file outside the allowed trees before opening.
     try ensureReadable(allocator, parsed.file_path, opts);
     for (parsed.joins) |j| try ensureReadable(allocator, j.right_file, opts);
 
+    var query = parsed;
+
+    // .xlsx: convert the first sheet to an in-memory CSV and point the query at it,
+    // so every path below runs unchanged.
+    var staged = std.ArrayList(memfile.FileWithPath){};
+    defer {
+        for (staged.items) |s| {
+            s.file.close();
+            s.cleanup(allocator);
+        }
+        staged.deinit(allocator);
+    }
+    var staged_joins: ?[]parser.JoinClause = null;
+    defer if (staged_joins) |j| allocator.free(j);
+    if (xlsx.isXlsx(query.file_path)) query.file_path = @constCast(try stageXlsx(allocator, &staged, query.file_path));
+    for (query.joins, 0..) |j, ji| {
+        if (!xlsx.isXlsx(j.right_file)) continue;
+        if (staged_joins == null) staged_joins = try allocator.dupe(parser.JoinClause, query.joins);
+        staged_joins.?[ji].right_file = @constCast(try stageXlsx(allocator, &staged, j.right_file));
+    }
+    if (staged_joins) |j| query.joins = j;
+
     // --deny-columns: refuse a query that names a denied column anywhere, and
     // turn SELECT * into the list of allowed columns.
-    var query = parsed;
     var star_cols: ?[][]u8 = null;
     defer if (star_cols) |cols| {
         for (cols) |c| allocator.free(c);

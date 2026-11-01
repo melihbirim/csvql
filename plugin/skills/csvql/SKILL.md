@@ -1,6 +1,6 @@
 ---
 name: csvql
-description: Query, inspect, filter, aggregate or join CSV and TSV files with SQL using the csvql CLI. Use whenever the user asks a question about the contents of a .csv or .tsv file, wants counts, totals, top N, group-bys or a schema of one, or the file is too large to read into context.
+description: Query, inspect, filter, aggregate or join CSV, TSV and Excel (.xlsx) files with SQL using the csvql CLI. Use whenever the user asks a question about the contents of a .csv, .tsv or .xlsx file, wants counts, totals, top N, group-bys or a schema of one, or the file is too large to read into context.
 ---
 
 # csvql
