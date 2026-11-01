@@ -840,6 +840,21 @@ check \
   "SELECT * FROM read_csv_auto('$CSV') AS e JOIN read_csv_auto('$DEPTS') AS d ON e.department = d.dept_name" \
   ""
 
+DEPTS_PART="$TMP/depts_part.csv"
+head -4 "$DEPTS" > "$DEPTS_PART"
+
+check \
+  "LEFT JOIN, half the departments missing" \
+  "SELECT e.name, e.department, d.region FROM '$CSV' e LEFT JOIN '$DEPTS_PART' d ON e.department = d.dept_name" \
+  "SELECT e.name, e.department, COALESCE(d.region, '') AS region FROM read_csv_auto('$CSV') AS e LEFT JOIN read_csv_auto('$DEPTS_PART') AS d ON e.department = d.dept_name" \
+  ""
+
+check \
+  "LEFT JOIN + WHERE right IS NULL" \
+  "SELECT e.name, e.department FROM '$CSV' e LEFT JOIN '$DEPTS_PART' d ON e.department = d.dept_name WHERE d.region IS NULL" \
+  "SELECT e.name, e.department FROM read_csv_auto('$CSV') AS e LEFT JOIN read_csv_auto('$DEPTS_PART') AS d ON e.department = d.dept_name WHERE d.region IS NULL" \
+  ""
+
 check \
   "JOIN cities" \
   "SELECT e.name, e.city, c.state, c.timezone FROM '$CSV' e INNER JOIN '$CITIES' c ON e.city = c.city" \

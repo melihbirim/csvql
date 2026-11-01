@@ -46,9 +46,9 @@ cat data.csv | csvql "SELECT * FROM '-' WHERE age > 30"
 
 ## SQL support
 
-SELECT, WHERE (AND/OR/NOT, LIKE/ILIKE, IN, BETWEEN, IS NULL), GROUP BY, HAVING, ORDER BY, LIMIT, DISTINCT, inner JOIN, `col IN (SELECT ...)`. Aggregates: COUNT, SUM, AVG, MIN, MAX, MEDIAN, QUANTILE, MODE, STDDEV, VARIANCE, GROUP_CONCAT, COUNT(DISTINCT). Date and string functions such as STRFTIME, DATEDIFF, LOWER, UPPER, SUBSTR, ROUND. Arithmetic (`+ - * /`, parentheses) over columns and numbers in SELECT, WHERE and inside SUM, AVG, MIN, MAX, STDDEV and VARIANCE, and over aggregate results: `SUM(price * qty)`, `WHERE price * qty > 100`, `SUM(a) / COUNT(*)`. Column names with spaces go in double quotes: `SELECT "First Name" FROM 'people.csv'`.
+SELECT, WHERE (AND/OR/NOT, LIKE/ILIKE, IN, BETWEEN, IS NULL), GROUP BY, HAVING, ORDER BY, LIMIT, DISTINCT, JOIN and LEFT JOIN (chained), `col IN (SELECT ...)`. Aggregates: COUNT, SUM, AVG, MIN, MAX, MEDIAN, QUANTILE, MODE, STDDEV, VARIANCE, GROUP_CONCAT, COUNT(DISTINCT). Date and string functions such as STRFTIME, DATEDIFF, LOWER, UPPER, SUBSTR, ROUND. Arithmetic (`+ - * /`, parentheses) over columns and numbers in SELECT, WHERE and inside SUM, AVG, MIN, MAX, STDDEV and VARIANCE, and over aggregate results: `SUM(price * qty)`, `WHERE price * qty > 100`, `SUM(a) / COUNT(*)`. Column names with spaces go in double quotes: `SELECT "First Name" FROM 'people.csv'`.
 
-Not supported: arithmetic around function calls (`ROUND(a) * 2`), LEFT/RIGHT/FULL/CROSS JOIN, window functions, UNION, subqueries in FROM, any writes. DATEDIFF and DATEADD take columns, not literals. For those, fall back to another tool.
+Not supported: arithmetic around function calls (`ROUND(a) * 2`), RIGHT/FULL/CROSS JOIN, window functions, UNION, subqueries in FROM, any writes. DATEDIFF and DATEADD take columns, not literals. For those, fall back to another tool.
 
 ## Exit codes
 

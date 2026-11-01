@@ -7,8 +7,21 @@
   "license": "MIT",
   "homepage": "https://github.com/melihbirim/csvql",
   "server": {
-    "type": "stdio",
-    "command": "server/csvql"
+    "type": "binary",
+    "entry_point": "server/csvql",
+    "mcp_config": {
+      "command": "${__dirname}/server/csvql",
+      "args": ["--mcp", "--root", "${user_config.data_folder}"]
+    }
+  },
+  "user_config": {
+    "data_folder": {
+      "type": "directory",
+      "title": "Data folder",
+      "description": "The only folder the agent can read. Subfolders included.",
+      "required": true,
+      "default": "${DOCUMENTS}"
+    }
   },
   "tools": [
     { "name": "csv_query", "description": "Run SQL against a CSV file; results are capped so large files never flood the context." },

@@ -372,13 +372,22 @@ test "parse chained JOIN with WHERE clause" {
     try std.testing.expectEqualStrings("West", comp.value);
 }
 
+test "parse LEFT JOIN, LEFT OUTER JOIN and mixed chains" {
+    const allocator = std.testing.allocator;
+    var q = try parser.parse(allocator, "SELECT * FROM 'a.csv' a LEFT OUTER JOIN 'b.csv' b ON a.id = b.id INNER JOIN 'c.csv' c ON b.k = c.k LEFT JOIN 'd.csv' d ON c.k = d.k");
+    defer q.deinit();
+    try std.testing.expectEqual(@as(usize, 3), q.joins.len);
+    try std.testing.expect(q.joins[0].left);
+    try std.testing.expect(!q.joins[1].left);
+    try std.testing.expect(q.joins[2].left);
+    try std.testing.expectEqualStrings("a.csv", q.file_path);
+    try std.testing.expectEqualStrings("b.csv", q.joins[0].right_file);
+    try std.testing.expectEqualStrings("c.csv", q.joins[1].right_file);
+}
+
 test "unsupported join types return UnsupportedJoinType error" {
     const allocator = std.testing.allocator;
 
-    try std.testing.expectError(
-        error.UnsupportedJoinType,
-        parser.parse(allocator, "SELECT * FROM 'a.csv' a LEFT JOIN 'b.csv' b ON a.id = b.id"),
-    );
     try std.testing.expectError(
         error.UnsupportedJoinType,
         parser.parse(allocator, "SELECT * FROM 'a.csv' a RIGHT JOIN 'b.csv' b ON a.id = b.id"),

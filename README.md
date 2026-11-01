@@ -29,7 +29,7 @@ Agents are getting access to company data. The usual paths are a database connec
 
 - **Read-only by construction.** The parser has no `INSERT`, `UPDATE`, `DELETE` or `DROP`. Nothing writes to an input file.
 - **No network.** No `std.net`, `std.http` or socket call in the codebase. No telemetry, no update check. `strace -f -e trace=network` shows an empty trace.
-- **Sandboxed by default for agents.** `csvql --mcp` only opens files under its working directory; `--root /data` picks the folders instead, and `--root /` allows everything. `/etc/passwd` and `../` traversal fail with `PathOutsideAllowedRoot`.
+- **Sandboxed by default for agents.** `csvql --mcp` only opens files under its working directory and refuses to start in the filesystem root; `--root /data` picks the folders instead, and `--root /` allows everything. `/etc/passwd` and `../` traversal fail with `PathOutsideAllowedRoot`.
 - **Private columns stay private.** `--deny-columns email,ssn` refuses any query that reads those columns, in SELECT, WHERE, ORDER BY or a subquery, and `SELECT *` leaves them out. The agent can still run `AVG(salary) GROUP BY dept`.
 - **Bounded output.** MCP results are capped at about 100 rows / 12 KB per call. A careless `SELECT *` cannot flood the context. The cap is per call, so an agent that pages with `OFFSET` can still read a whole table; keep data it must never see out with `--deny-columns`.
 - **Flat memory.** An aggregate holds a running accumulator, not a dataset: 74 MB on a 0.7 GB file and 74 MB on an 8 GB one. It fits on the small VM beside the data.
@@ -39,7 +39,7 @@ Full posture, including two known gaps on macOS and Windows: [SECURITY.md](SECUR
 
 ## What it does not do
 
-- **It is not a database.** No `UNION`, no window functions, no `LEFT`/`RIGHT`/`FULL`/`CROSS JOIN` (inner hash join only). The only subquery shape is `col IN (SELECT ...)`. These error rather than return wrong data. If you need full SQL, use DuckDB.
+- **It is not a database.** No `UNION`, no window functions, no `RIGHT`/`FULL`/`CROSS JOIN` (inner and left hash joins only). The only subquery shape is `col IN (SELECT ...)`. These error rather than return wrong data. If you need full SQL, use DuckDB.
 - **Scalar functions in `WHERE`** are limited to `DATEDIFF`, `DATEADD` and `EXTRACT`. Others (`UPPER`, `ROUND`, ...) are `SELECT`-only and currently fail in `WHERE` with a misleading `ColumnNotFound`.
 - **Excel files are read, not streamed.** `FROM 'sales.xlsx'` queries the first sheet (dates come out as `YYYY-MM-DD`, formulas as their saved value), but the sheet is unpacked in memory first: a 9 MB, 300k row workbook takes about 230 MB and 0.6 s. Other sheets, `.xls` and `.xlsb` are not supported.
 - **Quoted CSV is about 3x slower** than unquoted. Quotes disable the 16-byte skip the scanner relies on.
@@ -76,14 +76,14 @@ Flags: `-d/--delimiter`, `--json`, `--jsonl`, `--markdown`, `--no-header`, `--no
 ### Setup
 
 ```bash
-csvql install          # registers csvql in Claude Code and Claude Desktop; --print to dry-run
+cd ~/data && csvql install    # registers csvql in Claude Code and Claude Desktop; --print to dry-run
 ```
 
-It runs `claude mcp add` if the Claude Code CLI is present and merges an `mcpServers.csvql` entry into the Claude Desktop config, preserving your other servers. Restart Claude afterward.
+It runs `claude mcp add` if the Claude Code CLI is present and merges an `mcpServers.csvql` entry into the Claude Desktop config, preserving your other servers. Claude Desktop starts MCP servers in `/`, so the Desktop entry gets `--root` set to the folder you ran `install` from (or `--root <folder>`). Without a `--root`, `csvql --mcp` refuses to start in the filesystem root. Restart Claude afterward.
 
 Without MCP, a Claude Code skill teaches the agent to use the `csvql` CLI whenever a CSV comes up: `claude plugin marketplace add melihbirim/csvql` then `claude plugin install csvql@csvql`.
 
-Alternatives: a one-click `csvql-<platform>.mcpb` bundle for Claude Desktop on the [Releases](https://github.com/melihbirim/csvql/releases) page (Settings → Extensions), or a manual entry:
+Alternatives: a one-click `csvql-<platform>.mcpb` bundle for Claude Desktop on the [Releases](https://github.com/melihbirim/csvql/releases) page (Settings → Extensions), which asks for the data folder on install, or a manual entry:
 
 ```json
 { "mcpServers": { "csvql": { "command": "/usr/local/bin/csvql", "args": ["--mcp", "--root", "/data"] } } }
@@ -209,7 +209,7 @@ Every number has a reproduce script. Full tables, including quoted CSV, wide fil
 
 ## SQL
 
-Files: `.csv`, `.tsv` (with `-d '\t'`) and `.xlsx` (first sheet). `SELECT` / `FROM` / `WHERE` / `GROUP BY` / `HAVING` / `ORDER BY` / `LIMIT` / `OFFSET`, inner `JOIN` (chained), `col IN (SELECT ...)`, `LIKE` / `ILIKE` / `BETWEEN` / `IS NULL` / `AND` / `OR` / `NOT`, `DISTINCT`, `CASE WHEN`, arithmetic (`+ - * /` in `SELECT`, `WHERE`, inside aggregates and over their results: `SUM(price * qty)`, `WHERE price * qty > 100`, `SUM(a) / COUNT(*)`), column names with spaces as `"First Name"`, `` `First Name` `` or `[First Name]`. Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `VARIANCE`, `STDDEV`, `MEDIAN`, `QUANTILE`, `MODE`, `GROUP_CONCAT`, `COUNT(DISTINCT)`. Scalars in `SELECT`: string (`UPPER`, `LOWER`, `TRIM`, `LENGTH`, `REVERSE`, `CONCAT`, `LTRIM`, `RTRIM`, `LEFT`, `RIGHT`, `REPEAT`, `POSITION`, `INSTR`, `SUBSTR`, `REPLACE`, `SPLIT_PART`, `LPAD`, `RPAD`), math (`ABS`, `SIGN`, `CEIL`, `FLOOR`, `MOD`, `ROUND`, `TRUNC`, `SQRT`, `POWER`, `LN`, `LOG`, `EXP`, `GREATEST`, `LEAST`), `CAST`, `COALESCE`, `NULLIF`, `IFNULL`, dates (`STRFTIME`, `DATE_PART`, `EXTRACT`, `DATEDIFF`, `DATEADD`, `CURRENT_DATE`, `NOW()`, `CURRENT_TIMESTAMP`).
+Files: `.csv`, `.tsv` (with `-d '\t'`) and `.xlsx` (first sheet). `SELECT` / `FROM` / `WHERE` / `GROUP BY` / `HAVING` / `ORDER BY` / `LIMIT` / `OFFSET`, `JOIN` and `LEFT JOIN` (chained), `col IN (SELECT ...)`, `LIKE` / `ILIKE` / `BETWEEN` / `IS NULL` / `AND` / `OR` / `NOT`, `DISTINCT`, `CASE WHEN`, arithmetic (`+ - * /` in `SELECT`, `WHERE`, inside aggregates and over their results: `SUM(price * qty)`, `WHERE price * qty > 100`, `SUM(a) / COUNT(*)`), column names with spaces as `"First Name"`, `` `First Name` `` or `[First Name]`. Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `VARIANCE`, `STDDEV`, `MEDIAN`, `QUANTILE`, `MODE`, `GROUP_CONCAT`, `COUNT(DISTINCT)`. Scalars in `SELECT`: string (`UPPER`, `LOWER`, `TRIM`, `LENGTH`, `REVERSE`, `CONCAT`, `LTRIM`, `RTRIM`, `LEFT`, `RIGHT`, `REPEAT`, `POSITION`, `INSTR`, `SUBSTR`, `REPLACE`, `SPLIT_PART`, `LPAD`, `RPAD`), math (`ABS`, `SIGN`, `CEIL`, `FLOOR`, `MOD`, `ROUND`, `TRUNC`, `SQRT`, `POWER`, `LN`, `LOG`, `EXP`, `GREATEST`, `LEAST`), `CAST`, `COALESCE`, `NULLIF`, `IFNULL`, dates (`STRFTIME`, `DATE_PART`, `EXTRACT`, `DATEDIFF`, `DATEADD`, `CURRENT_DATE`, `NOW()`, `CURRENT_TIMESTAMP`).
 
 ```bash
 csvql "SELECT department, COUNT(*), AVG(salary) FROM 'data.csv' WHERE salary > 50000 GROUP BY department HAVING COUNT(*) > 10 ORDER BY department"

@@ -300,6 +300,8 @@ pub const JoinClause = struct {
     right_alias: []u8,
     left_col: []u8,
     right_col: []u8,
+    /// LEFT JOIN: a left row with no match is kept, right columns empty.
+    left: bool = false,
 
     pub fn deinit(self: *JoinClause, allocator: Allocator) void {
         allocator.free(self.right_file);
@@ -369,6 +371,8 @@ const JoinKeyword = struct {
     kw_start: usize,
     /// Index in the source string just after the JOIN keyword (points into right-file part)
     kw_end: usize,
+    /// LEFT [OUTER] JOIN: keep left rows with no match.
+    left: bool = false,
 };
 
 /// Returns true if `needle` appears case-insensitively in `s` at a position that is NOT
@@ -436,24 +440,36 @@ fn containsUnsupportedSubquery(s: []const u8) bool {
 /// Requires the keyword to be preceded by whitespace (or start of string) and followed by a space
 /// so that "join" inside a file name (e.g. 'data_join.csv') is not mistaken for the keyword.
 fn detectJoinKeyword(s: []const u8) ?JoinKeyword {
-    // Prefer "INNER JOIN " over bare "JOIN " to get the right kw_start
-    if (std.ascii.indexOfIgnoreCase(s, "INNER JOIN ")) |idx| {
-        // Verify it's preceded by whitespace or at position 0
-        if (idx == 0 or std.ascii.isWhitespace(s[idx - 1])) {
-            return JoinKeyword{ .kw_start = idx, .kw_end = idx + 10 }; // "INNER JOIN".len = 10
-        }
-    }
-    // Search for " JOIN " (with leading space) to avoid matching inside identifiers
+    // Search for " JOIN " (with leading space) to avoid matching inside identifiers,
+    // then fold a preceding INNER, LEFT or LEFT OUTER into the keyword span.
     var i: usize = 1;
     while (i + 5 <= s.len) : (i += 1) {
         if (std.ascii.isWhitespace(s[i - 1]) and
             std.ascii.eqlIgnoreCase(s[i .. i + 4], "JOIN") and
             std.ascii.isWhitespace(s[i + 4]))
         {
-            return JoinKeyword{ .kw_start = i, .kw_end = i + 4 }; // "JOIN".len = 4
+            var kw = JoinKeyword{ .kw_start = i, .kw_end = i + 4 };
+            var w = prevWord(s, i);
+            if (std.ascii.eqlIgnoreCase(w.word, "OUTER")) w = prevWord(s, w.start);
+            if (std.ascii.eqlIgnoreCase(w.word, "LEFT")) {
+                kw.kw_start = w.start;
+                kw.left = true;
+            } else if (std.ascii.eqlIgnoreCase(w.word, "INNER")) {
+                kw.kw_start = w.start;
+            }
+            return kw;
         }
     }
     return null;
+}
+
+/// The word ending just before `end` (skipping whitespace), and where it starts.
+fn prevWord(s: []const u8, end: usize) struct { word: []const u8, start: usize } {
+    var e = end;
+    while (e > 0 and std.ascii.isWhitespace(s[e - 1])) e -= 1;
+    var b = e;
+    while (b > 0 and std.ascii.isAlphabetic(s[b - 1])) b -= 1;
+    return .{ .word = s[b..e], .start = b };
 }
 
 const FileAlias = struct { file: []u8, alias: []u8 };
@@ -891,7 +907,7 @@ pub fn parseAt(allocator: Allocator, raw_input: []const u8, now_ts: i64) !Query 
 
     // Reject unsupported JOIN types before they silently fall through to single-file mode.
     // Use the quote-aware scanner so that filenames like '/tmp/left join.csv' are not flagged.
-    inline for ([_][]const u8{ "LEFT JOIN", "RIGHT JOIN", "OUTER JOIN", "FULL JOIN", "FULL OUTER JOIN", "CROSS JOIN" }) |kw| {
+    inline for ([_][]const u8{ "RIGHT JOIN", "RIGHT OUTER JOIN", "FULL JOIN", "FULL OUTER JOIN", "CROSS JOIN" }) |kw| {
         if (containsKeywordOutsideQuotes(from_rest, kw)) {
             return error.UnsupportedJoinType;
         }
@@ -922,6 +938,7 @@ pub fn parseAt(allocator: Allocator, raw_input: []const u8, now_ts: i64) !Query 
         var cursor = std.mem.trimLeft(u8, from_rest[first_jk.kw_end..], &std.ascii.whitespace);
         // left_alias for the *current* join step starts as the alias of the base left file.
         var current_left_alias = first_left_info.alias;
+        var current_is_left = first_jk.left;
         // We'll re-assign current_left_alias at each iteration; ownership of the original
         // string is transferred into the JoinClause we pushed in the *previous* iteration
         // (or remains as first_left_info.alias for the very first clause), so no extra free.
@@ -989,6 +1006,7 @@ pub fn parseAt(allocator: Allocator, raw_input: []const u8, now_ts: i64) !Query 
                 .right_alias = right_info.alias,
                 .left_col = ljc,
                 .right_col = rjc,
+                .left = current_is_left,
             });
 
             // The right alias of this step becomes the left alias of the *next* step
@@ -999,6 +1017,7 @@ pub fn parseAt(allocator: Allocator, raw_input: []const u8, now_ts: i64) !Query 
                 // Alias ownership already transferred above.  Derive new current_left_alias
                 // from right_info.alias (already stored in the clause, so dupe it).
                 current_left_alias = try allocator.dupe(u8, right_info.alias);
+                current_is_left = njk.left;
                 cursor = std.mem.trimLeft(u8, after_on[njk.kw_end..], &std.ascii.whitespace);
             } else {
                 // current_left_alias was transferred into the JoinClause; we're done.

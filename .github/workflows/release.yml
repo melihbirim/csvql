@@ -79,7 +79,7 @@ jobs:
           mkdir -p bundle/server release
           cp zig-out/bin/csvql${{ matrix.ext }} bundle/server/csvql${{ matrix.ext }}
           sed -e "s|\"version\": \"0.0.0\"|\"version\": \"$VERSION\"|" \
-              -e "s|\"command\": \"server/csvql\"|\"command\": \"server/csvql${{ matrix.ext }}\"|" \
+              -e "s|server/csvql\"|server/csvql${{ matrix.ext }}\"|g" \
               mcpb/manifest.json > bundle/manifest.json
           ( cd bundle && zip -qr "../release/${{ matrix.artifact }}.mcpb" manifest.json server )
 
