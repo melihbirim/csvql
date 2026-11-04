@@ -145,15 +145,47 @@ const ResolvedOrderKey = struct {
     order: parser.SortOrder,
 };
 
+/// One ORDER BY key in executeSequential: read from the projected output row
+/// when the column is SELECTed, otherwise from the raw source record.
+const OrderKeySrc = struct {
+    out_idx: ?usize,
+    raw_idx: usize,
+    order: parser.SortOrder,
+
+    fn value(self: OrderKeySrc, output_row: []const []const u8, record: []const []const u8) []const u8 {
+        if (self.out_idx) |oi| return output_row[oi];
+        return if (self.raw_idx < record.len) record[self.raw_idx] else "";
+    }
+};
+
+fn resolveOrderKeySrc(
+    col: []const u8,
+    order: parser.SortOrder,
+    out_hdr: []const []const u8,
+    specs: []const scalar.OutputColSpec,
+    low_hdr: []const []const u8,
+    alloc: std.mem.Allocator,
+) !OrderKeySrc {
+    if (try resolveOrderByIdx(col, out_hdr, specs, low_hdr, alloc)) |oi| {
+        return .{ .out_idx = oi, .raw_idx = 0, .order = order };
+    }
+    for (low_hdr, 0..) |name, idx| {
+        if (std.mem.eql(u8, name, col)) return .{ .out_idx = null, .raw_idx = idx, .order = order };
+    }
+    return error.OrderByColumnNotFound;
+}
+
 /// Multi-key sort comparator context — used when ORDER BY has ≥ 2 columns.
+/// The entry's sort_key is a CSV line holding every key's value in ORDER BY
+/// order (see executeSequential), so position i is key i.
 const MultiKeyCtx = struct {
-    keys: []const ResolvedOrderKey,
+    keys: []const OrderKeySrc,
     delimiter: u8,
 
     pub fn lessThan(ctx: MultiKeyCtx, a: fast_sort.SortKey, b: fast_sort.SortKey) bool {
-        for (ctx.keys) |k| {
-            const a_val = csvFieldAtPos(a.line, ctx.delimiter, k.col_idx);
-            const b_val = csvFieldAtPos(b.line, ctx.delimiter, k.col_idx);
+        for (ctx.keys, 0..) |k, ki| {
+            const a_val = csvFieldAtPos(a.sort_key, ctx.delimiter, ki);
+            const b_val = csvFieldAtPos(b.sort_key, ctx.delimiter, ki);
             const a_num = std.fmt.parseFloat(f64, a_val) catch std.math.nan(f64);
             const b_num = std.fmt.parseFloat(f64, b_val) catch std.math.nan(f64);
             if (!std.math.isNan(a_num) and !std.math.isNan(b_num)) {
@@ -911,46 +943,24 @@ fn executeSequential(
     // Buffer for ORDER BY support (offset-based to avoid dangling slices on arena growth)
     var sort_offsets: ?std.ArrayList(SortRowOffsets) = null;
     var arena: ?ArenaBuffer = null;
-    var order_by_column_idx: ?usize = null;
-    // Set when the ORDER BY column isn't in the SELECT list — sourced from the
-    // raw source row instead of the projected output row (#117). Standard SQL
-    // and DuckDB both allow sorting by an un-projected column.
-    var order_by_raw_idx: ?usize = null;
-    var order_by_resolved_keys = std.ArrayList(ResolvedOrderKey){};
-    defer order_by_resolved_keys.deinit(allocator);
+    // Every ORDER BY key, primary first. A key not in the SELECT list is read
+    // from the raw source row instead of the projected output row (#117);
+    // standard SQL and DuckDB both allow sorting by an un-projected column.
+    var order_keys = std.ArrayList(OrderKeySrc){};
+    defer order_keys.deinit(allocator);
     defer {
         if (sort_offsets) |*offsets| offsets.deinit(allocator);
         if (arena) |*a| a.deinit();
     }
 
-    // If ORDER BY is specified, prepare buffer and find column index
+    // If ORDER BY is specified, prepare buffer and resolve every key
     if (query.order_by) |order_by| {
         sort_offsets = std.ArrayList(SortRowOffsets){};
         arena = try ArenaBuffer.init(allocator, 16 * 1024 * 1024); // 16MB initial for large result sets
 
-        // Resolve primary key
-        order_by_column_idx = try resolveOrderByIdx(order_by.column, output_header.items, output_specs.items, lower_header, allocator);
-        if (order_by_column_idx == null) {
-            // Not projected — fall back to the raw source column (#117).
-            for (lower_header, 0..) |name, idx| {
-                if (std.mem.eql(u8, name, order_by.column)) {
-                    order_by_raw_idx = idx;
-                    break;
-                }
-            }
-            if (order_by_raw_idx == null) return error.OrderByColumnNotFound;
-        } else {
-            try order_by_resolved_keys.append(allocator, .{ .col_idx = order_by_column_idx.?, .order = order_by.order });
-
-            // Resolve secondary keys (skip any that can't be found). Only
-            // meaningful when the primary key is itself output-resolvable,
-            // since the multi-key comparator re-derives values from the
-            // projected output line (see MultiKeyCtx).
-            for (order_by.secondary) |sk| {
-                if (try resolveOrderByIdx(sk.column, output_header.items, output_specs.items, lower_header, allocator)) |si| {
-                    try order_by_resolved_keys.append(allocator, .{ .col_idx = si, .order = sk.order });
-                }
-            }
+        try order_keys.append(allocator, try resolveOrderKeySrc(order_by.column, order_by.order, output_header.items, output_specs.items, lower_header, allocator));
+        for (order_by.secondary) |sk| {
+            try order_keys.append(allocator, try resolveOrderKeySrc(sk.column, sk.order, output_header.items, output_specs.items, lower_header, allocator));
         }
     }
 
@@ -1069,11 +1079,20 @@ fn executeSequential(
             // Parse numeric key NOW from the source slice (stable, from record).
             // Then store offsets into the arena — NOT slices — because arena can
             // reallocate and invalidate pointers during later rows.
-            const sort_val = if (order_by_column_idx) |oi| output_row[oi] else record[order_by_raw_idx.?];
+            const sort_val = order_keys.items[0].value(output_row, record);
             const numeric_key = std.fmt.parseFloat(f64, sort_val) catch std.math.nan(f64);
             const a = &(arena.?);
             const sort_key_start = a.pos;
-            _ = try a.append(sort_val);
+            if (order_keys.items.len > 1) {
+                // Multi-key: the sort key is a CSV line of every key's value,
+                // so keys that aren't projected still take part (#27-class bug).
+                for (order_keys.items, 0..) |k, ki| {
+                    if (ki > 0) _ = try a.append(&[_]u8{opts.delimiter});
+                    try appendCsvFieldToArena(a, k.value(output_row, record), opts.delimiter);
+                }
+            } else {
+                _ = try a.append(sort_val);
+            }
             const sort_key_len = a.pos - sort_key_start;
 
             // Build the line representation: CSV or JSON depending on format
@@ -1148,9 +1167,9 @@ fn executeSequential(
 
             // Multi-column ORDER BY: use comparison sort with multi-key context.
             // Single-column: use the hardware-aware fast_sort strategy (radix / heap / comparison).
-            if (order_by_resolved_keys.items.len > 1) {
+            if (order_keys.items.len > 1) {
                 const ctx = MultiKeyCtx{
-                    .keys = order_by_resolved_keys.items,
+                    .keys = order_keys.items,
                     .delimiter = opts.delimiter,
                 };
                 std.mem.sort(SortEntry, entries.items, ctx, MultiKeyCtx.lessThan);
@@ -1664,6 +1683,9 @@ const JoinCtx = struct {
     output_row: [][]const u8,
     where_merged_idx: ?usize,
     where_expr: ?parser.Expression,
+    /// bare and alias.col names → merged-row index; the complex WHERE path
+    /// builds its row map from this so qualified references resolve (#48-class bug).
+    col_map: *const std.StringHashMap(usize),
     writer: *csv.RecordWriter,
     rows_written: i32,
     rows_skipped: i32,
@@ -1703,7 +1725,8 @@ fn expandAndEmit(merged: [][]const u8, filled_w: usize, step_idx: usize, ctx: *J
                 // Complex WHERE (AND/OR/NOT): build a temporary row map.
                 var row_map = std.StringHashMap([]const u8).init(ctx.allocator);
                 defer row_map.deinit();
-                for (ctx.final_headers, 0..) |h, ci| try row_map.put(h, merged[ci]);
+                var it = ctx.col_map.iterator();
+                while (it.next()) |e| try row_map.put(e.key_ptr.*, merged[e.value_ptr.*]);
                 if (!parser.evaluate(expr, row_map)) return;
             }
         }
@@ -1754,6 +1777,7 @@ const JoinWorkerCtx = struct {
     output_indices: []const usize,
     where_merged_idx: ?usize,
     where_expr: ?parser.Expression,
+    col_map: *const std.StringHashMap(usize),
     file: std.fs.File,
     opts: options_mod.Options,
     parent_allocator: Allocator,
@@ -1793,6 +1817,7 @@ fn joinWorkerRun(w: *JoinWorkerCtx) !void {
         .output_row = output_row,
         .where_merged_idx = w.where_merged_idx,
         .where_expr = w.where_expr,
+        .col_map = w.col_map,
         .writer = &writer,
         .rows_written = 0,
         .rows_skipped = 0,
@@ -1847,6 +1872,7 @@ fn isIdentStartChar(c: u8) bool {
 fn dealiasText(aa: Allocator, text: []const u8, aliases: []const []const u8, dups: *const std.StringHashMap(void)) ![]const u8 {
     var out = std.ArrayListUnmanaged(u8){};
     var i: usize = 0;
+    var after_as = false;
     outer: while (i < text.len) {
         const at_boundary = i == 0 or !isIdentChar(text[i - 1]);
         if (at_boundary) {
@@ -1863,12 +1889,38 @@ fn dealiasText(aa: Allocator, text: []const u8, aliases: []const []const u8, dup
                     var lower_buf: [256]u8 = undefined;
                     if (bare.len <= lower_buf.len) {
                         const lower = std.ascii.lowerString(lower_buf[0..bare.len], bare);
-                        if (dups.contains(lower)) return error.AmbiguousColumnReference;
+                        if (dups.contains(lower)) {
+                            // The staged file names this column "alias.col"
+                            // (executeJoinImpl with qualify_dup_headers), so
+                            // keep the qualified form.
+                            try out.appendSlice(aa, al);
+                            try out.append(aa, '.');
+                            try out.appendSlice(aa, bare);
+                            i = j;
+                            continue :outer;
+                        }
                     }
                     try out.appendSlice(aa, bare);
                     i = j;
                     continue :outer;
                 }
+            }
+            // A bare name that exists in more than one joined table has no
+            // single column to resolve to. The name after AS is an output
+            // alias, not a reference.
+            if (isIdentStartChar(text[i])) {
+                var j = i + 1;
+                while (j < text.len and isIdentChar(text[j])) : (j += 1) {}
+                const word = text[i..j];
+                var lower_buf: [256]u8 = undefined;
+                if (!after_as and word.len <= lower_buf.len and (j >= text.len or text[j] != '.')) {
+                    const lower = std.ascii.lowerString(lower_buf[0..word.len], word);
+                    if (dups.contains(lower)) return error.AmbiguousColumnReference;
+                }
+                after_as = std.ascii.eqlIgnoreCase(word, "as");
+                try out.appendSlice(aa, word);
+                i = j;
+                continue :outer;
             }
         }
         try out.append(aa, text[i]);
@@ -1986,7 +2038,7 @@ fn executeJoinThenAggregate(
         stage1_query.distinct = false;
         var stage1_opts = opts;
         stage1_opts.no_header = false;
-        try executeJoin(allocator, stage1_query, tmp_file, stage1_opts);
+        try executeJoinImpl(allocator, stage1_query, tmp_file, stage1_opts, true);
     }
 
     // ── Stage 2: run the (dealiased) aggregate/GROUP BY query against it ──
@@ -2027,6 +2079,20 @@ fn executeJoin(
     query: parser.Query,
     output_file: std.fs.File,
     opts: options_mod.Options,
+) !void {
+    return executeJoinImpl(allocator, query, output_file, opts, false);
+}
+
+/// `qualify_dup_headers`: in SELECT * output, name a column that exists in
+/// more than one joined table "alias.col" instead of the bare name. Used only
+/// by executeJoinThenAggregate's staging pass so GROUP BY d.dept can still
+/// pick one of two "dept" columns after the join is flattened.
+fn executeJoinImpl(
+    allocator: Allocator,
+    query: parser.Query,
+    output_file: std.fs.File,
+    opts: options_mod.Options,
+    qualify_dup_headers: bool,
 ) !void {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -2196,7 +2262,15 @@ fn executeJoin(
     if (query.all_columns) {
         for (0..total_w) |i| {
             try output_indices.append(aa, i);
-            try output_header_names.append(aa, final_headers[i]);
+            const h = final_headers[i];
+            if (qualify_dup_headers and (bare_count.get(h) orelse 0) > 1) {
+                for (alias_ranges) |ar| {
+                    if (ar.name.len > 0 and i >= ar.start and i < ar.start + ar.width) {
+                        try output_header_names.append(aa, try std.fmt.allocPrint(aa, "{s}.{s}", .{ ar.name, h }));
+                        break;
+                    }
+                } else try output_header_names.append(aa, h);
+            } else try output_header_names.append(aa, h);
         }
     } else {
         for (query.columns) |col_raw| {
@@ -2289,6 +2363,7 @@ fn executeJoin(
                 .output_indices = output_indices.items,
                 .where_merged_idx = where_merged_idx,
                 .where_expr = query.where_expr,
+                .col_map = &col_map,
                 .file = wfile,
                 .opts = opts,
                 .parent_allocator = allocator,
@@ -2328,6 +2403,7 @@ fn executeJoin(
         .output_row = output_row,
         .where_merged_idx = where_merged_idx,
         .where_expr = query.where_expr,
+        .col_map = &col_map,
         .writer = &writer,
         .rows_written = 0,
         .rows_skipped = 0,

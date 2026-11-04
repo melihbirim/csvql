@@ -12,13 +12,13 @@ Full syntax reference and runnable examples for every SQL feature csvql supports
 | **FROM**      | `FROM 'file.csv'` or `FROM -` (stdin); optional table alias — `FROM 'file.csv' AS t` or bare `FROM 'file.csv' t`, reference columns as `t.col` |
 | **WHERE**     | `=`, `!=`, `>`, `>=`, `<`, `<=` with auto numeric coercion              |
 | **Modulo**    | `WHERE col % n = val` — integer remainder test in WHERE (also `MOD(col, n)` as a SELECT expression) |
-| **LIKE**      | `WHERE col LIKE 'pattern'` — `%` any sequence, `_` any single char      |
-| **ILIKE**     | `WHERE col ILIKE 'pattern'` — same as LIKE but case-insensitive         |
+| **LIKE / NOT LIKE** | `WHERE col LIKE 'pattern'`, `WHERE col NOT LIKE 'pattern'` — `%` any sequence, `_` any single character (one UTF-8 character, so `'Z_rich'` matches `Zürich`) |
+| **ILIKE / NOT ILIKE** | `WHERE col ILIKE 'pattern'`, `WHERE col NOT ILIKE 'pattern'` — same as LIKE but case-insensitive (ASCII letters) |
 | **BETWEEN**   | `WHERE col BETWEEN low AND high` — inclusive numeric or string range    |
 | **IN / NOT IN** | `WHERE col IN ('a', 'b', 'c')`, `WHERE col NOT IN ('a', 'b')` — membership test and its negation |
 | **IN (subquery)** | `WHERE col IN (SELECT col FROM 'other.csv' WHERE ...)` — non-correlated, subquery must select exactly one column (also `NOT IN`); see [CORRECTNESS.md](CORRECTNESS.md#subqueries) |
 | **IS NULL**   | `WHERE col IS NULL` / `WHERE col IS NOT NULL` — empty-field test; also usable as a SELECT expression (`SELECT col IS NOT NULL AS has_val`), returns `true`/`false` |
-| **NOT**       | `WHERE NOT expr` — logical negation of any condition                    |
+| **NOT**       | `WHERE NOT expr` — logical negation of any condition. Binds tighter than AND and OR, as in SQL: `NOT a = 1 AND b = 2` is `(NOT a = 1) AND b = 2`; use parentheses for `NOT (a = 1 AND b = 2)`. An empty field is unknown, not false: `NOT age > 30`, `age != 30` and `age NOT IN (30)` all exclude a row with an empty `age`, same as `age > 30` does. Only `IS NULL`, `IS NOT NULL` and a comparison against `''` see the empty field itself |
 | **AND / OR**  | `WHERE cond1 AND cond2` / `WHERE cond1 OR cond2` — compound conditions  |
 | **JOIN**      | `FROM 'a.csv' a [INNER] JOIN 'b.csv' b ON a.key = b.key`               |
 | **GROUP BY**  | `GROUP BY col1` or `GROUP BY alias` — groups rows; accepts SELECT aliases |
@@ -71,7 +71,7 @@ Two intentional differences, found via differential testing against DuckDB (see 
 | `LENGTH(col)` on a unicode string | Byte length (UTF-8 bytes) | Character count (codepoints) |
 | `LEFT(col, n)` / `RIGHT(col, n)` on a unicode string | `n` counts bytes; a character that would be split is dropped | `n` counts codepoints |
 | `POSITION` / `INSTR` after a unicode character | The index counts bytes | The index counts codepoints |
-| Empty CSV field | Stays an empty string | Inferred as `NULL` |
+| Empty CSV field | Stays an empty string in output and in `GROUP BY`; in `WHERE` it behaves like `NULL` (no comparison, `!=`, `NOT` or `NOT IN` matches it; `IS NULL` and `= ''` do) | Inferred as `NULL` |
 | `MODE(col)` with several equally frequent values | The smallest value | Not specified |
 | `DATEDIFF('hour'/'minute'/etc, a, b)` on a non-exact interval | Fractional (e.g. `8.5` hours) | Truncated to whole units (e.g. `8`) |
 

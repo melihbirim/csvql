@@ -34,14 +34,33 @@ pub const Operator = enum {
 
 /// Match text against a SQL LIKE pattern.
 /// `%` matches any sequence of characters (including empty).
-/// `_` matches exactly one character.
+/// `_` matches exactly one character (one UTF-8 code point, so 'Z_rich'
+/// matches "Zürich").
 pub fn matchLike(text: []const u8, pattern: []const u8) bool {
+    return matchLikeImpl(text, pattern, false);
+}
+
+/// Match text against a SQL ILIKE pattern (case-insensitive variant of LIKE).
+/// `%` matches any sequence, `_` matches exactly one character.
+pub fn matchILike(text: []const u8, pattern: []const u8) bool {
+    return matchLikeImpl(text, pattern, true);
+}
+
+fn utf8Len(text: []const u8, t: usize) usize {
+    const n = std.unicode.utf8ByteSequenceLength(text[t]) catch 1;
+    return @min(n, text.len - t);
+}
+
+fn matchLikeImpl(text: []const u8, pattern: []const u8, fold_case: bool) bool {
     var t: usize = 0;
     var p: usize = 0;
     var star_p: usize = std.math.maxInt(usize); // sentinel: no wildcard seen yet
     var star_t: usize = 0;
     while (t < text.len) {
-        if (p < pattern.len and (pattern[p] == '_' or pattern[p] == text[t])) {
+        if (p < pattern.len and pattern[p] == '_') {
+            t += utf8Len(text, t);
+            p += 1;
+        } else if (p < pattern.len and (if (fold_case) std.ascii.toLower(pattern[p]) == std.ascii.toLower(text[t]) else pattern[p] == text[t])) {
             t += 1;
             p += 1;
         } else if (p < pattern.len and pattern[p] == '%') {
@@ -49,7 +68,9 @@ pub fn matchLike(text: []const u8, pattern: []const u8) bool {
             star_t = t;
             p += 1;
         } else if (star_p != std.math.maxInt(usize)) {
+            // Backtrack by one code point, never into the middle of one.
             star_t += 1;
+            while (star_t < text.len and (text[star_t] & 0xC0) == 0x80) star_t += 1;
             t = star_t;
             p = star_p + 1;
         } else {
@@ -57,34 +78,6 @@ pub fn matchLike(text: []const u8, pattern: []const u8) bool {
         }
     }
     // Consume trailing %
-    while (p < pattern.len and pattern[p] == '%') p += 1;
-    return p == pattern.len;
-}
-
-/// Match text against a SQL ILIKE pattern (case-insensitive variant of LIKE).
-/// `%` matches any sequence, `_` matches exactly one character.
-pub fn matchILike(text: []const u8, pattern: []const u8) bool {
-    var t: usize = 0;
-    var p: usize = 0;
-    var star_p: usize = std.math.maxInt(usize);
-    var star_t: usize = 0;
-    while (t < text.len) {
-        const tc = std.ascii.toLower(text[t]);
-        if (p < pattern.len and (pattern[p] == '_' or std.ascii.toLower(pattern[p]) == tc)) {
-            t += 1;
-            p += 1;
-        } else if (p < pattern.len and pattern[p] == '%') {
-            star_p = p;
-            star_t = t;
-            p += 1;
-        } else if (star_p != std.math.maxInt(usize)) {
-            star_t += 1;
-            t = star_t;
-            p = star_p + 1;
-        } else {
-            return false;
-        }
-    }
     while (p < pattern.len and pattern[p] == '%') p += 1;
     return p == pattern.len;
 }
@@ -1283,7 +1276,7 @@ fn findClauseKeyword(s: []const u8, keyword: []const u8) ?usize {
     return null;
 }
 
-const LeafOpKind = enum { is_not_null, is_null, ilike, like, not_in, in_kw, percent, ge, le, ne, eq, gt, lt, none };
+const LeafOpKind = enum { is_not_null, is_null, not_ilike, not_like, ilike, like, not_in, in_kw, percent, ge, le, ne, eq, gt, lt, none };
 
 /// Single left-to-right, quote/paren-depth-aware scan of an already-isolated
 /// leaf predicate (parseExpression's OR/AND/BETWEEN splitting above
@@ -1313,6 +1306,8 @@ fn scanLeafOperator(s: []const u8) struct { op: LeafOpKind, idx: usize } {
         .{ .pat = " IS NOT NULL", .op = .is_not_null },
         .{ .pat = " IS NULL", .op = .is_null },
         .{ .pat = " NOT IN (", .op = .not_in },
+        .{ .pat = " NOT ILIKE ", .op = .not_ilike },
+        .{ .pat = " NOT LIKE ", .op = .not_like },
         .{ .pat = " ILIKE ", .op = .ilike },
         .{ .pat = " LIKE ", .op = .like },
         .{ .pat = " IN (", .op = .in_kw },
@@ -1445,15 +1440,6 @@ pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
         }
     }
 
-    // NOT prefix — must be checked BEFORE IS NULL/IS NOT NULL so that
-    // "NOT col IS NULL" recurses correctly (inner "col IS NULL" is parsed separately).
-    if (trimmed.len > 4 and std.ascii.eqlIgnoreCase(trimmed[0..4], "NOT ")) {
-        const inner = try parseExpression(allocator, std.mem.trim(u8, trimmed[4..], &std.ascii.whitespace));
-        const un = try allocator.create(UnaryExpr);
-        un.* = .{ .expr = inner };
-        return Expression{ .unary = un };
-    }
-
     // AND/OR must be split before BETWEEN, IS NULL/IS NOT NULL (and before
     // LIKE/IN/operators) so that compound conditions such as "age IS NOT
     // NULL AND city = 'x'" are split into two predicates first, instead of
@@ -1485,6 +1471,18 @@ pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
         return Expression{ .binary = bin };
     }
 
+    // NOT prefix. Checked after the OR/AND splits so NOT binds tighter than
+    // AND, as in SQL: "NOT a = 1 AND b = 2" is "(NOT a = 1) AND b = 2", not
+    // "NOT (a = 1 AND b = 2)". Still before BETWEEN, IS NULL and the leaf
+    // operators so "NOT col IS NULL" and "NOT col BETWEEN 1 AND 5" recurse
+    // on the inner predicate.
+    if (trimmed.len > 4 and std.ascii.eqlIgnoreCase(trimmed[0..4], "NOT ")) {
+        const inner = try parseExpression(allocator, std.mem.trim(u8, trimmed[4..], &std.ascii.whitespace));
+        const un = try allocator.create(UnaryExpr);
+        un.* = .{ .expr = inner };
+        return Expression{ .unary = un };
+    }
+
     // BETWEEN — only reached once no top-level OR and no top-level logical
     // AND remains, so any top-level AND still in `trimmed` here is
     // BETWEEN's own "low AND high" separator.
@@ -1508,8 +1506,10 @@ pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
                 .numeric_value = null,
             } };
         },
-        .ilike => return parseILikeComparison(allocator, trimmed, leaf.idx),
-        .like => return parseLikeComparison(allocator, trimmed, leaf.idx),
+        .ilike => return parseLikeComparison(allocator, trimmed, leaf.idx, " ILIKE ".len, .ilike, false),
+        .like => return parseLikeComparison(allocator, trimmed, leaf.idx, " LIKE ".len, .like, false),
+        .not_ilike => return parseLikeComparison(allocator, trimmed, leaf.idx, " NOT ILIKE ".len, .ilike, true),
+        .not_like => return parseLikeComparison(allocator, trimmed, leaf.idx, " NOT LIKE ".len, .like, true),
         .not_in, .in_kw => return parseInComparison(allocator, trimmed, leaf.idx, leaf.op == .not_in),
         else => {},
     }
@@ -1630,40 +1630,28 @@ fn parseInComparison(allocator: Allocator, input: []const u8, in_idx: usize, neg
     };
 }
 
-fn parseLikeComparison(allocator: Allocator, input: []const u8, like_idx: usize) !Expression {
-    const column_part = std.mem.trim(u8, input[0..like_idx], &std.ascii.whitespace);
-    // " LIKE " is 6 bytes: space + L + I + K + E + space
-    const value_part = std.mem.trim(u8, input[like_idx + 6 ..], &std.ascii.whitespace);
+/// LIKE / ILIKE / NOT LIKE / NOT ILIKE. `kw_len` is the matched keyword's
+/// byte length including its surrounding spaces; `negate` wraps the result in
+/// a NOT so "name NOT LIKE '%e'" and "NOT name LIKE '%e'" are the same tree.
+fn parseLikeComparison(allocator: Allocator, input: []const u8, kw_idx: usize, kw_len: usize, op: Operator, negate: bool) !Expression {
+    const column_part = std.mem.trim(u8, input[0..kw_idx], &std.ascii.whitespace);
+    const value_part = std.mem.trim(u8, input[kw_idx + kw_len ..], &std.ascii.whitespace);
 
     const column_lower = try allocator.alloc(u8, column_part.len);
     _ = std.ascii.lowerString(column_lower, column_part);
 
-    return Expression{
+    const cmp = Expression{
         .comparison = Comparison{
             .column = column_lower,
-            .operator = .like,
+            .operator = op,
             .value = try dupeLiteral(allocator, value_part),
             .numeric_value = null, // LIKE is always a string pattern match
         },
     };
-}
-
-fn parseILikeComparison(allocator: Allocator, input: []const u8, ilike_idx: usize) !Expression {
-    const column_part = std.mem.trim(u8, input[0..ilike_idx], &std.ascii.whitespace);
-    // " ILIKE " is 7 bytes: space + I + L + I + K + E + space
-    const value_part = std.mem.trim(u8, input[ilike_idx + 7 ..], &std.ascii.whitespace);
-
-    const column_lower = try allocator.alloc(u8, column_part.len);
-    _ = std.ascii.lowerString(column_lower, column_part);
-
-    return Expression{
-        .comparison = Comparison{
-            .column = column_lower,
-            .operator = .ilike,
-            .value = try dupeLiteral(allocator, value_part),
-            .numeric_value = null, // ILIKE is always a string pattern match
-        },
-    };
+    if (!negate) return cmp;
+    const un = try allocator.create(UnaryExpr);
+    un.* = .{ .expr = cmp };
+    return Expression{ .unary = un };
 }
 
 /// Attempt to parse a scalar-function comparison such as
@@ -1933,12 +1921,43 @@ fn trimQuotes(input: []const u8) []const u8 {
     return input;
 }
 
+/// An empty field is csvql's NULL. A comparison against it is unknown, not
+/// false, so NOT / NOT IN / AND / OR follow SQL three-valued logic and a row
+/// with a missing age is excluded by both `age > 30` and `NOT age > 30`.
+/// `col = ''` and `col != ''` stay plain string comparisons, as before.
+fn isUnknown(comp: Comparison, value: []const u8) bool {
+    if (value.len != 0) return false;
+    if (comp.operator == .is_null or comp.operator == .is_not_null) return false;
+    return comp.value.len != 0 or comp.in_values != null or comp.in_values_set != null;
+}
+
+fn and3(a: ?bool, b: ?bool) ?bool {
+    if (a == false or b == false) return false;
+    if (a == null or b == null) return null;
+    return true;
+}
+
+fn or3(a: ?bool, b: ?bool) ?bool {
+    if (a == true or b == true) return true;
+    if (a == null or b == null) return null;
+    return false;
+}
+
+fn not3(a: ?bool) ?bool {
+    return if (a) |v| !v else null;
+}
+
 /// Evaluate an expression against a row
 pub fn evaluate(expr: Expression, row: std.StringHashMap([]const u8)) bool {
+    return evaluate3(expr, row) == true;
+}
+
+fn evaluate3(expr: Expression, row: std.StringHashMap([]const u8)) ?bool {
     switch (expr) {
         .arith_comparison => |ac| return ac.evalRow(row),
         .comparison => |comp| {
             const value = row.get(comp.column) orelse return false;
+            if (isUnknown(comp, value)) return null;
             return compareValues(comp, value);
         },
         .scalar_comparison => |sc| {
@@ -1982,14 +2001,14 @@ pub fn evaluate(expr: Expression, row: std.StringHashMap([]const u8)) bool {
             };
         },
         .binary => |bin| {
-            const left_result = evaluate(bin.left, row);
+            const left_result = evaluate3(bin.left, row);
             return switch (bin.op) {
-                .@"and" => left_result and evaluate(bin.right, row),
-                .@"or" => left_result or evaluate(bin.right, row),
+                .@"and" => if (left_result == false) false else and3(left_result, evaluate3(bin.right, row)),
+                .@"or" => if (left_result == true) true else or3(left_result, evaluate3(bin.right, row)),
             };
         },
         .unary => |un| {
-            return !evaluate(un.expr, row);
+            return not3(evaluate3(un.expr, row));
         },
     }
 }
@@ -1998,12 +2017,17 @@ pub fn evaluate(expr: Expression, row: std.StringHashMap([]const u8)) bool {
 /// Takes the parsed field array and lowercase column-name array directly.
 /// Avoids per-row heap allocation for AND/OR/NOT WHERE clauses in hot loops.
 pub fn evaluateDirect(expr: Expression, fields: []const []const u8, lower_header: []const []const u8) bool {
+    return evaluateDirect3(expr, fields, lower_header) == true;
+}
+
+fn evaluateDirect3(expr: Expression, fields: []const []const u8, lower_header: []const []const u8) ?bool {
     switch (expr) {
         .arith_comparison => |ac| return ac.evalDirect(fields, lower_header),
         .comparison => |comp| {
             for (lower_header, 0..) |col, i| {
                 if (std.mem.eql(u8, col, comp.column)) {
                     const value = if (i < fields.len) fields[i] else "";
+                    if (isUnknown(comp, value)) return null;
                     return compareValues(comp, value);
                 }
             }
@@ -2063,15 +2087,14 @@ pub fn evaluateDirect(expr: Expression, fields: []const []const u8, lower_header
             };
         },
         .binary => |bin| {
+            const left_result = evaluateDirect3(bin.left, fields, lower_header);
             return switch (bin.op) {
-                .@"and" => evaluateDirect(bin.left, fields, lower_header) and
-                    evaluateDirect(bin.right, fields, lower_header),
-                .@"or" => evaluateDirect(bin.left, fields, lower_header) or
-                    evaluateDirect(bin.right, fields, lower_header),
+                .@"and" => if (left_result == false) false else and3(left_result, evaluateDirect3(bin.right, fields, lower_header)),
+                .@"or" => if (left_result == true) true else or3(left_result, evaluateDirect3(bin.right, fields, lower_header)),
             };
         },
         .unary => |un| {
-            return !evaluateDirect(un.expr, fields, lower_header);
+            return not3(evaluateDirect3(un.expr, fields, lower_header));
         },
     }
 }
@@ -2149,6 +2172,9 @@ pub fn compareValues(comp: Comparison, candidate: []const u8) bool {
     // IS NULL / IS NOT NULL
     if (comp.operator == .is_null) return candidate.len == 0;
     if (comp.operator == .is_not_null) return candidate.len != 0;
+    // Empty field is NULL: no comparison against it is true, including != and
+    // NOT IN. Callers that need the unknown state use isUnknown first.
+    if (isUnknown(comp, candidate)) return false;
 
     // "col % divisor op value" (#119) — truncated remainder, sign follows the
     // dividend, matching SQL's % operator semantics (not Zig's @mod, which

@@ -855,6 +855,78 @@ check \
   "SELECT e.name, e.department FROM read_csv_auto('$CSV') AS e LEFT JOIN read_csv_auto('$DEPTS_PART') AS d ON e.department = d.dept_name WHERE d.region IS NULL" \
   ""
 
+# ── NULL handling, NOT precedence, un-projected ORDER BY keys, qualified
+# ── GROUP BY after a join. Small fixture with an empty age, an empty city, a
+# ── non-ASCII city and a column name shared by both joined tables.
+PEOPLE="$TMP/people.csv"
+cat > "$PEOPLE" <<'EOF'
+id,name,age,dept,city
+1,Alice,30,eng,NYC
+2,Bob,25,eng,SF
+3,Carol,,sales,NYC
+4,Dave,40,sales,LA
+5,Eve,30,hr,
+6,Frank,9,eng,SF
+7,Gina,100,hr,NYC
+8,Héloïse,35,eng,Zürich
+EOF
+PDEPTS="$TMP/people_depts.csv"
+printf 'dept,floor\neng,3\nsales,1\nops,2\n' > "$PDEPTS"
+
+check \
+  "NOT binds tighter than AND" \
+  "SELECT id FROM '$PEOPLE' WHERE NOT dept = 'eng' AND age > 20 ORDER BY id" \
+  "SELECT id FROM read_csv_auto('$PEOPLE') WHERE NOT dept = 'eng' AND age > 20 ORDER BY id" \
+  ""
+
+check \
+  "NOT over an empty value excludes the row" \
+  "SELECT id FROM '$PEOPLE' WHERE NOT age > 30 ORDER BY id" \
+  "SELECT id FROM read_csv_auto('$PEOPLE') WHERE NOT age > 30 ORDER BY id" \
+  ""
+
+check \
+  "NOT IN over an empty value excludes the row" \
+  "SELECT id FROM '$PEOPLE' WHERE age NOT IN (30, 25) ORDER BY id" \
+  "SELECT id FROM read_csv_auto('$PEOPLE') WHERE age NOT IN (30, 25) ORDER BY id" \
+  ""
+
+check \
+  "NOT (a OR b) over an empty value" \
+  "SELECT id FROM '$PEOPLE' WHERE NOT (dept = 'eng' OR age > 35) ORDER BY id" \
+  "SELECT id FROM read_csv_auto('$PEOPLE') WHERE NOT (dept = 'eng' OR age > 35) ORDER BY id" \
+  ""
+
+check \
+  "NOT LIKE" \
+  "SELECT name FROM '$PEOPLE' WHERE name NOT LIKE '%e' ORDER BY name" \
+  "SELECT name FROM read_csv_auto('$PEOPLE') WHERE name NOT LIKE '%e' ORDER BY name" \
+  ""
+
+check \
+  "LIKE _ matches one UTF-8 character" \
+  "SELECT id FROM '$PEOPLE' WHERE city LIKE 'Z_rich'" \
+  "SELECT id FROM read_csv_auto('$PEOPLE') WHERE city LIKE 'Z_rich'" \
+  ""
+
+check \
+  "ORDER BY with un-projected DESC key" \
+  "SELECT id FROM '$PEOPLE' ORDER BY dept, age DESC, id" \
+  "SELECT id FROM read_csv_auto('$PEOPLE') ORDER BY dept, age DESC, id" \
+  ""
+
+check \
+  "JOIN WHERE AND across both tables" \
+  "SELECT p.id FROM '$PEOPLE' p INNER JOIN '$PDEPTS' d ON p.dept = d.dept WHERE d.floor > 2 AND p.age >= 30 ORDER BY p.id" \
+  "SELECT p.id FROM read_csv_auto('$PEOPLE') AS p JOIN read_csv_auto('$PDEPTS') AS d ON p.dept = d.dept WHERE d.floor > 2 AND p.age >= 30 ORDER BY p.id" \
+  ""
+
+check \
+  "JOIN GROUP BY qualified column shared by both tables" \
+  "SELECT d.dept, COUNT(*) FROM '$PEOPLE' p INNER JOIN '$PDEPTS' d ON p.dept = d.dept GROUP BY d.dept ORDER BY d.dept" \
+  "SELECT d.dept, COUNT(*) FROM read_csv_auto('$PEOPLE') AS p JOIN read_csv_auto('$PDEPTS') AS d ON p.dept = d.dept GROUP BY d.dept ORDER BY d.dept" \
+  ""
+
 check \
   "JOIN cities" \
   "SELECT e.name, e.city, c.state, c.timezone FROM '$CSV' e INNER JOIN '$CITIES' c ON e.city = c.city" \

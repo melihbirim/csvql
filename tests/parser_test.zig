@@ -484,6 +484,78 @@ test "evaluateDirect: NOT negates condition" {
     try std.testing.expect(parser.evaluateDirect(where, &fields_la, &header));
 }
 
+test "NOT binds tighter than AND: NOT a = x AND b > n is (NOT a = x) AND b > n" {
+    const allocator = std.testing.allocator;
+    var query = try parser.parse(allocator, "SELECT id FROM 't.csv' WHERE NOT dept = 'eng' AND age > 20");
+    defer query.deinit();
+    const where = query.where_expr orelse return error.TestUnexpectedNull;
+    try std.testing.expect(where == .binary);
+    try std.testing.expect(where.binary.left == .unary);
+
+    const header = [_][]const u8{ "dept", "age" };
+    // eng, 30: NOT(eng) is false, row excluded. Under the old NOT(a AND b)
+    // reading it would have been included.
+    try std.testing.expect(!parser.evaluateDirect(where, &[_][]const u8{ "eng", "30" }, &header));
+    try std.testing.expect(parser.evaluateDirect(where, &[_][]const u8{ "hr", "30" }, &header));
+    try std.testing.expect(!parser.evaluateDirect(where, &[_][]const u8{ "hr", "10" }, &header));
+}
+
+test "an empty value under NOT, NOT IN and != is unknown, never a match" {
+    const allocator = std.testing.allocator;
+    const header = [_][]const u8{"age"};
+    const empty = [_][]const u8{""};
+    const thirty = [_][]const u8{"30"};
+    for ([_][]const u8{
+        "SELECT id FROM 't.csv' WHERE NOT age > 30",
+        "SELECT id FROM 't.csv' WHERE age NOT IN (30, 25)",
+        "SELECT id FROM 't.csv' WHERE NOT age IN (30, 25)",
+        "SELECT id FROM 't.csv' WHERE age != 30",
+        "SELECT id FROM 't.csv' WHERE NOT (age = 30 OR age > 35)",
+    }) |sql| {
+        var query = try parser.parse(allocator, sql);
+        defer query.deinit();
+        const where = query.where_expr orelse return error.TestUnexpectedNull;
+        try std.testing.expect(!parser.evaluateDirect(where, &empty, &header));
+    }
+    // IS NULL and comparison against '' still see the empty value.
+    for ([_][]const u8{
+        "SELECT id FROM 't.csv' WHERE age IS NULL",
+        "SELECT id FROM 't.csv' WHERE age = ''",
+        "SELECT id FROM 't.csv' WHERE NOT age != ''",
+    }) |sql| {
+        var query = try parser.parse(allocator, sql);
+        defer query.deinit();
+        const where = query.where_expr orelse return error.TestUnexpectedNull;
+        try std.testing.expect(parser.evaluateDirect(where, &empty, &header));
+        try std.testing.expect(!parser.evaluateDirect(where, &thirty, &header));
+    }
+}
+
+test "NOT LIKE and NOT ILIKE parse as a negated LIKE" {
+    const allocator = std.testing.allocator;
+    var query = try parser.parse(allocator, "SELECT name FROM 't.csv' WHERE name NOT LIKE '%e' AND name NOT ILIKE 'z%'");
+    defer query.deinit();
+    const where = query.where_expr orelse return error.TestUnexpectedNull;
+    try std.testing.expect(where.binary.left == .unary);
+    try std.testing.expectEqualStrings("name", where.binary.left.unary.expr.comparison.column);
+    try std.testing.expect(where.binary.left.unary.expr.comparison.operator == .like);
+    try std.testing.expect(where.binary.right.unary.expr.comparison.operator == .ilike);
+
+    const header = [_][]const u8{"name"};
+    try std.testing.expect(!parser.evaluateDirect(where, &[_][]const u8{"Alice"}, &header));
+    try std.testing.expect(!parser.evaluateDirect(where, &[_][]const u8{"Zed"}, &header));
+    try std.testing.expect(parser.evaluateDirect(where, &[_][]const u8{"Bob"}, &header));
+}
+
+test "LIKE _ matches one UTF-8 character, not one byte" {
+    try std.testing.expect(parser.matchLike("Zürich", "Z_rich"));
+    try std.testing.expect(parser.matchLike("Zürich", "%_rich"));
+    try std.testing.expect(!parser.matchLike("Zürich", "Z__rich"));
+    try std.testing.expect(parser.matchILike("Zürich", "z_RICH"));
+    try std.testing.expect(parser.matchLike("日本", "__"));
+    try std.testing.expect(!parser.matchLike("日本", "___"));
+}
+
 // col IN (SELECT ...) is now the one supported subquery shape (#124) — see
 // the "WHERE col IN (SELECT ...)" tests further down for its parsing, and
 // engine.zig for the resolved, end-to-end behavior. Every other subquery
