@@ -41,6 +41,31 @@ description: "Notes on building csvql, an analytical CSV query engine for AI age
 </header>
 
 <main class="wrap">
+  <a class="post" href="csvql-vs-duckdb-mcp-servers.html">
+    <div class="date">2026-11-08</div>
+    <h2>csvql vs DuckDB MCP Servers: Which Read-Only CSV Server Should an Agent Get?</h2>
+    <p>Several MCP servers give Claude read-only SQL over CSV files, and most wrap DuckDB. What each one lets an agent do, what it refuses, what SQL it understands, and when DuckDB is the better choice.</p>
+  </a>
+  <a class="post" href="csvql-vs-letting-the-agent-read-the-csv.html">
+    <div class="date">2026-11-08</div>
+    <h2>csvql vs Letting the Agent Read the CSV File Itself</h2>
+    <p>An agent with a file tool can open a CSV and answer questions about it, up to a point. Where that stops, in tokens, memory and what the agent can see, and what changes when it runs SQL on the file instead.</p>
+  </a>
+  <a class="post" href="claude-desktop-query-csv-with-sql.html">
+    <div class="date">2026-11-08</div>
+    <h2>How to Let Claude Desktop Query a CSV File With SQL Without Reading the Whole File</h2>
+    <p>Three commands to give Claude Desktop a read-only SQL tool over one folder of CSV and Excel files. The config, why --root is required, what the agent can and cannot do, and how to check it worked.</p>
+  </a>
+  <a class="post" href="claude-code-sql-over-a-folder-of-csv-and-excel-files.html">
+    <div class="date">2026-11-08</div>
+    <h2>Claude Code: SQL Over a Folder of CSV and Excel Files</h2>
+    <p>One command to register a read-only SQL tool over the CSV, TSV and .xlsx files in a project folder, the queries the agent will write, joins across files, and the limits to know before it hits them.</p>
+  </a>
+  <a class="post" href="hide-pii-columns-from-an-ai-agent.html">
+    <div class="date">2026-11-08</div>
+    <h2>Hide PII Columns From an AI Agent With --deny-columns</h2>
+    <p>Name the columns the agent must never read and every query that touches them is refused, while department, salary and region stay queryable. What it blocks, verified, and what it does not.</p>
+  </a>
   <a class="post" href="claude-desktop-starts-mcp-servers-in-root.html">
     <div class="date">2026-11-02</div>
     <h2>Claude Desktop Starts MCP Servers in /, So the Working Directory Is Not a Sandbox</h2>

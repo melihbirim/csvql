@@ -14,7 +14,7 @@ description: "Give an AI agent SQL over your CSV files, not your computer. Out o
       <div class="card"><h3>MCP-native</h3><p>Ships as an MCP server, wired up by <code>csvql install</code>. Results are capped at about 100 rows / 12&nbsp;KB, so a careless query can't flood the context. The cap is per call, so keep data an agent must never see out with <code>--deny-columns</code>.</p></div>
       <div class="card"><h3>3 to 11&times; less memory</h3><p>A <code>GROUP BY</code> on an 8&nbsp;GB file: <strong>74&nbsp;MB</strong> for csvql, 367 for DuckDB, 1,754 for polars. Counting 5 million distinct values in 11&nbsp;GB: <strong>235&nbsp;MB</strong> against 2,639 for DuckDB. Fits on the small VM next to your data.</p></div>
       <div class="card"><h3>Zero ingest, zero network</h3><p>Queries the raw CSV in place via mmap. No import step, no native store to build first. No cloud, no telemetry, air-gappable, with <code>--audit</code> logging.</p></div>
-      <div class="card"><h3>One static binary</h3><p>Written in Zig. No runtime, no dependencies. macOS, Linux, Windows. Also on npm, PyPI and Homebrew.</p></div>
+      <div class="card"><h3>One static binary</h3><p>Written in Zig. No runtime, no dependencies. macOS, Linux, Windows. Published as <code>csvql-query</code> on npm and PyPI, <code>csvql</code> on Homebrew.</p></div>
     </div>
   </div>
 </section>

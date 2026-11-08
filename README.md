@@ -10,7 +10,7 @@
 
 > A database is something you load your data *into*. csvql is a query you run on the data where it already lives.
 
-csvql runs `SELECT` on CSV files where they sit: no import, no ingest, no server. It ships as an [MCP](https://modelcontextprotocol.io/) server, so an agent can ask a question of a gigabyte file and get back a few hundred tokens instead of the file. Safe by construction, not by configuration: the SQL has no write statements and the binary has no network code. It is about as fast as DuckDB and polars on raw CSV and uses 3 to 11x less memory.
+csvql (published as `csvql-query` on npm and PyPI, `csvql` on Homebrew) runs `SELECT` on CSV files where they sit: no import, no ingest, no server. It ships as an [MCP](https://modelcontextprotocol.io/) server, so an agent can ask a question of a gigabyte file and get back a few hundred tokens instead of the file. Safe by construction, not by configuration: the SQL has no write statements and the binary has no network code. It is about as fast as DuckDB and polars on raw CSV and uses 3 to 11x less memory.
 
 ```bash
 $ csvql "SELECT cab_type, COUNT(*) FROM 'trips.csv' GROUP BY cab_type"
