@@ -235,16 +235,23 @@ pub fn main() !void {
             try install.run(allocator, argHas(args, "--print"), roots);
             return;
         }
-        if (std.mem.eql(u8, args[1], "--schema") or std.mem.eql(u8, args[1], "-schema") or std.mem.eql(u8, args[1], "-s")) {
-            if (args.len < 3) {
+        // --schema <file>, anywhere in the arguments, so `--root d --schema f`
+        // works the same as `--schema f --root d`. It used to be recognised
+        // only as the first argument and otherwise fell through to query mode.
+        var si: usize = 1;
+        while (si < args.len) : (si += 1) {
+            const schema_path = flagValue(args, &si, "--schema") orelse
+                flagValue(args, &si, "-schema") orelse
+                flagValue(args, &si, "-s") orelse continue;
+            if (schema_path.len == 0) {
                 try stderr_file.writeAll("error: --schema requires a file path argument\n");
                 std.process.exit(1);
             }
-            engine.ensurePathAllowed(allocator, args[2], roots) catch {
+            engine.ensurePathAllowed(allocator, schema_path, roots) catch {
                 try stderr_file.writeAll("error: path outside allowed --root\n");
                 std.process.exit(1);
             };
-            try runSchema(allocator, args[2], stdout_file, stderr_file);
+            try runSchema(allocator, schema_path, stdout_file, stderr_file);
             return;
         }
     }
@@ -596,7 +603,7 @@ fn unknownFlag(args: anytype) ?[]const u8 {
             i += 1;
         } else if (inList(&bare_flags, a) or
             std.mem.startsWith(u8, a, "--root=") or std.mem.startsWith(u8, a, "--audit=") or
-            std.mem.startsWith(u8, a, "--deny-columns="))
+            std.mem.startsWith(u8, a, "--deny-columns=") or std.mem.startsWith(u8, a, "--schema="))
         {
             continue;
         } else if (std.mem.startsWith(u8, a, "--") and std.mem.indexOfAny(u8, a, " \t\r\n") == null) {
