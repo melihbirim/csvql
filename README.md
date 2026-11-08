@@ -44,7 +44,7 @@ Full posture, including two known gaps on macOS and Windows: [SECURITY.md](SECUR
 - **Excel files are read, not streamed.** `FROM 'sales.xlsx'` queries the first sheet (dates come out as `YYYY-MM-DD`, formulas as their saved value), but the sheet is unpacked in memory first: a 9 MB, 300k row workbook takes about 230 MB and 0.6 s. Other sheets, `.xls` and `.xlsb` are not supported.
 - **Quoted CSV is about 3x slower** than unquoted. Quotes disable the 16-byte skip the scanner relies on.
 - **`MEDIAN` buffers every value in a group**, so on 20M rows it is 5x slower than DuckDB ([#205](https://github.com/melihbirim/csvql/issues/205)). High-cardinality `GROUP BY` (millions of groups) is also slower.
-- **CSV only.** JSON and JSONL are output formats, not input formats.
+- **Input is CSV, TSV or `.xlsx`.** No Parquet, no JSON or JSONL input; JSON and JSONL are output formats only.
 
 Full list with tracking issues: [SQL_REFERENCE.md#known-limitations](SQL_REFERENCE.md#known-limitations).
 
