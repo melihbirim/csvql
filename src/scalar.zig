@@ -185,11 +185,21 @@ pub const ScalarSpec = union(enum) {
     };
 
     /// THEN/ELSE branch value for a bare CASE WHEN (issue #105): a quoted
-    /// string literal, a bare numeric literal, or a column reference.
+    /// string literal, a bare numeric literal, a column reference, or any
+    /// other scalar expression such as UPPER(s) or NOW() (#258).
     pub const CaseValue = union(enum) {
         string_lit: []const u8,
         numeric_lit: f64,
         col_idx: usize,
+        scalar: *const ScalarSpec,
+
+        pub fn deinit(self: CaseValue, allocator: Allocator) void {
+            if (self == .scalar) {
+                const inner = @constCast(self.scalar);
+                inner.deinit(allocator);
+                allocator.destroy(inner);
+            }
+        }
     };
 
     pub const CaseOp = enum { eq, ne, gt, ge, lt, le };
@@ -234,8 +244,12 @@ pub const ScalarSpec = union(enum) {
         op: CaseOp,
         rhs_numeric: ?f64, // set when the WHEN condition's RHS is numeric
         rhs_string: ?[]const u8, // set when the WHEN condition's RHS is a string literal
+        rhs_owned: bool = false, // rhs_string was allocated (a clock keyword), free on deinit
         then_val: CaseValue,
         else_val: CaseValue,
+        /// Text the literal slices point into when the caller built it
+        /// (engine.parseCaseWithAggCondition's rewritten CASE); freed on deinit.
+        owned_text: ?[]const u8 = null,
     };
 
     /// Return the primary column index this spec operates on.
@@ -282,6 +296,12 @@ pub const ScalarSpec = union(enum) {
             .clock => |text| allocator.free(text),
             .arith => |e| e.deinit(allocator),
             .position => |a| if (a.needle_owned) allocator.free(a.needle),
+            .case_when => |a| {
+                a.then_val.deinit(allocator);
+                a.else_val.deinit(allocator);
+                if (a.rhs_owned) allocator.free(a.rhs_string.?);
+                if (a.owned_text) |txt| allocator.free(txt);
+            },
             else => {},
         }
     }
@@ -322,16 +342,22 @@ pub fn tryParseScalar(
 /// `tryParseScalar` with the instant CURRENT_DATE, NOW() and CURRENT_TIMESTAMP
 /// resolve to, as Unix seconds (UTC). Queries pass `Query.now_ts` so every
 /// expression in one query sees the same instant.
+/// Not inferred: CASE branches parse recursively through tryParseScalarAt
+/// (#258), and arith.parse already resolves to the global set.
+pub const ParseError = anyerror;
+
 pub fn tryParseScalarAt(
     expr: []const u8,
     column_map: std.StringHashMap(usize),
     allocator: Allocator,
     now_ts: i64,
-) !?ScalarSpec {
+) ParseError!?ScalarSpec {
     const t = std.mem.trim(u8, expr, &std.ascii.whitespace);
 
+    // A column named current_date or current_timestamp wins over the clock
+    // (#256); CURRENT_DATE() with parentheses is always the clock.
     if (datetime.matchClockKeyword(t)) |m| {
-        if (m.len == t.len) {
+        if (m.len == t.len and try resolveCol(t, column_map, allocator) == null) {
             var buf: [19]u8 = undefined;
             const text = try datetime.formatClock(&buf, m.kind, now_ts);
             return .{ .clock = try allocator.dupe(u8, text) };
@@ -352,9 +378,12 @@ pub fn tryParseScalarAt(
     // Bare CASE WHEN has no parens at all, so it must be checked before the
     // paren-based dispatch below rejects it outright (#105).
     if (std.ascii.startsWithIgnoreCase(t, "case")) {
-        if (try tryParseCaseWhen(t, column_map, allocator)) |args| {
+        if (try tryParseCaseWhen(t, column_map, allocator, now_ts)) |args| {
             return .{ .case_when = args };
         }
+        // "CASE WHEN ..." that did not parse is unsupported CASE syntax, not a
+        // missing column (#258). A column named case_id still falls through.
+        if (std.ascii.startsWithIgnoreCase(t, "case when ")) return error.UnsupportedCaseExpression;
         return null;
     }
 
@@ -882,7 +911,7 @@ pub fn tryParseScalarAt(
 /// aggregate wrapper — that's parseCaseAggCall in engine.zig). `t` is
 /// already known to start with "CASE" (case-insensitive).
 /// Single condition, no AND/OR/nesting — same scope as the aggregate version.
-fn tryParseCaseWhen(t: []const u8, column_map: std.StringHashMap(usize), allocator: Allocator) !?ScalarSpec.CaseWhenArgs {
+fn tryParseCaseWhen(t: []const u8, column_map: std.StringHashMap(usize), allocator: Allocator, now_ts: i64) !?ScalarSpec.CaseWhenArgs {
     const after_case = std.mem.trim(u8, t[4..], &std.ascii.whitespace);
     if (after_case.len < 5 or !std.ascii.eqlIgnoreCase(after_case[0..5], "WHEN ")) return null;
     const cond_and_rest = after_case[5..];
@@ -937,37 +966,52 @@ fn tryParseCaseWhen(t: []const u8, column_map: std.StringHashMap(usize), allocat
 
     var rhs_numeric: ?f64 = null;
     var rhs_string: ?[]const u8 = null;
+    var rhs_owned = false;
     if (rhs_str.len >= 2 and rhs_str[0] == '\'' and rhs_str[rhs_str.len - 1] == '\'') {
         rhs_string = rhs_str[1 .. rhs_str.len - 1];
     } else if (std.fmt.parseFloat(f64, rhs_str)) |v| {
         rhs_numeric = v;
-    } else |_| {
+    } else |_| if (datetime.matchClockKeyword(rhs_str)) |m| {
+        // WHEN s < NOW(): the clock becomes a string literal, same as in WHERE (#258).
+        if (m.len != rhs_str.len) return null;
+        var buf: [19]u8 = undefined;
+        rhs_string = try allocator.dupe(u8, try datetime.formatClock(&buf, m.kind, now_ts));
+        rhs_owned = true;
+    } else {
         return null; // unrecognized RHS — not a column ref, matches aggregate CASE's scope
     }
+    errdefer if (rhs_owned) allocator.free(rhs_string.?);
 
-    const then_val = try parseCaseValue(then_str, column_map, allocator);
-    const else_val = try parseCaseValue(else_str, column_map, allocator);
+    const then_val = try parseCaseValue(then_str, column_map, allocator, now_ts);
+    errdefer then_val.deinit(allocator);
+    const else_val = try parseCaseValue(else_str, column_map, allocator, now_ts);
 
     return ScalarSpec.CaseWhenArgs{
         .cond_col_idx = cond_col_idx,
         .op = op,
         .rhs_numeric = rhs_numeric,
         .rhs_string = rhs_string,
+        .rhs_owned = rhs_owned,
         .then_val = then_val,
         .else_val = else_val,
     };
 }
 
-/// THEN/ELSE branch: quoted string literal, numeric literal, or column reference.
-fn parseCaseValue(s: []const u8, column_map: std.StringHashMap(usize), allocator: Allocator) !ScalarSpec.CaseValue {
+/// THEN/ELSE branch: quoted string literal, numeric literal, column reference,
+/// or any scalar expression (UPPER(s), NOW(), a nested CASE) (#258).
+fn parseCaseValue(s: []const u8, column_map: std.StringHashMap(usize), allocator: Allocator, now_ts: i64) !ScalarSpec.CaseValue {
     if (s.len >= 2 and s[0] == '\'' and s[s.len - 1] == '\'') {
         return .{ .string_lit = s[1 .. s.len - 1] };
     }
     if (std.fmt.parseFloat(f64, s)) |v| {
         return .{ .numeric_lit = v };
     } else |_| {}
-    const idx = try resolveCol(s, column_map, allocator) orelse return error.ColumnNotFound;
-    return .{ .col_idx = idx };
+    if (try resolveCol(s, column_map, allocator)) |idx| return .{ .col_idx = idx };
+    var spec = (try tryParseScalarAt(s, column_map, allocator, now_ts)) orelse return error.ColumnNotFound;
+    errdefer spec.deinit(allocator);
+    const boxed = try allocator.create(ScalarSpec);
+    boxed.* = spec;
+    return .{ .scalar = boxed };
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -1326,11 +1370,15 @@ pub fn eval(spec: ScalarSpec, record: []const []const u8, arena: Allocator) []co
                     .le => val <= threshold,
                 };
             } else if (args.rhs_string) |rhs| {
-                // Only equality/inequality are meaningful for string comparisons.
+                // Byte order, same as WHERE on two strings: right for ISO dates.
+                const ord = std.mem.order(u8, fv, rhs);
                 matches = switch (args.op) {
-                    .eq => std.mem.eql(u8, fv, rhs),
-                    .ne => !std.mem.eql(u8, fv, rhs),
-                    else => false,
+                    .eq => ord == .eq,
+                    .ne => ord != .eq,
+                    .gt => ord == .gt,
+                    .ge => ord != .lt,
+                    .lt => ord == .lt,
+                    .le => ord != .gt,
                 };
             }
             return resolveCaseValue(if (matches) args.then_val else args.else_val, record, arena);
@@ -1346,6 +1394,7 @@ fn resolveCaseValue(v: ScalarSpec.CaseValue, record: []const []const u8, arena: 
             const buf = arena.alloc(u8, 32) catch break :blk "";
             break :blk fmtNum(buf, n);
         },
+        .scalar => |sp| eval(sp.*, record, arena),
     };
 }
 
@@ -2319,6 +2368,48 @@ test "clock keywords resolve to a fixed instant, alone or nested" {
         try std.testing.expectEqualStrings(c.want, eval(spec, &.{}, arena.allocator()));
     }
     try std.testing.expect((try tryParseScalarAt("NOW(1)", cm, allocator, ts)) == null);
+}
+
+test "CASE WHEN: scalar functions and clock keywords in WHEN, THEN and ELSE (#258)" {
+    const allocator = std.testing.allocator;
+    var cm = std.StringHashMap(usize).init(allocator);
+    defer cm.deinit();
+    try cm.put("s", 0);
+    try cm.put("v", 1);
+    try cm.put("d", 2);
+    const ts = try datetime.parseDateTime("2024-06-01 12:34:56");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    const row = [_][]const u8{ "ab", "5", "2024-01-01" };
+    const cases = [_]struct { sql: []const u8, want: []const u8 }{
+        .{ .sql = "CASE WHEN v = 5 THEN UPPER(s) ELSE 'x' END", .want = "AB" },
+        .{ .sql = "CASE WHEN v = 5 THEN NOW() ELSE 'x' END", .want = "2024-06-01 12:34:56" },
+        .{ .sql = "CASE WHEN d < NOW() THEN 'old' ELSE 'new' END", .want = "old" },
+        .{ .sql = "CASE WHEN d >= CURRENT_DATE THEN 'new' ELSE LENGTH(s) END", .want = "2" },
+        .{ .sql = "CASE WHEN s > 'aa' THEN 'gt' ELSE 'le' END", .want = "gt" },
+    };
+    for (cases) |c| {
+        var spec = (try tryParseScalarAt(c.sql, cm, allocator, ts)).?;
+        defer spec.deinit(allocator);
+        try std.testing.expectEqualStrings(c.want, eval(spec, &row, arena.allocator()));
+    }
+    try std.testing.expectError(error.ColumnNotFound, tryParseScalarAt("CASE WHEN v = 5 THEN nope ELSE 'x' END", cm, allocator, ts));
+    try std.testing.expectError(error.UnsupportedCaseExpression, tryParseScalarAt("CASE WHEN v = 5 THEN 'a' END", cm, allocator, ts));
+    // A column that merely starts with "case" is still a column.
+    try std.testing.expect((try tryParseScalarAt("case_id", cm, allocator, ts)) == null);
+}
+
+test "clock keyword names a column when the file has one (#256)" {
+    const allocator = std.testing.allocator;
+    var cm = std.StringHashMap(usize).init(allocator);
+    defer cm.deinit();
+    try cm.put("current_date", 0);
+    const ts = try datetime.parseDateTime("2026-03-05 07:08:09");
+    try std.testing.expect((try tryParseScalarAt("current_date", cm, allocator, ts)) == null);
+    var spec = (try tryParseScalarAt("CURRENT_DATE()", cm, allocator, ts)).?;
+    defer spec.deinit(allocator);
+    try std.testing.expect(spec == .clock);
 }
 
 test "REPEAT: counts, empty field, and the output cap" {

@@ -134,6 +134,7 @@ fn exitCodeForError(err: anyerror) u8 {
         error.OrderByColumnNotFound,
         error.MixedAggregateAndNonAggregateSelect,
         error.NestedFunctionNotSupported,
+        error.UnsupportedCaseExpression,
         error.PathOutsideAllowedRoot,
         error.UnterminatedQuotedValue,
         error.ArithmeticExpressionsNotSupported,
