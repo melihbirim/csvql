@@ -654,9 +654,10 @@ fn resolveClockKeywords(allocator: Allocator, text: []const u8, now_ts: i64) ![]
     var i: usize = 0;
     while (i < text.len) {
         const c = text[i];
-        if (c == '\'' or c == '"') {
+        if (c == '\'' or c == '"' or c == '`' or c == '[') {
+            const close: u8 = if (c == '[') ']' else c;
             i += 1;
-            while (i < text.len and text[i] != c) : (i += 1) {}
+            while (i < text.len and text[i] != close) : (i += 1) {}
             if (i < text.len) i += 1;
             continue;
         }
@@ -682,7 +683,22 @@ fn resolveClockKeywords(allocator: Allocator, text: []const u8, now_ts: i64) ![]
     }
     if (copied == 0) return text;
     try out.appendSlice(allocator, text[copied..]);
-    return out.items;
+    return try out.toOwnedSlice(allocator);
+}
+
+/// resolveClockKeywords on the text after the table FROM only. The SELECT
+/// list keeps the keywords: scalar.zig resolves them there and the output
+/// column keeps the name the caller wrote. Runs on the raw query, before
+/// quoted identifiers lose their quotes, so "current_date" stays a column
+/// reference (#256). Returns `text` itself when nothing changed.
+fn resolveClockKeywordsAfterFrom(allocator: Allocator, text: []const u8, now_ts: i64) ![]const u8 {
+    const select_idx = std.ascii.indexOfIgnoreCase(text, "SELECT") orelse return text;
+    const from_idx = findTableFromIdx(text, select_idx + 6) orelse return text;
+    const tail_in = text[from_idx + 4 ..];
+    const tail = try resolveClockKeywords(allocator, tail_in, now_ts);
+    if (tail.ptr == tail_in.ptr) return text;
+    defer allocator.free(tail);
+    return std.mem.concat(allocator, u8, &.{ text[0 .. from_idx + 4], tail });
 }
 
 /// Parse a SQL query string. CURRENT_DATE, NOW() and CURRENT_TIMESTAMP
@@ -801,7 +817,9 @@ pub fn parse(allocator: Allocator, input: []const u8) !Query {
 /// `parse` with the instant for CURRENT_DATE, NOW() and CURRENT_TIMESTAMP
 /// given as Unix seconds (UTC) instead of read from the clock.
 pub fn parseAt(allocator: Allocator, raw_input: []const u8, now_ts: i64) !Query {
-    const input = try rewriteQuotedIdentifiers(allocator, raw_input);
+    const clocked = try resolveClockKeywordsAfterFrom(allocator, raw_input, now_ts);
+    defer if (clocked.ptr != raw_input.ptr) allocator.free(clocked);
+    const input = try rewriteQuotedIdentifiers(allocator, clocked);
     var input_owned = true;
     defer if (input_owned) allocator.free(input);
     // Every slice field starts as a valid empty slice (safe to free as a
@@ -893,9 +911,8 @@ pub fn parseAt(allocator: Allocator, raw_input: []const u8, now_ts: i64) !Query 
 
     // Extract file path (and optional JOIN clauses) from FROM clause.
     // Supports chained JOINs:  FROM a JOIN b ON ... JOIN c ON ... WHERE ...
-    // The SELECT list keeps the keywords: scalar.zig resolves them there and
-    // the output column keeps the name the caller wrote.
-    const from_rest = try resolveClockKeywords(alias_scratch.allocator(), trimmed[from_idx + 4 ..], now_ts);
+    // Clock keywords in this part were already replaced by literals in parseAt.
+    const from_rest = trimmed[from_idx + 4 ..];
     var rest: []const u8 = undefined;
 
     // Reject unsupported JOIN types before they silently fall through to single-file mode.
@@ -2358,8 +2375,20 @@ test "resolveClockKeywords: replaces keywords outside quotes only" {
         try resolveClockKeywords(a, "WHERE d >= current_date AND t < NOW() OR u <= Current_Timestamp()", ts),
     );
     // Quoted text, longer identifiers, qualified names and a bare `now` column are left alone.
-    const untouched = "WHERE a = 'now()' AND b = \"CURRENT_DATE\" AND current_dates > 1 AND my_now() > 1 AND t.now() > 1 AND now > 1";
+    const untouched = "WHERE a = 'now()' AND b = \"CURRENT_DATE\" AND `now()` > 1 AND [current_date] > 1 AND current_dates > 1 AND my_now() > 1 AND t.now() > 1 AND now > 1";
     try std.testing.expectEqualStrings(untouched, try resolveClockKeywords(a, untouched, ts));
+}
+
+test "parseAt: a quoted clock-keyword identifier in WHERE stays a column (#256)" {
+    const a = std.testing.allocator;
+    const ts = try datetime.parseDateTime("2026-03-05 07:08:09");
+    var q = try parseAt(a, "SELECT id FROM 't.csv' WHERE \"current_date\" < '2024-06-01' AND d >= current_date", ts);
+    defer q.deinit();
+    const b = q.where_expr.?.binary;
+    try std.testing.expectEqualStrings("current_date", b.left.comparison.column);
+    try std.testing.expectEqualStrings("2024-06-01", b.left.comparison.value);
+    try std.testing.expectEqualStrings("d", b.right.comparison.column);
+    try std.testing.expectEqualStrings("2026-03-05", b.right.comparison.value);
 }
 
 test "parseAt: query keeps the instant it was parsed with" {

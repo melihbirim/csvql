@@ -3521,6 +3521,7 @@ fn parseCaseWithAggCondition(
     allocator: Allocator,
     expr: []const u8,
     column_map: std.StringHashMap(usize),
+    now_ts: i64,
 ) !?struct { agg_func: aggregation.AggregateFunc, spec: scalar.ScalarSpec } {
     const t = std.mem.trim(u8, expr, &std.ascii.whitespace);
     if (t.len < 10 or !std.ascii.eqlIgnoreCase(t[0..4], "CASE")) return null;
@@ -3556,16 +3557,20 @@ fn parseCaseWithAggCondition(
     const rewritten = try std.fmt.allocPrint(allocator, "CASE WHEN {s} {s} {s} THEN {s} ELSE {s} END", .{
         placeholder_map_key, split.op_text, split.right, then_str, else_str,
     });
-    defer allocator.free(rewritten);
+    // The spec's THEN/ELSE literals slice into this text, so the spec owns it
+    // (freeing it here was a use after free that printed garbage tiers).
+    errdefer allocator.free(rewritten);
 
     // THEN/ELSE values referencing a real column (not the aggregate
     // placeholder) fail to resolve here — tryParseScalar only sees
     // placeholder_map, not the query's actual columns — so this is the
     // common case that would otherwise leak agg_func (#173 follow-up).
-    const spec = (try scalar.tryParseScalar(rewritten, placeholder_map, allocator)) orelse {
+    var spec = (try scalar.tryParseScalarAt(rewritten, placeholder_map, allocator, now_ts)) orelse {
         agg_func.deinit(allocator);
+        allocator.free(rewritten);
         return null;
     };
+    spec.case_when.owned_text = rewritten;
     _ = column_map; // condition's own column refs (if any beyond the aggregate) aren't supported — matches this codebase's single-comparison CASE scope
     return .{ .agg_func = agg_func, .spec = spec };
 }
@@ -4373,7 +4378,7 @@ fn executeScalarAgg(
                 continue;
             }
             // CASE WHEN with an aggregate inside its condition (#113).
-            if (try parseCaseWithAggCondition(allocator, effective_col, column_map)) |result| {
+            if (try parseCaseWithAggCondition(allocator, effective_col, column_map, query.now_ts)) |result| {
                 var agg_func = result.agg_func;
                 errdefer agg_func.deinit(allocator);
                 var case_spec = result.spec;
@@ -4388,7 +4393,7 @@ fn executeScalarAgg(
                     allocator.free(agg_col);
                     agg_func.column = null;
                 }
-                const display_alias = if (sa.alias) |ua| try allocator.dupe(u8, ua) else try allocator.dupe(u8, effective_col);
+                const display_alias = sa.alias orelse effective_col; // not duped: nothing freed it (leak)
                 const gc_sep: []const u8 = agg_func.sep orelse ",";
                 agg_func.sep = null;
                 try agg_specs.append(allocator, AggSpec{
@@ -6364,7 +6369,7 @@ fn executeGroupBy(
                 }
                 // CASE WHEN with an aggregate inside its condition, e.g.
                 // CASE WHEN AVG(salary) > 80000 THEN 'high' ELSE 'low' END (#113).
-                if (try parseCaseWithAggCondition(allocator, effective_col, column_map)) |result| {
+                if (try parseCaseWithAggCondition(allocator, effective_col, column_map, query.now_ts)) |result| {
                     var agg_func = result.agg_func;
                     errdefer agg_func.deinit(allocator);
                     var case_spec = result.spec;
@@ -6379,7 +6384,7 @@ fn executeGroupBy(
                         allocator.free(agg_col);
                         agg_func.column = null;
                     }
-                    const display_alias = if (sa.alias) |ua| try allocator.dupe(u8, ua) else try allocator.dupe(u8, effective_col);
+                    const display_alias = sa.alias orelse effective_col; // not duped: nothing freed it (leak)
                     const gc_sep: []const u8 = agg_func.sep orelse ",";
                     agg_func.sep = null;
                     try agg_specs.append(allocator, AggSpec{
