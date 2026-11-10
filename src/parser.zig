@@ -536,8 +536,7 @@ fn extractFileAndAlias(allocator: Allocator, input: []const u8) !FileAlias {
         const file_raw = s[1 .. end_q + 1]; // inside the quotes
         const after = stripAsKeyword(std.mem.trim(u8, s[end_q + 2 ..], &std.ascii.whitespace));
         try checkAlias(after);
-        const alias_buf = try allocator.alloc(u8, after.len);
-        _ = std.ascii.lowerString(alias_buf, after);
+        const alias_buf = try std.ascii.allocLowerString(allocator, after);
         return FileAlias{
             .file = try allocator.dupe(u8, file_raw),
             .alias = alias_buf,
@@ -548,8 +547,7 @@ fn extractFileAndAlias(allocator: Allocator, input: []const u8) !FileAlias {
             const file_raw = s[0..sp];
             const after = stripAsKeyword(std.mem.trim(u8, s[sp + 1 ..], &std.ascii.whitespace));
             try checkAlias(after);
-            const alias_buf = try allocator.alloc(u8, after.len);
-            _ = std.ascii.lowerString(alias_buf, after);
+            const alias_buf = try std.ascii.allocLowerString(allocator, after);
             return FileAlias{
                 .file = try allocator.dupe(u8, file_raw),
                 .alias = alias_buf,
@@ -1005,10 +1003,8 @@ pub fn parseAt(allocator: Allocator, raw_input: []const u8, now_ts: i64) !Query 
             // Preserve the full ON operand (including alias prefix if present).
             // e.g. "a.dept_id" stays "a.dept_id", not stripped to "dept_id".
             // The engine resolves qualified names against alias-range-precise maps.
-            const ljc = try allocator.alloc(u8, on_left_expr.len);
-            _ = std.ascii.lowerString(ljc, on_left_expr);
-            const rjc = try allocator.alloc(u8, on_right_expr.len);
-            _ = std.ascii.lowerString(rjc, on_right_expr);
+            const ljc = try std.ascii.allocLowerString(allocator, on_left_expr);
+            const rjc = try std.ascii.allocLowerString(allocator, on_right_expr);
 
             try joins_list.append(allocator, JoinClause{
                 .right_file = right_info.file,
@@ -1200,8 +1196,7 @@ pub fn parseAt(allocator: Allocator, raw_input: []const u8, now_ts: i64) !Query 
                 ord = .asc;
             }
 
-            const col_lower = try allocator.alloc(u8, col_part.len);
-            _ = std.ascii.lowerString(col_lower, col_part);
+            const col_lower = try std.ascii.allocLowerString(allocator, col_part);
 
             if (first) {
                 primary_column_lower = col_lower;
@@ -1514,8 +1509,7 @@ pub fn parseExpression(allocator: Allocator, input: []const u8) !Expression {
     switch (leaf.op) {
         .is_not_null, .is_null => {
             const col_part = std.mem.trim(u8, trimmed[0..leaf.idx], &std.ascii.whitespace);
-            const col_lower = try allocator.alloc(u8, col_part.len);
-            _ = std.ascii.lowerString(col_lower, col_part);
+            const col_lower = try std.ascii.allocLowerString(allocator, col_part);
             return Expression{ .comparison = Comparison{
                 .column = col_lower,
                 .operator = if (leaf.op == .is_not_null) .is_not_null else .is_null,
@@ -1564,8 +1558,7 @@ fn parseBetween(allocator: Allocator, input: []const u8, between_idx: usize) !Ex
     const low_clean = trimQuotes(low_str);
     const high_clean = trimQuotes(high_str);
 
-    const col_lower = try allocator.alloc(u8, col_part.len);
-    _ = std.ascii.lowerString(col_lower, col_part);
+    const col_lower = try std.ascii.allocLowerString(allocator, col_part);
 
     return Expression{ .comparison = Comparison{
         .column = col_lower,
@@ -1654,8 +1647,7 @@ fn parseLikeComparison(allocator: Allocator, input: []const u8, kw_idx: usize, k
     const column_part = std.mem.trim(u8, input[0..kw_idx], &std.ascii.whitespace);
     const value_part = std.mem.trim(u8, input[kw_idx + kw_len ..], &std.ascii.whitespace);
 
-    const column_lower = try allocator.alloc(u8, column_part.len);
-    _ = std.ascii.lowerString(column_lower, column_part);
+    const column_lower = try std.ascii.allocLowerString(allocator, column_part);
 
     const cmp = Expression{
         .comparison = Comparison{
@@ -1861,8 +1853,7 @@ fn parseComparison(allocator: Allocator, input: []const u8, op_str: []const u8, 
     const numeric_value = std.fmt.parseFloat(f64, value_clean) catch null;
 
     // FIXED: Normalize column name to lowercase for case-insensitive matching
-    const column_lower = try allocator.alloc(u8, column_part.len);
-    _ = std.ascii.lowerString(column_lower, column_part);
+    const column_lower = try std.ascii.allocLowerString(allocator, column_part);
 
     return Expression{
         .comparison = Comparison{
@@ -1894,8 +1885,7 @@ fn parseModComparison(allocator: Allocator, input: []const u8, mod_idx: usize) !
         _ = std.fmt.parseFloat(f64, value_str) catch return null; // validate it's numeric
         const operator = Operator.fromString(op_str) orelse return null;
 
-        const column_lower = try allocator.alloc(u8, column_part.len);
-        _ = std.ascii.lowerString(column_lower, column_part);
+        const column_lower = try std.ascii.allocLowerString(allocator, column_part);
         return Expression{
             .comparison = Comparison{
                 .column = column_lower,

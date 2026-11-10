@@ -1422,7 +1422,7 @@ fn scalarProcessChunk(ctx: *ScalarWorkerCtx) !void {
         const fields = field_buf[0..n_fields];
         for (fields) |*f| {
             if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
-                f.* = unescapeQuotesArenaAlloc(row_arena.allocator(), f.*) catch f.*;
+                f.* = simd.unescapeQuotes(row_arena.allocator(), f.*) catch f.*;
             }
         }
         scalarProcessRecord(ctx, &row_arena, fields) catch break :flush;
@@ -1867,7 +1867,7 @@ fn joinWorkerRun(w: *JoinWorkerCtx) !void {
         _ = unescape_arena.reset(.retain_capacity);
         for (field_buf[0..rec.len]) |*f| {
             if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
-                f.* = unescapeQuotesArenaAlloc(unescape_arena.allocator(), f.*) catch f.*;
+                f.* = simd.unescapeQuotes(unescape_arena.allocator(), f.*) catch f.*;
             }
         }
         for (0..w.base_w) |ci| merged[ci] = if (ci < rec.len) rec[ci] else "";
@@ -1988,8 +1988,7 @@ fn executeJoinThenAggregate(
             defer file_map.unmap(data);
             const hinfo = try csv.resolveMmapHeader(aa, data, opts);
             for (hinfo.names) |name| {
-                const lower = try aa.alloc(u8, name.len);
-                _ = std.ascii.lowerString(lower, name);
+                const lower = try std.ascii.allocLowerString(aa, name);
                 if (seen_names.contains(lower)) {
                     try dup_names.put(lower, {});
                 } else {
@@ -2296,8 +2295,7 @@ fn executeJoinImpl(
     } else {
         for (query.columns) |col_raw| {
             const col = blk: {
-                const tmp = try aa.alloc(u8, col_raw.len);
-                _ = std.ascii.lowerString(tmp, col_raw);
+                const tmp = try std.ascii.allocLowerString(aa, col_raw);
                 break :blk tmp;
             };
             if (std.mem.indexOfScalar(u8, col, '.') == null) {
@@ -3156,25 +3154,7 @@ inline fn unquoteField(arena: Allocator, f: []const u8) []const u8 {
     var v = f;
     if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') v = v[1 .. v.len - 1];
     if (std.mem.indexOf(u8, v, "\"\"") == null) return v;
-    return unescapeQuotesArenaAlloc(arena, v) catch v;
-}
-
-fn unescapeQuotesArenaAlloc(alloc: Allocator, field: []const u8) ![]const u8 {
-    const out = try alloc.alloc(u8, field.len);
-    var w: usize = 0;
-    var i: usize = 0;
-    while (i < field.len) {
-        if (field[i] == '"' and i + 1 < field.len and field[i + 1] == '"') {
-            out[w] = '"';
-            w += 1;
-            i += 2;
-        } else {
-            out[w] = field[i];
-            w += 1;
-            i += 1;
-        }
-    }
-    return out[0..w];
+    return simd.unescapeQuotes(arena, v) catch v;
 }
 
 inline fn parseNumericFast(s: []const u8) !f64 {
@@ -4970,7 +4950,7 @@ fn gbProcessRecord(
     _ = unescape_arena.reset(.retain_capacity);
     for (field_stk[0..record.len]) |*f| {
         if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
-            f.* = unescapeQuotesArenaAlloc(unescape_arena.allocator(), f.*) catch f.*;
+            f.* = simd.unescapeQuotes(unescape_arena.allocator(), f.*) catch f.*;
         }
     }
     try gbProcessRecordCore(ctx, aa, key_buf, record);
@@ -5890,7 +5870,7 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                 _ = unescape_arena.reset(.retain_capacity);
                 for (field_stk[0..record.len]) |*f| {
                     if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
-                        f.* = unescapeQuotesArenaAlloc(unescape_arena.allocator(), f.*) catch f.*;
+                        f.* = simd.unescapeQuotes(unescape_arena.allocator(), f.*) catch f.*;
                     }
                 }
             }
@@ -6046,7 +6026,7 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
             _ = unescape_arena.reset(.retain_capacity);
             for (field_stk[0..record.len]) |*f| {
                 if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
-                    f.* = unescapeQuotesArenaAlloc(unescape_arena.allocator(), f.*) catch f.*;
+                    f.* = simd.unescapeQuotes(unescape_arena.allocator(), f.*) catch f.*;
                 }
             }
             if (ctx.where_expr) |expr| {
@@ -7144,8 +7124,7 @@ fn executeGroupBy(
             var having_map = std.StringHashMap([]const u8).init(ha);
             // Map alias names (from out_header_list)
             for (out_header_list.items, 0..) |hdr, hi| {
-                const lower_hdr = try ha.alloc(u8, hdr.len);
-                _ = std.ascii.lowerString(lower_hdr, hdr);
+                const lower_hdr = try std.ascii.allocLowerString(ha, hdr);
                 try having_map.put(lower_hdr, output_row[hi]);
             }
             // Also map original column expressions (pre-alias) so that
@@ -7153,8 +7132,7 @@ fn executeGroupBy(
             for (query.columns, 0..) |col, hi| {
                 if (hi >= output_row.len) break;
                 const sa = splitAlias(col);
-                const expr_lower = try ha.alloc(u8, sa.expr.len);
-                _ = std.ascii.lowerString(expr_lower, sa.expr);
+                const expr_lower = try std.ascii.allocLowerString(ha, sa.expr);
                 if (!having_map.contains(expr_lower)) {
                     try having_map.put(expr_lower, output_row[hi]);
                 }

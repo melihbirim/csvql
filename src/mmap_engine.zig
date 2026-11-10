@@ -9,26 +9,6 @@ const arena_buffer = @import("arena_buffer.zig");
 const simd = @import("simd.zig");
 const Allocator = std.mem.Allocator;
 
-/// Collapse `""` escape pairs to `"` within an already quote-stripped field.
-/// Only called when the field is known to contain `""` — see issue #89.
-fn unescapeQuotesArena(arena: *std.heap.ArenaAllocator, field: []const u8) ![]const u8 {
-    const out = try arena.allocator().alloc(u8, field.len);
-    var w: usize = 0;
-    var i: usize = 0;
-    while (i < field.len) {
-        if (field[i] == '"' and i + 1 < field.len and field[i + 1] == '"') {
-            out[w] = '"';
-            w += 1;
-            i += 2;
-        } else {
-            out[w] = field[i];
-            w += 1;
-            i += 1;
-        }
-    }
-    return out[0..w];
-}
-
 const ArenaBuffer = arena_buffer.ArenaBuffer;
 const appendJsonStringToArena = arena_buffer.appendJsonStringToArena;
 
@@ -343,7 +323,7 @@ pub fn executeMapped(
             _ = unescape_arena.reset(.retain_capacity);
             for (fields) |*field| {
                 if (std.mem.indexOf(u8, field.*, "\"\"") != null) {
-                    field.* = unescapeQuotesArena(&unescape_arena, field.*) catch field.*;
+                    field.* = simd.unescapeQuotes(unescape_arena.allocator(), field.*) catch field.*;
                 }
             }
 
