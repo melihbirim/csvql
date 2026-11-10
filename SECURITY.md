@@ -24,7 +24,11 @@ A few internal operations (resolving `IN (SELECT ...)` subqueries, staging a JOI
 
 If you're evaluating csvql for an air-gapped or hardened-filesystem environment, verify this claim yourself rather than take it on faith — `strace -f -e trace=network,open,openat` (Linux) or the equivalent will show it directly. That's the point: this is meant to be provable, not just stated.
 
-**Filesystem scoping.** By default csvql can read any file the process user can. Pass `--root <dir>[,<dir>]` to confine all file access (CLI and MCP) to those directory trees. Paths are resolved with `realpath`, so `../` traversal and symlink escape are rejected. Always set `--root` when exposing csvql to an agent or another user.
+**Filesystem scoping.** By default csvql can read any file the process user can. Pass `--root <dir>[,<dir>]` to confine all file access (CLI and MCP) to those directory trees. Paths are resolved with `realpath`, so `../` traversal and symlink escape are rejected. Always set `--root` when exposing csvql to an agent or another user. `-o/--output` is held to the same trees, and is refused when the target is a file the query reads. One limit: a hard link inside a root to a file outside it is readable, because a hard link has no path to resolve. Only someone who can already write to the root can create one, so keep roots read only for the querying user.
+
+**Column deny list.** `--deny-columns a,b` refuses any query that names those columns and drops them from `SELECT *`. A header that contains a denied name as a whole word (`id;ssn` from a file read with the wrong delimiter, `employee ssn`, a name with a non-breaking space in front) is dropped as well. The list needs the header row, so it cannot be combined with `--no-input-header`. Over MCP the agent cannot change the delimiter or the header mode.
+
+**Terminal safety.** `--table` and `--markdown` output replaces control bytes in cells with `?`, so data cannot send escape sequences to the terminal. Plain CSV output passes bytes through unchanged; JSON output escapes them.
 
 **Minimal attack surface.** A single static binary. No runtime, no interpreter, no dependencies to track for CVEs. With the SSH access model there is no long running daemon and no open port.
 

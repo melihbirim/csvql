@@ -422,6 +422,21 @@ fn isIdentByte(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
+/// True when header `name` is a denied column or contains one as a whole word.
+fn nameHoldsDenied(name: []const u8, deny: []const []const u8) bool {
+    for (deny) |d| {
+        if (d.len == 0 or d.len > name.len) continue;
+        var i: usize = 0;
+        while (i + d.len <= name.len) : (i += 1) {
+            if (!std.ascii.eqlIgnoreCase(name[i .. i + d.len], d)) continue;
+            const before_ok = i == 0 or !isIdentByte(name[i - 1]);
+            const after_ok = i + d.len == name.len or !isIdentByte(name[i + d.len]);
+            if (before_ok and after_ok) return true;
+        }
+    }
+    return false;
+}
+
 /// The header names of `path` minus the denied ones, for SELECT * under
 /// --deny-columns, written the way the parser writes a quoted identifier.
 /// A name with quotes or tabs cannot be referenced, so such a file has to
@@ -444,7 +459,10 @@ fn allowedColumns(allocator: Allocator, path: []const u8, opts: options_mod.Opti
     outer: for (hdr.names) |raw| {
         var name = std.mem.trim(u8, raw, " \t\r");
         if (name.len >= 2 and name[0] == '"' and name[name.len - 1] == '"') name = name[1 .. name.len - 1];
-        for (opts.deny_columns) |d| if (std.ascii.eqlIgnoreCase(name, d)) continue :outer;
+        // A header that holds a denied name as a whole word is left out too:
+        // "id;ssn" (a file read with the wrong delimiter), "\u{A0}ssn" (a
+        // non-breaking space from a spreadsheet export), "employee ssn".
+        if (nameHoldsDenied(name, opts.deny_columns)) continue :outer;
         if (std.mem.indexOfAny(u8, name, "\t\"'") != null) return error.DeniedColumnSelectStar;
         const ref = try allocator.dupe(u8, name);
         std.mem.replaceScalar(u8, ref, ' ', parser.ident_space);
@@ -645,6 +663,9 @@ pub fn execute(allocator: Allocator, parsed: parser.Query, output_file: std.fs.F
         allocator.free(cols);
     };
     if (opts.deny_columns.len > 0) {
+        // Without a header row the columns are c1..cN and the names in the
+        // deny list match nothing, so every column would be readable.
+        if (opts.no_input_header) return error.DeniedColumn;
         // Simple mode has no SQL text to check, so it is refused outright.
         if (query.sql.len == 0 or deniedColumnIn(query.sql, opts.deny_columns) != null) return error.DeniedColumn;
         if (query.all_columns) {
@@ -7661,6 +7682,30 @@ test "LEFT JOIN keeps unmatched left rows with empty right columns" {
     const out = try out_file.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(out);
     try std.testing.expectEqualStrings("name,dname\nann,eng\nbob,\n", out);
+}
+
+test "nameHoldsDenied: exact, whole word inside a longer header, not a substring" {
+    const deny = [_][]const u8{ "ssn", "Total Sales" };
+    for ([_][]const u8{ "ssn", "SSN", "id;ssn", "id;ssn;dept", "\xc2\xa0ssn", "employee ssn", "ssn\ttag", "total sales" }) |h|
+        try std.testing.expect(nameHoldsDenied(h, &deny));
+    for ([_][]const u8{ "ssn_hash", "hasssn", "ssn2", "id", "", "total" }) |h|
+        try std.testing.expect(!nameHoldsDenied(h, &deny));
+}
+
+test "deny-columns: SELECT * hides a denied name inside a misparsed header, and refuses header-less input" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const deny = options_mod.Options{ .deny_columns = &.{"ssn"} };
+    // Semicolon file read as comma CSV: the only column is "id;ssn".
+    try std.testing.expectError(error.DeniedColumn, runQueryForTestOpts(allocator, &tmp, "id;ssn\n1;111-11-1111\n", "SELECT * FROM '{s}'", deny));
+    // Non-breaking space in front of the name.
+    const out = try runQueryForTestOpts(allocator, &tmp, "id,\xc2\xa0ssn\n1,111-11-1111\n", "SELECT * FROM '{s}'", deny);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("id\n1\n", out);
+    var no_hdr = deny;
+    no_hdr.no_input_header = true;
+    try std.testing.expectError(error.DeniedColumn, runQueryForTestOpts(allocator, &tmp, "id,ssn\n1,111-11-1111\n", "SELECT c2 FROM '{s}'", no_hdr));
 }
 
 test "ensurePathAllowed confines file access to --root trees" {

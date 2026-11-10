@@ -318,6 +318,11 @@ pub fn main() !void {
         }
     }
 
+    if (opts.no_input_header and deny_columns.len > 0) {
+        try stderr_file.writeAll("error: --deny-columns needs the header row; it cannot be combined with --no-input-header\n");
+        std.process.exit(2);
+    }
+
     // Detect query mode: simple vs SQL
     if (clean_args.items.len > 1 and parser.isWriteStatement(clean_args.items[1])) {
         try stderr_file.writeAll("error: csvql is read-only; it runs SELECT queries and never writes files\n");
@@ -361,6 +366,13 @@ pub fn main() !void {
         if (opts.no_header) {
             try stderr_file.writeAll("error: --markdown cannot be combined with --no-header (a Markdown table needs a header row)\n");
             std.process.exit(1);
+        }
+    }
+
+    if (output_path) |p| {
+        if (outputPathProblem(allocator, p, query, roots)) |msg| {
+            try stderr_file.writeAll(msg);
+            std.process.exit(2);
         }
     }
 
@@ -425,7 +437,55 @@ fn renderTableOutput(allocator: Allocator, query: parser.Query, out_file: std.fs
     var table_buf: std.ArrayList(u8) = .{};
     defer table_buf.deinit(allocator);
     try renderCsvTable(allocator, csv_data, opts, &table_buf);
+    scrubControlBytes(table_buf.items);
     try out_file.writeAll(table_buf.items);
+}
+
+/// Replace terminal control bytes in rendered table text with '?', in place.
+/// A cell holding ESC sequences could otherwise retitle or clear the terminal
+/// of whoever reads the result. Newline and tab stay; so does all other UTF-8,
+/// except the C1 controls (U+0080..U+009F), which some terminals also obey.
+fn scrubControlBytes(text: []u8) void {
+    for (text, 0..) |c, i| {
+        if ((c < 0x20 and c != '\n' and c != '\t') or c == 0x7f) {
+            text[i] = '?';
+        } else if (c == 0xC2 and i + 1 < text.len and text[i + 1] >= 0x80 and text[i + 1] <= 0x9F) {
+            text[i] = '?';
+            text[i + 1] = '?';
+        }
+    }
+}
+
+/// Why `-o path` must be refused, or null. Two rules: the target stays inside
+/// --root when one is set, and it is never a file the query reads, because
+/// creating it truncates the input before the first row is read.
+fn outputPathProblem(allocator: Allocator, path: []const u8, query: parser.Query, roots: []const []const u8) ?[]const u8 {
+    const real_out: ?[]u8 = std.fs.realpathAlloc(allocator, path) catch null;
+    defer if (real_out) |r| allocator.free(r);
+    if (roots.len > 0) {
+        // A new file has no realpath yet, so its directory is what gets checked.
+        const dir = std.fs.path.dirname(path) orelse ".";
+        engine.ensurePathAllowed(allocator, dir, roots) catch return "error: --output path is outside the allowed --root\n";
+        if (real_out != null) engine.ensurePathAllowed(allocator, path, roots) catch return "error: --output path is outside the allowed --root\n";
+    }
+    const out = real_out orelse return null; // does not exist yet: cannot be an input
+    const clash = "error: --output would overwrite a file the query reads\n";
+    if (sameFile(allocator, out, query.file_path)) return clash;
+    for (query.joins) |j| if (sameFile(allocator, out, j.right_file)) return clash;
+    // Subquery files: every quoted literal in the SQL that names a real file.
+    var it = std.mem.splitScalar(u8, query.sql, '\'');
+    _ = it.next();
+    while (it.next()) |lit| {
+        if (sameFile(allocator, out, lit)) return clash;
+        _ = it.next();
+    }
+    return null;
+}
+
+fn sameFile(allocator: Allocator, real: []const u8, candidate: []const u8) bool {
+    const r = std.fs.realpathAlloc(allocator, candidate) catch return false;
+    defer allocator.free(r);
+    return std.mem.eql(u8, r, real);
 }
 
 /// Render CSV text as a table into `table_buf`. Markdown mode ignores the
@@ -1036,6 +1096,22 @@ fn renderMarkdownForTest(allocator: Allocator, csv_data: []const u8) ![]u8 {
     errdefer buf.deinit(allocator);
     try renderCsvTable(allocator, csv_data, .{ .table_mode = .markdown }, &buf);
     return buf.toOwnedSlice(allocator);
+}
+
+test "scrubControlBytes: ESC, BEL, DEL and C1 controls become '?', text stays" {
+    var buf = "a\x1b]0;T\x07b\x7f\xc2\x9bc\tr\n\xc3\xa9\xe2\x94\x82".*;
+    scrubControlBytes(&buf);
+    try std.testing.expectEqualStrings("a?]0;T?b???c\tr\n\xc3\xa9\xe2\x94\x82", &buf);
+}
+
+test "table output carries no escape sequence from a cell" {
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(allocator);
+    try renderCsvTable(allocator, "note\n\x1b[2Jx\n", .{ .table_mode = .markdown }, &buf);
+    scrubControlBytes(buf.items);
+    try std.testing.expect(std.mem.indexOfScalar(u8, buf.items, 0x1b) == null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "?[2Jx") != null);
 }
 
 test "markdown: header, separator and rows" {
