@@ -56,27 +56,6 @@ pub const BulkCsvReader = struct {
         self.unescape_arena.deinit();
     }
 
-    /// Collapse `""` escape pairs to `"` within an already quote-stripped field.
-    /// Only called when the field is known to contain `""`, so it always
-    /// allocates a (shorter-or-equal) replacement from the reader's scratch arena.
-    fn unescapeQuotes(self: *BulkCsvReader, field: []const u8) ![]const u8 {
-        var out = try self.unescape_arena.allocator().alloc(u8, field.len);
-        var w: usize = 0;
-        var i: usize = 0;
-        while (i < field.len) {
-            if (field[i] == '"' and i + 1 < field.len and field[i + 1] == '"') {
-                out[w] = '"';
-                w += 1;
-                i += 2;
-            } else {
-                out[w] = field[i];
-                w += 1;
-                i += 1;
-            }
-        }
-        return out[0..w];
-    }
-
     /// Find the absolute buffer index of the '\n' that ends the current CSV record,
     /// skipping '\n' characters that appear inside quoted fields.
     /// Returns null when no record-ending newline exists before `buffer_len`.
@@ -216,7 +195,7 @@ pub const BulkCsvReader = struct {
         const count = try simd.parseCSVFieldsStatic(line, &self.field_buf, self.delimiter);
         for (self.field_buf[0..count]) |*field| {
             if (std.mem.indexOf(u8, field.*, "\"\"") != null) {
-                field.* = try self.unescapeQuotes(field.*);
+                field.* = try simd.unescapeQuotes(self.unescape_arena.allocator(), field.*);
             }
         }
         return self.field_buf[0..count];

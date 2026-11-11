@@ -129,4 +129,3 @@ On a 10 GB file csv-parse loads the entire dataset into memory before a single r
 Full runnable example: `node --experimental-sqlite nodejs/example_etl.js`
 
 **Benchmarks:** `node --expose-gc nodejs/bench.js` — comparison against `csv-parse` and `papaparse` on 1M rows.
-**Feature comparison:** `node nodejs/compare.js` — side-by-side code and output for 10 common tasks.

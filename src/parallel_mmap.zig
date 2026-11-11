@@ -8,36 +8,6 @@ const fast_sort = @import("fast_sort.zig");
 const options_mod = @import("options.zig");
 const Allocator = std.mem.Allocator;
 
-/// Collapse `""` escape pairs to `"` within an already quote-stripped field.
-/// Only called when the field is known to contain `""` — see issue #89.
-/// simd.parseCSVFieldsStatic (the zero-copy variant used in this file) does
-/// not unescape; simd.parseCSVFields (the allocating variant) already does.
-fn unescapeQuotesArena(arena: *std.heap.ArenaAllocator, field: []const u8) ![]const u8 {
-    return unescapeQuotesAlloc(arena.allocator(), field);
-}
-
-/// Same collapse as unescapeQuotesArena, but takes a plain Allocator so
-/// callers can choose a persistent allocator (a value that must outlive
-/// this row, e.g. an ORDER BY sort key stored for later) instead of a
-/// per-row arena that would leave it dangling after the next reset (#107).
-fn unescapeQuotesAlloc(alloc: Allocator, field: []const u8) ![]const u8 {
-    const out = try alloc.alloc(u8, field.len);
-    var w: usize = 0;
-    var i: usize = 0;
-    while (i < field.len) {
-        if (field[i] == '"' and i + 1 < field.len and field[i + 1] == '"') {
-            out[w] = '"';
-            w += 1;
-            i += 2;
-        } else {
-            out[w] = field[i];
-            w += 1;
-            i += 1;
-        }
-    }
-    return out[0..w];
-}
-
 const WorkChunk = struct {
     start: usize,
     end: usize,
@@ -390,7 +360,7 @@ pub fn executeParallelMapped(
             _ = unescape_arena.reset(.retain_capacity);
             for (field_buf[0..field_count]) |*f| {
                 if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
-                    f.* = unescapeQuotesArena(&unescape_arena, f.*) catch f.*;
+                    f.* = simd.unescapeQuotes(unescape_arena.allocator(), f.*) catch f.*;
                 }
             }
 
@@ -612,7 +582,7 @@ fn processSortChunk(ctx: *SortWorkerContext) !void {
                 eval_buf = eval_storage[0..field_count];
                 for (eval_buf) |*f| {
                     if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
-                        f.* = unescapeQuotesAlloc(unescape_arena.allocator(), f.*) catch f.*;
+                        f.* = simd.unescapeQuotes(unescape_arena.allocator(), f.*) catch f.*;
                     }
                 }
             }
@@ -676,7 +646,7 @@ fn processSortChunk(ctx: *SortWorkerContext) !void {
             // ctx.result and must outlive this iteration (issue #107).
             const raw_sort_key = if (order_col < field_count) field_buf[order_col] else "";
             const sort_key = if (std.mem.indexOf(u8, raw_sort_key, "\"\"") != null)
-                unescapeQuotesAlloc(ctx.allocator, raw_sort_key) catch raw_sort_key
+                simd.unescapeQuotes(ctx.allocator, raw_sort_key) catch raw_sort_key
             else
                 raw_sort_key;
             const numeric_key = std.fmt.parseFloat(f64, sort_key) catch std.math.nan(f64);

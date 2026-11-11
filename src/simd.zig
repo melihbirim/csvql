@@ -221,6 +221,27 @@ pub fn scanRecordFused(data: []const u8, start: usize, delimiter: u8, positions:
     return .{ .end = null, .comma_count = comma_count, .had_quote = saw_quote };
 }
 
+/// Collapse `""` escape pairs to `"` within an already quote-stripped field.
+/// Always allocates; the caller picks the allocator by how long the value
+/// must live (per-row arena, or a persistent one for stored sort keys, #107).
+pub fn unescapeQuotes(alloc: std.mem.Allocator, field: []const u8) ![]const u8 {
+    const out = try alloc.alloc(u8, field.len);
+    var w: usize = 0;
+    var i: usize = 0;
+    while (i < field.len) {
+        if (field[i] == '"' and i + 1 < field.len and field[i + 1] == '"') {
+            out[w] = '"';
+            w += 1;
+            i += 2;
+        } else {
+            out[w] = field[i];
+            w += 1;
+            i += 1;
+        }
+    }
+    return out[0..w];
+}
+
 /// Quote-aware CSV field splitter into a caller-supplied static buffer.
 /// Returns the number of fields written.  All returned slices are zero-copy pointers into `line`.
 /// For quoted fields the surrounding `"` characters are stripped; `""` escape sequences are

@@ -422,6 +422,21 @@ fn isIdentByte(c: u8) bool {
     return std.ascii.isAlphanumeric(c) or c == '_';
 }
 
+/// True when header `name` is a denied column or contains one as a whole word.
+fn nameHoldsDenied(name: []const u8, deny: []const []const u8) bool {
+    for (deny) |d| {
+        if (d.len == 0 or d.len > name.len) continue;
+        var i: usize = 0;
+        while (i + d.len <= name.len) : (i += 1) {
+            if (!std.ascii.eqlIgnoreCase(name[i .. i + d.len], d)) continue;
+            const before_ok = i == 0 or !isIdentByte(name[i - 1]);
+            const after_ok = i + d.len == name.len or !isIdentByte(name[i + d.len]);
+            if (before_ok and after_ok) return true;
+        }
+    }
+    return false;
+}
+
 /// The header names of `path` minus the denied ones, for SELECT * under
 /// --deny-columns, written the way the parser writes a quoted identifier.
 /// A name with quotes or tabs cannot be referenced, so such a file has to
@@ -444,7 +459,10 @@ fn allowedColumns(allocator: Allocator, path: []const u8, opts: options_mod.Opti
     outer: for (hdr.names) |raw| {
         var name = std.mem.trim(u8, raw, " \t\r");
         if (name.len >= 2 and name[0] == '"' and name[name.len - 1] == '"') name = name[1 .. name.len - 1];
-        for (opts.deny_columns) |d| if (std.ascii.eqlIgnoreCase(name, d)) continue :outer;
+        // A header that holds a denied name as a whole word is left out too:
+        // "id;ssn" (a file read with the wrong delimiter), "\u{A0}ssn" (a
+        // non-breaking space from a spreadsheet export), "employee ssn".
+        if (nameHoldsDenied(name, opts.deny_columns)) continue :outer;
         if (std.mem.indexOfAny(u8, name, "\t\"'") != null) return error.DeniedColumnSelectStar;
         const ref = try allocator.dupe(u8, name);
         std.mem.replaceScalar(u8, ref, ' ', parser.ident_space);
@@ -645,6 +663,9 @@ pub fn execute(allocator: Allocator, parsed: parser.Query, output_file: std.fs.F
         allocator.free(cols);
     };
     if (opts.deny_columns.len > 0) {
+        // Without a header row the columns are c1..cN and the names in the
+        // deny list match nothing, so every column would be readable.
+        if (opts.no_input_header) return error.DeniedColumn;
         // Simple mode has no SQL text to check, so it is refused outright.
         if (query.sql.len == 0 or deniedColumnIn(query.sql, opts.deny_columns) != null) return error.DeniedColumn;
         if (query.all_columns) {
@@ -1401,7 +1422,7 @@ fn scalarProcessChunk(ctx: *ScalarWorkerCtx) !void {
         const fields = field_buf[0..n_fields];
         for (fields) |*f| {
             if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
-                f.* = unescapeQuotesArenaAlloc(row_arena.allocator(), f.*) catch f.*;
+                f.* = simd.unescapeQuotes(row_arena.allocator(), f.*) catch f.*;
             }
         }
         scalarProcessRecord(ctx, &row_arena, fields) catch break :flush;
@@ -1846,7 +1867,7 @@ fn joinWorkerRun(w: *JoinWorkerCtx) !void {
         _ = unescape_arena.reset(.retain_capacity);
         for (field_buf[0..rec.len]) |*f| {
             if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
-                f.* = unescapeQuotesArenaAlloc(unescape_arena.allocator(), f.*) catch f.*;
+                f.* = simd.unescapeQuotes(unescape_arena.allocator(), f.*) catch f.*;
             }
         }
         for (0..w.base_w) |ci| merged[ci] = if (ci < rec.len) rec[ci] else "";
@@ -1967,8 +1988,7 @@ fn executeJoinThenAggregate(
             defer file_map.unmap(data);
             const hinfo = try csv.resolveMmapHeader(aa, data, opts);
             for (hinfo.names) |name| {
-                const lower = try aa.alloc(u8, name.len);
-                _ = std.ascii.lowerString(lower, name);
+                const lower = try std.ascii.allocLowerString(aa, name);
                 if (seen_names.contains(lower)) {
                     try dup_names.put(lower, {});
                 } else {
@@ -2275,8 +2295,7 @@ fn executeJoinImpl(
     } else {
         for (query.columns) |col_raw| {
             const col = blk: {
-                const tmp = try aa.alloc(u8, col_raw.len);
-                _ = std.ascii.lowerString(tmp, col_raw);
+                const tmp = try std.ascii.allocLowerString(aa, col_raw);
                 break :blk tmp;
             };
             if (std.mem.indexOfScalar(u8, col, '.') == null) {
@@ -3135,25 +3154,7 @@ inline fn unquoteField(arena: Allocator, f: []const u8) []const u8 {
     var v = f;
     if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') v = v[1 .. v.len - 1];
     if (std.mem.indexOf(u8, v, "\"\"") == null) return v;
-    return unescapeQuotesArenaAlloc(arena, v) catch v;
-}
-
-fn unescapeQuotesArenaAlloc(alloc: Allocator, field: []const u8) ![]const u8 {
-    const out = try alloc.alloc(u8, field.len);
-    var w: usize = 0;
-    var i: usize = 0;
-    while (i < field.len) {
-        if (field[i] == '"' and i + 1 < field.len and field[i + 1] == '"') {
-            out[w] = '"';
-            w += 1;
-            i += 2;
-        } else {
-            out[w] = field[i];
-            w += 1;
-            i += 1;
-        }
-    }
-    return out[0..w];
+    return simd.unescapeQuotes(arena, v) catch v;
 }
 
 inline fn parseNumericFast(s: []const u8) !f64 {
@@ -4949,7 +4950,7 @@ fn gbProcessRecord(
     _ = unescape_arena.reset(.retain_capacity);
     for (field_stk[0..record.len]) |*f| {
         if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
-            f.* = unescapeQuotesArenaAlloc(unescape_arena.allocator(), f.*) catch f.*;
+            f.* = simd.unescapeQuotes(unescape_arena.allocator(), f.*) catch f.*;
         }
     }
     try gbProcessRecordCore(ctx, aa, key_buf, record);
@@ -5869,7 +5870,7 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
                 _ = unescape_arena.reset(.retain_capacity);
                 for (field_stk[0..record.len]) |*f| {
                     if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
-                        f.* = unescapeQuotesArenaAlloc(unescape_arena.allocator(), f.*) catch f.*;
+                        f.* = simd.unescapeQuotes(unescape_arena.allocator(), f.*) catch f.*;
                     }
                 }
             }
@@ -6025,7 +6026,7 @@ fn scalarAggWorkerScan(ctx: *ScalarAggWorkerCtx) !void {
             _ = unescape_arena.reset(.retain_capacity);
             for (field_stk[0..record.len]) |*f| {
                 if (std.mem.indexOf(u8, f.*, "\"\"") != null) {
-                    f.* = unescapeQuotesArenaAlloc(unescape_arena.allocator(), f.*) catch f.*;
+                    f.* = simd.unescapeQuotes(unescape_arena.allocator(), f.*) catch f.*;
                 }
             }
             if (ctx.where_expr) |expr| {
@@ -7123,8 +7124,7 @@ fn executeGroupBy(
             var having_map = std.StringHashMap([]const u8).init(ha);
             // Map alias names (from out_header_list)
             for (out_header_list.items, 0..) |hdr, hi| {
-                const lower_hdr = try ha.alloc(u8, hdr.len);
-                _ = std.ascii.lowerString(lower_hdr, hdr);
+                const lower_hdr = try std.ascii.allocLowerString(ha, hdr);
                 try having_map.put(lower_hdr, output_row[hi]);
             }
             // Also map original column expressions (pre-alias) so that
@@ -7132,8 +7132,7 @@ fn executeGroupBy(
             for (query.columns, 0..) |col, hi| {
                 if (hi >= output_row.len) break;
                 const sa = splitAlias(col);
-                const expr_lower = try ha.alloc(u8, sa.expr.len);
-                _ = std.ascii.lowerString(expr_lower, sa.expr);
+                const expr_lower = try std.ascii.allocLowerString(ha, sa.expr);
                 if (!having_map.contains(expr_lower)) {
                     try having_map.put(expr_lower, output_row[hi]);
                 }
@@ -7661,6 +7660,30 @@ test "LEFT JOIN keeps unmatched left rows with empty right columns" {
     const out = try out_file.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(out);
     try std.testing.expectEqualStrings("name,dname\nann,eng\nbob,\n", out);
+}
+
+test "nameHoldsDenied: exact, whole word inside a longer header, not a substring" {
+    const deny = [_][]const u8{ "ssn", "Total Sales" };
+    for ([_][]const u8{ "ssn", "SSN", "id;ssn", "id;ssn;dept", "\xc2\xa0ssn", "employee ssn", "ssn\ttag", "total sales" }) |h|
+        try std.testing.expect(nameHoldsDenied(h, &deny));
+    for ([_][]const u8{ "ssn_hash", "hasssn", "ssn2", "id", "", "total" }) |h|
+        try std.testing.expect(!nameHoldsDenied(h, &deny));
+}
+
+test "deny-columns: SELECT * hides a denied name inside a misparsed header, and refuses header-less input" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const deny = options_mod.Options{ .deny_columns = &.{"ssn"} };
+    // Semicolon file read as comma CSV: the only column is "id;ssn".
+    try std.testing.expectError(error.DeniedColumn, runQueryForTestOpts(allocator, &tmp, "id;ssn\n1;111-11-1111\n", "SELECT * FROM '{s}'", deny));
+    // Non-breaking space in front of the name.
+    const out = try runQueryForTestOpts(allocator, &tmp, "id,\xc2\xa0ssn\n1,111-11-1111\n", "SELECT * FROM '{s}'", deny);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("id\n1\n", out);
+    var no_hdr = deny;
+    no_hdr.no_input_header = true;
+    try std.testing.expectError(error.DeniedColumn, runQueryForTestOpts(allocator, &tmp, "id,ssn\n1,111-11-1111\n", "SELECT c2 FROM '{s}'", no_hdr));
 }
 
 test "ensurePathAllowed confines file access to --root trees" {

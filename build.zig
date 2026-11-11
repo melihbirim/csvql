@@ -157,34 +157,25 @@ pub fn build(b: *std.Build) void {
     const parser_bench_step = b.step("bench-parser", "Run WHERE-expression parser benchmark");
     parser_bench_step.dependOn(&parser_bench_run.step);
 
-    // Example executables for library users
-    const csv_example = b.addExecutable(.{
-        .name = "csv_reader_example",
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .root_source_file = b.path("examples/csv_reader_example.zig"),
-        }),
-    });
-    csv_example.linkLibC();
-
-    // Add src/ as a module so examples can import from it
+    // Example executables for library users: `zig build examples`.
+    // Not part of the default install, so a plain `zig build` stays lean.
+    const examples_step = b.step("examples", "Build the library examples into zig-out/bin");
     const csv_module = b.addModule("csv", .{
         .root_source_file = b.path("src/csv.zig"),
     });
-    csv_example.root_module.addImport("csv", csv_module);
-    b.installArtifact(csv_example);
-
-    const mmap_example = b.addExecutable(.{
-        .name = "mmap_csv_example",
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .root_source_file = b.path("examples/mmap_csv_example.zig"),
-        }),
-    });
-    mmap_example.linkLibC();
-    b.installArtifact(mmap_example);
+    for ([_][]const u8{ "csv_reader_example", "mmap_csv_example" }) |name| {
+        const example = b.addExecutable(.{
+            .name = name,
+            .root_module = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+                .root_source_file = b.path(b.fmt("examples/{s}.zig", .{name})),
+            }),
+        });
+        example.linkLibC();
+        example.root_module.addImport("csv", csv_module);
+        examples_step.dependOn(&b.addInstallArtifact(example, .{}).step);
+    }
 
     // Node.js N-API addon — zig build node -Doptimize=ReleaseFast
     // Output: zig-out/lib/csvql.node  (loaded by nodejs/index.js)
@@ -312,41 +303,6 @@ pub fn build(b: *std.Build) void {
     const run_csv_tests = b.addRunArtifact(csv_tests);
     test_step.dependOn(&run_csv_tests.step);
 
-    // Fast sort tests (internal module tests)
-    const fast_sort_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .root_source_file = b.path("src/fast_sort.zig"),
-        }),
-    });
-    fast_sort_tests.linkLibC();
-    const run_fast_sort_tests = b.addRunArtifact(fast_sort_tests);
-    test_step.dependOn(&run_fast_sort_tests.step);
-
-    // Engine tests (GROUP BY, aggregation integration)
-    const engine_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .root_source_file = b.path("src/engine.zig"),
-        }),
-    });
-    engine_tests.linkLibC();
-    const run_engine_tests = b.addRunArtifact(engine_tests);
-    test_step.dependOn(&run_engine_tests.step);
-
-    // Options tests (thread count configuration)
-    const options_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .root_source_file = b.path("src/options.zig"),
-        }),
-    });
-    const run_options_tests = b.addRunArtifact(options_tests);
-    test_step.dependOn(&run_options_tests.step);
-
     // Main tests (exit code classification for --strict / query errors)
     const main_test_mod = b.createModule(.{
         .target = target,
@@ -359,133 +315,31 @@ pub fn build(b: *std.Build) void {
     const run_main_tests = b.addRunArtifact(main_tests);
     test_step.dependOn(&run_main_tests.step);
 
-    // MCP tests (token guardrails: default row cap)
-    const mcp_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .root_source_file = b.path("src/mcp.zig"),
-        }),
-    });
-    mcp_tests.linkLibC();
-    const run_mcp_tests = b.addRunArtifact(mcp_tests);
-    test_step.dependOn(&run_mcp_tests.step);
-
-    // Install tests (Claude Desktop config merge preserves other keys)
-    const install_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .root_source_file = b.path("src/install.zig"),
-        }),
-    });
-    install_tests.linkLibC();
-    const run_install_tests = b.addRunArtifact(install_tests);
-    test_step.dependOn(&run_install_tests.step);
-
-    // Audit-log tests
-    const audit_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .root_source_file = b.path("src/audit.zig"),
-        }),
-    });
-    audit_tests.linkLibC();
-    const run_audit_tests = b.addRunArtifact(audit_tests);
-    test_step.dependOn(&run_audit_tests.step);
-
-    // Scalar tests (COALESCE multi-arg, etc.)
-    const scalar_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .root_source_file = b.path("src/scalar.zig"),
-        }),
-    });
-    scalar_tests.linkLibC();
-    const run_scalar_tests = b.addRunArtifact(scalar_tests);
-    test_step.dependOn(&run_scalar_tests.step);
-
-    // Arithmetic expression tests (price * qty, SUM(price * qty))
-    const arith_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .root_source_file = b.path("src/arith.zig"),
-        }),
-    });
-    const run_arith_tests = b.addRunArtifact(arith_tests);
-    test_step.dependOn(&run_arith_tests.step);
-
-    // .xlsx reader tests (zip, shared strings, date serials)
-    const xlsx_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .root_source_file = b.path("src/xlsx.zig"),
-        }),
-    });
-    const run_xlsx_tests = b.addRunArtifact(xlsx_tests);
-    test_step.dependOn(&run_xlsx_tests.step);
-
-    // BulkCsvReader tests (TooManyColumns, etc.)
-    const bulk_csv_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .root_source_file = b.path("src/bulk_csv.zig"),
-        }),
-    });
-    bulk_csv_tests.linkLibC();
-    const run_bulk_csv_tests = b.addRunArtifact(bulk_csv_tests);
-    test_step.dependOn(&run_bulk_csv_tests.step);
-
-    // Mmap engine tests (DISTINCT, ORDER BY, scan paths)
-    const mmap_engine_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .root_source_file = b.path("src/mmap_engine.zig"),
-        }),
-    });
-    mmap_engine_tests.linkLibC();
-    const run_mmap_engine_tests = b.addRunArtifact(mmap_engine_tests);
-    test_step.dependOn(&run_mmap_engine_tests.step);
-
-    // Simd utility tests (parseIntFast, stringsEqualFast, parseCSVFields)
-    const simd_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .root_source_file = b.path("src/simd.zig"),
-        }),
-    });
-    simd_tests.linkLibC();
-    const run_simd_tests = b.addRunArtifact(simd_tests);
-    test_step.dependOn(&run_simd_tests.step);
-
-    // ArenaBuffer tests (grow/realloc, JSON escaping)
-    const arena_buffer_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .root_source_file = b.path("src/arena_buffer.zig"),
-        }),
-    });
-    arena_buffer_tests.linkLibC();
-    const run_arena_buffer_tests = b.addRunArtifact(arena_buffer_tests);
-    test_step.dependOn(&run_arena_buffer_tests.step);
-
-    // file_map tests (mmap on POSIX, MapViewOfFile on Windows)
-    const file_map_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-            .root_source_file = b.path("src/file_map.zig"),
-        }),
-    });
-    file_map_tests.linkLibC();
-    const run_file_map_tests = b.addRunArtifact(file_map_tests);
-    test_step.dependOn(&run_file_map_tests.step);
+    // Single-file test roots: each file's own `test` blocks, no extra imports.
+    for ([_][]const u8{
+        "fast_sort", // internal module tests
+        "engine", // GROUP BY, aggregation integration
+        "options", // thread count configuration
+        "mcp", // token guardrails: default row cap
+        "install", // Claude Desktop config merge preserves other keys
+        "audit", // audit log
+        "scalar", // COALESCE multi-arg, etc.
+        "arith", // price * qty, SUM(price * qty)
+        "xlsx", // zip, shared strings, date serials
+        "bulk_csv", // TooManyColumns, etc.
+        "mmap_engine", // DISTINCT, ORDER BY, scan paths
+        "simd", // parseIntFast, stringsEqualFast, parseCSVFields
+        "arena_buffer", // grow/realloc, JSON escaping
+        "file_map", // mmap on POSIX, MapViewOfFile on Windows
+    }) |name| {
+        const t = b.addTest(.{
+            .root_module = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+                .root_source_file = b.path(b.fmt("src/{s}.zig", .{name})),
+            }),
+        });
+        t.linkLibC();
+        test_step.dependOn(&b.addRunArtifact(t).step);
+    }
 }

@@ -72,8 +72,7 @@ fn parseColumns(allocator: Allocator, input: []const u8) ![][]u8 {
         const trimmed = std.mem.trim(u8, part, &std.ascii.whitespace);
         if (trimmed.len > 0) {
             // Lowercase the column name for case-insensitive matching
-            const col_lower = try allocator.alloc(u8, trimmed.len);
-            _ = std.ascii.lowerString(col_lower, trimmed);
+            const col_lower = try std.ascii.allocLowerString(allocator, trimmed);
             try columns.append(allocator, col_lower);
         }
     }
@@ -125,8 +124,7 @@ fn parseComparison(allocator: Allocator, input: []const u8) (Allocator.Error || 
             }
 
             // Lowercase the column name for case-insensitive matching
-            const column_lower = try allocator.alloc(u8, column_part.len);
-            _ = std.ascii.lowerString(column_lower, column_part);
+            const column_lower = try std.ascii.allocLowerString(allocator, column_part);
 
             const value_copy = try allocator.dupe(u8, value_part);
 
@@ -152,8 +150,7 @@ fn parseOrderBy(allocator: Allocator, input: []const u8) !parser.OrderBy {
         const order_part = input[colon_pos + 1 ..];
 
         // Lowercase the column name
-        const column_lower = try allocator.alloc(u8, column_part.len);
-        _ = std.ascii.lowerString(column_lower, column_part);
+        const column_lower = try std.ascii.allocLowerString(allocator, column_part);
 
         const order = if (std.mem.eql(u8, order_part, "desc"))
             parser.SortOrder.desc
@@ -167,8 +164,7 @@ fn parseOrderBy(allocator: Allocator, input: []const u8) !parser.OrderBy {
         };
     } else {
         // No colon, default to ascending
-        const column_lower = try allocator.alloc(u8, input.len);
-        _ = std.ascii.lowerString(column_lower, input);
+        const column_lower = try std.ascii.allocLowerString(allocator, input);
 
         return parser.OrderBy{
             .column = column_lower,

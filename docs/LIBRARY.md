@@ -104,7 +104,7 @@ Check out complete examples in the `examples/` directory:
 Build and run:
 
 ```bash
-zig build -Doptimize=ReleaseFast
+zig build examples -Doptimize=ReleaseFast
 ./zig-out/bin/csv_reader_example data.csv
 ```
 
