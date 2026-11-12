@@ -71,11 +71,18 @@ npm run build && node dist/cli.js ~/data
 
 Claude Desktop starts MCP servers in `/`, not in your project folder. csvql refuses to start there without `--root`, and `csvql install` writes the `--root` for you. duckdb-mcp defaults to the current directory when `--dir` is unset; check what that resolves to under Desktop.
 
+## Polars Nanook
+
+Since 5 November 2026 there is a non-DuckDB option on the platform side. Polars renamed Polars Cloud to Polars Nanook, a managed compute platform that ships an MCP server alongside query profiling on every plan, including the free one. Polars plans to unify writing queries, starting compute and finding data behind it.
+
+It needs an account and a cluster, and on AWS its compute takes about 45 seconds to boot. Its pricing page does not say whether that MCP is read only, confined to certain data, or can hide columns. Full comparison: [csvql vs Polars Nanook](csvql-vs-polars-nanook.html).
+
 ## When to pick which
 
 - **Pick csvql** when the data is CSV or Excel exports, the agent is not fully trusted, and you want the sandbox, the output cap and the column deny list without configuring anything. Also when the server runs on a small machine.
 - **Pick duckdb-mcp** when you need Parquet, JSON, window functions or profiling tools, and you are comfortable that read-only is enforced by a statement gate in front of a writable engine.
 - **Pick duckcoop** when you already run Node and want DuckDB SQL with a sandbox root, and you have read its ADRs for the security model, since the README leaves most of the above unstated.
+- **Pick Polars Nanook** when your team already runs Polars and wants the agent on the same managed platform, with an account and compute to provision.
 - **Do not give the agent the DuckDB CLI through a shell** unless you have set `enable_external_access=false` and read-only mode yourself. By default it can write files and fetch URLs.
 
 Check the csvql column yourself: every claim is in the [README](https://github.com/melihbirim/csvql#what-an-agent-can-do-out-of-the-box) with the command that demonstrates it. The DuckDB CLI defaults: `duckdb -c "SELECT current_setting('enable_external_access')"`.
