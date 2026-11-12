@@ -1,11 +1,13 @@
 ---
 layout: post
 title: "How to Let Claude Desktop Query a CSV File With SQL Without Reading the Whole File"
-description: "Three commands to give Claude Desktop a read-only SQL tool over one folder of CSV and Excel files. What the config looks like, why --root is required, what the agent can and cannot do, and how to check it worked."
+description: "When a CSV is too big to upload to Claude, or Claude cannot read the file, give Claude Desktop a read-only SQL tool over the folder instead. Three commands. What the config looks like, why --root is required, what the agent can and cannot do, and how to check it worked."
 date: 2026-11-08
 ---
 
-Claude Desktop cannot read a large CSV: a 1 MB file is already several times a 200K token context. What it can do is call a tool that runs SQL on the file and returns a few rows. This page sets that up with csvql (published as `csvql-query` on npm and PyPI), a single read-only binary that ships as an MCP server.
+Claude Desktop cannot read a large CSV: a 1 MB file is already several times a 200K token context. What it can do is call a tool that runs SQL on the file and returns a few rows. Uploading the file has the same problem: a large CSV attached to a chat can be refused or only partly read, and an answer built from part of a file looks just as confident as one built from all of it.
+
+This page sets that up with csvql (published as `csvql-query` on npm and PyPI), a single read-only binary that ships as an MCP server.
 
 ## 1. Install
 
@@ -67,6 +69,15 @@ Columns the agent must never see, such as `email` or `national_id`, go in `--den
 ```
 
 Any query that reads those columns is refused, and `SELECT *` leaves them out. Details: [Hide PII columns from an AI agent](hide-pii-columns-from-an-ai-agent.html).
+
+## Why not upload the CSV to Claude instead
+
+Uploading works for small files you want Claude to read end to end. For anything bigger, the MCP tool is the better fit:
+
+- **No size limit from the context window.** The file stays on disk. Claude sends SQL and gets back the result rows, so a 3 GB CSV costs about the same tokens as a 10 row one.
+- **Exact answers.** `SUM` and `COUNT` run over every row, not over the part of the file that fit.
+- **The file never leaves your machine.** Only query results go into the conversation, and `--deny-columns` keeps chosen columns out of those too.
+- **Same folder, every chat.** No re-uploading after the data changes.
 
 ## Check it worked
 
