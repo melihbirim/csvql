@@ -342,7 +342,7 @@ pub fn main() !void {
         defer allocator.free(query_text);
 
         break :blk parser.parse(allocator, query_text) catch |err| {
-            std.debug.print("SQL parse error: {}\n", .{err});
+            printQueryError(err);
             std.debug.print("\nRun 'csvql --help' for usage information.\n", .{});
             auditCli(allocator, audit_path, clean_args.items[1..], @errorName(err));
             std.process.exit(2); // the query is wrong, not csvql
@@ -356,7 +356,7 @@ pub fn main() !void {
     // not inside execute(), since execute() only ever sees a by-value copy;
     // see engine.zig's resolveInSubqueries for why that distinction matters.
     engine.resolveQuery(allocator, &query, opts) catch |err| {
-        std.debug.print("execution error: {}\n", .{err});
+        printQueryError(err);
         auditCli(allocator, audit_path, clean_args.items[1..], @errorName(err));
         std.process.exit(exitCodeForError(err));
     };
@@ -394,7 +394,7 @@ pub fn main() !void {
         } else stdout_file;
         defer if (output_path != null) md_out.close();
         renderTableOutput(allocator, query, md_out, opts) catch |err| {
-            std.debug.print("execution error: {}\n", .{err});
+            printQueryError(err);
             auditCli(allocator, audit_path, clean_args.items[1..], @errorName(err));
             std.process.exit(exitCodeForError(err));
         };
@@ -406,19 +406,19 @@ pub fn main() !void {
         };
         defer out.close();
         engine.execute(allocator, query, out, opts) catch |err| {
-            std.debug.print("execution error: {}\n", .{err});
+            printQueryError(err);
             auditCli(allocator, audit_path, clean_args.items[1..], @errorName(err));
             std.process.exit(exitCodeForError(err));
         };
     } else if (use_table) {
         renderTableOutput(allocator, query, stdout_file, opts) catch |err| {
-            std.debug.print("execution error: {}\n", .{err});
+            printQueryError(err);
             auditCli(allocator, audit_path, clean_args.items[1..], @errorName(err));
             std.process.exit(exitCodeForError(err));
         };
     } else {
         engine.execute(allocator, query, stdout_file, opts) catch |err| {
-            std.debug.print("execution error: {}\n", .{err});
+            printQueryError(err);
             auditCli(allocator, audit_path, clean_args.items[1..], @errorName(err));
             std.process.exit(exitCodeForError(err));
         };
@@ -426,6 +426,17 @@ pub fn main() !void {
 
     // Audit the query after it ran (best-effort). Descriptor = the query text/args.
     auditCli(allocator, audit_path, clean_args.items[1..], null);
+}
+
+/// Print a query error as a sentence plus the error name, with a hint when
+/// the column names would fix it (#302). Exit codes are unchanged.
+fn printQueryError(err: anyerror) void {
+    if (engine.describeError(err)) |msg| {
+        std.debug.print("error: {s} ({s})\n", .{ msg, @errorName(err) });
+    } else {
+        std.debug.print("execution error: {}\n", .{err});
+    }
+    if (engine.wantsColumnHint(err)) std.debug.print("hint: csvql --schema <file> lists the columns\n", .{});
 }
 
 /// Append one audit record for this CLI run. `err_name` is set when the query

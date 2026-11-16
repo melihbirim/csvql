@@ -3150,6 +3150,65 @@ fn columnLookupError(expr: []const u8) anyerror {
 /// quoted, because it excludes delimiters found inside a quoted field. So a
 /// quoted row needs the same split as an unquoted one plus this per field, not
 /// a second full parse of the record.
+/// One plain sentence per error a query can hit, for the CLI and MCP (#302).
+/// Unknown errors return null and keep their bare name.
+pub fn describeError(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.ColumnNotFound => "column not found",
+        error.OrderByColumnNotFound => "ORDER BY column not found",
+        error.JoinColumnNotFound => "JOIN ON column not found",
+        error.AmbiguousColumnReference => "column name is ambiguous across joined files; qualify it as table.column",
+        error.DeniedColumn => "query reads a column that is denied by --deny-columns",
+        error.DeniedColumnSelectStar => "SELECT * cannot run here because a denied column is involved; name the columns instead",
+        error.PathOutsideAllowedRoot => "file is outside the allowed --root, or does not exist",
+        error.NotARegularFile => "path is not a regular file",
+        error.IsDir => "path is a directory, not a file",
+        error.EmptyFile => "file is empty",
+        error.NoHeader => "file has no header row",
+        error.TooManyColumns => "row has more columns than csvql supports",
+        error.InvalidQuery, error.InvalidExpression => "query could not be parsed",
+        error.InvalidOperator => "unknown comparison operator",
+        error.InvalidJoinSyntax => "JOIN syntax not understood; use JOIN 'file' ON a.col = b.col",
+        error.UnterminatedQuotedValue => "quoted value is not closed",
+        error.UnexpectedTextAfterTable => "unexpected text after the FROM table",
+        error.UnsupportedJoinType => "RIGHT, FULL and CROSS JOIN are not supported; use JOIN or LEFT JOIN",
+        error.UnsupportedSetOperation => "UNION, INTERSECT and EXCEPT are not supported",
+        error.SubqueriesNotSupported => "this kind of subquery is not supported; only col IN (SELECT ...) is",
+        error.SubqueryMustSelectOneColumn => "IN (SELECT ...) subquery must select exactly one column",
+        error.InvalidSubquery => "subquery could not be parsed",
+        error.MixedAggregateAndNonAggregateSelect => "SELECT mixes aggregates and plain columns; add the plain columns to GROUP BY",
+        error.NestedFunctionNotSupported => "this function cannot be nested here",
+        error.UnsupportedCaseExpression => "this CASE expression is not supported",
+        error.UnsupportedHavingComparesTwoAggregates => "HAVING cannot compare two aggregates with each other",
+        error.ArithmeticExpressionsNotSupported => "arithmetic is not supported in this position",
+        error.NegativeLimitNotAllowed => "LIMIT cannot be negative",
+        error.NegativeOffsetNotAllowed => "OFFSET cannot be negative",
+        error.StrictModeNonNumericValue => "--strict: a non-numeric value was compared as a number",
+        error.ReadOnly => "csvql is read only; only SELECT is supported",
+        error.XlsxNotAZip, error.XlsxBadZip, error.XlsxZip => "file is not a valid .xlsx workbook",
+        error.XlsxUnsupportedCompression => ".xlsx uses a compression method csvql cannot read",
+        error.XlsxTooLarge => ".xlsx sheet is too large to load",
+        error.XlsxNoSheets, error.XlsxMissingSheet => ".xlsx workbook has no readable sheet",
+        error.XlsxBadSharedString => ".xlsx shared strings table is damaged",
+        else => null,
+    };
+}
+
+/// True for errors where knowing the column names is the fix.
+pub fn wantsColumnHint(err: anyerror) bool {
+    return switch (err) {
+        error.ColumnNotFound, error.OrderByColumnNotFound, error.JoinColumnNotFound, error.AmbiguousColumnReference => true,
+        else => false,
+    };
+}
+
+test "describeError covers lookup errors and leaves unknown ones alone" {
+    try std.testing.expectEqualStrings("column not found", describeError(error.ColumnNotFound).?);
+    try std.testing.expect(wantsColumnHint(error.OrderByColumnNotFound));
+    try std.testing.expect(!wantsColumnHint(error.DeniedColumn));
+    try std.testing.expect(describeError(error.OutOfMemory) == null);
+}
+
 inline fn unquoteField(arena: Allocator, f: []const u8) []const u8 {
     var v = f;
     if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') v = v[1 .. v.len - 1];

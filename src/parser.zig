@@ -1850,7 +1850,12 @@ fn parseComparison(allocator: Allocator, input: []const u8, op_str: []const u8, 
         }
     }
     const value_clean = trimQuotes(value_part);
-    const numeric_value = std.fmt.parseFloat(f64, value_clean) catch null;
+    // A single-quoted literal is text for = and != (#301): code = '007' must not
+    // match 7 or 7.0. Range operators keep comparing numbers when both sides
+    // parse, so salary > '50000' still means what it says.
+    // ponytail: equality only; a range over zero-padded codes still compares numerically.
+    const quoted_text = value_part.len >= 2 and value_part[0] == '\'' and (operator == .equal or operator == .not_equal);
+    const numeric_value = if (quoted_text) null else std.fmt.parseFloat(f64, value_clean) catch null;
 
     // FIXED: Normalize column name to lowercase for case-insensitive matching
     const column_lower = try std.ascii.allocLowerString(allocator, column_part);
@@ -2297,6 +2302,19 @@ test "parse simple query" {
     try std.testing.expectEqualStrings("age", query.columns[1]);
     try std.testing.expectEqualStrings("data.csv", query.file_path);
     try std.testing.expectEqual(@as(i32, 10), query.limit);
+}
+
+test "quoted literal compares as text for = and != but stays numeric for ranges (#301)" {
+    const a = std.testing.allocator;
+    var q1 = try parse(a, "SELECT id FROM 'c.csv' WHERE code = '007'");
+    defer q1.deinit();
+    try std.testing.expect(q1.where_expr.?.comparison.numeric_value == null);
+    var q2 = try parse(a, "SELECT id FROM 'c.csv' WHERE code = 7");
+    defer q2.deinit();
+    try std.testing.expect(q2.where_expr.?.comparison.numeric_value != null);
+    var q3 = try parse(a, "SELECT id FROM 'c.csv' WHERE salary > '50000'");
+    defer q3.deinit();
+    try std.testing.expect(q3.where_expr.?.comparison.numeric_value != null);
 }
 
 test "malformed WHERE with trailing content after quoted value errors (#163)" {

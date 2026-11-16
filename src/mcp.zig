@@ -193,7 +193,10 @@ fn toolCsvQuery(
         // Refused or failed queries are audited too: blocked attempts are what
         // a reviewer looks for first (#308).
         if (g_audit) |ap| audit.record(allocator, ap, sql, null, null, @errorName(err));
-        const msg = try std.fmt.allocPrint(allocator, "Query error: {s}", .{@errorName(err)});
+        const msg = if (engine.describeError(err)) |d|
+            try std.fmt.allocPrint(allocator, "Query error: {s} ({s}){s}", .{ d, @errorName(err), if (engine.wantsColumnHint(err)) ". Call csv_schema to see the columns." else "" })
+        else
+            try std.fmt.allocPrint(allocator, "Query error: {s}", .{@errorName(err)});
         defer allocator.free(msg);
         try sendToolError(allocator, id, msg, resp);
         return;

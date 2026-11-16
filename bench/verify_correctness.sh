@@ -1139,6 +1139,19 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+# -- #301: a quoted literal is text for = and !=, so '007' does not match 7
+#    or 7.0. 60k rows so the parallel scan path runs, not just the small one.
+CODES="$TMP/codes.csv"
+awk 'BEGIN{print "id,code"; for(i=1;i<=60000;i++){c=(i%3==0)?"007":((i%3==1)?"7":"7.0"); print i "," c}}' > "$CODES"
+check \
+  "quoted literal = '007' compares as text (#301)" \
+  "SELECT COUNT(*) FROM '$CODES' WHERE code = '007'" \
+  "SELECT COUNT(*) FROM read_csv_auto('$CODES', types={'code':'VARCHAR'}) WHERE code = '007'"
+check \
+  "quoted literal != '007' compares as text (#301)" \
+  "SELECT COUNT(*) FROM '$CODES' WHERE code != '007'" \
+  "SELECT COUNT(*) FROM read_csv_auto('$CODES', types={'code':'VARCHAR'}) WHERE code != '007'"
+
 TOTAL=$((TOTAL + 1))
 RAGGED="$TMP/ragged.csv"
 printf "id,name,age\n1,alice,30\n2,bob\n3,carol,25,extra\n" > "$RAGGED"
