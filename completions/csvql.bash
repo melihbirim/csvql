@@ -42,13 +42,13 @@ _csvql() {
             _csvql_files "$cur"
             return 0
             ;;
-        -d|--delimiter|--threads)
+        -d|--delimiter|--threads|--max-join-rows)
             return 0
             ;;
     esac
 
     if [[ $cur == -* ]]; then
-        COMPREPLY=( $(compgen -W '-h --help -v --version --no-header --no-input-header -o --output -d --delimiter --json --jsonl --table --no-table --markdown --wrap --threads --strict --schema --mcp --root --audit --deny-columns' -- "$cur") )
+        COMPREPLY=( $(compgen -W '-h --help -v --version --no-header --no-input-header -o --output -d --delimiter --json --jsonl --table --no-table --markdown --wrap --threads --strict --schema --mcp --root --audit --deny-columns --max-join-rows' -- "$cur") )
         return 0
     fi
 

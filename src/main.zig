@@ -94,6 +94,8 @@ const help_text =
     \\                          working directory; --root / allows the whole filesystem.
     \\  --deny-columns <a,b>    Refuse any query that reads these columns; SELECT * leaves
     \\                          them out. For personal data an agent must never see.
+    \\  --max-join-rows <N>     Refuse a JOIN that produces more than N rows (0 = no cap).
+    \\                          Default: no cap on the CLI, 10000000 with --mcp
     \\  --audit <file>          Append a JSONL record per query (timestamp, SQL) for compliance
     \\  install                 Register csvql as an MCP server in Claude (Code + Desktop),
     \\                          no manual config. Claude Desktop gets --root set to the
@@ -142,6 +144,7 @@ fn exitCodeForError(err: anyerror) u8 {
         error.DeniedColumn,
         error.DeniedColumnSelectStar,
         error.UnexpectedTextAfterTable,
+        error.JoinRowLimit,
         error.NotARegularFile,
         error.ReadOnly,
         => 2,
@@ -171,6 +174,7 @@ pub fn main() !void {
     var roots_list = std.ArrayList([]const u8){};
     defer roots_list.deinit(allocator);
     var audit_path: ?[]const u8 = null;
+    var max_join_rows: ?u64 = null;
     var deny_list = std.ArrayList([]const u8){};
     defer deny_list.deinit(allocator);
     if (unknownFlag(args[1..])) |bad| {
@@ -199,6 +203,11 @@ pub fn main() !void {
                     try stderr_file.writeAll("error: --deny-columns requires a column list\n");
                     std.process.exit(2);
                 }
+            } else if (flagValue(args, &i, "--max-join-rows")) |v| {
+                max_join_rows = std.fmt.parseInt(u64, v, 10) catch {
+                    try stderr_file.writeAll("error: --max-join-rows requires a whole number (0 = no cap)\n");
+                    std.process.exit(2);
+                };
             } else if (flagValue(args, &i, "--audit")) |v| {
                 if (v.len == 0) {
                     try stderr_file.writeAll("error: --audit requires a file path argument\n");
@@ -231,7 +240,7 @@ pub fn main() !void {
                     "Add --root <folder> to choose what the agent can read, or run 'csvql install' from that folder.\n");
                 std.process.exit(2);
             }
-            try mcp.run(allocator, if (roots.len > 0) roots else &.{"."}, audit_path, deny_columns);
+            try mcp.run(allocator, if (roots.len > 0) roots else &.{"."}, audit_path, deny_columns, max_join_rows orelse mcp.default_max_join_rows);
             return;
         }
         if (std.mem.eql(u8, args[1], "install")) {
@@ -260,7 +269,7 @@ pub fn main() !void {
     }
 
     // Strip --no-header / -d / --delimiter flags; collect remainder for query parsing.
-    var opts = options_mod.Options{ .roots = roots, .audit_path = audit_path, .deny_columns = deny_columns };
+    var opts = options_mod.Options{ .roots = roots, .audit_path = audit_path, .deny_columns = deny_columns, .max_join_rows = max_join_rows orelse 0 };
     var output_path: ?[]const u8 = null;
     var clean_args = try std.ArrayList([]const u8).initCapacity(allocator, args.len);
     defer clean_args.deinit(allocator);
@@ -304,9 +313,9 @@ pub fn main() !void {
                 std.process.exit(1);
             }
             opts.delimiter = parseDelimiter(args[i]);
-        } else if (std.mem.eql(u8, arg, "--root") or std.mem.eql(u8, arg, "--audit") or std.mem.eql(u8, arg, "--deny-columns")) {
+        } else if (std.mem.eql(u8, arg, "--root") or std.mem.eql(u8, arg, "--audit") or std.mem.eql(u8, arg, "--deny-columns") or std.mem.eql(u8, arg, "--max-join-rows")) {
             i += 1; // value already parsed into opts above; skip it here
-        } else if (std.mem.startsWith(u8, arg, "--root=") or std.mem.startsWith(u8, arg, "--audit=") or std.mem.startsWith(u8, arg, "--deny-columns=")) {
+        } else if (std.mem.startsWith(u8, arg, "--root=") or std.mem.startsWith(u8, arg, "--audit=") or std.mem.startsWith(u8, arg, "--deny-columns=") or std.mem.startsWith(u8, arg, "--max-join-rows=")) {
             // parsed above
         } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
             i += 1;
@@ -670,7 +679,7 @@ fn getTerminalWidth() usize {
 /// non-empty count, and empty count.  Also prints a summary header line.
 /// True if `tok` appears anywhere in args[1..].
 /// Flags that consume the next argument as their value.
-const value_flags = [_][]const u8{ "--threads", "-d", "--delimiter", "--root", "--audit", "--deny-columns", "-o", "--output", "--schema", "-schema", "-s" };
+const value_flags = [_][]const u8{ "--threads", "-d", "--delimiter", "--root", "--audit", "--deny-columns", "--max-join-rows", "-o", "--output", "--schema", "-schema", "-s" };
 /// Flags that stand alone.
 const bare_flags = [_][]const u8{ "--no-header", "--json", "--jsonl", "--table", "--wrap", "--no-input-header", "--no-table", "--markdown", "--strict", "--mcp", "--version", "-v", "--help", "-h", "--print" };
 
@@ -691,7 +700,7 @@ fn unknownFlag(args: anytype) ?[]const u8 {
             i += 1;
         } else if (inList(&bare_flags, a) or
             std.mem.startsWith(u8, a, "--root=") or std.mem.startsWith(u8, a, "--audit=") or
-            std.mem.startsWith(u8, a, "--deny-columns=") or std.mem.startsWith(u8, a, "--schema="))
+            std.mem.startsWith(u8, a, "--deny-columns=") or std.mem.startsWith(u8, a, "--max-join-rows=") or std.mem.startsWith(u8, a, "--schema="))
         {
             continue;
         } else if (std.mem.startsWith(u8, a, "--") and std.mem.indexOfAny(u8, a, " \t\r\n") == null) {

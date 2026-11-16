@@ -34,5 +34,6 @@ _arguments -S \
     '--root[confine file access to these directories]:directories:{_dir_list -s ,}' \
     '--audit[append a JSONL record per query]:audit file:_files' \
     '--deny-columns[refuse queries that read these columns]:columns: ' \
+    '--max-join-rows[refuse a JOIN that produces more than N rows]:rows: ' \
     '1:file or subcommand: _alternative "subcommands:subcommand:(install)" "files:file:_files"' \
     '*:file or query:_files'

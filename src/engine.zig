@@ -1720,6 +1720,10 @@ const JoinCtx = struct {
     limit: i32,
     offset: i32,
     allocator: Allocator, // for complex WHERE row_map only
+    /// --max-join-rows (#310): joined rows past WHERE, counted across all
+    /// workers. 0 = no cap; then `produced` is never touched.
+    max_rows: u64 = 0,
+    produced: ?*std.atomic.Value(u64) = null,
 };
 
 /// Recursively fill `merged[filled_w..]` from right-table matches for `step_idx`,
@@ -1759,6 +1763,9 @@ fn expandAndEmit(merged: [][]const u8, filled_w: usize, step_idx: usize, ctx: *J
             }
         }
         if (ctx.limit == 0) return error.LimitReached; // stop before the first write (#111)
+        if (ctx.max_rows > 0) {
+            if (ctx.produced.?.fetchAdd(1, .monotonic) >= ctx.max_rows) return error.JoinRowLimit;
+        }
         if (ctx.rows_skipped < ctx.offset) {
             ctx.rows_skipped += 1;
             return;
@@ -1809,6 +1816,7 @@ const JoinWorkerCtx = struct {
     file: std.fs.File,
     opts: options_mod.Options,
     parent_allocator: Allocator,
+    produced: *std.atomic.Value(u64),
     err: ?anyerror = null,
 };
 
@@ -1852,6 +1860,8 @@ fn joinWorkerRun(w: *JoinWorkerCtx) !void {
         .limit = -1, // parallel path is gated to no-LIMIT queries
         .offset = 0,
         .allocator = wa,
+        .max_rows = w.opts.max_join_rows,
+        .produced = w.produced,
     };
 
     // ponytail: 512-column ceiling matches the other parallel scan paths; a wider
@@ -2126,6 +2136,7 @@ fn executeJoinImpl(
     const aa = arena.allocator();
     const joins = query.joins;
     std.debug.assert(joins.len > 0);
+    var join_rows_produced = std.atomic.Value(u64).init(0);
 
     // ── Step 1: Read base schema (header only; rows are streamed in Step 4) ──
     const base_file = try std.fs.cwd().openFile(query.file_path, .{});
@@ -2393,6 +2404,7 @@ fn executeJoinImpl(
                 .file = wfile,
                 .opts = opts,
                 .parent_allocator = allocator,
+                .produced = &join_rows_produced,
             };
         }
         for (0..nthreads) |i| threads[i] = try std.Thread.spawn(.{}, joinWorker, .{&workers[i]});
@@ -2436,6 +2448,8 @@ fn executeJoinImpl(
         .limit = query.limit,
         .offset = query.offset,
         .allocator = allocator,
+        .max_rows = opts.max_join_rows,
+        .produced = &join_rows_produced,
     };
 
     // Headerless: base_hdr_raw is the first data row; stream the rest after it.
@@ -3266,6 +3280,7 @@ pub fn describeError(err: anyerror) ?[]const u8 {
         error.NegativeOffsetNotAllowed => "OFFSET cannot be negative",
         error.StrictModeNonNumericValue => "--strict: a non-numeric value was compared as a number",
         error.RaggedRow => "--strict: a row has a different number of fields than the header",
+        error.JoinRowLimit => "JOIN produced more rows than --max-join-rows allows; add a WHERE filter or check the ON key",
         error.ReadOnly => "csvql is read only; only SELECT is supported",
         error.XlsxNotAZip, error.XlsxBadZip, error.XlsxZip => "file is not a valid .xlsx workbook",
         error.XlsxUnsupportedCompression => ".xlsx uses a compression method csvql cannot read",
@@ -7801,6 +7816,28 @@ test "LEFT JOIN keeps unmatched left rows with empty right columns" {
     const out = try out_file.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(out);
     try std.testing.expectEqualStrings("name,dname\nann,eng\nbob,\n", out);
+}
+
+test "--max-join-rows: a JOIN past the cap errors, at the cap it runs (#310)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // 3 x 3 rows on one key: 9 joined rows.
+    try tmp.dir.writeFile(.{ .sub_path = "s.csv", .data = "id,k\n1,a\n2,a\n3,a\n" });
+    var sb: [std.fs.max_path_bytes]u8 = undefined;
+    const sp = try tmp.dir.realpath("s.csv", &sb);
+    for ([_][]const u8{ "SELECT x.id FROM '{s}' x JOIN '{s}' y ON x.k = y.k", "SELECT COUNT(*) FROM '{s}' x JOIN '{s}' y ON x.k = y.k" }) |fmt| {
+        const sql = try std.fmt.allocPrint(allocator, "{s}", .{fmt});
+        defer allocator.free(sql);
+        const full = try std.mem.replaceOwned(u8, allocator, sql, "{s}", sp);
+        defer allocator.free(full);
+        var query = try parser.parse(allocator, full);
+        defer query.deinit();
+        const out_file = try tmp.dir.createFile("out.csv", .{ .read = true });
+        defer out_file.close();
+        try std.testing.expectError(error.JoinRowLimit, execute(allocator, query, out_file, .{ .max_join_rows = 8 }));
+        try execute(allocator, query, out_file, .{ .max_join_rows = 9 });
+    }
 }
 
 test "nameHoldsDenied: exact, whole word inside a longer header, not a substring" {
