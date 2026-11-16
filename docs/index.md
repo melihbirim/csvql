@@ -58,7 +58,7 @@ csvql --root /data <span class="k">"SELECT COUNT(*) FROM '/data/events.csv'"</sp
 
 <span class="c"># blocked, including ../ traversal</span>
 csvql --root /data <span class="k">"SELECT COUNT(*) FROM '/etc/passwd'"</span>
-execution error: error.PathOutsideAllowedRoot</pre>
+error: file is outside the allowed --root, or does not exist (PathOutsideAllowedRoot)</pre>
     <p>Combined with SELECT-only execution, no network calls and <code>--audit</code> logging, that is the whole trust story: the tool cannot modify your data, cannot phone home, and cannot read outside its root.</p>
     <p>Token cost: five questions about a taxi dataset cost about <strong>640 tokens</strong> over MCP, tool schema included, and that does not change with file size. Pasting the 417&nbsp;MB file would cost about 230 million tokens, so pasting was never an option. An agent that already shells out to <code>duckdb -csv</code> uses slightly fewer tokens than csvql over MCP, because MCP returns JSON. The case for csvql is the paragraph above, not the token count.</p>
   </div>

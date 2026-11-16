@@ -56,6 +56,11 @@ pub const Options = struct {
     /// mode is for callers who'd rather find out their data has a type
     /// mismatch than get a silently-partial result.
     strict: bool = false,
+    /// Cap on joined rows (`--max-join-rows`, #310). 0 = no cap. --mcp
+    /// defaults to 10 million so one runaway JOIN cannot exhaust memory.
+    /// ponytail: caps joins only; a huge single-file GROUP BY or ORDER BY can
+    /// still use a lot of memory. Add a byte budget if that shows up.
+    max_join_rows: u64 = 0,
 };
 
 /// Resolve the configured worker count.

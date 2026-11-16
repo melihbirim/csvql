@@ -83,7 +83,7 @@ Start the server by hand and watch it refuse:
 
 ```bash
 csvql --root ~/hr-exports --deny-columns email "SELECT email FROM 'employees.csv' LIMIT 1"
-# execution error: error.DeniedColumn
+# error: query reads a column that is denied by --deny-columns (DeniedColumn)
 csvql --root ~/hr-exports --deny-columns email "SELECT department, COUNT(*) FROM 'employees.csv' GROUP BY department"
 # department,COUNT(*)
 # ...

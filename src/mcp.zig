@@ -51,7 +51,12 @@ var g_deny: []const []const u8 = &.{};
 // Optional audit-log path, set once at startup. null = off.
 var g_audit: ?[]const u8 = null;
 
-pub fn run(allocator: Allocator, roots: []const []const u8, audit_path: ?[]const u8, deny_columns: []const []const u8) !void {
+/// One runaway JOIN must not take the host down (#310).
+pub const default_max_join_rows: u64 = 10_000_000;
+var g_max_join_rows: u64 = default_max_join_rows;
+
+pub fn run(allocator: Allocator, roots: []const []const u8, audit_path: ?[]const u8, deny_columns: []const []const u8, max_join_rows: u64) !void {
+    g_max_join_rows = max_join_rows;
     g_roots = roots;
     g_deny = deny_columns;
     g_audit = audit_path;
@@ -193,7 +198,10 @@ fn toolCsvQuery(
         // Refused or failed queries are audited too: blocked attempts are what
         // a reviewer looks for first (#308).
         if (g_audit) |ap| audit.record(allocator, ap, sql, null, null, @errorName(err));
-        const msg = try std.fmt.allocPrint(allocator, "Query error: {s}", .{@errorName(err)});
+        const msg = if (engine.describeError(err)) |d|
+            try std.fmt.allocPrint(allocator, "Query error: {s} ({s}){s}", .{ d, @errorName(err), if (engine.wantsColumnHint(err)) ". Call csv_schema to see the columns." else "" })
+        else
+            try std.fmt.allocPrint(allocator, "Query error: {s}", .{@errorName(err)});
         defer allocator.free(msg);
         try sendToolError(allocator, id, msg, resp);
         return;
@@ -424,7 +432,7 @@ fn runOnce(allocator: Allocator, q: parser.Query, format: options_mod.OutputForm
 /// Every query an agent sends runs with the server's sandbox. stdin is the
 /// JSON-RPC stream itself, so it is never a readable file here.
 fn sandboxOptions(format: options_mod.OutputFormat) options_mod.Options {
-    return .{ .format = format, .roots = g_roots, .deny_columns = g_deny, .allow_stdin = false };
+    return .{ .format = format, .roots = g_roots, .deny_columns = g_deny, .allow_stdin = false, .max_join_rows = g_max_join_rows };
 }
 
 fn runQuery(allocator: Allocator, sql: []const u8, format: options_mod.OutputFormat) !QueryResult {

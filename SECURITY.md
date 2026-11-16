@@ -39,6 +39,7 @@ When running csvql on a server that an agent or remote user queries:
 * Set `--root` to the data directory so nothing else is readable.
 * Run as a dedicated, unprivileged user with a read only mount of the data.
 * Prefer the SSH access model (`ssh host csvql --mcp --root /data`). It reuses your existing SSH keys, bastion, and audit trail, and needs no open port.
+* Resource limit: in `--mcp` mode a JOIN that produces more than 10 million rows is refused with `JoinRowLimit` (`--max-join-rows N` changes it, `0` removes it). There is no query timeout, and a very large single-file `GROUP BY` or `ORDER BY` can still use a lot of memory, so run the server under an OS memory limit (`systemd` `MemoryMax`, a container limit) when the files are large.
 * Enable `--audit <file>` to record every query (timestamp and SQL) as JSONL for compliance and forensics. Refused queries are recorded too, with an `error` field such as `DeniedColumn` or `PathOutsideAllowedRoot`, and so are `csv_schema` calls.
 * If you expose an HTTP transport later, keep csvql behind a reverse proxy that terminates TLS and handles authentication.
 

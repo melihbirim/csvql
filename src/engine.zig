@@ -655,6 +655,13 @@ pub fn execute(allocator: Allocator, parsed: parser.Query, output_file: std.fs.F
     }
     if (staged_joins) |j| query.joins = j;
 
+    // --strict: a row whose field count differs from the header is an error,
+    // not a silently padded or truncated row (#300).
+    if (opts.strict) {
+        try checkFieldCounts(query.file_path, opts.delimiter);
+        for (query.joins) |j| try checkFieldCounts(j.right_file, opts.delimiter);
+    }
+
     // --deny-columns: refuse a query that names a denied column anywhere, and
     // turn SELECT * into the list of allowed columns.
     var star_cols: ?[][]u8 = null;
@@ -1713,6 +1720,10 @@ const JoinCtx = struct {
     limit: i32,
     offset: i32,
     allocator: Allocator, // for complex WHERE row_map only
+    /// --max-join-rows (#310): joined rows past WHERE, counted across all
+    /// workers. 0 = no cap; then `produced` is never touched.
+    max_rows: u64 = 0,
+    produced: ?*std.atomic.Value(u64) = null,
 };
 
 /// Recursively fill `merged[filled_w..]` from right-table matches for `step_idx`,
@@ -1752,6 +1763,9 @@ fn expandAndEmit(merged: [][]const u8, filled_w: usize, step_idx: usize, ctx: *J
             }
         }
         if (ctx.limit == 0) return error.LimitReached; // stop before the first write (#111)
+        if (ctx.max_rows > 0) {
+            if (ctx.produced.?.fetchAdd(1, .monotonic) >= ctx.max_rows) return error.JoinRowLimit;
+        }
         if (ctx.rows_skipped < ctx.offset) {
             ctx.rows_skipped += 1;
             return;
@@ -1802,6 +1816,7 @@ const JoinWorkerCtx = struct {
     file: std.fs.File,
     opts: options_mod.Options,
     parent_allocator: Allocator,
+    produced: *std.atomic.Value(u64),
     err: ?anyerror = null,
 };
 
@@ -1845,6 +1860,8 @@ fn joinWorkerRun(w: *JoinWorkerCtx) !void {
         .limit = -1, // parallel path is gated to no-LIMIT queries
         .offset = 0,
         .allocator = wa,
+        .max_rows = w.opts.max_join_rows,
+        .produced = w.produced,
     };
 
     // ponytail: 512-column ceiling matches the other parallel scan paths; a wider
@@ -2119,6 +2136,7 @@ fn executeJoinImpl(
     const aa = arena.allocator();
     const joins = query.joins;
     std.debug.assert(joins.len > 0);
+    var join_rows_produced = std.atomic.Value(u64).init(0);
 
     // ── Step 1: Read base schema (header only; rows are streamed in Step 4) ──
     const base_file = try std.fs.cwd().openFile(query.file_path, .{});
@@ -2386,6 +2404,7 @@ fn executeJoinImpl(
                 .file = wfile,
                 .opts = opts,
                 .parent_allocator = allocator,
+                .produced = &join_rows_produced,
             };
         }
         for (0..nthreads) |i| threads[i] = try std.Thread.spawn(.{}, joinWorker, .{&workers[i]});
@@ -2429,6 +2448,8 @@ fn executeJoinImpl(
         .limit = query.limit,
         .offset = query.offset,
         .allocator = allocator,
+        .max_rows = opts.max_join_rows,
+        .produced = &join_rows_produced,
     };
 
     // Headerless: base_hdr_raw is the first data row; stream the rest after it.
@@ -3150,6 +3171,141 @@ fn columnLookupError(expr: []const u8) anyerror {
 /// quoted, because it excludes delimiters found inside a quoted field. So a
 /// quoted row needs the same split as an unquoted one plus this per field, not
 /// a second full parse of the record.
+/// 1-based line of the first ragged row found by checkFieldCounts, for the
+/// error message. One query per process run on the CLI, sequential in MCP.
+pub var ragged_line: usize = 0;
+
+/// --strict pre-pass (#300): every record must have as many fields as the
+/// header. Quote aware, so a delimiter or newline inside quotes does not count.
+/// Blank lines are skipped, as the scan paths skip them. stdin is not checked.
+/// ponytail: separate full pass, only paid under --strict; fold into the scan
+/// paths if a default-on warning is wanted.
+fn checkFieldCounts(path: []const u8, delimiter: u8) !void {
+    if (std.mem.eql(u8, path, "-")) return;
+    const f = try std.fs.cwd().openFile(path, .{});
+    defer f.close();
+    const data = try file_map.map(f, (try f.stat()).size);
+    defer file_map.unmap(data);
+    if (findRaggedLine(data, delimiter)) |line| {
+        ragged_line = line;
+        return error.RaggedRow;
+    }
+}
+
+/// Returns the 1-based line where the first record with a field count
+/// different from the header starts, or null when every record matches.
+fn findRaggedLine(data: []const u8, delimiter: u8) ?usize {
+    var expected: ?usize = null;
+    var fields: usize = 1;
+    var line: usize = 1;
+    var rec_line: usize = 1;
+    var rec_len: usize = 0;
+    var in_quote = false;
+    var i: usize = 0;
+    while (i <= data.len) : (i += 1) {
+        const at_end = i == data.len;
+        const c: u8 = if (at_end) '\n' else data[i];
+        if (in_quote and !at_end) {
+            if (c == '"') {
+                if (i + 1 < data.len and data[i + 1] == '"') {
+                    i += 1;
+                } else in_quote = false;
+            } else if (c == '\n') line += 1;
+            rec_len += 1;
+            continue;
+        }
+        if (c == '\n') {
+            const blank = rec_len == 0 or (rec_len == 1 and data[i - 1] == '\r');
+            if (!blank) {
+                if (expected) |e| {
+                    if (fields != e) return rec_line;
+                } else expected = fields;
+            }
+            fields = 1;
+            rec_len = 0;
+            line += 1;
+            rec_line = line;
+            in_quote = false;
+            continue;
+        }
+        if (c == '"' and (rec_len == 0 or data[i - 1] == delimiter)) in_quote = true;
+        if (c == delimiter) fields += 1;
+        rec_len += 1;
+    }
+    return null;
+}
+
+test "findRaggedLine: short and long rows, quotes, CRLF, blank lines" {
+    try std.testing.expectEqual(@as(?usize, null), findRaggedLine("a,b\n1,2\n3,4\n", ','));
+    try std.testing.expectEqual(@as(?usize, null), findRaggedLine("a,b\r\n1,2\r\n\r\n3,4", ','));
+    try std.testing.expectEqual(@as(?usize, 3), findRaggedLine("a,b,c\n1,2,3\n4,5\n", ','));
+    try std.testing.expectEqual(@as(?usize, 2), findRaggedLine("a,b\n1,2,3\n", ','));
+    try std.testing.expectEqual(@as(?usize, null), findRaggedLine("a,b\n\"x,\ny\",2\n3,4\n", ','));
+    try std.testing.expectEqual(@as(?usize, 4), findRaggedLine("a,b\n\"x,\ny\",2\n3\n", ','));
+    try std.testing.expectEqual(@as(?usize, null), findRaggedLine("a\tb\n1\t2\n", '\t'));
+}
+
+/// One plain sentence per error a query can hit, for the CLI and MCP (#302).
+/// Unknown errors return null and keep their bare name.
+pub fn describeError(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.ColumnNotFound => "column not found",
+        error.OrderByColumnNotFound => "ORDER BY column not found",
+        error.JoinColumnNotFound => "JOIN ON column not found",
+        error.AmbiguousColumnReference => "column name is ambiguous across joined files; qualify it as table.column",
+        error.DeniedColumn => "query reads a column that is denied by --deny-columns",
+        error.DeniedColumnSelectStar => "SELECT * cannot run here because a denied column is involved; name the columns instead",
+        error.PathOutsideAllowedRoot => "file is outside the allowed --root, or does not exist",
+        error.NotARegularFile => "path is not a regular file",
+        error.IsDir => "path is a directory, not a file",
+        error.EmptyFile => "file is empty",
+        error.NoHeader => "file has no header row",
+        error.TooManyColumns => "row has more columns than csvql supports",
+        error.InvalidQuery, error.InvalidExpression => "query could not be parsed",
+        error.InvalidOperator => "unknown comparison operator",
+        error.InvalidJoinSyntax => "JOIN syntax not understood; use JOIN 'file' ON a.col = b.col",
+        error.UnterminatedQuotedValue => "quoted value is not closed",
+        error.UnexpectedTextAfterTable => "unexpected text after the FROM table",
+        error.UnsupportedJoinType => "RIGHT, FULL and CROSS JOIN are not supported; use JOIN or LEFT JOIN",
+        error.UnsupportedSetOperation => "UNION, INTERSECT and EXCEPT are not supported",
+        error.SubqueriesNotSupported => "this kind of subquery is not supported; only col IN (SELECT ...) is",
+        error.SubqueryMustSelectOneColumn => "IN (SELECT ...) subquery must select exactly one column",
+        error.InvalidSubquery => "subquery could not be parsed",
+        error.MixedAggregateAndNonAggregateSelect => "SELECT mixes aggregates and plain columns; add the plain columns to GROUP BY",
+        error.NestedFunctionNotSupported => "this function cannot be nested here",
+        error.UnsupportedCaseExpression => "this CASE expression is not supported",
+        error.UnsupportedHavingComparesTwoAggregates => "HAVING cannot compare two aggregates with each other",
+        error.ArithmeticExpressionsNotSupported => "arithmetic is not supported in this position",
+        error.NegativeLimitNotAllowed => "LIMIT cannot be negative",
+        error.NegativeOffsetNotAllowed => "OFFSET cannot be negative",
+        error.StrictModeNonNumericValue => "--strict: a non-numeric value was compared as a number",
+        error.RaggedRow => "--strict: a row has a different number of fields than the header",
+        error.JoinRowLimit => "JOIN produced more rows than --max-join-rows allows; add a WHERE filter or check the ON key",
+        error.ReadOnly => "csvql is read only; only SELECT is supported",
+        error.XlsxNotAZip, error.XlsxBadZip, error.XlsxZip => "file is not a valid .xlsx workbook",
+        error.XlsxUnsupportedCompression => ".xlsx uses a compression method csvql cannot read",
+        error.XlsxTooLarge => ".xlsx sheet is too large to load",
+        error.XlsxNoSheets, error.XlsxMissingSheet => ".xlsx workbook has no readable sheet",
+        error.XlsxBadSharedString => ".xlsx shared strings table is damaged",
+        else => null,
+    };
+}
+
+/// True for errors where knowing the column names is the fix.
+pub fn wantsColumnHint(err: anyerror) bool {
+    return switch (err) {
+        error.ColumnNotFound, error.OrderByColumnNotFound, error.JoinColumnNotFound, error.AmbiguousColumnReference => true,
+        else => false,
+    };
+}
+
+test "describeError covers lookup errors and leaves unknown ones alone" {
+    try std.testing.expectEqualStrings("column not found", describeError(error.ColumnNotFound).?);
+    try std.testing.expect(wantsColumnHint(error.OrderByColumnNotFound));
+    try std.testing.expect(!wantsColumnHint(error.DeniedColumn));
+    try std.testing.expect(describeError(error.OutOfMemory) == null);
+}
+
 inline fn unquoteField(arena: Allocator, f: []const u8) []const u8 {
     var v = f;
     if (v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"') v = v[1 .. v.len - 1];
@@ -7660,6 +7816,28 @@ test "LEFT JOIN keeps unmatched left rows with empty right columns" {
     const out = try out_file.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(out);
     try std.testing.expectEqualStrings("name,dname\nann,eng\nbob,\n", out);
+}
+
+test "--max-join-rows: a JOIN past the cap errors, at the cap it runs (#310)" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // 3 x 3 rows on one key: 9 joined rows.
+    try tmp.dir.writeFile(.{ .sub_path = "s.csv", .data = "id,k\n1,a\n2,a\n3,a\n" });
+    var sb: [std.fs.max_path_bytes]u8 = undefined;
+    const sp = try tmp.dir.realpath("s.csv", &sb);
+    for ([_][]const u8{ "SELECT x.id FROM '{s}' x JOIN '{s}' y ON x.k = y.k", "SELECT COUNT(*) FROM '{s}' x JOIN '{s}' y ON x.k = y.k" }) |fmt| {
+        const sql = try std.fmt.allocPrint(allocator, "{s}", .{fmt});
+        defer allocator.free(sql);
+        const full = try std.mem.replaceOwned(u8, allocator, sql, "{s}", sp);
+        defer allocator.free(full);
+        var query = try parser.parse(allocator, full);
+        defer query.deinit();
+        const out_file = try tmp.dir.createFile("out.csv", .{ .read = true });
+        defer out_file.close();
+        try std.testing.expectError(error.JoinRowLimit, execute(allocator, query, out_file, .{ .max_join_rows = 8 }));
+        try execute(allocator, query, out_file, .{ .max_join_rows = 9 });
+    }
 }
 
 test "nameHoldsDenied: exact, whole word inside a longer header, not a substring" {

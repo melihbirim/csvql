@@ -33,10 +33,10 @@ Agents are getting access to company data. The usual paths are a database connec
 - **Read-only by construction.** The parser has no `INSERT`, `UPDATE`, `DELETE` or `DROP`. Nothing writes to an input file.
 - **No network.** No `std.net`, `std.http` or socket call in the codebase. No telemetry, no update check. `strace -f -e trace=network` shows an empty trace.
 - **Sandboxed by default for agents.** `csvql --mcp` only opens files under its working directory and refuses to start in the filesystem root; `--root /data` picks the folders instead, and `--root /` allows everything. `/etc/passwd` and `../` traversal fail with `PathOutsideAllowedRoot`.
-- **Private columns stay private.** `--deny-columns email,ssn` refuses any query that reads those columns, in SELECT, WHERE, ORDER BY or a subquery, and `SELECT *` leaves them out. The agent can still run `AVG(salary) GROUP BY dept`.
-- **Bounded output.** MCP results are capped at about 100 rows / 12 KB per call. A careless `SELECT *` cannot flood the context. The cap is per call, so an agent that pages with `OFFSET` can still read a whole table; keep data it must never see out with `--deny-columns`.
+- **Private columns stay private.** `--deny-columns email,ssn` refuses any query that reads those columns, in SELECT, WHERE, ORDER BY or a subquery, and `SELECT *` leaves them out. The agent can still run `AVG(salary) GROUP BY dept`. Names match as whole words, so list variants such as `customer_ssn` too.
+- **Bounded output.** MCP results are capped at about 100 rows / 12 KB per call. A careless `SELECT *` cannot flood the context. The cap is per call, so an agent that pages with `OFFSET` can still read a whole table; keep data it must never see out with `--deny-columns`. A JOIN that produces more than 10 million rows is refused in `--mcp` mode (`--max-join-rows` changes it), so one runaway query cannot exhaust memory.
 - **Flat memory.** An aggregate holds a running accumulator, not a dataset: 74 MB on a 0.7 GB file and 74 MB on an 8 GB one. It fits on the small VM beside the data.
-- **Auditable.** `--audit <file>` appends one JSONL record per query. Over SSH you inherit your existing keys, bastion and logs.
+- **Auditable.** `--audit <file>` appends one JSONL record per query, including refused ones with the error name. Over SSH you inherit your existing keys, bastion and logs.
 
 Full posture, including two known gaps on macOS and Windows: [SECURITY.md](SECURITY.md).
 
@@ -260,8 +260,9 @@ Full syntax reference and runnable examples for every SQL feature csvql supports
 | **SELECT**    | `SELECT col1, col2` or `SELECT *`                                       |
 | **AS alias**  | `SELECT expr AS alias` — rename any column or expression in output; `AS` is optional (`SELECT expr alias` also works) |
 | **DISTINCT**  | `SELECT DISTINCT col1, col2` — deduplicates output rows                 |
+| **Input files** | `.csv`, `.tsv` and `.xlsx`. The delimiter is `,` unless you pass `-d`, so a TSV needs `-d '\t'`; the file extension does not pick it. `.xlsx` reads the first worksheet only, entirely in memory: formulas give their saved value, dates come out as `YYYY-MM-DD`. Other sheets, `.xls` and `.xlsb` are not supported |
 | **FROM**      | `FROM 'file.csv'` or `FROM -` (stdin); optional table alias — `FROM 'file.csv' AS t` or bare `FROM 'file.csv' t`, reference columns as `t.col` |
-| **WHERE**     | `=`, `!=`, `>`, `>=`, `<`, `<=` with auto numeric coercion              |
+| **WHERE**     | `=`, `!=`, `>`, `>=`, `<`, `<=`. An unquoted number compares numerically when the field parses as a number, so `code = 7` matches `7`, `007` and `7.0`. A single-quoted literal is text for `=` and `!=`: `code = '007'` matches only `007`. `<`, `>`, `<=`, `>=` and `BETWEEN` compare numerically whenever both sides parse, quoted or not, so `salary > '50000'` is a numeric comparison |
 | **Modulo**    | `WHERE col % n = val` — integer remainder test in WHERE (also `MOD(col, n)` as a SELECT expression) |
 | **LIKE / NOT LIKE** | `WHERE col LIKE 'pattern'`, `WHERE col NOT LIKE 'pattern'` — `%` any sequence, `_` any single character (one UTF-8 character, so `'Z_rich'` matches `Zürich`) |
 | **ILIKE / NOT ILIKE** | `WHERE col ILIKE 'pattern'`, `WHERE col NOT ILIKE 'pattern'` — same as LIKE but case-insensitive (ASCII letters) |
@@ -272,6 +273,9 @@ Full syntax reference and runnable examples for every SQL feature csvql supports
 | **NOT**       | `WHERE NOT expr` — logical negation of any condition. Binds tighter than AND and OR, as in SQL: `NOT a = 1 AND b = 2` is `(NOT a = 1) AND b = 2`; use parentheses for `NOT (a = 1 AND b = 2)`. An empty field is unknown, not false: `NOT age > 30`, `age != 30` and `age NOT IN (30)` all exclude a row with an empty `age`, same as `age > 30` does. Only `IS NULL`, `IS NOT NULL` and a comparison against `''` see the empty field itself |
 | **AND / OR**  | `WHERE cond1 AND cond2` / `WHERE cond1 OR cond2` — compound conditions  |
 | **JOIN**      | `FROM 'a.csv' a [INNER] JOIN 'b.csv' b ON a.key = b.key`               |
+| **LEFT JOIN** | `FROM 'a.csv' a LEFT [OUTER] JOIN 'b.csv' b ON a.key = b.key` — every left row is kept; right columns are empty where nothing matched. Joins can be chained. `RIGHT`, `FULL` and `CROSS JOIN` are not supported |
+| **Arithmetic** | `+ - * /` with the usual precedence (`*` and `/` before `+` and `-`) and parentheses, in the `SELECT` list (`price * qty AS total`, `(a + b) / 2`), in `WHERE` (`WHERE price * qty > 100`), inside aggregates (`SUM(price * qty)`) and over aggregate results (`SUM(a) / COUNT(*)`). Division by zero gives an empty field (NULL), not an error. A non-numeric operand gives an empty field |
+| **Quoted identifiers** | A column name with spaces or a reserved word can be written `"First Name"`, `` `First Name` `` or `[First Name]`. Backticks and brackets are always identifiers. A double-quoted token is an identifier when it names a column; on the right side of a `WHERE` comparison it is a value if no column has that name. The output header is the column name without quotes |
 | **GROUP BY**  | `GROUP BY col1` or `GROUP BY alias` — groups rows; accepts SELECT aliases |
 | **COUNT**     | `COUNT(*)` or `COUNT(col)` — with or without `GROUP BY`                 |
 | **SUM**       | `SUM(col)` or `SUM(CASE WHEN cond THEN n ELSE m END)` — conditional sum |
@@ -281,7 +285,7 @@ Full syntax reference and runnable examples for every SQL feature csvql supports
 | **QUANTILE** | `QUANTILE(col, p)` — the `p`-th quantile of numeric values, `p` a numeric literal from 0 to 1 (`QUANTILE(latency_ms, 0.95)` is the p95). Interpolates linearly between the two nearest values, like DuckDB's `quantile_cont`, so `QUANTILE(col, 0.5)` equals `MEDIAN(col)`. Empty and non-numeric fields are skipped; a group with none gives an empty field. A `p` outside 0 to 1, or a missing `p`, is a query error. Like `MEDIAN`, it buffers every value of a group, so memory is O(rows) rather than O(groups); several `QUANTILE`/`MEDIAN` calls in one query each keep their own buffer |
 | **MODE**      | `MODE(col)` — the most frequent value, as text. Empty fields are not counted; a group with no values gives an empty field. Ties go to the smallest value (numerically when both are numbers, otherwise byte order), so the result does not depend on row order or `--threads`. Memory is O(distinct values) per group |
 | **GROUP_CONCAT** | `GROUP_CONCAT(col [, 'sep'])` — concatenate group values (default separator `,`; alias `STRING_AGG`) |
-| **CASE WHEN** | `CASE WHEN col OP val THEN n ELSE m END` inside any aggregate function, or wrapping an aggregate in its own condition — `CASE WHEN AVG(col) > n THEN ... END` |
+| **CASE WHEN** | `CASE WHEN col OP val THEN n ELSE m END` inside any aggregate function, or wrapping an aggregate in its own condition — `CASE WHEN AVG(col) > n THEN ... END`. As a plain `SELECT` column, `THEN` and `ELSE` take a literal, a column or any scalar expression (`UPPER(s)`, `NOW()`, a nested `CASE`), and the `WHEN` value may be a literal or a clock keyword (`WHEN d < NOW()`); string comparisons use byte order. One condition, no `AND`/`OR`; other shapes fail with `UnsupportedCaseExpression` |
 | **MIN / MAX** | `MIN(col)`, `MAX(col)` — with or without `GROUP BY`                     |
 | **HAVING**    | `HAVING expr` — filter groups after aggregation (e.g. `HAVING COUNT(*) > 5`); `AND`/`OR` of multiple aggregates not in `SELECT` also works (e.g. `HAVING COUNT(*) > 5 AND MAX(col) > 100`) |
 | **STRFTIME**  | `STRFTIME('%Y-%m', col)` — date bucketing in `SELECT` and `GROUP BY`    |
@@ -309,7 +313,7 @@ Full syntax reference and runnable examples for every SQL feature csvql supports
 | **CAST**      | `SELECT CAST(col AS INTEGER/FLOAT/TEXT)` — type conversion              |
 | **DATEDIFF**  | `DATEDIFF('unit', start_col, end_col)` — duration between two datetime columns. Units: `second`, `minute`, `hour`, `day`, `week`, `month` (≈30 days), `year` (≈365 days). Auto-detects ISO-8601, US (MM/DD/YYYY), EU (DD.MM.YYYY) and mixed formats in the same file |
 | **DATEADD**   | `DATEADD('unit', amount, date_col)` — add/subtract interval from a datetime column. `amount` may be negative. Units: `second`, `minute`, `hour`, `day`, `week`, `month` (≈30 days), `year` (≈365 days). Returns `YYYY-MM-DD HH:MM:SS` |
-| **CURRENT_DATE / NOW() / CURRENT_TIMESTAMP** | The current UTC date or time: `CURRENT_DATE` is `YYYY-MM-DD`, `NOW()` and `CURRENT_TIMESTAMP` are `YYYY-MM-DD HH:MM:SS`. The parentheses are optional on `CURRENT_DATE` and `CURRENT_TIMESTAMP` and required on `NOW()`, so a column called `now` still works. Usable in the `SELECT` list (the header is the text you wrote unless you give an alias) and as the value on the right of a `WHERE` comparison, e.g. `WHERE created_at >= CURRENT_DATE`. The clock is read once when the query is parsed, so every row, and a `col IN (SELECT ...)` subquery, sees the same instant. Set `CSVQL_NOW` to `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS` (UTC) to pin it for scripts and tests; a value that does not parse is a query error. Not supported: arithmetic such as `CURRENT_DATE - 7`, `DATEADD`/`DATEDIFF` on the keywords (those take a column), and the keywords on the left of a `WHERE` comparison. Quoted text and longer identifiers such as `current_dates` are left alone, but a column named `current_date` cannot be selected unquoted |
+| **CURRENT_DATE / NOW() / CURRENT_TIMESTAMP** | The current UTC date or time: `CURRENT_DATE` is `YYYY-MM-DD`, `NOW()` and `CURRENT_TIMESTAMP` are `YYYY-MM-DD HH:MM:SS`. The parentheses are optional on `CURRENT_DATE` and `CURRENT_TIMESTAMP` and required on `NOW()`, so a column called `now` still works. Usable in the `SELECT` list (the header is the text you wrote unless you give an alias) and as the value on the right of a `WHERE` comparison, e.g. `WHERE created_at >= CURRENT_DATE`. The clock is read once when the query is parsed, so every row, and a `col IN (SELECT ...)` subquery, sees the same instant. Set `CSVQL_NOW` to `YYYY-MM-DD` or `YYYY-MM-DD HH:MM:SS` (UTC) to pin it for scripts and tests; a value that does not parse is a query error. Not supported: arithmetic such as `CURRENT_DATE - 7`, `DATEADD`/`DATEDIFF` on the keywords (those take a column), and the keywords on the left of a `WHERE` comparison. Quoted text and longer identifiers such as `current_dates` are left alone. A column named `current_date` or `current_timestamp` wins over the clock in the `SELECT` list (write `CURRENT_DATE()` for the clock there); in `WHERE` the bare word is always the clock, so quote the column: `WHERE "current_date" < '2024-06-01'` |
 | **ORDER BY**  | `ORDER BY col [ASC\|DESC]`, multi-column `ORDER BY col1 ASC, col2 DESC`, alias, positional (`ORDER BY 1`), or a column not in the `SELECT` list (sorts by the raw source/grouping column) |
 | **LIMIT / OFFSET** | `LIMIT n [OFFSET m]` — return up to `n` rows after skipping the first `m` result rows |
 
@@ -325,6 +329,10 @@ Two intentional differences, found via differential testing against DuckDB (see 
 | Empty CSV field | Stays an empty string in output and in `GROUP BY`; in `WHERE` it behaves like `NULL` (no comparison, `!=`, `NOT` or `NOT IN` matches it; `IS NULL` and `= ''` do) | Inferred as `NULL` |
 | `MODE(col)` with several equally frequent values | The smallest value | Not specified |
 | `DATEDIFF('hour'/'minute'/etc, a, b)` on a non-exact interval | Fractional (e.g. `8.5` hours) | Truncated to whole units (e.g. `8`) |
+| A row with fewer or more fields than the header | Padded with empty fields or truncated, silently. `--strict` makes it an error (exit 3) naming the first such line | Error by default; padded only with `null_padding` or `ignore_errors` |
+| `col < '10'` on a column of zero-padded codes | Numeric comparison when both sides parse | String comparison when the column was inferred as `VARCHAR` |
+
+CSV columns have no declared type here, so a quoted literal only switches to text comparison for `=` and `!=`. Use `=` or `IN` for codes and ids with leading zeros.
 
 If you need character count instead of byte length, NULL instead of empty-string semantics, or truncated instead of fractional interval math, be aware the two engines diverge here rather than assume identical output.
 
@@ -565,7 +573,44 @@ csvql "SELECT * FROM 'orders.csv' o JOIN 'customers.csv' c ON o.customer_id = c.
 csvql "SELECT e.name, d.dept_name FROM 'employees.csv' e JOIN 'departments.csv' d ON e.dept_id = d.id LIMIT 10"
 ```
 
-**Notes:**
+# LEFT JOIN keeps every employee, with an empty dept_name where there is no match
+csvql "SELECT e.name, d.dept_name FROM 'employees.csv' e LEFT JOIN 'departments.csv' d ON e.dept_id = d.id"
+
+# Chained joins
+csvql "SELECT o.id, c.name, p.title FROM 'orders.csv' o JOIN 'customers.csv' c ON o.customer_id = c.id LEFT JOIN 'products.csv' p ON o.product_id = p.id"
+```
+
+## Arithmetic Examples
+
+```bash
+# In the SELECT list, with an alias
+csvql "SELECT id, price * qty AS total FROM 'orders.csv'"
+
+# Precedence and parentheses: * before +, parentheses first
+csvql "SELECT price + qty * 2, (price + qty) / 2 FROM 'orders.csv'"
+
+# In WHERE, inside an aggregate, and over aggregate results
+csvql "SELECT region, SUM(price * qty) AS revenue FROM 'orders.csv' WHERE price * qty > 100 GROUP BY region"
+csvql "SELECT SUM(revenue) / COUNT(*) AS avg_revenue FROM 'orders.csv'"
+```
+
+## Quoted Identifiers and Excel Examples
+
+```bash
+# Column names with spaces: three equivalent spellings; the header prints as First Name
+csvql "SELECT \"First Name\", [Last Name], `Employee ID` FROM 'staff.csv'"
+
+# Leading zeros: quote the literal so it compares as text
+csvql "SELECT * FROM 'accounts.csv' WHERE code = '007'"
+
+# First worksheet of an Excel file
+csvql "SELECT region, SUM(amount) FROM 'sales.xlsx' GROUP BY region"
+
+# TSV needs the delimiter
+csvql "SELECT name FROM 'data.tsv'" -d '\t'
+```
+
+**Join notes:**
 - Table aliases are required when using qualified column references (`alias.col`)
 - Unqualified column names are resolved from the left table first, then the right
 - The right table is fully loaded into memory (build side); the left table is streamed (probe side)
@@ -599,7 +644,7 @@ csvql is built to be safe to run next to sensitive data, including on corporate 
 
 **Read only.** csvql runs `SELECT` only. The parser has no `INSERT`, `UPDATE`, `DELETE`, or `DROP`. It cannot modify, delete, or write your data files.
 
-**No data egress.** Data stays on the machine. A query returns only its result, never the file. Over MCP, `csv_query` results are capped (about 12 KB per response), which also limits how much an agent can pull out across queries.
+**No data egress.** Data stays on the machine. A query returns only its result, never the file. Over MCP, `csv_query` results are capped (about 12 KB per response). The cap is per call: an agent that pages with `OFFSET` can still read a whole table, so keep columns it must never see out with `--deny-columns`.
 
 **No network, air gappable.** csvql makes zero outbound connections. No telemetry, no cloud, no API keys, no update checks. It runs fully offline. Verified by reading the source, not just asserted: there is no `std.net`, `std.http`, or socket call anywhere in the codebase.
 
@@ -609,7 +654,11 @@ A few internal operations (resolving `IN (SELECT ...)` subqueries, staging a JOI
 
 If you're evaluating csvql for an air-gapped or hardened-filesystem environment, verify this claim yourself rather than take it on faith — `strace -f -e trace=network,open,openat` (Linux) or the equivalent will show it directly. That's the point: this is meant to be provable, not just stated.
 
-**Filesystem scoping.** By default csvql can read any file the process user can. Pass `--root <dir>[,<dir>]` to confine all file access (CLI and MCP) to those directory trees. Paths are resolved with `realpath`, so `../` traversal and symlink escape are rejected. Always set `--root` when exposing csvql to an agent or another user.
+**Filesystem scoping.** By default csvql can read any file the process user can. Pass `--root <dir>[,<dir>]` to confine all file access (CLI and MCP) to those directory trees. Paths are resolved with `realpath`, so `../` traversal and symlink escape are rejected. Always set `--root` when exposing csvql to an agent or another user. `-o/--output` is held to the same trees, and is refused when the target is a file the query reads. One limit: a hard link inside a root to a file outside it is readable, because a hard link has no path to resolve. Only someone who can already write to the root can create one, so keep roots read only for the querying user.
+
+**Column deny list.** `--deny-columns a,b` refuses any query that names those columns and drops them from `SELECT *`. A header that contains a denied name as a whole word (`id;ssn` from a file read with the wrong delimiter, `employee ssn`, a name with a non-breaking space in front) is dropped as well. The list needs the header row, so it cannot be combined with `--no-input-header`. Over MCP the agent cannot change the delimiter or the header mode. Matching is by whole word, so `ssn` does not cover `customer_ssn` or `ssn_number`: list every variant name your files use.
+
+**Terminal safety.** `--table` and `--markdown` output replaces control bytes in cells with `?`, so data cannot send escape sequences to the terminal. Plain CSV output passes bytes through unchanged; JSON output escapes them.
 
 **Minimal attack surface.** A single static binary. No runtime, no interpreter, no dependencies to track for CVEs. With the SSH access model there is no long running daemon and no open port.
 
@@ -620,7 +669,8 @@ When running csvql on a server that an agent or remote user queries:
 * Set `--root` to the data directory so nothing else is readable.
 * Run as a dedicated, unprivileged user with a read only mount of the data.
 * Prefer the SSH access model (`ssh host csvql --mcp --root /data`). It reuses your existing SSH keys, bastion, and audit trail, and needs no open port.
-* Enable `--audit <file>` to record every query (timestamp and SQL) as JSONL for compliance and forensics.
+* Resource limit: in `--mcp` mode a JOIN that produces more than 10 million rows is refused with `JoinRowLimit` (`--max-join-rows N` changes it, `0` removes it). There is no query timeout, and a very large single-file `GROUP BY` or `ORDER BY` can still use a lot of memory, so run the server under an OS memory limit (`systemd` `MemoryMax`, a container limit) when the files are large.
+* Enable `--audit <file>` to record every query (timestamp and SQL) as JSONL for compliance and forensics. Refused queries are recorded too, with an `error` field such as `DeniedColumn` or `PathOutsideAllowedRoot`, and so are `csv_schema` calls.
 * If you expose an HTTP transport later, keep csvql behind a reverse proxy that terminates TLS and handles authentication.
 
 See the README section "Remote and on-prem" for the SSH setup.

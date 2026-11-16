@@ -84,7 +84,8 @@ const help_text =
     \\  --wrap                  Wrap long cell text across lines instead of dropping columns
     \\  --threads <N>           Worker threads for parallel execution (0 = auto)
     \\  --strict                Error on a WHERE numeric comparison against a non-numeric
-    \\                          value instead of silently skipping that row
+    \\                          value instead of silently skipping that row, and on a row
+    \\                          whose field count differs from the header
     \\  --schema <file>         Show column names, inferred types, row count, and file size
     \\  --mcp                   Start as an MCP (Model Context Protocol) server
     \\                          Exposes csv_query, csv_schema, csv_list tools
@@ -93,6 +94,8 @@ const help_text =
     \\                          working directory; --root / allows the whole filesystem.
     \\  --deny-columns <a,b>    Refuse any query that reads these columns; SELECT * leaves
     \\                          them out. For personal data an agent must never see.
+    \\  --max-join-rows <N>     Refuse a JOIN that produces more than N rows (0 = no cap).
+    \\                          Default: no cap on the CLI, 10000000 with --mcp
     \\  --audit <file>          Append a JSONL record per query (timestamp, SQL) for compliance
     \\  install                 Register csvql as an MCP server in Claude (Code + Desktop),
     \\                          no manual config. Claude Desktop gets --root set to the
@@ -107,7 +110,7 @@ const help_text =
     \\  0  success
     \\  1  uncategorized failure (IO error, internal error, file not found)
     \\  2  the query is wrong (bad/unsupported SQL, unresolved column) — your bug
-    \\  3  the data defeated csvql (currently: --strict's non-numeric WHERE value)
+    \\  3  the data defeated csvql (--strict: non-numeric WHERE value, ragged row)
     \\
 ;
 
@@ -116,8 +119,8 @@ const help_text =
 ///   1 = uncategorized failure (IO error, internal error, file not found)
 ///   2 = the query is wrong — bad/unsupported SQL, unresolved column, a
 ///       structural mismatch between the query and the file. The user's bug.
-///   3 = the data defeated csvql — currently only --strict's non-numeric
-///       WHERE comparison. A data-quality signal, not a query bug; script
+///   3 = the data defeated csvql — --strict's non-numeric WHERE comparison
+///       or a ragged row. A data-quality signal, not a query bug; script
 ///       callers may want to route this differently (e.g. quarantine the
 ///       file) instead of treating it the same as a typo'd query.
 /// Exact codes are part of the CLI contract — treat changes here as breaking.
@@ -141,10 +144,12 @@ fn exitCodeForError(err: anyerror) u8 {
         error.DeniedColumn,
         error.DeniedColumnSelectStar,
         error.UnexpectedTextAfterTable,
+        error.JoinRowLimit,
         error.NotARegularFile,
         error.ReadOnly,
         => 2,
         error.StrictModeNonNumericValue,
+        error.RaggedRow,
         error.EmptyFile,
         error.NoHeader,
         => 3,
@@ -169,6 +174,7 @@ pub fn main() !void {
     var roots_list = std.ArrayList([]const u8){};
     defer roots_list.deinit(allocator);
     var audit_path: ?[]const u8 = null;
+    var max_join_rows: ?u64 = null;
     var deny_list = std.ArrayList([]const u8){};
     defer deny_list.deinit(allocator);
     if (unknownFlag(args[1..])) |bad| {
@@ -197,6 +203,11 @@ pub fn main() !void {
                     try stderr_file.writeAll("error: --deny-columns requires a column list\n");
                     std.process.exit(2);
                 }
+            } else if (flagValue(args, &i, "--max-join-rows")) |v| {
+                max_join_rows = std.fmt.parseInt(u64, v, 10) catch {
+                    try stderr_file.writeAll("error: --max-join-rows requires a whole number (0 = no cap)\n");
+                    std.process.exit(2);
+                };
             } else if (flagValue(args, &i, "--audit")) |v| {
                 if (v.len == 0) {
                     try stderr_file.writeAll("error: --audit requires a file path argument\n");
@@ -229,7 +240,7 @@ pub fn main() !void {
                     "Add --root <folder> to choose what the agent can read, or run 'csvql install' from that folder.\n");
                 std.process.exit(2);
             }
-            try mcp.run(allocator, if (roots.len > 0) roots else &.{"."}, audit_path, deny_columns);
+            try mcp.run(allocator, if (roots.len > 0) roots else &.{"."}, audit_path, deny_columns, max_join_rows orelse mcp.default_max_join_rows);
             return;
         }
         if (std.mem.eql(u8, args[1], "install")) {
@@ -258,7 +269,7 @@ pub fn main() !void {
     }
 
     // Strip --no-header / -d / --delimiter flags; collect remainder for query parsing.
-    var opts = options_mod.Options{ .roots = roots, .audit_path = audit_path, .deny_columns = deny_columns };
+    var opts = options_mod.Options{ .roots = roots, .audit_path = audit_path, .deny_columns = deny_columns, .max_join_rows = max_join_rows orelse 0 };
     var output_path: ?[]const u8 = null;
     var clean_args = try std.ArrayList([]const u8).initCapacity(allocator, args.len);
     defer clean_args.deinit(allocator);
@@ -302,9 +313,9 @@ pub fn main() !void {
                 std.process.exit(1);
             }
             opts.delimiter = parseDelimiter(args[i]);
-        } else if (std.mem.eql(u8, arg, "--root") or std.mem.eql(u8, arg, "--audit") or std.mem.eql(u8, arg, "--deny-columns")) {
+        } else if (std.mem.eql(u8, arg, "--root") or std.mem.eql(u8, arg, "--audit") or std.mem.eql(u8, arg, "--deny-columns") or std.mem.eql(u8, arg, "--max-join-rows")) {
             i += 1; // value already parsed into opts above; skip it here
-        } else if (std.mem.startsWith(u8, arg, "--root=") or std.mem.startsWith(u8, arg, "--audit=") or std.mem.startsWith(u8, arg, "--deny-columns=")) {
+        } else if (std.mem.startsWith(u8, arg, "--root=") or std.mem.startsWith(u8, arg, "--audit=") or std.mem.startsWith(u8, arg, "--deny-columns=") or std.mem.startsWith(u8, arg, "--max-join-rows=")) {
             // parsed above
         } else if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--output")) {
             i += 1;
@@ -342,7 +353,7 @@ pub fn main() !void {
         defer allocator.free(query_text);
 
         break :blk parser.parse(allocator, query_text) catch |err| {
-            std.debug.print("SQL parse error: {}\n", .{err});
+            printQueryError(err);
             std.debug.print("\nRun 'csvql --help' for usage information.\n", .{});
             auditCli(allocator, audit_path, clean_args.items[1..], @errorName(err));
             std.process.exit(2); // the query is wrong, not csvql
@@ -356,7 +367,7 @@ pub fn main() !void {
     // not inside execute(), since execute() only ever sees a by-value copy;
     // see engine.zig's resolveInSubqueries for why that distinction matters.
     engine.resolveQuery(allocator, &query, opts) catch |err| {
-        std.debug.print("execution error: {}\n", .{err});
+        printQueryError(err);
         auditCli(allocator, audit_path, clean_args.items[1..], @errorName(err));
         std.process.exit(exitCodeForError(err));
     };
@@ -394,7 +405,7 @@ pub fn main() !void {
         } else stdout_file;
         defer if (output_path != null) md_out.close();
         renderTableOutput(allocator, query, md_out, opts) catch |err| {
-            std.debug.print("execution error: {}\n", .{err});
+            printQueryError(err);
             auditCli(allocator, audit_path, clean_args.items[1..], @errorName(err));
             std.process.exit(exitCodeForError(err));
         };
@@ -406,19 +417,19 @@ pub fn main() !void {
         };
         defer out.close();
         engine.execute(allocator, query, out, opts) catch |err| {
-            std.debug.print("execution error: {}\n", .{err});
+            printQueryError(err);
             auditCli(allocator, audit_path, clean_args.items[1..], @errorName(err));
             std.process.exit(exitCodeForError(err));
         };
     } else if (use_table) {
         renderTableOutput(allocator, query, stdout_file, opts) catch |err| {
-            std.debug.print("execution error: {}\n", .{err});
+            printQueryError(err);
             auditCli(allocator, audit_path, clean_args.items[1..], @errorName(err));
             std.process.exit(exitCodeForError(err));
         };
     } else {
         engine.execute(allocator, query, stdout_file, opts) catch |err| {
-            std.debug.print("execution error: {}\n", .{err});
+            printQueryError(err);
             auditCli(allocator, audit_path, clean_args.items[1..], @errorName(err));
             std.process.exit(exitCodeForError(err));
         };
@@ -426,6 +437,18 @@ pub fn main() !void {
 
     // Audit the query after it ran (best-effort). Descriptor = the query text/args.
     auditCli(allocator, audit_path, clean_args.items[1..], null);
+}
+
+/// Print a query error as a sentence plus the error name, with a hint when
+/// the column names would fix it (#302). Exit codes are unchanged.
+fn printQueryError(err: anyerror) void {
+    if (engine.describeError(err)) |msg| {
+        std.debug.print("error: {s} ({s})\n", .{ msg, @errorName(err) });
+    } else {
+        std.debug.print("execution error: {}\n", .{err});
+    }
+    if (engine.wantsColumnHint(err)) std.debug.print("hint: csvql --schema <file> lists the columns\n", .{});
+    if (err == error.RaggedRow) std.debug.print("first at line {d}\n", .{engine.ragged_line});
 }
 
 /// Append one audit record for this CLI run. `err_name` is set when the query
@@ -656,7 +679,7 @@ fn getTerminalWidth() usize {
 /// non-empty count, and empty count.  Also prints a summary header line.
 /// True if `tok` appears anywhere in args[1..].
 /// Flags that consume the next argument as their value.
-const value_flags = [_][]const u8{ "--threads", "-d", "--delimiter", "--root", "--audit", "--deny-columns", "-o", "--output", "--schema", "-schema", "-s" };
+const value_flags = [_][]const u8{ "--threads", "-d", "--delimiter", "--root", "--audit", "--deny-columns", "--max-join-rows", "-o", "--output", "--schema", "-schema", "-s" };
 /// Flags that stand alone.
 const bare_flags = [_][]const u8{ "--no-header", "--json", "--jsonl", "--table", "--wrap", "--no-input-header", "--no-table", "--markdown", "--strict", "--mcp", "--version", "-v", "--help", "-h", "--print" };
 
@@ -677,7 +700,7 @@ fn unknownFlag(args: anytype) ?[]const u8 {
             i += 1;
         } else if (inList(&bare_flags, a) or
             std.mem.startsWith(u8, a, "--root=") or std.mem.startsWith(u8, a, "--audit=") or
-            std.mem.startsWith(u8, a, "--deny-columns=") or std.mem.startsWith(u8, a, "--schema="))
+            std.mem.startsWith(u8, a, "--deny-columns=") or std.mem.startsWith(u8, a, "--max-join-rows=") or std.mem.startsWith(u8, a, "--schema="))
         {
             continue;
         } else if (std.mem.startsWith(u8, a, "--") and std.mem.indexOfAny(u8, a, " \t\r\n") == null) {
