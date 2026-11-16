@@ -9,8 +9,9 @@ Full syntax reference and runnable examples for every SQL feature csvql supports
 | **SELECT**    | `SELECT col1, col2` or `SELECT *`                                       |
 | **AS alias**  | `SELECT expr AS alias` — rename any column or expression in output; `AS` is optional (`SELECT expr alias` also works) |
 | **DISTINCT**  | `SELECT DISTINCT col1, col2` — deduplicates output rows                 |
+| **Input files** | `.csv`, `.tsv` and `.xlsx`. The delimiter is `,` unless you pass `-d`, so a TSV needs `-d '\t'`; the file extension does not pick it. `.xlsx` reads the first worksheet only, entirely in memory: formulas give their saved value, dates come out as `YYYY-MM-DD`. Other sheets, `.xls` and `.xlsb` are not supported |
 | **FROM**      | `FROM 'file.csv'` or `FROM -` (stdin); optional table alias — `FROM 'file.csv' AS t` or bare `FROM 'file.csv' t`, reference columns as `t.col` |
-| **WHERE**     | `=`, `!=`, `>`, `>=`, `<`, `<=` with auto numeric coercion              |
+| **WHERE**     | `=`, `!=`, `>`, `>=`, `<`, `<=`. An unquoted number compares numerically when the field parses as a number, so `code = 7` matches `7`, `007` and `7.0`. A single-quoted literal is text for `=` and `!=`: `code = '007'` matches only `007`. `<`, `>`, `<=`, `>=` and `BETWEEN` compare numerically whenever both sides parse, quoted or not, so `salary > '50000'` is a numeric comparison |
 | **Modulo**    | `WHERE col % n = val` — integer remainder test in WHERE (also `MOD(col, n)` as a SELECT expression) |
 | **LIKE / NOT LIKE** | `WHERE col LIKE 'pattern'`, `WHERE col NOT LIKE 'pattern'` — `%` any sequence, `_` any single character (one UTF-8 character, so `'Z_rich'` matches `Zürich`) |
 | **ILIKE / NOT ILIKE** | `WHERE col ILIKE 'pattern'`, `WHERE col NOT ILIKE 'pattern'` — same as LIKE but case-insensitive (ASCII letters) |
@@ -21,6 +22,9 @@ Full syntax reference and runnable examples for every SQL feature csvql supports
 | **NOT**       | `WHERE NOT expr` — logical negation of any condition. Binds tighter than AND and OR, as in SQL: `NOT a = 1 AND b = 2` is `(NOT a = 1) AND b = 2`; use parentheses for `NOT (a = 1 AND b = 2)`. An empty field is unknown, not false: `NOT age > 30`, `age != 30` and `age NOT IN (30)` all exclude a row with an empty `age`, same as `age > 30` does. Only `IS NULL`, `IS NOT NULL` and a comparison against `''` see the empty field itself |
 | **AND / OR**  | `WHERE cond1 AND cond2` / `WHERE cond1 OR cond2` — compound conditions  |
 | **JOIN**      | `FROM 'a.csv' a [INNER] JOIN 'b.csv' b ON a.key = b.key`               |
+| **LEFT JOIN** | `FROM 'a.csv' a LEFT [OUTER] JOIN 'b.csv' b ON a.key = b.key` — every left row is kept; right columns are empty where nothing matched. Joins can be chained. `RIGHT`, `FULL` and `CROSS JOIN` are not supported |
+| **Arithmetic** | `+ - * /` with the usual precedence (`*` and `/` before `+` and `-`) and parentheses, in the `SELECT` list (`price * qty AS total`, `(a + b) / 2`), in `WHERE` (`WHERE price * qty > 100`), inside aggregates (`SUM(price * qty)`) and over aggregate results (`SUM(a) / COUNT(*)`). Division by zero gives an empty field (NULL), not an error. A non-numeric operand gives an empty field |
+| **Quoted identifiers** | A column name with spaces or a reserved word can be written `"First Name"`, `` `First Name` `` or `[First Name]`. Backticks and brackets are always identifiers. A double-quoted token is an identifier when it names a column; on the right side of a `WHERE` comparison it is a value if no column has that name. The output header is the column name without quotes |
 | **GROUP BY**  | `GROUP BY col1` or `GROUP BY alias` — groups rows; accepts SELECT aliases |
 | **COUNT**     | `COUNT(*)` or `COUNT(col)` — with or without `GROUP BY`                 |
 | **SUM**       | `SUM(col)` or `SUM(CASE WHEN cond THEN n ELSE m END)` — conditional sum |
@@ -74,6 +78,9 @@ Two intentional differences, found via differential testing against DuckDB (see 
 | Empty CSV field | Stays an empty string in output and in `GROUP BY`; in `WHERE` it behaves like `NULL` (no comparison, `!=`, `NOT` or `NOT IN` matches it; `IS NULL` and `= ''` do) | Inferred as `NULL` |
 | `MODE(col)` with several equally frequent values | The smallest value | Not specified |
 | `DATEDIFF('hour'/'minute'/etc, a, b)` on a non-exact interval | Fractional (e.g. `8.5` hours) | Truncated to whole units (e.g. `8`) |
+| `col < '10'` on a column of zero-padded codes | Numeric comparison when both sides parse | String comparison when the column was inferred as `VARCHAR` |
+
+CSV columns have no declared type here, so a quoted literal only switches to text comparison for `=` and `!=`. Use `=` or `IN` for codes and ids with leading zeros.
 
 If you need character count instead of byte length, NULL instead of empty-string semantics, or truncated instead of fractional interval math, be aware the two engines diverge here rather than assume identical output.
 
@@ -314,7 +321,44 @@ csvql "SELECT * FROM 'orders.csv' o JOIN 'customers.csv' c ON o.customer_id = c.
 csvql "SELECT e.name, d.dept_name FROM 'employees.csv' e JOIN 'departments.csv' d ON e.dept_id = d.id LIMIT 10"
 ```
 
-**Notes:**
+# LEFT JOIN keeps every employee, with an empty dept_name where there is no match
+csvql "SELECT e.name, d.dept_name FROM 'employees.csv' e LEFT JOIN 'departments.csv' d ON e.dept_id = d.id"
+
+# Chained joins
+csvql "SELECT o.id, c.name, p.title FROM 'orders.csv' o JOIN 'customers.csv' c ON o.customer_id = c.id LEFT JOIN 'products.csv' p ON o.product_id = p.id"
+```
+
+## Arithmetic Examples
+
+```bash
+# In the SELECT list, with an alias
+csvql "SELECT id, price * qty AS total FROM 'orders.csv'"
+
+# Precedence and parentheses: * before +, parentheses first
+csvql "SELECT price + qty * 2, (price + qty) / 2 FROM 'orders.csv'"
+
+# In WHERE, inside an aggregate, and over aggregate results
+csvql "SELECT region, SUM(price * qty) AS revenue FROM 'orders.csv' WHERE price * qty > 100 GROUP BY region"
+csvql "SELECT SUM(revenue) / COUNT(*) AS avg_revenue FROM 'orders.csv'"
+```
+
+## Quoted Identifiers and Excel Examples
+
+```bash
+# Column names with spaces: three equivalent spellings; the header prints as First Name
+csvql "SELECT \"First Name\", [Last Name], `Employee ID` FROM 'staff.csv'"
+
+# Leading zeros: quote the literal so it compares as text
+csvql "SELECT * FROM 'accounts.csv' WHERE code = '007'"
+
+# First worksheet of an Excel file
+csvql "SELECT region, SUM(amount) FROM 'sales.xlsx' GROUP BY region"
+
+# TSV needs the delimiter
+csvql "SELECT name FROM 'data.tsv'" -d '\t'
+```
+
+**Join notes:**
 - Table aliases are required when using qualified column references (`alias.col`)
 - Unqualified column names are resolved from the left table first, then the right
 - The right table is fully loaded into memory (build side); the left table is streamed (probe side)
