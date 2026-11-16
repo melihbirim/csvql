@@ -190,6 +190,9 @@ fn toolCsvQuery(
     };
 
     const res = runQuery(allocator, sql, .json) catch |err| {
+        // Refused or failed queries are audited too: blocked attempts are what
+        // a reviewer looks for first (#308).
+        if (g_audit) |ap| audit.record(allocator, ap, sql, null, null, @errorName(err));
         const msg = try std.fmt.allocPrint(allocator, "Query error: {s}", .{@errorName(err)});
         defer allocator.free(msg);
         try sendToolError(allocator, id, msg, resp);
@@ -201,7 +204,7 @@ fn toolCsvQuery(
 
     // Audit the executed query (best-effort). Records even when the result is
     // then refused below, because the query still read the data.
-    if (g_audit) |ap| audit.record(allocator, ap, sql, std.mem.count(u8, trimmed, "{"), trimmed.len);
+    if (g_audit) |ap| audit.record(allocator, ap, sql, std.mem.count(u8, trimmed, "{"), trimmed.len, null);
 
     // runQuery already tried shrinking LIMIT to fit MAX_RESULT_BYTES. This
     // only fires when even a single row doesn't fit (pathologically wide).
@@ -258,6 +261,7 @@ fn toolCsvSchema(
     defer allocator.free(sql);
 
     const res = runQuery(allocator, sql, .json) catch |err| {
+        if (g_audit) |ap| audit.record(allocator, ap, sql, null, null, @errorName(err));
         const msg = try std.fmt.allocPrint(
             allocator,
             "Error reading '{s}': {s}",
@@ -269,7 +273,10 @@ fn toolCsvSchema(
     };
     defer allocator.free(res.output);
 
-    try sendToolResult(allocator, id, std.mem.trim(u8, res.output, "\r\n "), resp);
+    const out = std.mem.trim(u8, res.output, "\r\n ");
+    // csv_schema returns real sample rows, so it is audited like a query (#309).
+    if (g_audit) |ap| audit.record(allocator, ap, sql, std.mem.count(u8, out, "{"), out.len, null);
+    try sendToolResult(allocator, id, out, resp);
 }
 
 // ---------------------------------------------------------------------------

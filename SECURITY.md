@@ -14,7 +14,7 @@ csvql is built to be safe to run next to sensitive data, including on corporate 
 
 **Read only.** csvql runs `SELECT` only. The parser has no `INSERT`, `UPDATE`, `DELETE`, or `DROP`. It cannot modify, delete, or write your data files.
 
-**No data egress.** Data stays on the machine. A query returns only its result, never the file. Over MCP, `csv_query` results are capped (about 12 KB per response), which also limits how much an agent can pull out across queries.
+**No data egress.** Data stays on the machine. A query returns only its result, never the file. Over MCP, `csv_query` results are capped (about 12 KB per response). The cap is per call: an agent that pages with `OFFSET` can still read a whole table, so keep columns it must never see out with `--deny-columns`.
 
 **No network, air gappable.** csvql makes zero outbound connections. No telemetry, no cloud, no API keys, no update checks. It runs fully offline. Verified by reading the source, not just asserted: there is no `std.net`, `std.http`, or socket call anywhere in the codebase.
 
@@ -26,7 +26,7 @@ If you're evaluating csvql for an air-gapped or hardened-filesystem environment,
 
 **Filesystem scoping.** By default csvql can read any file the process user can. Pass `--root <dir>[,<dir>]` to confine all file access (CLI and MCP) to those directory trees. Paths are resolved with `realpath`, so `../` traversal and symlink escape are rejected. Always set `--root` when exposing csvql to an agent or another user. `-o/--output` is held to the same trees, and is refused when the target is a file the query reads. One limit: a hard link inside a root to a file outside it is readable, because a hard link has no path to resolve. Only someone who can already write to the root can create one, so keep roots read only for the querying user.
 
-**Column deny list.** `--deny-columns a,b` refuses any query that names those columns and drops them from `SELECT *`. A header that contains a denied name as a whole word (`id;ssn` from a file read with the wrong delimiter, `employee ssn`, a name with a non-breaking space in front) is dropped as well. The list needs the header row, so it cannot be combined with `--no-input-header`. Over MCP the agent cannot change the delimiter or the header mode.
+**Column deny list.** `--deny-columns a,b` refuses any query that names those columns and drops them from `SELECT *`. A header that contains a denied name as a whole word (`id;ssn` from a file read with the wrong delimiter, `employee ssn`, a name with a non-breaking space in front) is dropped as well. The list needs the header row, so it cannot be combined with `--no-input-header`. Over MCP the agent cannot change the delimiter or the header mode. Matching is by whole word, so `ssn` does not cover `customer_ssn` or `ssn_number`: list every variant name your files use.
 
 **Terminal safety.** `--table` and `--markdown` output replaces control bytes in cells with `?`, so data cannot send escape sequences to the terminal. Plain CSV output passes bytes through unchanged; JSON output escapes them.
 
@@ -39,7 +39,7 @@ When running csvql on a server that an agent or remote user queries:
 * Set `--root` to the data directory so nothing else is readable.
 * Run as a dedicated, unprivileged user with a read only mount of the data.
 * Prefer the SSH access model (`ssh host csvql --mcp --root /data`). It reuses your existing SSH keys, bastion, and audit trail, and needs no open port.
-* Enable `--audit <file>` to record every query (timestamp and SQL) as JSONL for compliance and forensics.
+* Enable `--audit <file>` to record every query (timestamp and SQL) as JSONL for compliance and forensics. Refused queries are recorded too, with an `error` field such as `DeniedColumn` or `PathOutsideAllowedRoot`, and so are `csv_schema` calls.
 * If you expose an HTTP transport later, keep csvql behind a reverse proxy that terminates TLS and handles authentication.
 
 See the README section "Remote and on-prem" for the SSH setup.

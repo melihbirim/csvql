@@ -30,10 +30,10 @@ Agents are getting access to company data. The usual paths are a database connec
 - **Read-only by construction.** The parser has no `INSERT`, `UPDATE`, `DELETE` or `DROP`. Nothing writes to an input file.
 - **No network.** No `std.net`, `std.http` or socket call in the codebase. No telemetry, no update check. `strace -f -e trace=network` shows an empty trace.
 - **Sandboxed by default for agents.** `csvql --mcp` only opens files under its working directory and refuses to start in the filesystem root; `--root /data` picks the folders instead, and `--root /` allows everything. `/etc/passwd` and `../` traversal fail with `PathOutsideAllowedRoot`.
-- **Private columns stay private.** `--deny-columns email,ssn` refuses any query that reads those columns, in SELECT, WHERE, ORDER BY or a subquery, and `SELECT *` leaves them out. The agent can still run `AVG(salary) GROUP BY dept`.
+- **Private columns stay private.** `--deny-columns email,ssn` refuses any query that reads those columns, in SELECT, WHERE, ORDER BY or a subquery, and `SELECT *` leaves them out. The agent can still run `AVG(salary) GROUP BY dept`. Names match as whole words, so list variants such as `customer_ssn` too.
 - **Bounded output.** MCP results are capped at about 100 rows / 12 KB per call. A careless `SELECT *` cannot flood the context. The cap is per call, so an agent that pages with `OFFSET` can still read a whole table; keep data it must never see out with `--deny-columns`.
 - **Flat memory.** An aggregate holds a running accumulator, not a dataset: 74 MB on a 0.7 GB file and 74 MB on an 8 GB one. It fits on the small VM beside the data.
-- **Auditable.** `--audit <file>` appends one JSONL record per query. Over SSH you inherit your existing keys, bastion and logs.
+- **Auditable.** `--audit <file>` appends one JSONL record per query, including refused ones with the error name. Over SSH you inherit your existing keys, bastion and logs.
 
 Full posture, including two known gaps on macOS and Windows: [SECURITY.md](SECURITY.md).
 
