@@ -655,6 +655,13 @@ pub fn execute(allocator: Allocator, parsed: parser.Query, output_file: std.fs.F
     }
     if (staged_joins) |j| query.joins = j;
 
+    // --strict: a row whose field count differs from the header is an error,
+    // not a silently padded or truncated row (#300).
+    if (opts.strict) {
+        try checkFieldCounts(query.file_path, opts.delimiter);
+        for (query.joins) |j| try checkFieldCounts(j.right_file, opts.delimiter);
+    }
+
     // --deny-columns: refuse a query that names a denied column anywhere, and
     // turn SELECT * into the list of allowed columns.
     var star_cols: ?[][]u8 = null;
@@ -3150,6 +3157,80 @@ fn columnLookupError(expr: []const u8) anyerror {
 /// quoted, because it excludes delimiters found inside a quoted field. So a
 /// quoted row needs the same split as an unquoted one plus this per field, not
 /// a second full parse of the record.
+/// 1-based line of the first ragged row found by checkFieldCounts, for the
+/// error message. One query per process run on the CLI, sequential in MCP.
+pub var ragged_line: usize = 0;
+
+/// --strict pre-pass (#300): every record must have as many fields as the
+/// header. Quote aware, so a delimiter or newline inside quotes does not count.
+/// Blank lines are skipped, as the scan paths skip them. stdin is not checked.
+/// ponytail: separate full pass, only paid under --strict; fold into the scan
+/// paths if a default-on warning is wanted.
+fn checkFieldCounts(path: []const u8, delimiter: u8) !void {
+    if (std.mem.eql(u8, path, "-")) return;
+    const f = try std.fs.cwd().openFile(path, .{});
+    defer f.close();
+    const data = try file_map.map(f, (try f.stat()).size);
+    defer file_map.unmap(data);
+    if (findRaggedLine(data, delimiter)) |line| {
+        ragged_line = line;
+        return error.RaggedRow;
+    }
+}
+
+/// Returns the 1-based line where the first record with a field count
+/// different from the header starts, or null when every record matches.
+fn findRaggedLine(data: []const u8, delimiter: u8) ?usize {
+    var expected: ?usize = null;
+    var fields: usize = 1;
+    var line: usize = 1;
+    var rec_line: usize = 1;
+    var rec_len: usize = 0;
+    var in_quote = false;
+    var i: usize = 0;
+    while (i <= data.len) : (i += 1) {
+        const at_end = i == data.len;
+        const c: u8 = if (at_end) '\n' else data[i];
+        if (in_quote and !at_end) {
+            if (c == '"') {
+                if (i + 1 < data.len and data[i + 1] == '"') {
+                    i += 1;
+                } else in_quote = false;
+            } else if (c == '\n') line += 1;
+            rec_len += 1;
+            continue;
+        }
+        if (c == '\n') {
+            const blank = rec_len == 0 or (rec_len == 1 and data[i - 1] == '\r');
+            if (!blank) {
+                if (expected) |e| {
+                    if (fields != e) return rec_line;
+                } else expected = fields;
+            }
+            fields = 1;
+            rec_len = 0;
+            line += 1;
+            rec_line = line;
+            in_quote = false;
+            continue;
+        }
+        if (c == '"' and (rec_len == 0 or data[i - 1] == delimiter)) in_quote = true;
+        if (c == delimiter) fields += 1;
+        rec_len += 1;
+    }
+    return null;
+}
+
+test "findRaggedLine: short and long rows, quotes, CRLF, blank lines" {
+    try std.testing.expectEqual(@as(?usize, null), findRaggedLine("a,b\n1,2\n3,4\n", ','));
+    try std.testing.expectEqual(@as(?usize, null), findRaggedLine("a,b\r\n1,2\r\n\r\n3,4", ','));
+    try std.testing.expectEqual(@as(?usize, 3), findRaggedLine("a,b,c\n1,2,3\n4,5\n", ','));
+    try std.testing.expectEqual(@as(?usize, 2), findRaggedLine("a,b\n1,2,3\n", ','));
+    try std.testing.expectEqual(@as(?usize, null), findRaggedLine("a,b\n\"x,\ny\",2\n3,4\n", ','));
+    try std.testing.expectEqual(@as(?usize, 4), findRaggedLine("a,b\n\"x,\ny\",2\n3\n", ','));
+    try std.testing.expectEqual(@as(?usize, null), findRaggedLine("a\tb\n1\t2\n", '\t'));
+}
+
 /// One plain sentence per error a query can hit, for the CLI and MCP (#302).
 /// Unknown errors return null and keep their bare name.
 pub fn describeError(err: anyerror) ?[]const u8 {
@@ -3184,6 +3265,7 @@ pub fn describeError(err: anyerror) ?[]const u8 {
         error.NegativeLimitNotAllowed => "LIMIT cannot be negative",
         error.NegativeOffsetNotAllowed => "OFFSET cannot be negative",
         error.StrictModeNonNumericValue => "--strict: a non-numeric value was compared as a number",
+        error.RaggedRow => "--strict: a row has a different number of fields than the header",
         error.ReadOnly => "csvql is read only; only SELECT is supported",
         error.XlsxNotAZip, error.XlsxBadZip, error.XlsxZip => "file is not a valid .xlsx workbook",
         error.XlsxUnsupportedCompression => ".xlsx uses a compression method csvql cannot read",

@@ -28,7 +28,7 @@ _arguments -S \
     '(--json --jsonl --no-header)--markdown[render output as a Markdown table]' \
     '--wrap[wrap long cell text across lines]' \
     '--threads[worker threads for parallel execution (0 = auto)]:threads: ' \
-    '--strict[error on non-numeric values in WHERE numeric comparisons]' \
+    '--strict[error on non-numeric values in WHERE numeric comparisons and on ragged rows]' \
     '--schema[show column names, inferred types, row count, file size]:csv file:_files' \
     '--mcp[start as an MCP server]' \
     '--root[confine file access to these directories]:directories:{_dir_list -s ,}' \

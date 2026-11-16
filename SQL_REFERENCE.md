@@ -78,6 +78,7 @@ Two intentional differences, found via differential testing against DuckDB (see 
 | Empty CSV field | Stays an empty string in output and in `GROUP BY`; in `WHERE` it behaves like `NULL` (no comparison, `!=`, `NOT` or `NOT IN` matches it; `IS NULL` and `= ''` do) | Inferred as `NULL` |
 | `MODE(col)` with several equally frequent values | The smallest value | Not specified |
 | `DATEDIFF('hour'/'minute'/etc, a, b)` on a non-exact interval | Fractional (e.g. `8.5` hours) | Truncated to whole units (e.g. `8`) |
+| A row with fewer or more fields than the header | Padded with empty fields or truncated, silently. `--strict` makes it an error (exit 3) naming the first such line | Error by default; padded only with `null_padding` or `ignore_errors` |
 | `col < '10'` on a column of zero-padded codes | Numeric comparison when both sides parse | String comparison when the column was inferred as `VARCHAR` |
 
 CSV columns have no declared type here, so a quoted literal only switches to text comparison for `=` and `!=`. Use `=` or `IN` for codes and ids with leading zeros.

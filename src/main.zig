@@ -84,7 +84,8 @@ const help_text =
     \\  --wrap                  Wrap long cell text across lines instead of dropping columns
     \\  --threads <N>           Worker threads for parallel execution (0 = auto)
     \\  --strict                Error on a WHERE numeric comparison against a non-numeric
-    \\                          value instead of silently skipping that row
+    \\                          value instead of silently skipping that row, and on a row
+    \\                          whose field count differs from the header
     \\  --schema <file>         Show column names, inferred types, row count, and file size
     \\  --mcp                   Start as an MCP (Model Context Protocol) server
     \\                          Exposes csv_query, csv_schema, csv_list tools
@@ -107,7 +108,7 @@ const help_text =
     \\  0  success
     \\  1  uncategorized failure (IO error, internal error, file not found)
     \\  2  the query is wrong (bad/unsupported SQL, unresolved column) — your bug
-    \\  3  the data defeated csvql (currently: --strict's non-numeric WHERE value)
+    \\  3  the data defeated csvql (--strict: non-numeric WHERE value, ragged row)
     \\
 ;
 
@@ -116,8 +117,8 @@ const help_text =
 ///   1 = uncategorized failure (IO error, internal error, file not found)
 ///   2 = the query is wrong — bad/unsupported SQL, unresolved column, a
 ///       structural mismatch between the query and the file. The user's bug.
-///   3 = the data defeated csvql — currently only --strict's non-numeric
-///       WHERE comparison. A data-quality signal, not a query bug; script
+///   3 = the data defeated csvql — --strict's non-numeric WHERE comparison
+///       or a ragged row. A data-quality signal, not a query bug; script
 ///       callers may want to route this differently (e.g. quarantine the
 ///       file) instead of treating it the same as a typo'd query.
 /// Exact codes are part of the CLI contract — treat changes here as breaking.
@@ -145,6 +146,7 @@ fn exitCodeForError(err: anyerror) u8 {
         error.ReadOnly,
         => 2,
         error.StrictModeNonNumericValue,
+        error.RaggedRow,
         error.EmptyFile,
         error.NoHeader,
         => 3,
@@ -437,6 +439,7 @@ fn printQueryError(err: anyerror) void {
         std.debug.print("execution error: {}\n", .{err});
     }
     if (engine.wantsColumnHint(err)) std.debug.print("hint: csvql --schema <file> lists the columns\n", .{});
+    if (err == error.RaggedRow) std.debug.print("first at line {d}\n", .{engine.ragged_line});
 }
 
 /// Append one audit record for this CLI run. `err_name` is set when the query
