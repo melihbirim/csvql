@@ -7,9 +7,10 @@ const Allocator = std.mem.Allocator;
 
 /// Append a JSONL record: {"ts":<unix>,"sql":"...","rows":N,"bytes":N}.
 /// `rows`/`bytes` are optional (null when unknown, e.g. streamed CLI output).
+/// A refused query passes its error name instead: {"ts":..,"sql":"..","error":"DeniedColumn"}.
 /// ponytail: plain append with seekFromEnd. One process/query at a time here
 /// (MCP is sequential, CLI is one query per run), so no cross-process locking.
-pub fn record(allocator: Allocator, path: []const u8, sql: []const u8, rows: ?usize, bytes: ?usize) void {
+pub fn record(allocator: Allocator, path: []const u8, sql: []const u8, rows: ?usize, bytes: ?usize, err_name: ?[]const u8) void {
     var line = std.ArrayList(u8){};
     defer line.deinit(allocator);
 
@@ -20,6 +21,11 @@ pub fn record(allocator: Allocator, path: []const u8, sql: []const u8, rows: ?us
     line.append(allocator, '"') catch return;
     if (rows) |r| line.writer(allocator).print(",\"rows\":{d}", .{r}) catch return;
     if (bytes) |b| line.writer(allocator).print(",\"bytes\":{d}", .{b}) catch return;
+    if (err_name) |e| {
+        line.appendSlice(allocator, ",\"error\":\"") catch return;
+        appendEscaped(&line, allocator, e) catch return;
+        line.append(allocator, '"') catch return;
+    }
     line.appendSlice(allocator, "}\n") catch return;
 
     // Open or create without truncating, then append at the end.
@@ -52,14 +58,15 @@ test "audit record appends a valid JSONL line" {
     }
     const path = try tmp.dir.realpath("audit.log", &path_buf);
 
-    record(allocator, path, "SELECT * FROM 'a.csv' WHERE x = \"q\"", 3, 42);
-    record(allocator, path, "SELECT COUNT(*) FROM 'b.csv'", null, null);
+    record(allocator, path, "SELECT * FROM 'a.csv' WHERE x = \"q\"", 3, 42, null);
+    record(allocator, path, "SELECT COUNT(*) FROM 'b.csv'", null, null, null);
+    record(allocator, path, "SELECT ssn FROM 'c.csv'", null, null, "DeniedColumn");
 
     const data = try tmp.dir.readFileAlloc(allocator, "audit.log", 64 * 1024);
     defer allocator.free(data);
     try std.testing.expect(std.mem.indexOf(u8, data, "\"rows\":3") != null);
     try std.testing.expect(std.mem.indexOf(u8, data, "\"bytes\":42") != null);
     try std.testing.expect(std.mem.indexOf(u8, data, "\\\"q\\\"") != null); // escaped quote
-    // two lines
-    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, data, "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, data, "\"error\":\"DeniedColumn\"}") != null);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, data, "\n"));
 }

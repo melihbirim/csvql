@@ -333,6 +333,7 @@ pub fn main() !void {
         break :blk simple_parser.parseSimple(allocator, clean_args.items[1..]) catch |err| {
             std.debug.print("error: {}\n", .{err});
             std.debug.print("\nRun 'csvql --help' for usage information.\n", .{});
+            auditCli(allocator, audit_path, clean_args.items[1..], @errorName(err));
             std.process.exit(2); // the query is wrong, not csvql
         };
     } else blk: {
@@ -343,6 +344,7 @@ pub fn main() !void {
         break :blk parser.parse(allocator, query_text) catch |err| {
             std.debug.print("SQL parse error: {}\n", .{err});
             std.debug.print("\nRun 'csvql --help' for usage information.\n", .{});
+            auditCli(allocator, audit_path, clean_args.items[1..], @errorName(err));
             std.process.exit(2); // the query is wrong, not csvql
         };
     };
@@ -355,6 +357,7 @@ pub fn main() !void {
     // see engine.zig's resolveInSubqueries for why that distinction matters.
     engine.resolveQuery(allocator, &query, opts) catch |err| {
         std.debug.print("execution error: {}\n", .{err});
+        auditCli(allocator, audit_path, clean_args.items[1..], @errorName(err));
         std.process.exit(exitCodeForError(err));
     };
 
@@ -372,6 +375,7 @@ pub fn main() !void {
     if (output_path) |p| {
         if (outputPathProblem(allocator, p, query, roots)) |msg| {
             try stderr_file.writeAll(msg);
+            auditCli(allocator, audit_path, clean_args.items[1..], "OutputPathRefused");
             std.process.exit(2);
         }
     }
@@ -391,6 +395,7 @@ pub fn main() !void {
         defer if (output_path != null) md_out.close();
         renderTableOutput(allocator, query, md_out, opts) catch |err| {
             std.debug.print("execution error: {}\n", .{err});
+            auditCli(allocator, audit_path, clean_args.items[1..], @errorName(err));
             std.process.exit(exitCodeForError(err));
         };
     } else if (output_path) |p| {
@@ -402,26 +407,34 @@ pub fn main() !void {
         defer out.close();
         engine.execute(allocator, query, out, opts) catch |err| {
             std.debug.print("execution error: {}\n", .{err});
+            auditCli(allocator, audit_path, clean_args.items[1..], @errorName(err));
             std.process.exit(exitCodeForError(err));
         };
     } else if (use_table) {
         renderTableOutput(allocator, query, stdout_file, opts) catch |err| {
             std.debug.print("execution error: {}\n", .{err});
+            auditCli(allocator, audit_path, clean_args.items[1..], @errorName(err));
             std.process.exit(exitCodeForError(err));
         };
     } else {
         engine.execute(allocator, query, stdout_file, opts) catch |err| {
             std.debug.print("execution error: {}\n", .{err});
+            auditCli(allocator, audit_path, clean_args.items[1..], @errorName(err));
             std.process.exit(exitCodeForError(err));
         };
     }
 
     // Audit the query after it ran (best-effort). Descriptor = the query text/args.
-    if (audit_path) |ap| {
-        const desc = try std.mem.join(allocator, " ", clean_args.items[1..]);
-        defer allocator.free(desc);
-        audit.record(allocator, ap, desc, null, null);
-    }
+    auditCli(allocator, audit_path, clean_args.items[1..], null);
+}
+
+/// Append one audit record for this CLI run. `err_name` is set when the query
+/// was refused or failed, so blocked attempts leave a trace too (#308).
+fn auditCli(allocator: std.mem.Allocator, audit_path: ?[]const u8, args: []const []const u8, err_name: ?[]const u8) void {
+    const ap = audit_path orelse return;
+    const desc = std.mem.join(allocator, " ", args) catch return;
+    defer allocator.free(desc);
+    audit.record(allocator, ap, desc, null, null, err_name);
 }
 
 /// Run the engine into a memory-backed scratch file, read back, parse CSV,
