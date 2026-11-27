@@ -177,3 +177,4 @@ Earlier rows are left blank under the same policy as `Distinct` above.
 | 2026-11-24 | 307834567 | 50000 | 46372 | 19818 | 0 | 3.1.0 | 1.5.5 | `./bench/query_fuzz.sh --seed 307834567 --count 50000` |  |
 | 2026-11-25 | 213972534 | 50000 | 46326 | 19600 | 0 | 3.1.0 | 1.5.5 | `./bench/query_fuzz.sh --seed 213972534 --count 50000` |  |
 | 2026-11-26 | 11565314 | 50000 | 46345 | 19723 | 0 | 3.1.0 | 1.5.5 | `./bench/query_fuzz.sh --seed 11565314 --count 50000` |  |
+| 2026-11-27 | 515932062 | 50000 | 46322 | 19766 | 0 | 3.1.0 | 1.5.5 | `./bench/query_fuzz.sh --seed 515932062 --count 50000` |  |
